@@ -1,3 +1,3 @@
 max_access_R: 50
-slice_start_distance: 20
+slice_start_distance: 75
 zap: true

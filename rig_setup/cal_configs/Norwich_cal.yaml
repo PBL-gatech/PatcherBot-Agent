@@ -9,9 +9,9 @@ autofocus_dist: 50
 stage_diag_move: 500
 frame_lag: 4
 pipette_y_rotation: 25
-pipette_k_scale: 0.79156
-stage_x_axis_flip: false
+pipette_k_scale: -0.79156
+stage_x_axis_flip: true
 stage_y_axis_flip: false
-pipette_z_rotation: -20.0105
+pipette_z_rotation: -17.1
 microscope_units_per_um: 1.0
 safe_position_delta_um: -18000
