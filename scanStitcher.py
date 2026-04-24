@@ -1518,7 +1518,7 @@ def main():
     use_pixel_drift_stitch = True
     use_streaming_stitch = True
     downsample = 1
-    date_time_folder = "2026_03_02-16_06"
+    date_time_folder = "2026_03_06-15_55"
     stitcher = ScanStitcher(
         date_time_folder=date_time_folder,
         use_calibration=True,
