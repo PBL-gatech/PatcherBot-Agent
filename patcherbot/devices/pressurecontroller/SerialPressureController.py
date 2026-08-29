@@ -34,36 +34,6 @@ class SerialPressureController(PressureController):
                  native_zero=None, native_per_mbar=None,
                  sensor_offset=None, sensor_scale=None,
                  serial_cmd_timeout=None):
-        """
-        Initialize a SerialPressureController instance.
-
-        Args:
-            channel (int): Pressure box channel number.
-            controllerSerial (serial.Serial, optional): Serial port for controlling pressure output.
-            readerSerial (serial.Serial, optional): Serial port for reading pressure sensor data.
-            validProducts (list[str], optional): USB product names allowed for device discovery.
-            validVIDs (list[int], optional): USB Vendor IDs allowed for device discovery.
-            nativeZero (float, optional): DAC units corresponding to 0 mBar.
-            nativePerMbar (float, optional): DAC units per mBar of pressure.
-            readerOffset (float, optional): Sensor offset before scaling to raw units.
-            readerScale (float, optional): Sensor scale factor for converting to raw units.
-            serialCmdTimeout (float, optional): Timeout for serial command responses in seconds.
-            valid_products (list[str], optional): Alias for `validProducts`.
-            valid_vids (list[int], optional): Alias for `validVIDs`.
-            native_zero (float, optional): Alias for `nativeZero`.
-            native_per_mbar (float, optional): Alias for `nativePerMbar`.
-            sensor_offset (float, optional): Alias for `readerOffset`.
-            sensor_scale (float, optional): Alias for `readerScale`.
-            serial_cmd_timeout (float, optional): Alias for `serialCmdTimeout`.
-
-        Raises:
-            Exception: If `controllerSerial` or `readerSerial` are not provided.
-
-        Notes:
-            - Sets initial pressure to 0 mBar and starts the acquisition thread at ~60 Hz.
-            - Sets initial state to non-atmospheric mode (controlled pressure).
-            - Any argument that is `None` will be replaced by its class default value.
-        """
         super().__init__()
         # time.sleep(2) # wait for arduino to boot up
 
@@ -121,9 +91,6 @@ class SerialPressureController(PressureController):
     def set_pressure(self, pressure):
         '''
         Tell pressure controller to go to a given setpoint pressure in mbar
-
-        Args:
-            pressure (float): Target pressure in mBar.
         '''
         nativeUnits = self.mbarToNative(pressure)
         # self.info(f"Setting pressure to {nativeUnits} mbar")
@@ -131,13 +98,7 @@ class SerialPressureController(PressureController):
     
     def mbarToNative(self, pressure):
         '''
-        Convert from a pressure in mBar to native units
-
-        Args:
-            pressure (float): Pressure in mBar.
-
-        Returns:
-            int: DAC units clamped to 0 – (2 * nativeZero).
+        Comvert from a pressure in mBar to native units
         '''
         raw_pressure = int((pressure * self.nativePerMbar + self.nativeZero))
         return min(max(raw_pressure, 0), self.nativeZero * 2) # clamp native units to 0-3924
@@ -145,13 +106,7 @@ class SerialPressureController(PressureController):
 
     def nativeToMbar(self, raw_pressure) -> float:
         '''
-        Convert from native units to a pressure in mBar
-
-        Args:
-            raw_pressure (int): DAC units.
-
-        Returns:
-            float: Pressure in mBar.
+        Comvert from native units to a pressure in mBar
         '''
         pressure = (raw_pressure - self.nativeZero) / self.nativePerMbar
         return pressure
@@ -159,9 +114,6 @@ class SerialPressureController(PressureController):
     def set_pressure_raw(self, raw_pressure: int):
         '''
         Tell pressure controller to go to a given setpoint pressure in native DAC units
-
-        Args:
-            raw_pressure (int): Target pressure in native DAC units.
         '''
         self.setpoint_raw = raw_pressure
         self.info(f"Setting pressure to {self.nativeToMbar(raw_pressure)} mbar (raw: {raw_pressure})")
@@ -175,18 +127,12 @@ class SerialPressureController(PressureController):
     def get_pressure(self) -> float:
         '''
         Gets the current setpoint in millibar
-
-        Returns:
-            float: Setpoint pressure in mBar.
         '''
         return self.nativeToMbar(self.setpoint_raw)
 
     def measure(self) -> float:
         '''
         Read the pressure sensor value from the Arduino
-        
-        Returns:
-            float: Measured pressure in mBar.
         '''
         pressureVal = self.lastVal
 
@@ -210,9 +156,6 @@ class SerialPressureController(PressureController):
     
     def pulse(self, delayMs):
         '''Tell the onboard arduino to pulse pressure for a certain period of time
-
-        Args:
-            delayMs (int): Duration of pulse in milliseconds.
         '''
         cmd = f"pulse {self.channel} {delayMs}\n"
         self.info(f"Pulsing pressure for {delayMs} ms")
@@ -223,9 +166,6 @@ class SerialPressureController(PressureController):
         '''Send a serial command activating or deactivating the atmosphere solenoid valve
            atm = True -> pressure output is at atmospheric pressure 
            atm = False -> pressure output comes from pressure regulator
-
-        Args:
-            atm (bool): True for atmospheric mode, False for regulated pressure.
         '''
         if atm:
             cmd = f"switchAtm {self.channel}\n" # switch to ATM command

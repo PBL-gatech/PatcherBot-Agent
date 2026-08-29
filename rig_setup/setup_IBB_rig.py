@@ -1,5 +1,5 @@
 '''
-"Fake setup" for GUI development on a computer without access to a rig
+"Fake setup" for GUI development on a computer without access to a rig LEGACY CODE NOW
 '''
 from patcherbot.devices.amplifier.multiclamp import MultiClampChannel
 from patcherbot.devices.amplifier.amplifier import FakeAmplifier

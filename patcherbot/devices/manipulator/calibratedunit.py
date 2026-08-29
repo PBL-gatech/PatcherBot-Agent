@@ -24,13 +24,12 @@ from numpy.linalg import inv, pinv, norm
 from threading import Thread
 from .CalibrationConfig import CalibrationConfig
 from .StageCalHelper import FocusHelper, StageCalHelper
+from .StageScanHelper import StageScanHelper
 from .PipetteCalHelper import PipetteCalHelper, PipetteFocusHelper
-from .CellTrackHelper import CellTrackHelper
 
 __all__ = ['CalibratedUnit', 'CalibrationError', 'CalibratedStage']
 
 verbose = True
-
 
 class CalibrationError(Exception):
     """
@@ -74,7 +73,9 @@ class CalibratedUnit(ManipulatorUnit):
         self.saved_state_question = ('Move manipulator and stage back to '
                                      'initial position?')
         if config is None:
-            config = CalibrationConfig(name='Calibration config')
+            raise ValueError(
+                "CalibratedUnit requires an explicit CalibrationConfig instance."
+            )
         self.config = config
         if stage is None: # In this case we assume the unit is on a fixed element.
             self.stage = FixedStage()
@@ -243,10 +244,33 @@ class CalibratedUnit(ManipulatorUnit):
 
 
     def autofocus_pipette(self):
-        '''Use the microscope image to put the pipette in focus'''
-        self.debug('Autofocusing pipette')
-        self.abort_if_requested()
-        self.pipetteFocusHelper.focus()
+        '''Use the microscope image to put the pipette in focus
+        '''
+        if not self.config.pipette_focus_crop_feature:
+            self.info('Autofocusing pipette without cropping')
+            self.abort_if_requested()
+            self.pipetteFocusHelper.focus()
+        else:
+            self.info('Autofocusing pipette with cropping')
+            self.abort_if_requested()
+            self.autofocus_cropped_pipette()
+
+    def autofocus_cropped_pipette(self,crop_size=256):
+        ''' use pipette detector to crop ROI of pipette tip, then feed directly into focushelpers focuser'''
+        _, _, _, img = self.camera.raw_frame_queue[0]
+        pipette_px = self.pipetteCalHelper.pipetteDetector.detect_pipette(img)
+        if pipette_px is None:
+            self.error("No pipette detected in the current frame.")
+            return
+        pipette_px = np.array(pipette_px)
+        h, w = img.shape[:2]
+        x_min = max(int(pipette_px[0] - crop_size // 2), 0)
+        x_max = min(int(pipette_px[0] + crop_size // 2), w)
+        y_min = max(int(pipette_px[1] - crop_size // 2), 0)
+        y_max = min(int(pipette_px[1] + crop_size // 2), h)
+        cropped_img = img[y_min:y_max, x_min:x_max]
+        self.pipetteFocusHelper.focus(cropped_img)
+
 
     def safe_move(self, r):
         '''
@@ -434,6 +458,50 @@ class CalibratedUnit(ManipulatorUnit):
         # self.debug("DEBUG: Centering move complete.")
 
 
+    def direct_pipette_3D(self, desired_px3D):
+        '''
+        Moves the pipette so that its detected position matches the requested 3D image coordinates.
+        '''
+        self.abort_if_requested()
+        #(1) get image from raw frame queue
+        _, _, _, img = self.camera.raw_frame_queue[0]
+        #(2) get detected pipette position from deep learning detector
+        detected_px = np.array(self.pipetteCalHelper.pipetteDetector.detect_pipette(img))
+        #(3) extract planar values from desired_px3D
+        if detected_px is None:
+            self.error("No pipette detected in the current frame.")
+            return
+        detected_px = np.asarray(detected_px, dtype=float)  # expected length 2 (x, y)
+        desired_px3D = np.asarray(desired_px3D, dtype=float)
+        if desired_px3D.size < 3:
+            # goal z defaults to 0 defocus if not provided
+            desired_px3D = np.pad(desired_px3D, (0, 3 - desired_px3D.size), constant_values=0)
+        desired_px = desired_px3D[:2]
+
+        # (4) Compute the pixel error (desired minus detected).
+        error_px = desired_px - detected_px
+        # self.debug("DEBUG: Pixel error (desired - detected):", error_px)
+        
+        # (5) Convert the pixel error into a correction (in microns).
+        # pixels_to_um_relative() expects a 3-element vector.
+        error_um = self.pixels_to_um_relative(np.array([error_px[0], error_px[1], 0]))
+
+        # (5.5) Add z correction from desired_px3D (treat value as defocus to negate)
+        z_correction = -float(desired_px3D[2])
+        error_um_3D = np.array([error_um[0], error_um[1], z_correction])
+
+        # (6) Get the current manipulator (pipette) position (in microns) and compute the target.
+        current_um = self.position()
+        # self.debug("DEBUG: Current manipulator position (um):", current_um)
+        target_um = current_um + error_um_3D
+        # self.debug("DEBUG: Computed target manipulator position (um):", target_um)
+        
+        # (7) Command the move and wait until the unit is still.
+        self.absolute_move(target_um.tolist())
+        self.wait_until_still()
+        # self.debug("DEBUG: Centering move complete.")
+
+
     def record_cal_point(self):
         '''
         records a calibration point for the pipette
@@ -550,17 +618,160 @@ class CalibratedUnit(ManipulatorUnit):
         self.wait_until_still()
 
 
-    def move_pipette_random(self, movement = 100):
-        '''
-        Moves the pipette randomly in xy plane, method used for testing/calibration.
-        
-        Args:
-            movement (float, optional): Movement magnitude.
-        '''
-        movement_vector = np.array([movement * (np.random.rand() - 0.5), movement * (np.random.rand() - 0.5), 0])
-        self.relative_move(movement_vector)
-        self.wait_until_still()
+    def velocity_position_control(self, position_delta, speed):
+        """
+        Convert a displacement vector and scalar speed into per-axis velocities.
 
+        Parameters
+        ----------
+        position_delta : iterable of length 3
+            Relative displacement [dx, dy, dz] in um.
+        speed : float
+            Requested travel speed magnitude in um/s.
+
+        Returns
+        -------
+        list
+            Velocity command [vx, vy, vz] in um/s.
+        """
+        delta = np.asarray(position_delta, dtype=float).reshape(-1)
+        if delta.size != 3:
+            raise ValueError("position_delta must be a 3-element vector [dx, dy, dz].")
+
+        distance = float(norm(delta))
+        if distance == 0:
+            return [0.0, 0.0, 0.0]
+
+        speed = abs(float(speed))
+        if speed == 0:
+            raise ValueError("Speed must be non-zero for velocity control.")
+
+        unit_direction = delta / distance
+        return (unit_direction * speed).tolist()
+
+
+    def _velocity_move_by_displacement(self, movement_vector, speed, poll_interval=0.01):
+        """
+        Execute a relative displacement using a continuous velocity command.
+
+        This is used for low-speed motion where firmware clamps can prevent
+        `relative_move` from honoring requested speeds.
+        """
+        movement_vector = np.asarray(movement_vector, dtype=float)
+        distance = float(norm(movement_vector))
+        if distance == 0:
+            return
+
+        speed = abs(float(speed))
+        if speed == 0:
+            raise ValueError("Speed must be non-zero for velocity moves.")
+
+        direction = movement_vector / distance
+        velocity = self.velocity_position_control(movement_vector, speed)
+        start_pos = np.asarray(self.position(), dtype=float)
+        expected_time = distance / speed
+        timeout = max(2.0, expected_time * 5.0)
+        start_time = time.perf_counter()
+        opposite_direction_warned = False
+
+        self.absolute_move_group_velocity(velocity)
+        try:
+            while not self.abort_requested:
+                curr_pos = np.asarray(self.position(), dtype=float)
+                signed_traveled = float(np.dot(curr_pos - start_pos, direction))
+                # Use absolute progress (same spirit as hunt_cell's abs z-distance check)
+                # so axis sign conventions do not stall the move.
+                traveled = abs(signed_traveled)
+                if traveled >= distance:
+                    break
+                if (signed_traveled < 0) and (not opposite_direction_warned):
+                    self.warning(
+                        "Velocity move is progressing opposite commanded direction; "
+                        "using absolute displacement criterion."
+                    )
+                    opposite_direction_warned = True
+                if (time.perf_counter() - start_time) > timeout:
+                    self.warning(
+                        f"Velocity move timeout after {timeout:.2f}s "
+                        f"(target {distance:.2f} um, traveled {signed_traveled:.2f} um signed)."
+                    )
+                    break
+                self.sleep(poll_interval)
+        finally:
+            self.stop()
+            self.wait_until_still()
+
+    def move_pipette_random_velocity(self, movement = 100, speed = 200):
+        '''
+        Moves the pipette randomly in xy plane, method used for testing/calibration/data collection.
+        For speeds below 1000 um/s, this uses velocity commands instead of
+        relative moves to avoid firmware speed clamping.
+        '''
+        orig = self.get_max_speed()
+        self.info(f"Moving pipette randomly for testing/calibration, original speed is: {orig} um/s")
+
+        requested_speed = abs(float(speed))
+        if requested_speed == 0:
+            raise ValueError("Speed must be non-zero.")
+
+        velocity_threshold = 1000.0
+        use_velocity_mode = requested_speed < velocity_threshold
+
+        if use_velocity_mode:
+            self.info(
+                f"Requested pipette speed {requested_speed:.1f} um/s is below "
+                f"{int(velocity_threshold)} um/s; using velocity-command motion."
+            )
+        else:
+            requested_speed_int = int(requested_speed)
+            self.set_max_speed(requested_speed_int)
+            test_speed = self.get_max_speed()
+            if test_speed != requested_speed_int:
+                self.warning(
+                    f"Requested pipette speed {requested_speed_int} um/s, but device readback is {test_speed} um/s. "
+                    "This is likely a Scientifica firmware clamp or device-unit limit."
+                )
+            else:
+                self.info(f"Set pipette speed to {test_speed} um/s for random movement.")
+
+        try:
+            # this section is for testing the find pipette method.
+            # movement_vector = np.array([movement * (np.random.rand() - 0.5), movement * (np.random.rand() - 0.5), (movement/5) * (np.random.rand() - 0.5)])
+            # self.relative_move_group(movement_vector)
+            # self.wait_until_still()
+
+            # # the proceeding section is for data collection for focusing and detection models.
+            movement_vector = np.array([movement * (np.random.rand() - 0.5), movement * (np.random.rand() - 0.5), 0], dtype=float)
+            movement_z_vector = np.array([0,0,movement/5], dtype=float)
+            movement_sequence = [
+                movement_vector,
+                movement_z_vector,
+                -movement_z_vector,
+                -movement_z_vector,
+                movement_z_vector,
+                -movement_vector,
+            ]
+
+            for step_vector in movement_sequence:
+                if use_velocity_mode:
+                    self._velocity_move_by_displacement(step_vector, requested_speed)
+                else:
+                    self.relative_move(step_vector)
+                    self.wait_until_still()
+        finally:
+            if (not use_velocity_mode) and (orig is not None):
+                self.set_max_speed(orig)
+            self.info(f"Reset pipette speed to {self.get_max_speed()} um/s after random movement.")
+            self.info("Finished random pipette movement.")
+
+
+    def move_pipette_random(self, movement=100):
+        '''
+        Moves pipette randomly in xyz. This is used for testing find_pipette.
+        '''
+        movement_vector = np.array([movement * (np.random.rand() - 0.5), movement * (np.random.rand() - 0.5), (movement/5) * (np.random.rand() - 0.5)])
+        self.relative_move_group(movement_vector)
+        self.wait_until_still()
 
     def save_configuration(self):
         '''
@@ -627,17 +838,27 @@ class CalibratedStage(CalibratedUnit):
 
         self.focusHelper = FocusHelper(microscope, camera)
         self.stageCalHelper = StageCalHelper(unit, camera, self.config.frame_lag)
-        self.cellTrackHelper = CellTrackHelper(
-            self,
-            camera,
-            use_ai_features=bool(getattr(self.config, "use_ai_features", True)),
-        )
+        self.stageScanHelper = StageScanHelper(camera, config=self.config)
+        self.cellTrackHelper = None
+        if self.config.use_ai_features:
+            from .CellTrackHelper import CellTrackHelper
+            self.cellTrackHelper = CellTrackHelper(self, camera)
         self.pipette_cal_position = np.zeros(2)
         self.unit = unit
 
         # It should be an XY stage, ie, two axes
         if len(self.axes) != 2:
             raise CalibrationError('The unit should have exactly two axes for horizontal calibration.')
+
+    def _ensure_cell_track_helper(self):
+        if not self.config.use_ai_features:
+            raise NotImplementedError(
+                "Cell tracking is disabled. Set calibration.use_ai_features to true before use."
+            )
+        if self.cellTrackHelper is None:
+            from .CellTrackHelper import CellTrackHelper
+            self.cellTrackHelper = CellTrackHelper(self, self.camera)
+        return self.cellTrackHelper
 
     def reference_position(self):
         '''
@@ -706,6 +927,31 @@ class CalibratedStage(CalibratedUnit):
         self.abort_if_requested()
         pos_microns = dot(self.Minv, pos_pix)
         self.relative_move(pos_microns)
+
+    @property
+    def is_collecting_scan_corners(self):
+        return self.stageScanHelper.is_collecting
+
+    @property
+    def scan_corner_positions(self):
+        return self.stageScanHelper.corner_positions
+
+    def start_selecting_scan_corners(self):
+        self.stageScanHelper.start_corner_collection(self)
+
+    def reset_scan_corners(self):
+        self.stageScanHelper.reset()
+
+    def store_scan_corner(self, click_position):
+        return self.stageScanHelper.record_corner_from_click(
+            self, self.microscope, click_position
+        )
+
+    def move_to_scan_start(self, speed=None):
+        self.stageScanHelper.move_to_scan_start(self, speed=speed)
+
+    def scan_area(self, speed=None):
+        self.stageScanHelper.scan_area(self, speed=speed)
 
     def calibrate(self):
         '''
@@ -820,17 +1066,14 @@ class CalibratedStage(CalibratedUnit):
         template_prompt = np.array([ref_w / 2.0, ref_h / 2.0], dtype=np.float32)
 
         self.info(f"Centering on cell at approx. {expected_px} px")
-        try:
-            centroid = self.cellTrackHelper.find_centroid(
-                reference_image,
-                image,
-                use_centroid=use_centroid,
-                prompt_point=template_prompt,
-                expected_point=expected_px,
-            )
-        except NotImplementedError as exc:
-            self.warning("Center-on-cell unavailable: %s", exc)
-            return self.wait_until_still
+        cell_track_helper = self._ensure_cell_track_helper()
+        centroid = cell_track_helper.find_centroid(
+            reference_image,
+            image,
+            use_centroid=use_centroid,
+            prompt_point=template_prompt,
+            expected_point=expected_px,
+        )
         if centroid is None:
             return self.wait_until_still        # keep call chain consistent
 
@@ -868,19 +1111,20 @@ class CalibratedStage(CalibratedUnit):
         # self.info(f"new stage px offset  : {self.reference_position()}")
 
 
-    def get_cell_position(self, cell, use_centroid=True):
+    def get_cell_position(
+        self,
+        cell,
+        use_centroid=True,
+        tracking_mode="fast",
+        track_max_fast_jump_px=80.0,
+    ):
         """
         Find the cell centroid in pixel space.
 
         Returns the centroid position (in pixels) as a numpy array.
-
-        Args:
-            cell (tuple): Cell data.
-            use_centroid (bool, optional): Use centroid detection.
-
-        Returns:
-            tuple: (centroid, error_px)
         """
+        cell_track_helper = self._ensure_cell_track_helper()
+
         _cell_coords, reference_image, _position = cell
 
         # capture new image
@@ -895,17 +1139,15 @@ class CalibratedStage(CalibratedUnit):
         template_prompt = np.array([ref_w / 2.0, ref_h / 2.0], dtype=np.float32)
 
         self.info(f"Getting position of cell at approx. {expected_px} px")
-        try:
-            centroid = self.cellTrackHelper.find_centroid(
-                reference_image,
-                image,
-                use_centroid=use_centroid,
-                prompt_point=template_prompt,
-                expected_point=expected_px,
-            )
-        except NotImplementedError as exc:
-            self.warning("Cell position lookup unavailable: %s", exc)
-            return None, None
+        centroid = cell_track_helper.track_cell(
+            cell,
+            image,
+            use_centroid=use_centroid,
+            prompt_point=template_prompt,
+            expected_point=expected_px,
+            mode=tracking_mode,
+            max_fast_jump_px=track_max_fast_jump_px,
+        )
         if centroid is None:
             return None, None
 

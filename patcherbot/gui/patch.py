@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import QFileDialog, QTabWidget, QWidget,QMessageBox
 import qtawesome as qta
 
 from patcherbot.controller import TaskController
+from patcherbot.gui.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.patch import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
@@ -188,6 +189,7 @@ class PatchGui(ManipulatorGui):
             self.pipette_interfaces = pipette_interfaces
             self.patch_interfaces = patch_interfaces
         self.recording_state_manager = recording_state_manager
+
         self._cell_list_signature = None
         self.cell_list_window = CellListWindow(self)
         self.cell_list_window.closed.connect(self._cells_window_closed)
@@ -241,6 +243,8 @@ class PatchGui(ManipulatorGui):
             self.add_config_gui(curr_pipette_interface.calibration_config, curr_config_tab)
             self.add_config_gui(curr_patch_interface.config, curr_config_tab)
             self.add_config_gui(curr_patch_interface.protocol_config, curr_config_tab)
+            self.add_config_gui(curr_patch_interface.experiment_book_config, curr_config_tab)
+            # self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
             logging.debug("Added config GUI.")
             classic_patching_tab = ClassicPatchButtons(curr_patch_interface, curr_pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
             self.classic_tabs.append(classic_patching_tab)
@@ -279,7 +283,9 @@ class PatchGui(ManipulatorGui):
         # self.register_mouse_action(Qt.LeftButton, Qt.ShiftModifier,
         #                            self.active_patch_interface.patch_with_move)
         self.register_mouse_action(Qt.LeftButton, Qt.NoModifier,
-                                   self.active_patch_interface.add_cell)
+                                   self.patch_interface.add_cell)
+        self.register_mouse_action(Qt.RightButton, Qt.ShiftModifier,
+                                   self.patch_interface.handle_corner_right_click)
         self.register_key_action(Qt.Key_B, None,
                                  self.active_patch_interface.break_in)
         self.register_key_action(Qt.Key_F2, None,
@@ -480,6 +486,40 @@ class PatchGui(ManipulatorGui):
         self.task_abort_button.setEnabled(False)
         self.task_success_button.setEnabled(False)
         self.active_patch_interface.abort_task()
+
+    def toggle_cell_list_window(self, checked=None):
+        if checked is None:
+            checked = self.show_cells_button.isChecked()
+        if checked:
+            self.show_cells_button.setText("Hide Cells")
+            self._refresh_cell_list_window(force=True)
+            self.cell_list_window.show()
+            self.cell_list_window.raise_()
+            self.cell_list_window.activateWindow()
+            self._cell_list_timer.start()
+        else:
+            self.cell_list_window.close()
+
+    def _cells_window_closed(self):
+        self._cell_list_timer.stop()
+        if self.show_cells_button.isChecked():
+            self.show_cells_button.blockSignals(True)
+            self.show_cells_button.setChecked(False)
+            self.show_cells_button.blockSignals(False)
+        self.show_cells_button.setText("Show Cells")
+
+    def _refresh_cell_list_window(self, force=False):
+        if not self.cell_list_window.isVisible():
+            return
+        cells = list(self.patch_interface.cells_to_patch)
+        try:
+            stage_reference = self.patch_interface.current_autopatcher.calibrated_stage.reference_position()
+        except Exception:
+            stage_reference = None
+        signature = tuple(id(cell) for cell in cells)
+        full_refresh = force or (signature != self._cell_list_signature)
+        self.cell_list_window.update_cells(cells, stage_reference, full_refresh=full_refresh)
+        self._cell_list_signature = signature
 
 class CollapsibleGroupBox(QtWidgets.QGroupBox):
     """A QGroupBox subclass with collapsible content area and custom styling."""
@@ -968,6 +1008,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
         self.section_buttons = {}  # Dictionary to store buttons by section
         self.section_button_map = {}  # section -> {button_name: button}
         self.active_buttons_by_section = {}  # section -> set(button_name)
+        self.section_button_map = {}  # section -> {button_name: button}
+        self.active_buttons_by_section = {}  # section -> set(button_name)
         self.color_change_sections = []  # Sections that should change color on completion
         self.section_colors = {}  # Store custom colors for different sections
 
@@ -991,6 +1033,12 @@ class ButtonTabWidget(QtWidgets.QWidget):
             cmds = [cmds]
         else:
             cmds = self._flatten_sequential_cmds(cmds)
+        try:
+            repeat_count = max(1, int(repeat))
+        except (TypeError, ValueError):
+            repeat_count = 1
+        if repeat_count > 1:
+            cmds = cmds * repeat_count
             
         # Have the button immediately lose focus to prevent persistent outline
         if button:
@@ -1099,22 +1147,22 @@ class ButtonTabWidget(QtWidgets.QWidget):
             self._run_next_seq_command()
 
 
-    def run_command(self, cmds):
-        """
-        Executes one or more commands immediately. Supports nested lists of commands.
+    def run_command(self, cmds, repeat=1):
+        try:
+            repeat_count = max(1, int(repeat))
+        except (TypeError, ValueError):
+            repeat_count = 1
 
-        Args:
-            cmds (callable or list): Command(s) to execute.
-        """
-        if isinstance(cmds, list):
-            for cmd in cmds:
-                if isinstance(cmd, list):
-                    for sub_cmd in cmd:
-                        self.execute_command(sub_cmd)
-                else:
-                    self.execute_command(cmd)
-        else:
-            self.execute_command(cmds)
+        for _ in range(repeat_count):
+            if isinstance(cmds, list):
+                for cmd in cmds:
+                    if isinstance(cmd, list):
+                        for sub_cmd in cmd:
+                            self.execute_command(sub_cmd)
+                    else:
+                        self.execute_command(cmd)
+            else:
+                self.execute_command(cmds)
     
 
     def execute_command(self, cmd):
@@ -1136,13 +1184,6 @@ class ButtonTabWidget(QtWidgets.QWidget):
             cmd()
 
     def _set_button_completion_style(self, button, color="rgba(0, 0, 255, 0.3)"):
-        """
-        Applies a completion style to a button, typically after a command sequence completes.
-
-        Args:
-            button (QPushButton): The button to style.
-            color (str, optional): Background color to apply. Defaults to a light blue overlay.
-        """
         if button is None:
             return
         button.setStyleSheet(f"""
@@ -1165,13 +1206,6 @@ class ButtonTabWidget(QtWidgets.QWidget):
         """)
 
     def _set_button_active_style(self, button, color="rgba(173, 216, 230, 0.5)"):
-        """
-        Applies an active style to a button during execution of its associated commands.
-
-        Args:
-            button (QPushButton): The button to style.
-            color (str, optional): Background color to apply. Defaults to semi-transparent light blue.
-        """
         self._set_button_completion_style(button, color)
 
     def addPositionBox(self, name: str, layout, update_func, tare_func=None, axes=['x', 'y', 'z']):
@@ -1293,11 +1327,19 @@ class ButtonTabWidget(QtWidgets.QWidget):
             for j, button_name in enumerate(buttons_in_row):
                 button = QtWidgets.QPushButton(button_name)
                 button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-                button.setMinimumWidth(30)
-                button.setMinimumHeight(30)
+                button.setMinimumWidth(50)
+                button.setMinimumHeight(50)
+
+                button_freq = 1
+                if freq is not None and i < len(freq) and j < len(freq[i]):
+                    try:
+                        button_freq = max(1, int(freq[i][j]))
+                    except (TypeError, ValueError):
+                        button_freq = 1
                 
                 # Track this button for this section
                 section_buttons.append((button, i, j, button_name))
+                self.section_button_map.setdefault(box_name, {})[button_name] = button
                 self.section_button_map.setdefault(box_name, {})[button_name] = button
 
                 # Use a lambda function with default arguments to correctly capture the command
@@ -1305,9 +1347,9 @@ class ButtonTabWidget(QtWidgets.QWidget):
                     button_cmd = cmds[i][j]
                     if sequential:
                         button.clicked.connect(lambda state, cmd=button_cmd, btn=button, section=box_name, 
-                                            name=button_name: self.run_sequential_commands(cmd, btn, section, name))
+                                            name=button_name, repeat=button_freq: self.run_sequential_commands(cmd, btn, section, name, repeat))
                     else:
-                        button.clicked.connect(lambda state, cmd=button_cmd: self.run_command(cmd))
+                        button.clicked.connect(lambda state, cmd=button_cmd, repeat=button_freq: self.run_command(cmd, repeat))
                 else:
                     button.clicked.connect(self.do_nothing)
 
@@ -1440,76 +1482,62 @@ class ClassicPatchButtons(ButtonTabWidget):
                         change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)")
 
         # Add a box for movement commands 
-        buttonList = [['move group down','move group up'],['move group in x','move group in y'],['Move to Safe Position','Move to Home Position'],['Move to cell plane','Focus Stage'],['Center Pipette','Clean pipette','Focus Pipette']]
-        # buttonList = [['Move to Safe Position','Move to Home Position'],['Move to Floor','Focus Stage'],['Center Pipette','Clean pipette','Focus Pipette']]
+        buttonList = [
+            ['Move to Safe Position','Move to Home Position'],
+            ['Move to cell plane','Focus Stage'],
+            ['Store corners', 'Start Scan'],
+            ['Move group up', 'Move group down'],
+            ['Center Pipette','Clean pipette','Focus Pipette'],
+        ]
         cmds = [
-            [self.patch_interface.move_group_down, self.patch_interface.move_group_up],
-            [self.patch_interface.move_group_in_x, self.patch_interface.move_group_in_y],
             [self.patch_interface.move_to_safe_space, self.patch_interface.move_to_home_space],
+
             [self.pipette_interface.go_to_floor,self.pipette_interface.focus_stage],
-            [self.pipette_interface.center_pipette,
-             [self.cell_sorter_led_on, self.patch_interface.clean_pipette],
-             self.pipette_interface.focus_pipette]
+            [
+                self.patch_interface.start_selecting_corners,
+                [[self.patch_interface.move_to_scan_start, self.start_recording, self.patch_interface.start_scan, self.stop_recording]],
+            ],
+            [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
+            [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
         ]
         self.addButtonList('movement', layout, buttonList, cmds, sequential=True)
 
-        # self.pipette_location = [self.pipette_interface.follow_stage, self.pipette_interface.move_pipette_random,self.rest,self.start_recording,self.patch_interface.find_pipette]
-        # self.pipette_location = [self.pipette_interface.follow_stage, self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
-        self.pipette_location = [self.patch_interface.find_pipette]
+        # Find Pipette path
+        self.pipette_location = [self.pipette_interface.center_pipette,self.pipette_interface.focus_pipette,self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
         # add a box for testing controllability of the pipette and stage
-        buttonList = [['Follow Stage','Move Pipette Random','Find Pipette']]
-        cmds = [[self.pipette_interface.follow_stage, self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
-                ]
-        self.addButtonList('testing', layout, buttonList, cmds,sequential=True)
+        buttonList = [['Find Pipette','Test Pipette Movement']]
+        cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity]]
+        freq = [[1, 3]]
+        self.addButtonList('testing', layout, buttonList, cmds, freq=freq, sequential=True)
 
-        # Add a box for light controls
-        buttonList = [['toggle Light', 'toggle fluorescense'],
-                      ['move cube left', 'move cube right']]
-        cmds = [[self.toggle_cell_sorter_led, self.patch_interface.toggle_fluorescence],
-                [self.patch_interface.move_cube_left, self.patch_interface.move_cube_right]]
-        self.addButtonList('Light', layout, buttonList, cmds)
-
-        self.cell_sorter_led_button = self.get_section_button('Light', 'toggle Light')
-        if self.cell_sorter_led_button is not None:
-            self.cell_sorter_led_button.setCheckable(True)
-            self.cell_sorter_led_button.setChecked(False)
-            self._update_cell_sorter_led_button_style(False)
-            self.toggle_cell_sorter_led(False)
+        # # Add a box for lamp commands
+        buttonList = [['toggle shutter', 'toggle fluorescense'],['move cube left','move cube right']]
+        cmds = [[ self.patch_interface.toggle_shutter, self.patch_interface.toggle_fluorescence],
+                [self.patch_interface.move_cube_left, self.patch_interface.move_cube_right]
+        ]
+        self.addButtonList('fluorescence', layout, buttonList, cmds, sequential=True)
 
         # Add a box for patching commands
-        buttonList = [['Select Cell','Remove Last Cell','Center on Cell','Move Stage to Cell'],
+        buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
                       ['Locate Cell','Hunt Cell','Gigaseal'],
                       ['Break-in','Escape Cell'],
-                      ['Patch Cell','Attempt Whole Cell','Run Protocols']]
-        cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell, self.patch_interface.move_stage_to_cell],
+                      ['Patch Cell','Run Protocols']]
+        cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell],
                 [self.patch_interface.locate_cell,
-                 [self.start_recording,self.patch_interface.hunt_cell],
-                 [self.cell_sorter_led_off, self.patch_interface.gigaseal]],
-                [[self.cell_sorter_led_off, self.patch_interface.break_in],
-                 [self.stop_recording, self.cell_sorter_led_on, self.patch_interface.escape_cell]],
-                [[self.start_recording, self.cell_sorter_led_off, self.patch_interface.patch, self.stop_recording],
-                 [self.start_recording, self.cell_sorter_led_off, self.patch_interface.whole_cell, self.stop_recording],
-                 [self.stop_recording, self.cell_sorter_led_off, self.patch_interface.run_protocols]]
-
-  
+                 [self.start_recording,self.patch_interface.hunt_cell],[self.patch_interface.gigaseal]],
+                [[ self.patch_interface.break_in],
+                 [self.stop_recording,  self.patch_interface.escape_cell]],
+                [[self.start_recording,  self.patch_interface.patch, self.stop_recording],
+                 [self.stop_recording,  self.patch_interface.run_protocols]]
 ]
-        self.addButtonList(
-            'patching',
-            layout,
-            buttonList,
-            cmds,
-            sequential=True,
-            change_color_during={
-                'Locate Cell',
-                'Hunt Cell',
-                'Gigaseal',
-                'Break-in',
-                'Escape Cell',
-                'Patch Cell',
-                'Attempt Whole Cell',
-                'Run Protocols',
-            },
-        )
+        self.addButtonList('patching', layout, buttonList, cmds, sequential=True, change_color_during={
+            'Locate Cell',
+            'Hunt Cell',
+            'Gigaseal',
+            'Break-in',
+            'Escape Cell',
+            'Run Protocols',
+        })
 
         # Add a box for Rig Recorder
         self.record_button = QtWidgets.QPushButton("Start Recording")
@@ -1593,6 +1621,8 @@ class ClassicPatchButtons(ButtonTabWidget):
         Args:
             enabled (bool): Whether the LED is enabled.
         """
+        if self.cell_sorter_led_button is None:
+            return
         if enabled:
             self.cell_sorter_led_button.setStyleSheet("""
                 QPushButton {
@@ -1616,13 +1646,7 @@ class ClassicPatchButtons(ButtonTabWidget):
             self.cell_sorter_led_button.setStyleSheet("")
 
     def _set_cell_sorter_led_state(self, enabled: bool):
-        """
-        Sets the LED state and updates both UI and hardware.
-
-        Args:
-            enabled (bool): Desired LED state.
-        """
-        if self.cell_sorter_led_button.isChecked() != enabled:
+        if self.cell_sorter_led_button is not None and self.cell_sorter_led_button.isChecked() != enabled:
             self.cell_sorter_led_button.blockSignals(True)
             self.cell_sorter_led_button.setChecked(enabled)
             self.cell_sorter_led_button.blockSignals(False)
@@ -1633,20 +1657,14 @@ class ClassicPatchButtons(ButtonTabWidget):
             self.patch_interface.cell_sorter_led_off()
 
     def cell_sorter_led_off(self):
-        """Turns the cell sorter LED off."""
         self._set_cell_sorter_led_state(False)
 
     def cell_sorter_led_on(self):
-        """Turns the cell sorter LED on."""
         self._set_cell_sorter_led_state(True)
 
     def toggle_cell_sorter_led(self, checked=None):
-        """
-        Toggles the LED state based on button state or provided value.
-
-        Args:
-            checked (bool, optional): Desired LED state. If None, uses button state.
-        """
+        if self.cell_sorter_led_button is None:
+            return
         enabled = self.cell_sorter_led_button.isChecked() if checked is None else bool(checked)
         self._set_cell_sorter_led_state(enabled)
 
@@ -1731,7 +1749,8 @@ class ClassicPatchButtons(ButtonTabWidget):
         zPos = self.pipette_interface.microscope.position()
         self.currz_stage_pos = [0, 0, zPos]
         # update pipette controller stage tare at z position as a numpy array
-        self.pipette_interface.tare_stage[2] = zPos
+        z_scale = self.pipette_interface.calibrated_unit.config.microscope_units_per_um
+        self.pipette_interface.tare_stage[2] = zPos / z_scale
         print("Tare stage z: ", self.currz_stage_pos)
         self.pipette_interface.write_tare()
 
@@ -1754,33 +1773,7 @@ class ClassicPatchButtons(ButtonTabWidget):
             if i < 2:
                 label.setText(f'{label.text().split(":")[0]}: {xyPos[i]:.2f}')
             else:
-                label.setText(f'{label.text().split(":")[0]}: {zPos:.2f}')
+                z_scale = self.pipette_interface.calibrated_unit.config.microscope_units_per_um
+                label.setText(f'{label.text().split(":")[0]}: {zPos / z_scale:.2f}')
 
-    def add_global_status_dropdown(self, status_widget):
-            """
-            Injects the global pipette status widget into the layout.
-            Added at the very top of the layout for easy visibility.
-            """
-            self.layout().insertWidget(0, status_widget)
 
-# def make_dynamic_command(gui_instance, method_name):
-#     """
-#     Creates a proxy function that dynamically calls the active pipette's method,
-#     but preserves the @command metadata required by the help menu generator.
-#     """
-#     def proxy_command(*args, **kwargs):
-#         # Dynamically grab the method from whichever pipette is currently active
-#         method = getattr(gui_instance.active_patch_interface, method_name)
-#         return method(*args, **kwargs)
-        
-#     # Copy the decorator metadata from the first pipette to satisfy the GUI
-#     sample_method = getattr(gui_instance.active_patch_interface, method_name)
-#     if hasattr(sample_method, 'category'):
-#         proxy_command.category = sample_method.category
-#     if hasattr(sample_method, 'description'):
-#         proxy_command.description = sample_method.description
-#     if hasattr(sample_method, 'auto_description'):
-#         proxy_command.auto_description = sample_method.auto_description
-#     if hasattr(sample_method, 'is_blocking'):
-#         proxy_command.auto_description = sample_method.is_blocking
-#     return proxy_command

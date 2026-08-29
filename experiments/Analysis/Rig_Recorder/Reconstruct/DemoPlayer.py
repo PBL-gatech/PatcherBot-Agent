@@ -618,8 +618,8 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     # data_path = r"experiments/Datasets/PatcherBot_test_dataset_v0_201/PatcherBot_test_dataset_v0_201_find_pipette.hdf5"
 
-    data_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_dataset_v0_510\PatcherBot_dataset_v0_510_find_pipette.hdf5"
-
+    # data_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_dataset_v0_740\PatcherBot_dataset_v0_740_find_pipette.hdf5"
+    data_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBotViewer_test_dataset_v0_001\PatcherBotViewer_test_dataset_v0_001_hunt_cell.hdf5"
     viewer = DemoPlayer(data_path)
     viewer.show()
     sys.exit(app.exec_())

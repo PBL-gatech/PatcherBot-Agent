@@ -9,11 +9,6 @@ __all__ = ["CalibrationConfig"]
 
 
 class CalibrationConfig(Config):
-    """
-    Configuration container for calibration parameters of manipulator, stage,
-    and pipette systems, including motion settings, coordinate transforms,
-    pressure calibration, and AI-assisted features.
-    """
     position_update = NumberWithUnit(1000, unit="ms",
                                      doc="dt for updating displayed pos.",
                                      bounds=(0, 10000))
@@ -30,6 +25,10 @@ class CalibrationConfig(Config):
                                      doc="number of frames between for computing change with optical flow",
                                      bounds=(1, 20))
 
+    y_delta_scan = NumberWithUnit(750, unit="um",
+                                  doc="configured vertical scan distance for stage scans",
+                                  bounds=(0, 100000))
+
     pipette_diag_move = NumberWithUnit(200, unit="um",
                                      doc="x, y dist to move for pipette cal.",
                                      bounds=(50, 10000))
@@ -43,13 +42,19 @@ class CalibrationConfig(Config):
     pipette_y_rotation = NumberWithUnit(25, unit="degrees",
                                 doc="Rotation of the pipette in the xz plane (degrees)",
                                 bounds=(-90, 90))
-    pipette_k_scale = Number(-0.79,
+    clean_move_order = param.List(default=["y", "x", "z"],
+                                item_type=str,
+                                doc="Axis command order for cleaning approach; safe-space return uses reverse order")
+    pipette_k_scale = Number(1.0,
                                 doc="Scaling factor for pipette movement",
                                 bounds=(-10.0, 10.0))
 
     microscope_units_per_um = Number(5.0,
                                      doc="Microscope controller units per micron",
                                      bounds=(0.001, 1000))
+    objective_lift_um = NumberWithUnit(10000, unit="um",
+                                     doc="Distance to lift the microscope objective during objective switches",
+                                        bounds=(0, 20000))
     home_position_delta_um = NumberWithUnit(-1000, unit="um",
                                            doc="Vertical offset from stage cell surface to pipette home position",
                                              bounds=(-100000, 100000))
@@ -72,7 +77,9 @@ class CalibrationConfig(Config):
                                           doc="Pipette detector model path")
     pipette_focuser_model = param.String(default="",
                                          doc="Pipette focuser model path")
-    use_ai_features = Boolean(True,
+    pipette_focus_crop_feature = Boolean(False,
+                                         doc="Whether to crop the image around the pipette tip for the focus model")
+    use_ai_features = Boolean(False,
                               doc="Enable AI-based vision features (SAM/LightGlue/robomimic)")
 
     home_position =  Tuple((0, 0, 0), doc="Home position of the pipette in um")
@@ -86,17 +93,21 @@ class CalibrationConfig(Config):
             "autofocus_dist",
             "stage_diag_move",
             "frame_lag",
+            "y_delta_scan",
             "stage_x_axis_flip",
             "stage_y_axis_flip",
             "microscope_units_per_um",
+            "objective_lift_um",
         ]),
         ("Pipette Calibration", [
             "pipette_diag_move",
             "pipette_z_rotation",
             "pipette_y_rotation",
+            "clean_move_order",
             "pipette_k_scale",
             "pipette_detector_model",
             "pipette_focuser_model",
+            "pipette_focus_crop_feature",
             "use_ai_features",
         ]),
         ("Display", ["position_update"]),

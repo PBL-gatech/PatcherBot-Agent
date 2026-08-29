@@ -394,7 +394,6 @@ class HoldingProtocolGraph(ProtocolGraph):
         self.graph_interface.daq.holding_protocol_data = None  # Reset after plotting
 
 class OptogeneticBaseGraph(ProtocolGraph):
-    """Base class for optogenetic stimulation protocol graphs."""
     def __init__(
         self,
         graph_interface: GraphInterface,
@@ -403,15 +402,6 @@ class OptogeneticBaseGraph(ProtocolGraph):
         window_title: str,
         protocol_key: str,
     ):
-        """
-        Initialize the Optogenetic protocol graph.
-
-        Args:
-            graph_interface (GraphInterface): Interface to access DAQ data and graphing utilities.
-            recording_state_manager (RecordingStateManager): Tracks sample number and recording state.
-            window_title (str): Title for the graph window.
-            protocol_key (str): Key to identify the protocol in the DAQ's optogenetic data.
-        """
         super().__init__(
             graph_interface,
             recording_state_manager,
@@ -425,7 +415,6 @@ class OptogeneticBaseGraph(ProtocolGraph):
         self.protocol_key = protocol_key
 
     def update_plot(self):
-        """Update the plot with optogenetic protocol data and log ephys traces and stimulation metadata."""
         daq = self.graph_interface.daq
         entry = daq.pop_optogenetic_entry(self.protocol_key)
         if entry is None:
@@ -566,15 +555,7 @@ class OptogeneticBaseGraph(ProtocolGraph):
 
 
 class OptogeneticStimProtocolGraph(OptogeneticBaseGraph):
-    """Graph for visualizing optogenetic stimulation protocols (power control)."""
     def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
-        """
-        Initialize the Optogenetic Stim Protocol graph.
-        
-        Args:
-            graph_interface (GraphInterface): Interface to access DAQ data and graphing utilities.
-            recording_state_manager (RecordingStateManager): Tracks sample number and recording state.
-        """
         super().__init__(
             graph_interface,
             recording_state_manager,
@@ -584,15 +565,7 @@ class OptogeneticStimProtocolGraph(OptogeneticBaseGraph):
 
 
 class OptogeneticWavelengthProtocolGraph(OptogeneticBaseGraph):
-    """Graph for visualizing optogenetic wavelength protocols."""
     def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
-        """
-        Initialize the Optogenetic Wavelength Protocol graph.
-
-        Args:
-            graph_interface (GraphInterface): Interface to access DAQ data and graphing utilities.
-            recording_state_manager (RecordingStateManager): Tracks sample number and recording state.
-        """
         super().__init__(
             graph_interface,
             recording_state_manager,
@@ -601,16 +574,9 @@ class OptogeneticWavelengthProtocolGraph(OptogeneticBaseGraph):
         )
 
 class NoiseGraph(QWidget):
-    """Graph for visualizing and analyzing noise in electrophysiology recordings."""
     noise_state_changed = pyqtSignal(bool)
 
     def __init__(self, graph_interface: GraphInterface):
-        """
-        Initialize the Noise Graph and its plots.
-        
-        Args:
-            graph_interface (GraphInterface): Interface to access DAQ data and compute noise metrics.
-        """
         super().__init__()
         self.graph_interface = graph_interface
         self.setWindowTitle("Noise Graph (4-10 ms)")
@@ -654,20 +620,9 @@ class NoiseGraph(QWidget):
         self.closeEvent = lambda event: (event.ignore(), self.stop())
 
     def is_active(self):
-        """
-        Check if the noise graph update timer is active.
-
-        Returns:
-            bool: True if the graph is actively updating, False otherwise.
-        """
         return self.updateTimer.isActive()
 
     def start(self):
-        """
-        Start updating the noise graph and make it visible.
-        Emits:
-            noise_state_changed: True
-        """
         if not self.updateTimer.isActive():
             self.updateTimer.start(self.updateDt)
         self.setHidden(False)
@@ -675,25 +630,12 @@ class NoiseGraph(QWidget):
         self.noise_state_changed.emit(True)
 
     def stop(self):
-        """
-        Stop updating the noise graph and hide it.
-        Emits:
-            noise_state_changed: False
-        """
         if self.updateTimer.isActive():
             self.updateTimer.stop()
         self.setHidden(True)
         self.noise_state_changed.emit(False)
 
     def update_plot(self):
-        """
-        Fetch noise metrics from GraphInterface and update the zoom and FFT plots.
-
-        Updates:
-            p2pLabel, stdLabel, avgP2pLabel: Display peak-to-peak, std deviation, and average P2P metrics.
-            zoomPlot: Time-domain plot of noise.
-            fftPlot: Frequency-domain plot of noise.
-        """
         metrics = self.graph_interface.get_noise_metrics()
         if not metrics:
             return
@@ -936,11 +878,8 @@ class EPhysGraph(QWidget):
         self.updateTimer.timeout.connect(self.update_plot)
         self.updateTimer.start(self.updateDt)
 
-        self.noiseGraph = NoiseGraph(self.graph_interface)
-        self.noiseGraph.noise_state_changed.connect(self.updateNoiseButton)
-
-        # self.show()
-        # self.raise_()
+        self.show()
+        self.raise_()
 
     def update_plot(self):
         """
@@ -1180,15 +1119,6 @@ class EPhysGraph(QWidget):
             logging.error(f"Error in laserPowerBoxReturnPressed: {e}")
 
     def _resolve_laser_label(self, wavelength):
-        """
-        Determine the display label and color for a given laser wavelength.
-
-        Args:
-            wavelength (int | str | object): Laser wavelength or named channel.
-
-        Returns:
-            tuple: Label string and hex color code.
-        """
         if wavelength is None:
             return "Unknown", "#e0e0e0"
         if isinstance(wavelength, str):
@@ -1216,10 +1146,6 @@ class EPhysGraph(QWidget):
         return name, "#e0e0e0"
 
     def update_laser_controls(self):
-        """
-        Refresh the laser control widgets (power, toggle button, left/right arrows)
-        to reflect current GraphInterface state.
-        """
         power_state = self.graph_interface.get_laser_power_state()
         wavelength = self.graph_interface.get_laser_wavelength()
         power = self.graph_interface.get_laser_power()
@@ -1228,10 +1154,8 @@ class EPhysGraph(QWidget):
         power_value = int(round(power))
         self.laserPowerBox.setPlaceholderText(f"Set to: {power_value} %")
         self.laserPowerLabel.setText(f"Power: {power_value} %")
-
-        laser_available = power_state is not None or wavelength is not None
         for widget in (self.laserPowerBox, self.laserLeftButton, self.laserToggleButton, self.laserRightButton):
-            widget.setEnabled(laser_available)
+            widget.setEnabled(True)
 
         if power_state != "on":
             self.laserToggleButton.setText("Off")
@@ -1248,43 +1172,25 @@ class EPhysGraph(QWidget):
         )
 
     def updateNoiseButton(self, active):
-        """
-        Update noise check button label based on active state.
-
-        Args:
-            active (bool): True if noise check is running, False otherwise.
-        """
         if active:
             self.noiseButton.setText("Stop Noise Check")
         else:
             self.noiseButton.setText("Check Noise")
 
     def toggleNoise(self):
-        """
-        Start or stop the noise check via the NoiseGraph interface.
-        """
         if self.noiseGraph.is_active():
             self.noiseGraph.stop()
         else:
             self.noiseGraph.start()
 
     def handle_laser_left(self):
-        """
-        Shift laser wavelength down via GraphInterface and update controls.
-        """
         self.graph_interface.wavelength_down()
         self.update_laser_controls()
 
     def handle_laser_right(self):
-        """
-        Shift laser wavelength up via GraphInterface and update controls.
-        """
         self.graph_interface.wavelength_up()
         self.update_laser_controls()
 
     def handle_laser_toggle(self):
-        """
-        Toggle laser output on/off via GraphInterface and update controls.
-        """
         self.graph_interface.toggle_laser_output()
         self.update_laser_controls()

@@ -85,9 +85,6 @@ class SensapexManip(Manipulator):
         self._polling_thread.start()
 
     def __del__(self):
-        """
-        Destructor: disables the velocity worker thread.
-        """
         try:
             self._vel_enabled = False
         except Exception:
@@ -95,40 +92,16 @@ class SensapexManip(Manipulator):
 
     # ---- Speed / accel compatibility ----
     def get_max_speed(self):
-        """
-        Returns the maximum speed in µm/s.
-
-        Returns:
-            float: Maximum speed.
-        """
         return float(self._max_speed)
 
     def get_max_accel(self):
-        """
-        Returns the maximum acceleration.
-
-        Returns:
-            float: Maximum acceleration.
-        """
         return float(self._max_accel)
 
     def set_max_speed(self, speed):
-        """
-        Sets the maximum speed.
-
-        Args:
-            speed (float): Desired maximum speed.
-        """
         self.max_speed = speed
         self._max_speed = float(speed)
 
     def set_max_accel(self, accel):
-        """
-        Sets the maximum acceleration.
-
-        Args:
-            accel (float): Desired maximum acceleration.
-        """
         self.max_acceleration = accel
         self._max_accel = float(accel)
 
@@ -138,14 +111,6 @@ class SensapexManip(Manipulator):
         Convert between Sensapex motor coords and stage/world coords.
         direction=True: motor -> stage/world
         direction=False: stage/world -> motor
-
-        Args:
-            xyz (list[float]): Coordinate vector.
-            angle (float): Tilt angle in degrees.
-            direction (bool): True for motor -> stage/world, False for stage/world -> motor.
-
-        Returns:
-            list[float]: Transformed coordinates.
         """
         coords = list(xyz)
         if len(coords) < 3:
@@ -215,9 +180,6 @@ class SensapexManip(Manipulator):
         """
         Constantly polls device position and updates self.current_pos.
         Uses device.get_pos(1) which returns micrometers.
-        
-        Args:
-            freq (float, optional): Polling frequency in Hz. Defaults to 100.0.
         """
         period = 1.0 / float(freq) if freq and freq > 0 else 0.01
        
@@ -241,12 +203,6 @@ class SensapexManip(Manipulator):
                 time.sleep(sleep_time)
 
     def _get_last_move_event(self):
-        """
-        Returns the finished_event of the last issued move, if available.
-
-        Returns:
-            threading.Event or None: Event associated with last move.
-        """
         with self._lock:
             mv = self._last_move
         if mv is None:
@@ -257,15 +213,6 @@ class SensapexManip(Manipulator):
             return None
 
     def _wait_for_last_move_event(self, timeout=None):
-        """
-        Blocks until the last issued move finishes or timeout occurs.
-
-        Args:
-            timeout (float, optional): Timeout in seconds. None for indefinite wait.
-
-        Returns:
-            bool: True if move finished, False if timeout or error.
-        """
         evt = self._get_last_move_event()
         if evt is None:
             return False
@@ -276,17 +223,6 @@ class SensapexManip(Manipulator):
             return False
 
     def _issue_move(self, target, speed, gate=True):
-        """
-        Sends a move command to the device, optionally gating with the move lock.
-
-        Args:
-            target (list[float]): Target position in stage/world coordinates.
-            speed (float): Speed for the move.
-            gate (bool, optional): Whether to use the move lock. Defaults to True.
-
-        Returns:
-            MoveHandle: Movement handle exposing finished_event.
-        """
         if gate:
             with self._move_gate:
                 self._wait_for_last_move_event(None)
@@ -303,14 +239,6 @@ class SensapexManip(Manipulator):
 
     # ---- Motion primitives ----
     def absolute_move(self, pos, axis, speed=None):
-        """
-        Move a single axis to an absolute position.
-
-        Args:
-            pos (float): Target position.
-            axis (int): Axis number (1-based).
-            speed (float, optional): Movement speed. Defaults to max_speed.
-        """
         self.absolute_move_group([pos], [axis], speed=speed)
 
     def absolute_move_group(self, x, axes, speed=None):
@@ -365,14 +293,6 @@ class SensapexManip(Manipulator):
         Supports both call styles:
           - relative_move_group(pos, axis, speed=None)
           - relative_move_group(x_list, axes_list, speed=None)
-
-        Args:
-            x (float or list[float]): Relative movement(s).
-            axes (int or list[int]): Axis number(s) (1-based).
-            speed (float, optional): Movement speed. Defaults to max_speed.
-
-        Returns:
-            MoveHandle: Movement handle exposing finished_event.
         """
         if isinstance(axes, (int, np.integer)) and not isinstance(x, (list, tuple, np.ndarray)):
             pos = float(x)
@@ -396,10 +316,6 @@ class SensapexManip(Manipulator):
     def absolute_move_group_velocity(self, vel, axes=None):
         """
         Emulates continuous velocity commands by integrating a requested velocity vector.
-        
-        Args:
-            vel (list[float]): Velocity vector in µm/s.
-            axes (list[int], optional): Axis numbers affected. Defaults to all axes.
         """
         vel = list(vel)
         v3 = [0.0, 0.0, 0.0]
@@ -415,6 +331,12 @@ class SensapexManip(Manipulator):
         with self._lock:
             self._vel = v3
 
+    def relative_move_group_velocity(self, vel, axes=None):
+        """
+        Relative velocity-mode API; Sensapex backend integrates commanded velocities.
+        """
+        self.absolute_move_group_velocity(vel, axes=axes)
+
     def wait_until_still(self, axes=None, axis=None):
         """
         Block until the device is no longer moving.
@@ -427,10 +349,6 @@ class SensapexManip(Manipulator):
           - um_get_drive_status(hndl, dev): "Obtain position drive status." :contentReference[oaicite:3]{index=3}
 
         umsdk also notes function name migration from ump_* -> um_* in the newer branch, so we try both. :contentReference[oaicite:4]{index=4}
-        
-        Args:
-            axes (list[int], optional): Axes to monitor.
-            axis (int, optional): Single axis to monitor.
         """
         def _call_any(names):
             for fn in names:

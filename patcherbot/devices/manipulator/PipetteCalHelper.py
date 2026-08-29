@@ -1,6 +1,7 @@
 import time
 import cv2
 import numpy as np
+import os
 from pathlib import Path
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.manipulator import Manipulator
@@ -26,13 +27,30 @@ def _resolve_model_path(model_name):
     """
     if model_name is None:
         return None
-    if isinstance(model_name, str) and not model_name.strip():
+    model_text = str(model_name).strip()
+    if not model_text:
         return None
-    path = Path(str(model_name))
+
+    # Normalize accidental wrappers like r'...', "...", and stray quote tails.
+    while model_text:
+        previous = model_text
+        if len(model_text) >= 2 and model_text[0].lower() == "r" and model_text[1] in ("'", '"'):
+            model_text = model_text[1:].strip()
+        if len(model_text) >= 2 and model_text[0] in ("'", '"') and model_text[-1] == model_text[0]:
+            model_text = model_text[1:-1].strip()
+        model_text = model_text.strip(" '\"")
+        if model_text == previous:
+            break
+
+    if not model_text:
+        return None
+
+    path = Path(model_text).expanduser()
     if path.is_absolute():
         return path
-    base_dir = Path(__file__).resolve().parents[2] / "deepLearning" / "pipetteModel"
-    return base_dir / path
+
+    model_dir = Path(__file__).resolve().parents[2] / "deepLearning" / "pipetteModel"
+    return model_dir / path
 
 
 class PipetteCalHelper():
@@ -72,13 +90,21 @@ class PipetteCalHelper():
         self.microscope: Microscope = microscope
         self.camera = camera
         self.config = config
+        device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
         model_name = getattr(self.config, "pipette_detector_model", None) if self.config is not None else None
         model_path = _resolve_model_path(model_name)
         try:
-            self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(model_path=model_path)
+            self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(
+                model_path=model_path,
+                device=device,
+            )
         except Exception as exc:
-            logging.warning("Failed to initialize PipetteDetectorYOLO1 (%s); using default model path", exc)
-            self.pipetteDetector = PipetteDetectorYOLO1(model_path=None)
+            logging.warning(
+                "Failed to initialize PipetteDetectorYOLO1 with model '%s' (%s); using default model path",
+                model_name,
+                exc,
+            )
+            self.pipetteDetector = PipetteDetectorYOLO1(device=device)
         self.calibrated_stage = calibrated_stage
         # Each calibration point will be a tuple:
         #   (image_x, image_y, encoder_x, encoder_y)
@@ -234,16 +260,25 @@ class PipetteFocusHelper():
         self.config = config
         model_name = getattr(self.config, "pipette_focuser_model", None) if self.config is not None else None
         model_path = _resolve_model_path(model_name)
-        self.pipetteFocuser: PipetteFocuser = PipetteFocuser(model_path=model_path)
+        try:
+            self.pipetteFocuser: PipetteFocuser = PipetteFocuser(model_path=model_path)
+        except Exception as exc:
+            logging.warning(
+                "Failed to initialize PipetteFocuser with model '%s' (%s); using default model path",
+                model_name,
+                exc,
+            )
+            self.pipetteFocuser = PipetteFocuser()
     
-    def focus(self):
+    def focus(self,frame=None):
         """
         Adjusts the pipette focus by capturing an image,
         predicting the defocus value, and commanding a relative move
         using that value.
         """
-        # logging.info("Focusing pipette...")
-        frame = self.camera.get_16bit_image()
+        if frame is None:
+            # Get the latest frame from the camera if not provided.
+            _, _, _, frame = self.camera.raw_frame_queue[0]
         # convert to 8-bit for display
         frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
         defocus_value = self.pipetteFocuser.get_pipette_focus_value(frame)

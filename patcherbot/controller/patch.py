@@ -49,31 +49,39 @@ class AutopatchError(Exception):
 
 
 class AutoPatcher(TaskController):
-    """
-    Controller class for managing the automated patch-clamp process.
-
-    Coordinates hardware components such as amplifier, DAQ, pressure controller,
-    manipulators, and imaging devices to execute patching protocols.
-    """
-    def __init__(self, amplifier: Amplifier, daq: DAQ, pressure: PressureController, calibrated_unit: CalibratedUnit, microscope: Microscope, calibrated_stage: CalibratedStage, lamp: Lamp, laser: Laser, config: PatchConfig, protocol_config: ProtocolConfig):
-        """
-        Initialize the AutoPatcher with hardware interfaces and configuration.
-
-        Args:
-            amplifier (Amplifier): Amplifier interface.
-            daq (DAQ): Data acquisition system.
-            pressure (PressureController): Pressure control system.
-            calibrated_unit (CalibratedUnit): Pipette manipulator unit.
-            microscope (Microscope): Microscope interface.
-            calibrated_stage (CalibratedStage): Stage positioning system.
-            lamp (Lamp): Illumination source.
-            laser (Laser): Laser control system.
-            config (PatchConfig): General patching configuration.
-            protocol_config (ProtocolConfig): Protocol-specific configuration.
-        """
+    def __init__(
+        self,
+        amplifier: Amplifier,
+        daq: NiDAQ,
+        pressure: PressureController,
+        calibrated_unit: CalibratedUnit,
+        microscope: Microscope,
+        calibrated_stage: CalibratedStage,
+        lamp: Lamp,
+        laser=None,
+        config: PatchConfig | None = None,
+        protocol_config: ProtocolConfig | None = None,
+    ):
         super().__init__()
         self.config = config
         self.protocol_config = protocol_config
+
+    def __init__(
+        self,
+        amplifier: Amplifier,
+        daq: NiDAQ,
+        pressure: PressureController,
+        calibrated_unit: CalibratedUnit,
+        microscope: Microscope,
+        calibrated_stage: CalibratedStage,
+        lamp: Lamp,
+        laser=None,
+        config: PatchConfig | None = None,
+        protocol_config: ProtocolConfig | None = None,
+    ):
+        super().__init__()
+        self.config = config if config is not None else PatchConfig(name="Patch")
+        self.protocol_config = protocol_config if protocol_config is not None else ProtocolConfig(name="Protocols")
         self.amplifier = amplifier
         self.daq = daq
         if isinstance(self.daq, FakeDAQ):
@@ -83,6 +91,7 @@ class AutoPatcher(TaskController):
         self.calibrated_stage = calibrated_stage
         self.microscope = microscope
         self.lamp = lamp
+        self.laser = laser
         self.laser = laser
         self.safe_position = None
         self.safe_stage_position = None
@@ -100,12 +109,36 @@ class AutoPatcher(TaskController):
         self.attempt_counter = 0
         self._state_recorder = None
         self._in_patch       = False
-        self.agenthelper =   AgentHelper()
+        self.agenthelper = AgentHelper(
+            use_ai_features=bool(self.calibrated_stage.config.use_ai_features)
+        )
         self.current_protocol_graph = None
         self.goal_needed = True
         self.goal_random = True
         self.ninput = None
         self.done = False
+        self.find_pipette_velocity_speed_um_s = 1000.0
+        # Agent find_pipette toggle:
+        # False -> interpret model output as displacement (xy px, z um) and use relative moves.
+        # True  -> interpret model output as velocity (xy px/s, z um/s) and stream velocity commands.
+        self.velocity_prediction = False
+        self._track_cell_ai_disabled_logged = False
+        self._last_track_cell_status = None
+
+        self._last_status_msg = None
+        self._last_error_msg = None
+        self._last_warning_msg = None
+        self.last_log_time = 0
+        
+
+    def _microscope_z_um(self) -> float:
+        """
+        Get the current microscope Z position.
+
+        Returns:
+            float: Microscope Z position in micrometers.
+        """
+        return float(self.microscope.position())
 
         self._last_status_msg = None
         self._last_error_msg = None
@@ -141,13 +174,8 @@ class AutoPatcher(TaskController):
         return self._state_recorder
 
     def getHolding(self):
-        """
-        Get the holding current as measured by the DAQ.
-        
-        Returns:
-            float: Holding current in picoamperes (pA).
-        """
-        if  self.protocol_config.custom_cclamp_protocol:
+        """Get the holding current as measured by the DAQ."""
+        if self.protocol_config.custom_cclamp_protocol:
             holding_current = self.protocol_config.cclamp_hold
             return holding_current
         else:
@@ -188,7 +216,6 @@ class AutoPatcher(TaskController):
             #         holding_current = -50
             return holding_current
 
-
     @record_state("find_pipette")
     def find_pipette(self):
         """
@@ -196,8 +223,49 @@ class AutoPatcher(TaskController):
         a direct control strategy or an agent-based policy.
         """
         self.info("Finding pipette")
-        self.agenthelper.prepare_model("find_pipette")
-        sleep_time = 0.005 # seconds
+        # Only load the agent policy when running in Agent mode.
+        if self.config.mode == 'Agent':
+            self.agenthelper.prepare_model("find_pipette", allow_goal_placeholders=True)
+        elif self.config.mode == 'Adaptive':
+            self.info('Adaptive mode detected; skipping agent model load for find_pipette')
+        else:
+            self.info("Classic/Manual/Training mode detected; skipping agent model load for find_pipette")
+        max_sleep_time = 0.005  # seconds (slowest polling)
+        min_sleep_time = 0.001  # seconds (fastest polling)
+        sleep_time = max_sleep_time
+        command_speed_um_s = abs(float(getattr(self, "find_pipette_velocity_speed_um_s", 200.0)))
+        if command_speed_um_s == 0:
+            raise ValueError("find_pipette_velocity_speed_um_s must be non-zero.")
+        non_agent_relative_move_threshold_um_s = 1000.0
+        use_non_agent_relative_move = command_speed_um_s >= non_agent_relative_move_threshold_um_s
+        use_velocity_prediction = bool(getattr(self, "velocity_prediction", False))
+        if self.config.mode == "Agent":
+            if use_velocity_prediction:
+                self.info(
+                    "Agent find_pipette action mode: velocity "
+                    "(xy in px/s converted to um/s, z in um/s)."
+                )
+            else:
+                self.info(
+                    "Agent find_pipette action mode: displacement "
+                    "(xy in px converted to um, z in um)."
+                )
+
+        def _log_timing(label: str, duration_s: float) -> None:
+            """Lightweight timing logger for find_pipette stages."""
+            # self.info(f"[find_pipette timing] {label}: {duration_s * 1000.0:.1f} ms")
+
+        def _adaptive_sleep_time(goal_error_um: float, tol_um: float) -> float:
+            """
+            Error-scaled polling:
+            - near goal   -> faster polling (min_sleep_time)
+            - far from goal -> slower polling (max_sleep_time)
+            """
+            if goal_error_um is None or (not np.isfinite(goal_error_um)):
+                return max_sleep_time
+            far_error_um = max(float(tol_um) * 10.0, float(tol_um))
+            ratio = float(np.clip(float(goal_error_um) / far_error_um, 0.0, 1.0))
+            return min_sleep_time + (max_sleep_time - min_sleep_time) * ratio
 
         goal_needed = bool(self.goal_needed)
         random = bool(self.goal_random)
@@ -208,14 +276,15 @@ class AutoPatcher(TaskController):
 
         center_x = int(round(width / 2)) if isinstance(width, (int, float)) else 640
         center_y = int(round(height / 2)) if isinstance(height, (int, float)) else 640
-        goal_center = np.array([center_x, center_y], dtype=int)
+        goal_center = np.array([center_x, center_y, 0.0], dtype=float)
+        self.info(f"Using goal center at: {goal_center} (px)")
 
         goal = None
         if goal_needed:
             goal = goal_center.astype(np.float32)
             if random:
                 offsets = np.random.randint(-300, 301, size=2)
-                goal = goal + offsets.astype(np.float32)
+                goal[:2] = goal[:2] + offsets.astype(np.float32)
                 if isinstance(width, (int, float)) and width > 0:
                     max_x = max(int(width) - 1, 0)
                     goal[0] = float(np.clip(goal[0], 0, max_x))
@@ -230,13 +299,32 @@ class AutoPatcher(TaskController):
         goal_display_tuple = (int(goal_display[0]), int(goal_display[1]))
         goal_error_target = goal.astype(float) if goal is not None else goal_center.astype(float)
 
-        done = False
         err = None
         action = None
         target_point = None
+        velocity_start_pos_um = None
+        velocity_direction = None
+        velocity_distance_um = None
+        velocity_start_time = None
+        velocity_timeout_s = None
+        velocity_opposite_direction_warned = False
 
-        while not done:
+        def _reset_velocity_motion(stop_motion: bool = False) -> None:
+            nonlocal velocity_start_pos_um, velocity_direction, velocity_distance_um
+            nonlocal velocity_start_time, velocity_timeout_s, velocity_opposite_direction_warned
+            if stop_motion:
+                self.calibrated_unit.stop()
+            velocity_start_pos_um = None
+            velocity_direction = None
+            velocity_distance_um = None
+            velocity_start_time = None
+            velocity_timeout_s = None
+            velocity_opposite_direction_warned = False
+
+        while True:
+            obs_start = time.perf_counter()
             observation = self.observe()
+            # _log_timing("observation", time.perf_counter() - obs_start)
             curr_point = observation[0]
 
             if curr_point is None:
@@ -246,27 +334,35 @@ class AutoPatcher(TaskController):
 
             if isinstance(curr_point, np.ndarray):
                 curr_point = curr_point.tolist()
-            if len(curr_point) < 2 or any(value is None for value in curr_point[:2]):
+            if len(curr_point) < 3 or any(value is None for value in curr_point[:3]):
                 self.warning("Pipette detector returned incomplete coordinates; waiting for next frame")
                 self.sleep(sleep_time)
                 continue
 
-            curr_array = np.asarray(curr_point[:2], dtype=float)
+            curr_array = np.asarray(curr_point[:3], dtype=float)
             if np.isnan(curr_array).any():
                 self.warning("Pipette detector returned NaN coordinates; waiting for next frame")
                 self.sleep(sleep_time)
                 continue
 
-            curr_point = tuple(int(round(coord)) for coord in curr_array)
+            curr_point = tuple(float(coord) for coord in curr_array)
             curr_point_np = np.asarray(curr_point, dtype=float)
             camera = self.calibrated_stage.camera
+            adaptive_mode = self.config.mode == 'Adaptive'
             should_act = self.config.mode == 'Agent'
+            z_weight = 1.0
+            tol_um = 2.0
+            px_per_um = self.calibrated_unit.pixel_per_um()
 
-            if not should_act:
-                xgerr = goal_error_target[0] - curr_point_np[0]
-                ygerr = goal_error_target[1] - curr_point_np[1]
-                gerr = float(np.sqrt((xgerr ** 2 + ygerr ** 2) / 2.0))
-                self.info(f" Goal error:{gerr}")
+            if adaptive_mode:
+                xgerr_px = goal_error_target[0] - curr_point_np[0]
+                ygerr_px = goal_error_target[1] - curr_point_np[1]
+                zerr_um = -curr_point_np[2]  # drive defocus to 0
+
+                dx_um = xgerr_px / px_per_um[0] if px_per_um and px_per_um[0] else np.nan
+                dy_um = ygerr_px / px_per_um[1] if px_per_um and px_per_um[1] else np.nan
+                gerr_um = float(np.sqrt((dx_um ** 2 + dy_um ** 2 + z_weight * (zerr_um ** 2)) / (2 + z_weight)))
+                self.info(f' Goal error (um):{gerr_um}')
 
                 if goal_needed and camera is not None:
                     camera.show_circle(
@@ -275,21 +371,89 @@ class AutoPatcher(TaskController):
                         show_center=False,
                     )
 
-                if gerr <= 20:
-                    done = True
+                if gerr_um <= tol_um:
+                    self.info('Pipette found')
+                    self.calibrated_unit.stop()
+                    if self.config.mode == 'Training':
+                        self.info('Training mode: goal condition reached. Click Success or Abort to finish.')
+                        while True:
+                            self.sleep(0.1)
                     self.success_requested = True
-                    self.info("Pipette found")
-                    break
+                    self.success_if_requested()
 
                 action = None
                 target_point = None
                 err = None
-                self.calibrated_unit.direct_pipette(goal)
-                self.sleep(sleep_time)
+                act_start = time.perf_counter()
+                xy_um = self.calibrated_unit.pixels_to_um_relative([xgerr_px, ygerr_px, 0])
+                # target_um = self.calibrated_unit.position() + np.array([xy_um[0], xy_um[1], zerr_um])
+                # self.calibrated_unit.absolute_move(target_um.tolist())
+                # self.calibrated_unit.wait_until_still()
+                move_um = np.array([xy_um[0], xy_um[1], zerr_um], dtype=float)
+                move_distance_um = float(np.linalg.norm(move_um))
+                if move_distance_um > 0:
+                    if use_non_agent_relative_move:
+                        self.calibrated_unit.relative_move_group(move_um.tolist())
+                        self.calibrated_unit.wait_until_still()
+                    else:
+                        velocity = self.calibrated_unit.velocity_position_control(move_um, command_speed_um_s)
+                        velocity_command_local = -np.asarray(velocity, dtype=float)
+                        self.calibrated_unit.absolute_move_group_velocity(velocity_command_local.tolist())
+                self.sleep(_adaptive_sleep_time(gerr_um, tol_um))
+                continue
+
+            if not should_act:
+                xgerr_px = goal_error_target[0] - curr_point_np[0]
+                ygerr_px = goal_error_target[1] - curr_point_np[1]
+                zerr_um = -curr_point_np[2]  # drive defocus to 0
+
+                dx_um = xgerr_px / px_per_um[0] if px_per_um and px_per_um[0] else np.nan
+                dy_um = ygerr_px / px_per_um[1] if px_per_um and px_per_um[1] else np.nan
+                gerr_um = float(np.sqrt((dx_um ** 2 + dy_um ** 2 + z_weight * (zerr_um ** 2)) / (2 + z_weight)))
+                self.info(f" Goal error (um):{gerr_um}")
+
+                if goal_needed and camera is not None:
+                    camera.show_circle(
+                        point=goal_display_tuple,
+                        color=(255, 255, 255),
+                        show_center=False,
+                    )
+
+                if gerr_um <= tol_um:
+                    self.info("Pipette found")
+                    self.calibrated_unit.stop()
+                    if self.config.mode == "Training":
+                        self.info("Training mode: goal condition reached. Click Success or Abort to finish.")
+                        while True:
+                            self.sleep(0.1)
+                    self.success_requested = True
+                    self.success_if_requested()
+
+                action = None
+                target_point = None
+                err = None
+                act_start = time.perf_counter()
+                xy_um = self.calibrated_unit.pixels_to_um_relative([xgerr_px, ygerr_px, 0])
+                # target_um = self.calibrated_unit.position() + np.array([xy_um[0], xy_um[1], zerr_um])
+                # self.calibrated_unit.absolute_move(target_um.tolist())
+                # self.calibrated_unit.wait_until_still()
+                move_um = np.array([xy_um[0], xy_um[1], zerr_um], dtype=float)
+                move_distance_um = float(np.linalg.norm(move_um))
+                if move_distance_um > 0:
+                    if use_non_agent_relative_move:
+                        self.calibrated_unit.relative_move_group(move_um.tolist())
+                        self.calibrated_unit.wait_until_still()
+                    else:
+                        velocity = self.calibrated_unit.velocity_position_control(move_um, command_speed_um_s)
+                        velocity_command_local = -np.asarray(velocity, dtype=float)
+                        self.calibrated_unit.absolute_move_group_velocity(velocity_command_local.tolist())
+                # _log_timing("action_direct_pipette", time.perf_counter() - act_start)
+                self.sleep(_adaptive_sleep_time(gerr_um, tol_um))
                 continue
 
             if action is None:
                 # preprocess goal by cropping  and rescaling to 85 by 85
+                inf_start = time.perf_counter()
                 agent_goal = goal
                 if goal is not None:
                     agent = getattr(self.agenthelper, "agent", None)
@@ -308,98 +472,130 @@ class AutoPatcher(TaskController):
                                         offset_y = frame_params.get("offset_y", 0.0)
                                         goal_array[..., 0] = (goal_array[..., 0] - offset_x) * scale_x
                                         goal_array[..., 1] = (goal_array[..., 1] - offset_y) * scale_y
+                                        if goal_array.shape[-1] < 3:
+                                            goal_array = np.pad(goal_array, (0, 3 - goal_array.shape[-1]), constant_values=0)
                                         agent_goal = goal_array
                                         self.info(f"goal scaled: {agent_goal} um")
                         except Exception as exc:
                             self.warning(f"Goal preprocessing failed; using raw goal. Error: {exc}")
                 action = self.agenthelper.run_inference(observation=observation, goal=agent_goal, is_demo=False)
-                self.info(f"pipette prediction: {action} um")
+                # _log_timing("inference_block", time.perf_counter() - inf_start)
+                prediction_units = "velocity (xy px/s, z um/s)" if use_velocity_prediction else "displacement (xy px, z um)"
+                self.info(f"pipette prediction: {action} [{prediction_units}]")
 
                 if action is None:
                     self.warning("Model did not return an action; retrying inference")
+                    if use_velocity_prediction:
+                        _reset_velocity_motion(stop_motion=True)
                     err = None
                     self.sleep(sleep_time)
                     continue
 
-                pred_offset = np.asarray(action[:2], dtype=float)
-                if pred_offset.size < 2:
+                pred_offset_xy = np.asarray(action[:2], dtype=float)
+                if pred_offset_xy.size < 2:
                     self.warning("Predicted offset missing coordinates; retrying inference")
+                    if use_velocity_prediction:
+                        _reset_velocity_motion(stop_motion=True)
                     action = None
                     target_point = None
                     err = None
                     self.sleep(sleep_time)
                     continue
 
-                if np.isnan(pred_offset).any():
+                if np.isnan(pred_offset_xy).any():
                     self.warning("Predicted offset contains NaNs; retrying inference")
+                    if use_velocity_prediction:
+                        _reset_velocity_motion(stop_motion=True)
                     action = None
                     target_point = None
                     err = None
                     self.sleep(sleep_time)
                     continue
 
-                target_point_float = np.asarray(curr_point, dtype=float) + pred_offset
-                target_point_pixels = (
-                    ((target_point_float[0])),
-                    ((target_point_float[1]))
-                )
-
-                target_point_microns = (
-                    ((pred_offset[0])),
-                    ((pred_offset[1])),
-                    0
-                )
-
-                target_point_microns_relative = self.calibrated_unit.pixels_to_um_relative(target_point_microns) 
-                self.info(f"target converted relative distance: {target_point_microns_relative} um")
-                target_point_microns_absolute = target_point_microns_relative + self.calibrated_unit.position()
-
-                self.info(f" target converted distance in um: {target_point_microns_absolute} um")
-
-                self.info(f"acting...")
-                
-                # self.calibrated_unit.absolute_move(np.array(target_point_microns))
-                self.calibrated_unit.relative_move(np.array(target_point_microns_relative))
-
-                # self.calibrated_unit.absolute_move(target_point_microns)
-                # # intstead, divide the values by 33ms of time, the rough recording frequency and command themn to move at that velocity
-                # target_point_microns_velocity = (
-                #     ((pred_offset[0]))/0.033,
-                #     ((pred_offset[1]))/0.033,
-                #     0
-                # )
-
-                # target_point_microns_velocity = list(target_point_microns_velocity)
-                # self.info(f"velocity: {target_point_microns_velocity} um/s")
-                # self.calibrated_unit.absolute_move_group_velocity(target_point_microns_velocity)
-                
-
-                width = getattr(camera, "width", None)
-                height = getattr(camera, "height", None)
-
-                if width is not None and height is not None:
-                    if not (0 <= target_point_pixels[0] < width and 0 <= target_point_pixels[1] < height):
-                        self.warning(f"predicted point not on screen: {target_point_pixels}")
+                if use_velocity_prediction:
+                    # Velocity mode: model output is interpreted directly as [vx_px, vy_px, vz_um].
+                    # Convert xy into manipulator-frame um/s; pass z through as-is.
+                    z_velocity_um_s = 0.0 if len(action) < 3 or action[2] is None else float(action[2])
+                    velocity_xy_um_s = self.calibrated_unit.pixels_to_um_relative(
+                        [-pred_offset_xy[0], -pred_offset_xy[1], 0.0]
+                    )
+                    velocity_um_s = np.array(
+                        [velocity_xy_um_s[0], velocity_xy_um_s[1], z_velocity_um_s],
+                        dtype=float,
+                    )
+                    if not np.isfinite(velocity_um_s).all():
+                        self.warning("Predicted velocity contains invalid values; retrying inference")
                         action = None
                         target_point = None
                         err = None
-                        self.sleep(0.04)
+                        _reset_velocity_motion(stop_motion=True)
+                        self.sleep(sleep_time)
                         continue
+                    if float(np.linalg.norm(velocity_um_s)) == 0.0:
+                        self.info("Predicted velocity is zero; stopping motion and requesting next action.")
+                        action = None
+                        target_point = None
+                        err = None
+                        _reset_velocity_motion(stop_motion=True)
+                        self.sleep(sleep_time)
+                        continue
+                    self.calibrated_unit.relative_move_group_velocity(velocity_um_s.tolist())
+                    action = None
+                    target_point = None
+                    err = None
+                    _reset_velocity_motion(stop_motion=False)
+                else:
+                    # Displacement mode: treat model output as [dx_px, dy_px, dz_um], then do a relative move.
+                    # Negate agent find_pipette Z output to match coordinate convention used by this rig.
+                    z_component = -float(action[2]) if len(action) >= 3 and action[2] is not None else None
+                    z_offset_um = -curr_point_np[2] if z_component is None else z_component
+                    target_point_float = np.asarray(curr_point[:2], dtype=float) + pred_offset_xy
+                    target_point_pixels = (target_point_float[0], target_point_float[1])
+                    width = getattr(camera, "width", None)
+                    height = getattr(camera, "height", None)
+                    if width is not None and height is not None:
+                        if not (0 <= target_point_pixels[0] < width and 0 <= target_point_pixels[1] < height):
+                            self.warning(f"predicted point not on screen: {target_point_pixels}")
+                            action = None
+                            target_point = None
+                            err = None
+                            _reset_velocity_motion(stop_motion=True)
+                            self.sleep(0.04)
+                            continue
+                    move_xy_um = self.calibrated_unit.pixels_to_um_relative(
+                        [pred_offset_xy[0], pred_offset_xy[1], 0.0]
+                    )
+                    move_um = np.array([move_xy_um[0], move_xy_um[1], -z_offset_um], dtype=float)
+                    if not np.isfinite(move_um).all():
+                        self.warning("Predicted displacement contains invalid values; retrying inference")
+                        action = None
+                        target_point = None
+                        err = None
+                        self.sleep(sleep_time)
+                        continue
+                    move_distance_um = float(np.linalg.norm(move_um))
+                    if move_distance_um == 0:
+                        self.info("Predicted movement is zero; requesting next action.")
+                        action = None
+                        target_point = None
+                        err = None
+                        self.sleep(sleep_time)
+                        continue
+                    self.calibrated_unit.relative_move_group(move_um.tolist())
+                    self.calibrated_unit.wait_until_still()
+                    action = None
+                    target_point = None
+                    err = None
+                    _reset_velocity_motion(stop_motion=False)
 
-                target_point = target_point_pixels
-
-            # pipette_action = np.asarray(action[:3], dtype=float)
-            # # if pipette_action.size < 3:
-            # #     pipette_action = np.pad(pipette_action, (0, 3 - pipette_action.size), constant_values=0.0)
-            # # if np.linalg.norm(pipette_action) < 0.1:
-            # #     count += 1
-            # #     if count >= 5:
-            # #         done = True
-
-            xgerr = goal_error_target[0] - curr_point_np[0]  # switch
+            xgerr = goal_error_target[0] - curr_point_np[0]
             ygerr = goal_error_target[1] - curr_point_np[1]
-            gerr = float(np.sqrt((xgerr ** 2 + ygerr ** 2) / 2.0))
-            self.info(f" Goal error:{gerr}")
+            zerr_um_goal = -curr_point_np[2]
+            dx_um = xgerr / px_per_um[0] if px_per_um and px_per_um[0] else np.nan
+            dy_um = ygerr / px_per_um[1] if px_per_um and px_per_um[1] else np.nan
+            gerr = float(np.sqrt((dx_um ** 2 + dy_um ** 2 + z_weight * (zerr_um_goal ** 2)) / (2 + z_weight)))
+            self.info(f" Goal error (um):{gerr}")
+            loop_sleep_time = _adaptive_sleep_time(gerr, tol_um)
 
             if goal_needed and camera is not None:
                 camera.show_circle(
@@ -409,27 +605,64 @@ class AutoPatcher(TaskController):
                     show_center=False,
                 )
 
-            if gerr <= 20:
-                self.success_requested = True
-
-            if self.success_requested:
+            if gerr <= tol_um:
                 self.info("Pipette found")
+                _reset_velocity_motion(stop_motion=True)
+                if self.config.mode == "Training":
+                    self.info("Training mode: goal condition reached. Click Success or Abort to finish.")
+                    while True:
+                        self.sleep(0.1)
+                self.success_requested = True
                 self.success_if_requested()
+
+            if target_point is not None and velocity_start_pos_um is not None and velocity_direction is not None and velocity_distance_um is not None:
+                current_position_um = np.asarray(self.calibrated_unit.position(), dtype=float)
+                signed_traveled_um = float(np.dot(current_position_um - velocity_start_pos_um, velocity_direction))
+                traveled_um = abs(signed_traveled_um)
+                if traveled_um >= velocity_distance_um:
+                    _reset_velocity_motion(stop_motion=True)
+                    action = None
+                    target_point = None
+                    err = None
+                    self.sleep(loop_sleep_time)
+                    continue
+                if (signed_traveled_um < 0) and (not velocity_opposite_direction_warned):
+                    self.warning(
+                        "Find-pipette velocity move is progressing opposite commanded direction; "
+                        "using absolute displacement criterion."
+                    )
+                    velocity_opposite_direction_warned = True
+                if velocity_start_time is not None and velocity_timeout_s is not None:
+                    elapsed_s = time.perf_counter() - velocity_start_time
+                    if elapsed_s > velocity_timeout_s:
+                        self.warning(
+                            f"Find-pipette velocity move timeout after {velocity_timeout_s:.2f}s "
+                            f"(target {velocity_distance_um:.2f} um, traveled {signed_traveled_um:.2f} um signed)."
+                        )
+                        _reset_velocity_motion(stop_motion=True)
+                        action = None
+                        target_point = None
+                        err = None
+                        self.sleep(loop_sleep_time)
+                        continue
 
             if target_point is not None:
                 xerr = curr_point_np[0] - target_point[0]
                 yerr = curr_point_np[1] - target_point[1]
-                err = float(np.sqrt((xerr ** 2 + yerr ** 2) / 2.0))
-                self.info(f"total pixel error: {err}")
+                dx_um = xerr / px_per_um[0] if px_per_um and px_per_um[0] else np.nan
+                dy_um = yerr / px_per_um[1] if px_per_um and px_per_um[1] else np.nan
+                err = float(np.sqrt((dx_um ** 2 + dy_um ** 2) / 2.0))
+                # self.info(f"total XY error (um): {err}")
 
-                if err <= 10:
+                if err <= (tol_um / 2):
+                    _reset_velocity_motion(stop_motion=True)
                     action = None
                     target_point = None
                     err = None
-                    self.sleep(sleep_time)
+                    self.sleep(loop_sleep_time)
                     continue
 
-            self.sleep(sleep_time)
+            self.sleep(loop_sleep_time)
 
     @record_state("run_protocols")
     def run_protocols(self):
@@ -586,9 +819,9 @@ class AutoPatcher(TaskController):
             self.daq.getDataFromCurrentProtocol(
                 custom=self.protocol_config.custom_cclamp_protocol,
                 factor=1,
-                startCurrentPicoAmp=(self.protocol_config.cclamp_start),
-                endCurrentPicoAmp=(self.protocol_config.cclamp_end),
-                stepCurrentPicoAmp=(self.protocol_config.cclamp_step),
+                startCurrentPicoAmp=self.protocol_config.cclamp_start,
+                endCurrentPicoAmp=self.protocol_config.cclamp_end,
+                stepCurrentPicoAmp=self.protocol_config.cclamp_step,
                 recordingTimeMs=self.protocol_config.cclamp_recording_time_ms,
                 dutyCycle=self.protocol_config.cclamp_duty_cycle,
             )
@@ -783,18 +1016,6 @@ class AutoPatcher(TaskController):
     def move_stage_to_cell(self, cell):
         '''
         Moves the stage to the XY position of the target cell.
-
-        Args:
-            cell (array-like | tuple | list):
-                Cell representation containing at least XY coordinates. Can be:
-                - a numeric array of shape (3,)
-                - a tuple/list where the first element contains coordinates
-        
-        Raises:
-            AutopatchError:
-                If no cell is provided or stage is not calibrated.
-            AutopatchError:
-                If the cell does not contain valid XY coordinates.
         '''
         if cell is None:
             raise AutopatchError("No cell given to move stage to")
@@ -816,17 +1037,19 @@ class AutoPatcher(TaskController):
         self.calibrated_stage.safe_move(np.array(cell_pos_planar))
         self.calibrated_stage.wait_until_still()
 
+    @record_state("scan_area")
+    def scan_area(self, speed=None):
+        '''
+        Scan the currently selected plate area using stored corners.
+        '''
+        self.calibrated_stage.scan_area(speed=speed)
+        self.success_requested = True
+        self.success_if_requested()
+
     @record_state("locate_cell") 
     def locate_cell(self, cell):
         '''
         Performs regional pipette localization to bring pipette above the cell.
-        
-        Args:
-            cell (tuple):
-                Tuple containing:
-                - cell_pos (array-like): 3D coordinates of the cell
-                - cell_img: associated image data
-                - pos: additional metadata
         '''
          # regional pipette localization: 
         # move stage and pipette to safe space
@@ -839,9 +1062,7 @@ class AutoPatcher(TaskController):
         self.move_to_home_space()
         # center pipette on cell xy 
         self.info("Centering pipette")
-        self.calibrated_unit.center_pipette()
-        self.calibrated_unit.wait_until_still()
-        self.calibrated_unit.center_pipette()
+        self.fine_calibrate_pipette()
         
         # move to cell_distance above cell.
         cell_pos, cell_img,pos = cell
@@ -865,10 +1086,16 @@ class AutoPatcher(TaskController):
         disp[1] = stage_pos[1] - self.home_stage_position[1]
         disp[2] = 0
         # print(f"Disp: {disp}")
-        pipette_disp = self.calibrated_unit.rotate(disp, 2)
+        # center pipette on cell xy 
+        pipette_disp = self.calibrated_unit.rotate(disp,2)
         self.calibrated_unit.relative_move(pipette_disp)
         self.calibrated_unit.wait_until_still() 
-        # center pipette on cell xy 
+
+       
+ #drop speed to approach cell
+        self.calibrated_stage.set_max_speed(self.config.max_locate_speed)
+        self.calibrated_unit.set_max_speed(self.config.max_locate_speed)
+
         self.fine_calibrate_pipette()
         zdist_cell = self.home_stage_position[2] - cell_pos[2]
         self.move_group_down(-zdist_cell/2)# on real rig
@@ -879,14 +1106,20 @@ class AutoPatcher(TaskController):
         self.sleep(0.1)
         self.fine_calibrate_pipette()
 
-        self.align(cell, cell_distance,self.config.use_centroid)
-        self.info("Located Cell")
-
         self.amplifier.start_patch()
 
+        self.align(cell, cell_distance,self.config.use_centroid)
+        
+        if self.config.cell_type_toggle and self.config.cell_type == "Slice":
+            self.clear_to_cell(cell)
+            self.align(cell, self.config.cell_distance,self.config.use_centroid)
+
+        
+        self.calibrated_stage.set_max_speed(10000)
+        self.calibrated_unit.set_max_speed(100000)
+        self.info("Located Cell")
         self.success_requested = True
         self.success_if_requested()
-
 
     def fine_calibrate_pipette(self):
         '''
@@ -895,9 +1128,13 @@ class AutoPatcher(TaskController):
         self.info("Fine calibrating pipette using imaging")
         self.calibrated_unit.center_pipette()
         self.calibrated_unit.wait_until_still()
+        self.calibrated_unit.autofocus_pipette()
+        self.calibrated_unit.wait_until_still()
         self.calibrated_unit.center_pipette()
         self.calibrated_unit.wait_until_still()
         self.calibrated_unit.autofocus_pipette()
+        self.calibrated_unit.wait_until_still()
+        self.calibrated_unit.center_pipette()
         self.calibrated_unit.wait_until_still()
         self.calibrated_unit.autofocus_pipette()
         self.calibrated_unit.wait_until_still()
@@ -919,7 +1156,7 @@ class AutoPatcher(TaskController):
 
         self.microscope.move_to_floor()
         self.microscope.wait_until_still()
-        z_pos = self._microscope_z_um()
+        z_pos = self.microscope.position() / self.calibrated_unit.config.microscope_units_per_um
         zdistleft = z_pos - cell_pos[2]
         self.microscope.relative_move(-zdistleft)
         self.microscope.wait_until_still()
@@ -935,6 +1172,43 @@ class AutoPatcher(TaskController):
             self.calibrated_unit.wait_until_still()
             self.microscope.relative_move(cell_distance)
             self.microscope.wait_until_still()
+
+    def clear_to_cell(self, cell):
+        '''
+        Clears the pipette to the cell by moving down while checking resistance
+        Moves the pipette down to cell plane and detects a cell using resistance measurements
+        
+        Args:
+            cell (optional):
+                Cell data used for tracking or validation.
+
+        Raises:
+            AutopatchError:
+                If the rig is not ready or no cell is provided.
+        '''
+        self.info("Clearing to cell")
+        self.isrigready()
+
+        if self.rig_ready == False:
+            raise AutopatchError("Rig not ready for clearing to cell")
+        
+        if cell is None:
+            raise AutopatchError("No cell given to patch!")
+        
+        # if a slice, push pipette into slice from above surface, just about 20um above cell of interest
+
+        if self.config.cell_type_toggle and self.config.cell_type == "Slice":
+            self.info("Moving pipette to slice position")
+            speed = [0,0,self.config.max_clearing_speed]
+            cell_hover_pos =  self.config.cell_distance - self.config.slice_start_distance
+            # move the stage up to the cell hover position
+            self.microscope.relative_move(-self.config.cell_distance)
+            start_pos = self.calibrated_unit.position()
+            self.calibrated_unit.absolute_move_group_velocity(speed)
+            self.info(f"Cell hover position: {cell_hover_pos} um")
+            while start_pos[2] - self.calibrated_unit.position()[2] > cell_hover_pos and not self.abort_requested:
+                self.sleep(0.1)
+            self.calibrated_unit.stop()
         
     @record_state("hunt_cell")
     def hunt_cell(self,cell = None):
@@ -959,19 +1233,6 @@ class AutoPatcher(TaskController):
         if cell is None:
             raise AutopatchError("No cell given to patch!")
         
-        # if a slice, push pipette into slice from above surface, just about 20um above cell of interest
-
-        if self.config.cell_type_toggle and self.config.cell_type == "Slice":
-            self.info("Moving pipette to slice position")
-            speed = [0, 0, self.config.max_descent_speed*5]
-            start_pos = self.calibrated_unit.position()
-            self.calibrated_unit.absolute_move_group_velocity(speed)
-            cell_hover_pos = self.config.cell_distance - self.config.slice_start_distance
-            self.info(f"Cell hover position: {cell_hover_pos} um")
-            while start_pos[2] - self.calibrated_unit.position()[2] > cell_hover_pos and not self.abort_requested:
-                self.sleep(0.1)
-            self.calibrated_unit.stop()
-            
         # # #ensure "near cell" pressure
         self.info(f"Setting pressure to {self.config.pressure_near} mbar")
         self.pressure.set_pressure(self.config.pressure_near)
@@ -997,6 +1258,12 @@ class AutoPatcher(TaskController):
             self.calibrated_unit.absolute_move_group_velocity(speed)
             self.info(f"moving pipette at: {speed} um/s")
             autoHunt=True
+        elif self.config.mode == 'Adaptive':
+            speed = [0, 0, self.config.max_descent_speed]
+
+            self.calibrated_unit.absolute_move_group_velocity(speed)
+            self.info(f'moving pipette at: {speed} um/s')
+            autoHunt=True
         elif self.config.mode == 'Agent':
             #prepare model
             # cell_pos, cell_img,goal_pos = cell
@@ -1006,7 +1273,24 @@ class AutoPatcher(TaskController):
         else:
             autoHunt = False
 
+        self._track_cell_ai_disabled_logged = False
+        self._last_track_cell_status = None
+        if self.config.track_cell and bool(self.calibrated_stage.config.use_ai_features):
+            cell_track_helper = getattr(self.calibrated_stage, "cellTrackHelper", None)
+            if cell_track_helper is not None:
+                cell_track_helper.reset_tracking()
+        training_mode = self.config.mode == "Training"
+        enforce_max_hunt_distance = self.config.mode != "Training"
+        if not enforce_max_hunt_distance:
+            self.info(
+                "Training mode: max hunt distance check disabled; waiting for resistance threshold."
+            )
+        hunt_termination_reason = None
         cell_detected = self._isCellDetected(lastResDeque=lastResDeque,cellThreshold = self.config.cell_R_increase)
+        last_training_threshold_status = None
+        if training_mode:
+            last_training_threshold_status = cell_detected
+            self.info(f"Training mode: resistance threshold achieved: {cell_detected}")
         while not cell_detected and self.abort_requested == False:
             # if autoHunt:
             #     try: 
@@ -1028,9 +1312,17 @@ class AutoPatcher(TaskController):
                 # self.calibrated_unit.relative_move(pi_pos)
 
             curr_pos = self.calibrated_unit.position()
-            if abs(curr_pos[2] - start_pos[2]) >= (int(self.config.max_distance)):
+            if (
+                enforce_max_hunt_distance
+                and abs(curr_pos[2] - start_pos[2]) >= (int(self.config.max_distance))
+            ):
                 # we have moved expected um down and still no cell detected
-                self.info("cell not detected")
+                moved_distance = abs(curr_pos[2] - start_pos[2])
+                hunt_termination_reason = (
+                    "Cell not detected before reaching max hunt distance "
+                    f"({moved_distance:.1f} um >= {float(self.config.max_distance):.1f} um)."
+                )
+                self.info(hunt_termination_reason)
                 self.calibrated_unit.stop()
                 self.calibrated_stage.stop()
                 self.microscope.stop()
@@ -1042,27 +1334,83 @@ class AutoPatcher(TaskController):
                     self.microscope.stop()
 
                 self.info("Cell Detected")
-                self.success_requested = True
-                self.success_if_requested()
                 break
-            #TODO will add another condition to check if cell and pipette have moved away from each other based on the mask and original image.
-            if self.config.track_cell:
-                position, disp = self.calibrated_stage.get_cell_position(cell,use_centroid=self.config.use_centroid)
-                if position is not None and disp is not None:
-                    self.info(f"cell displacement: {disp} px")
-                    self.info(f"cell position: {position} px")
-                else:
-                    self.info("lost track of cell")
+
+            self.track_cell(cell)
 
             self.sleep(0.04)
             lastResDeque.append(daqResistance)
             daqResistance = self.daq.resistance()
             cell_detected = self._isCellDetected(lastResDeque=lastResDeque,cellThreshold=self.config.cell_R_increase)
+            if training_mode and cell_detected != last_training_threshold_status:
+                self.info(f"Training mode: resistance threshold achieved: {cell_detected}")
+                last_training_threshold_status = cell_detected
 
         self.calibrated_stage.stop()
         self.calibrated_unit.stop()
         self.microscope.stop()
+        if cell_detected:
+            self.info("Cell Detected")
+            if training_mode:
+                self.info("Training mode: waiting for manual Success or Abort.")
+                while True:
+                    self.sleep(0.1)
+            self.success_requested = True
+            self.success_if_requested()
+        elif hunt_termination_reason is not None:
+            if self.config.mode == "Training":
+                self.info(
+                    "Training mode: hunt ended without cell detection. "
+                    "Click Success or Abort to finish."
+                )
+                while True:
+                    self.sleep(0.1)
+            raise AutopatchError(hunt_termination_reason)
+        elif self.abort_requested:
+            self.abort_if_requested()
 
+    def track_cell(self, cell):
+        '''
+        Track the cell during hunting and return its current position in pixels.
+        '''
+        # TODO will add another condition to check if cell and pipette have moved away from each other based on the mask and original image.
+        if not self.config.track_cell:
+            return None
+
+        ai_tracking_enabled = bool(self.calibrated_stage.config.use_ai_features)
+        if ai_tracking_enabled:
+            position, disp = self.calibrated_stage.get_cell_position(
+                cell,
+                use_centroid=self.config.use_centroid,
+                tracking_mode=self.config.tracking_mode,
+                track_max_fast_jump_px=self.config.track_max_fast_jump_px,
+            )
+            status = {}
+            cell_track_helper = getattr(self.calibrated_stage, "cellTrackHelper", None)
+            if cell_track_helper is not None:
+                status = getattr(cell_track_helper, "last_tracking_status", {}) or {}
+            method = status.get("method")
+            status_name = status.get("status")
+            if position is not None and disp is not None:
+                status_label = f"{method}/{status_name}" if method else str(status_name)
+                self.info(f"cell tracking: {status_label}")
+                self.info(f"cell displacement: {disp} px")
+                self.info(f"cell position: {position} px")
+                self._last_track_cell_status = status_name
+                return position
+            else:
+                if self._last_track_cell_status != status_name:
+                    self.info("lost track of cell")
+                    self._last_track_cell_status = status_name
+                return None
+
+        if not self._track_cell_ai_disabled_logged:
+            self.info(
+                "Track-cell is enabled, but calibration.use_ai_features is false; skipping AI cell tracking."
+            )
+            self._track_cell_ai_disabled_logged = True
+        return None
+    
     @record_state("escape")
     def escape(self):
             """   Safely terminate the patching process and reset hardware to a stable state."""
@@ -1214,12 +1562,233 @@ class AutoPatcher(TaskController):
         Raises:
             AutopatchError: If seal formation fails or deadline is exceeded.
         """
-        sim = isinstance(self.daq, FakeDAQ)
-        if sim:
-            self.daq.start()
-        try:
-            if self.config.mode == 'Classic':
-                autoPressure = True
+        # TODO: reimplement fake daq simulation thread
+        autoPressure = (self.config.mode == 'Classic')
+        adaptivePressure = (self.config.mode == 'Adaptive')
+        agentPressure = (self.config.mode == 'Agent')
+        agent_resistance_input_width = 0
+        agent_resistance_history = collections.deque(maxlen=1)
+        if agentPressure:
+            self.info("Agent gigaseal mode detected; preparing gigaseal policy.")
+            self.agenthelper.prepare_model("gigaseal")
+            agent_resistance_input_width = self._agent_resistance_input_width()
+            agent_resistance_history = collections.deque(
+                maxlen=max(1, agent_resistance_input_width)
+            )
+        self.info(f"{self.config.mode}: Attempting to form gigaseal...")
+        self.amplifier.auto_fast_compensation()
+        self.sleep(1)
+        self.daq.setCellMode(True)
+        self.sleep(0.1)
+        self.info("Collecting baseline resistance...")
+
+        num_slope_samples = 5
+        sample_interval = float(self.config.measurement_speed)
+
+        avg_resistance = self.resistanceRamp(
+            num_measurements=num_slope_samples,
+            interval=sample_interval,
+        )
+        consecutive_success = 0
+
+        self.pressure.set_ATM(atm=True)
+
+        self.sleep(3)
+
+        if autoPressure:
+            currPressure = -5
+            self.pressure.set_pressure(currPressure)
+            self.pressure.set_ATM(atm=False)
+            prevpressure = currPressure
+            speed = 1
+            bad_cell_count = 0
+            # this is already negative, e.g. -30 mbar
+            max_pressure = self.config.pressure_ramp_max
+        elif adaptivePressure:
+            currPressure = -5
+            self.pressure.set_pressure(currPressure)
+            self.pressure.set_ATM(atm=False)
+            prevpressure = currPressure
+            speed = 1
+            bad_cell_count = 0
+            # this is already negative, e.g. -30 mbar
+            max_pressure = self.config.pressure_ramp_max
+
+        holding_switched = False
+        last_progress_time = time.time()
+        last_agent_action = None
+        observations_since_last_action = 0
+
+        while not self.abort_requested:
+            # Deadline check
+            if time.time() - last_progress_time >= self.config.seal_deadline:
+                raise AutopatchError(f"Seal attempt failed: resistance did not improve by at least {self.config.gigaseal_min_delta_R} MegaOhms by the {self.config.seal_deadline} second deadline.")
+
+            prev_resistance = avg_resistance
+            avg_resistance = self.resistanceRamp(
+                num_measurements=num_slope_samples,
+                interval=sample_interval,
+            )
+
+            delta_resistance = avg_resistance - prev_resistance
+            rate_mohm_per_sec = delta_resistance / (num_slope_samples * sample_interval)
+
+            if delta_resistance >= self.config.gigaseal_min_delta_R:
+                last_progress_time = time.time()
+
+            # ---------------------- auto-pressure logic ----------------------
+            if agentPressure:
+                observation = self.observe(include_pressure_state=True)
+                self._attach_agent_resistance_input(
+                    observation,
+                    agent_resistance_history,
+                    agent_resistance_input_width,
+                )
+                observation["observations_since_last_action"] = np.asarray(
+                    [observations_since_last_action],
+                    dtype=np.float32,
+                )
+                self.info(
+                    "Gigaseal agent observation collected: "
+                    f"resistance={float(observation['resistance'][0]):.3f} MΩ, "
+                    f"actual_pressure={float(observation['pressure'][0]):.3f} mbar, "
+                    f"setpoint={float(observation['commanded_pressure_mbar'][0]):.3f} mbar, "
+                    f"atm={bool(observation['pressure_atm_state'][0])}, "
+                    f"observations_since_last_action={int(observation['observations_since_last_action'][0])}"
+                )
+                action = self.agenthelper.run_inference(observation=observation, is_demo=False)
+                self.info(f"Gigaseal agent raw action: {action}")
+                if action is None:
+                    self.warning("Gigaseal agent did not return an action; skipping pressure update for this iteration.")
+                else:
+                    action_array = np.asarray(action).reshape(-1)
+                    if action_array.size < 1:
+                        self.warning(
+                            f"Gigaseal agent action must have at least 1 value; received shape {action_array.shape}."
+                        )
+                    else:
+                        first_action_value = float(action_array[0])
+                        if action_array.size == 1:
+                            target_atm = bool(first_action_value >= 0.0)
+                            if target_atm:
+                                commanded_pressure = float(self.pressure.get_pressure())
+                            else:
+                                commanded_pressure = float(
+                                    np.clip(first_action_value, float(self.config.pressure_ramp_max), -5.0)
+                                )
+                        else:
+                            commanded_pressure = float(
+                                np.clip(first_action_value, float(self.config.pressure_ramp_max), -5.0)
+                            )
+                            target_atm = bool(float(action_array[1]) >= 0.5)
+                        self.info(
+                            "Gigaseal agent decoded action: "
+                            f"commanded_pressure={commanded_pressure:.3f} mbar, atm={target_atm}"
+                        )
+
+                        current_agent_action = (commanded_pressure, target_atm)
+                        if current_agent_action != last_agent_action:
+                            self.pressure.set_pressure(commanded_pressure)
+                            self.pressure.set_ATM(atm=target_atm)
+                            observations_since_last_action = 0
+                            last_agent_action = current_agent_action
+                        else:
+                            observations_since_last_action += 1
+            elif autoPressure:
+                # adjust currPressure by ±5 based on rate_mohm_per_sec, speed, etc.
+                increase_gate = self.config.increase_slope_gate
+                constant_gate = self.config.constant_slope_gate
+                decrease_gate = self.config.decrease_slope_gate
+
+                increase_thresh = self.config.gigaseal_R / increase_gate
+                constant_thresh = self.config.gigaseal_R / constant_gate
+                decrease_thresh = self.config.gigaseal_R / decrease_gate
+
+                if rate_mohm_per_sec < increase_thresh:
+                    currPressure -= 5; speed = 3; max_pressure = self.config.pressure_ramp_max
+                elif rate_mohm_per_sec <= constant_thresh:
+                    speed = 1  # maintain
+                elif rate_mohm_per_sec <= decrease_thresh:
+                    max_pressure = self.config.pressure_ramp_max; currPressure += 5; speed = 3
+
+                currPressure = min(currPressure, -5.0)
+                currPressure = max(currPressure, self.config.pressure_ramp_max)
+
+                if currPressure != prevpressure:
+                    self.pressure.set_pressure(currPressure)
+                    prevpressure = currPressure
+                    self.sleep(5 / speed)
+
+                if currPressure <= max_pressure:
+                    self.pressure.set_ATM(True)
+                    self.sleep(5)
+                    testresistance = self.resistanceRamp(
+                        num_measurements=num_slope_samples,
+                        interval=sample_interval,
+                    )
+                    difference = testresistance - avg_resistance
+                    self.info(f"Test resistance: {testresistance} MΩ; difference: {difference} MΩ")
+                    if difference < 0:
+                        bad_cell_count += 1
+                        if bad_cell_count > 5:
+                            raise AutopatchError("Bad cell detected")
+
+                    currPressure = -5
+                    self.pressure.set_pressure(currPressure)
+                    self.pressure.set_ATM(atm=False)
+            elif adaptivePressure:
+                # adjust currPressure by ±5 based on rate_mohm_per_sec, speed, etc.
+                increase_gate = self.config.increase_slope_gate
+                constant_gate = self.config.constant_slope_gate
+                decrease_gate = self.config.decrease_slope_gate
+
+                increase_thresh = self.config.gigaseal_R / increase_gate
+                constant_thresh = self.config.gigaseal_R / constant_gate
+                decrease_thresh = self.config.gigaseal_R / decrease_gate
+
+                if rate_mohm_per_sec < increase_thresh:
+                    currPressure -= 5; speed = 3; max_pressure = self.config.pressure_ramp_max
+                elif rate_mohm_per_sec <= constant_thresh:
+                    speed = 1  # maintain
+                elif rate_mohm_per_sec <= decrease_thresh:
+                    max_pressure = self.config.pressure_ramp_max; currPressure += 5; speed = 3
+
+                currPressure = min(currPressure, -5.0)
+                currPressure = max(currPressure, self.config.pressure_ramp_max)
+
+                if currPressure != prevpressure:
+                    self.pressure.set_pressure(currPressure)
+                    prevpressure = currPressure
+                    self.sleep(5 / speed)
+
+                if currPressure <= max_pressure:
+                    self.pressure.set_ATM(True)
+                    self.sleep(5)
+                    testresistance = self.resistanceRamp(
+                        num_measurements=num_slope_samples,
+                        interval=sample_interval,
+                    )
+                    difference = testresistance - avg_resistance
+                    self.info(f'Test resistance: {testresistance} MΩ; difference: {difference} MΩ')
+                    if difference < 0:
+                        bad_cell_count += 1
+                        if bad_cell_count > 5:
+                            raise AutopatchError('Bad cell detected')
+
+                    currPressure = -5
+                    self.pressure.set_pressure(currPressure)
+                    self.pressure.set_ATM(atm=False)
+            # ---------------------------------------------------------------
+
+            # Holding potential switch
+            if avg_resistance >= self.config.gigaseal_R / self.config.hold_switch and not holding_switched:
+                self.amplifier.set_holding(self.protocol_config.vclamp_hold)
+                self.amplifier.switch_holding(True)
+                holding_switched = True
+
+            # Success check with consecutive-hit filter
+            if avg_resistance >= self.config.gigaseal_R:
+                consecutive_success += 1
             else:
                 autoPressure = False
             self.info(f"{self.config.mode}: Attempting to form gigaseal...")
@@ -1229,125 +1798,20 @@ class AutoPatcher(TaskController):
             self.sleep(0.1)
             self.info("Collecting baseline resistance...")
 
-            num_slope_samples = 5
-            sample_interval = self.config.measurement_speed
-
-            avg_resistance = self.resistanceRamp(
-                num_measurements=num_slope_samples,
-                interval=sample_interval,
-            )
-            consecutive_success = 0
-
-            self.pressure.set_ATM(atm=True)
-
-            self.sleep(3)
-
-            if autoPressure:
-                currPressure = -5
-                self.pressure.set_pressure(currPressure)
-                # if sim:
-                #     self.gigaseal_sim.update_pressure(self.pressure.get_pressure())
-                self.pressure.set_ATM(atm=False)
-                prevpressure = currPressure
-                speed = 1
-                bad_cell_count = 0
-                # this is already negative, e.g. -30 mbar
-                max_pressure = self.config.pressure_ramp_max
-
-            holding_switched = False
-            last_progress_time = time.time()
-
-            while not self.abort_requested:
-                # Deadline check
-                if time.time() - last_progress_time >= self.config.seal_deadline:
-                    raise AutopatchError(f"Seal attempt failed: resistance did not improve by at least {self.config.gigaseal_min_delta_R} MegaOhms by the {self.config.seal_deadline} second deadline.")
-
-                prev_resistance = avg_resistance
-                avg_resistance = self.resistanceRamp(
-                    num_measurements=num_slope_samples,
-                    interval=sample_interval,
-                )
-
-                delta_resistance = avg_resistance - prev_resistance
-                rate_mohm_per_sec = delta_resistance / (num_slope_samples * sample_interval)
-
-                if delta_resistance >= self.config.gigaseal_min_delta_R:
-                    last_progress_time = time.time()
-
-                # ---------------------- auto-pressure logic ----------------------
-            
-                if autoPressure:
-                    # adjust currPressure by ±5 based on rate_mohm_per_sec, speed, etc.
-                    increase_gate = self.config.increase_slope_gate
-                    constant_gate = self.config.constant_slope_gate
-                    decrease_gate = self.config.decrease_slope_gate
-
-                    increase_thresh = self.config.gigaseal_R / increase_gate
-                    constant_thresh = self.config.gigaseal_R / constant_gate
-                    decrease_thresh = self.config.gigaseal_R / decrease_gate
-
-                    if rate_mohm_per_sec < increase_thresh:
-                        currPressure -= 5; speed = 3; max_pressure = self.config.pressure_ramp_max
-                    elif rate_mohm_per_sec <= constant_thresh:
-                        speed = 1  # maintain
-                    elif rate_mohm_per_sec <= decrease_thresh:
-                        max_pressure = self.config.pressure_ramp_max; currPressure += 5; speed = 3
-
-                    currPressure = min(currPressure, -5.0)
-                    currPressure = max(currPressure, self.config.pressure_ramp_max)
-
-                    if currPressure != prevpressure:
-                        self.pressure.set_pressure(currPressure)
-                        # if sim:
-                        #     self.gigaseal_sim.update_pressure(self.pressure.get_pressure())
-                        prevpressure = currPressure
-                        self.sleep(5 / speed)
-
-                    if currPressure <= max_pressure:
-                        self.pressure.set_ATM(True)
-                        self.sleep(5)
-                        testresistance = self.resistanceRamp(
-                            num_measurements=num_slope_samples,
-                            interval=sample_interval,
-                        )
-                        difference = testresistance - avg_resistance
-                        self.info(f"Test resistance: {testresistance} MΩ; difference: {difference} MΩ")
-                        if difference < 0:
-                            bad_cell_count += 1
-                            if bad_cell_count > 5:
-                                raise AutopatchError("Bad cell detected")
-
-                        currPressure = -5
-                        self.pressure.set_pressure(currPressure)
-                        # if hasattr(self, "gigaseal_sim"):
-                        #     self.gigaseal_sim.update_pressure(self.pressure.get_pressure())
-                        self.pressure.set_ATM(atm=False)
-                # ---------------------------------------------------------------
-
-                # Holding potential switch
-                if avg_resistance >= self.config.gigaseal_R / self.config.hold_switch and not holding_switched:
-                    self.amplifier.set_holding(self.protocol_config.vclamp_hold)
-                    self.amplifier.switch_holding(True)
-                    holding_switched = True
-
-                # Success check with consecutive-hit filter
-                if avg_resistance >= self.config.gigaseal_R:
-                    consecutive_success += 1
-                else:
-                    consecutive_success = 0
-
-                if consecutive_success >= 3:
-                    self.pressure.set_ATM(atm=True)
-                    self.success_requested = True
-                    self.info("Seal successful!")
-                    self.success_requested = True
-                    self.success_if_requested()
-                    return
+            if consecutive_success >= 3:
+                self.pressure.set_ATM(atm=True)
+                self.info("Seal successful!")
+                if self.config.mode == "Training":
+                    self.info("Training mode: goal condition reached. Click Success or Abort to finish.")
+                    while True:
+                        self.sleep(0.1)
+                self.success_requested = True
+                self.success_if_requested()
 
         # Abort request came in
-        finally:
-            if sim:
-                self.daq.stop()
+        # finally:
+        #     if sim:
+        #         self.daq.stop()
         raise AutopatchError("Seal attempt failed: gigaseal criteria not met.")
    
     @record_state("break_in")
@@ -1373,6 +1837,15 @@ class AutoPatcher(TaskController):
         # ---------- initial setup (unchanged) ----------
         self.daq.setCellMode(True)
         autoPressure = (self.config.mode == 'Classic')
+        adaptivePressure = (self.config.mode == 'Adaptive')
+        agentMode = (self.config.mode == 'Agent')
+        agent_resistance_input_width = 0
+        agent_resistance_history = deque(maxlen=1)
+        if agentMode:
+            self.info("Agent break-in mode detected; preparing break-in policy.")
+            self.agenthelper.prepare_model("break_in")
+            agent_resistance_input_width = self._agent_resistance_input_width()
+            agent_resistance_history = deque(maxlen=max(1, agent_resistance_input_width))
         self.info(f"{self.config.mode}: Attempting Break in...")
         self.sleep(3)
         self.pressure.set_pressure(self.config.pulse_pressure_break_in)
@@ -1414,8 +1887,66 @@ class AutoPatcher(TaskController):
             else:
                 good_count = 0             # reset streak on failure
 
-            # ---- 2) full break-in cycle (runs only after a “bad” access-R) ----
-            if autoPressure:
+            # ---- 2) full break-in cycle (runs only after a "bad" access-R) ----
+            if agentMode:
+                # ---------- Agent mode: let policy control ATM + zap ----------
+                trials += 1
+                self.debug(f"Trial: {trials} (Agent mode)")
+
+                # Collect observation with pressure state for the agent
+                observation = self.observe(include_pressure_state=True)
+                self._attach_agent_resistance_input(
+                    observation,
+                    agent_resistance_history,
+                    agent_resistance_input_width,
+                )
+                action = self.agenthelper.run_inference(observation=observation, is_demo=False)
+                self.info(f"Break-in agent raw action: {action}")
+
+                if action is None:
+                    self.warning("Break-in agent did not return an action; skipping action application for this iteration.")
+                else:
+                    try:
+                        action_array = np.asarray(action, dtype=float).reshape(-1)
+                    except (TypeError, ValueError) as exc:
+                        self.warning(f"Break-in agent action could not be converted to a numeric array: {exc}")
+                        action_array = None
+
+                    if action_array is not None:
+                        if action_array.size < 1:
+                            self.warning(
+                                f"Break-in agent action must have at least 1 value; received shape {action_array.shape}."
+                            )
+                        elif not np.isfinite(action_array[0]):
+                            self.warning(f"Break-in agent ATM action is invalid: {action_array[0]}")
+                        else:
+                            # Break-in action dims: ATM state, optional zap command.
+                            target_atm = bool(float(action_array[0]) >= 0.5)
+                            current_atm = bool(self.pressure.get_ATM())
+                            if current_atm != target_atm:
+                                self.pressure.set_ATM(atm=target_atm)
+                                self.info(f"Break-in agent set ATM: {target_atm}")
+
+                            should_zap = False
+                            if action_array.size >= 2:
+                                if np.isfinite(action_array[1]):
+                                    should_zap = bool(float(action_array[1]) >= 0.5)
+                                else:
+                                    self.warning(f"Break-in agent zap action is invalid: {action_array[1]}")
+                            if should_zap and self.config.zap:
+                                self.info("zapping (Agent command)")
+                                self.amplifier.zap()
+                                self.sleep(0.5)
+
+                            self.info(
+                                "Break-in agent decoded action: "
+                                f"atm={target_atm}, zap={should_zap}"
+                            )
+
+                self.sleep(wait_period * (1 + trials / 2))
+
+            elif autoPressure:
+                # ---------- Classic mode: heuristic pressure pulsing + periodic zap ----------
                 trials += 1
                 self.debug(f"Trial: {trials}")
 
@@ -1435,7 +1966,28 @@ class AutoPatcher(TaskController):
 
                 self.sleep(1)
 
-            # slow ramps (only if previous access-R was “bad”)
+            elif adaptivePressure:
+                # ---------- Adaptive mode: cloned heuristic pressure pulsing + periodic zap ----------
+                trials += 1
+                self.debug(f'Trial: {trials}')
+
+                speedosc = trials % 5
+                if speedosc == 0:
+                    speed = 2*self.config.pulse_pressure_duration
+                self.pressure.set_ATM(atm=False)
+                self.sleep(1 / speed)
+                self.pressure.set_ATM(atm=True)
+                self.sleep(wait_period*(1 + trials/2))
+
+                osc = trials % 3
+                if self.config.zap and osc == 0:
+                    self.info('zapping')
+                    self.amplifier.zap(); self.sleep(0.5)
+                    self.amplifier.zap(); self.sleep(0.5)
+
+                self.sleep(1)
+
+            # slow ramps (only if previous access-R was "bad")
             measuredResistance  = self.resistanceRamp()
             measuredCapacitance = self.capacitanceRamp()
 
@@ -1449,11 +2001,24 @@ class AutoPatcher(TaskController):
                     self.info("Break-in failed")
                     raise AutopatchError("Break-in failed")
 
+            elif adaptivePressure:
+                self.info(
+                    f'Trial {trials}: Running Avg Membrane Resistance: '
+                    f'{measuredResistance}; Membrane Capacitance: '
+                    f'{measuredCapacitance}, Access Resistance: {r_ax}')
+
+                if trials > 15:
+                    self.info('Break-in failed')
+                    raise AutopatchError('Break-in failed')
+
         # ---------- success ----------
-        self.success_requested = True
         self.pressure.set_pressure(0)
         self.info("Successful break-in, Running Avg Access Resistance = "
                 f"{measuredAccessResistance:.2f}")
+        if self.config.mode == "Training":
+            self.info("Training mode: goal condition reached. Click Success or Abort to finish.")
+            while True:
+                self.sleep(0.1)
         self.success_requested = True
         self.success_if_requested()
 
@@ -1487,10 +2052,9 @@ class AutoPatcher(TaskController):
         detected = cellThreshold <= r_delta
         if detected:
             self.info(f"Cell detected: {detected}; resistance: {r_delta}")
-            self.success_requested = True
             self.calibrated_unit.stop()
 
-        return cellThreshold <= r_delta
+        return detected
    
     @record_state("patch")
     def patch(self, cell=None):
@@ -1545,7 +2109,7 @@ class AutoPatcher(TaskController):
             self.info("Whole-cell achieved, resting for 5 seconds")
             self.sleep(5)
             
-            if not self.protocol_config.custom_cclamp_protocol: 
+            if not self.protocol_config.custom_cclamp_protocol:
                     #! Phase 4: run protocols
                     self.info(f"Running protocol")
                     _run_phase(self.run_protocols)
@@ -1576,11 +2140,7 @@ class AutoPatcher(TaskController):
 
     @record_state("whole_cell")
     def whole_cell(self, cell=None):
-        """ 
-        Method similar to patch, but starts from gigaseal stage.
-
-        Args:
-            cell: Cell object to patch. Required.
+        """ method similar to patch, but starts from gigaseal stage
         """
         self._in_patch = True
         self._get_state_recorder()
@@ -1734,12 +2294,10 @@ class AutoPatcher(TaskController):
         self.info('MOVING GROUP DOWN')
 
         try:
-            self.calibrated_unit.relative_move(dist, axis=2)
-            self.calibrated_unit.wait_until_still(2)
             self.microscope.relative_move(dist)
             self.microscope.wait_until_still()
-            # end = time.perf_counter_ns()
-            # print(f"Time taken to move down: {(end-start)/1e6} ms")
+            self.calibrated_unit.relative_move(dist, axis=2)
+            self.calibrated_unit.wait_until_still(2)
         finally:
             pass
     
@@ -1750,12 +2308,40 @@ class AutoPatcher(TaskController):
         Args:
             dist (float): Distance to move in micrometers. Defaults to 25 µm.
         '''
+        self.info('MOVING GROUP UP')
     
         try:
-            self.calibrated_unit.relative_move(-dist, axis=2)
-            self.calibrated_unit.wait_until_still(2)
             self.microscope.relative_move(-dist)
             self.microscope.wait_until_still()
+            self.calibrated_unit.relative_move(-dist, axis=2)
+            self.calibrated_unit.wait_until_still(2)
+        finally:
+            pass
+
+    def move_group_in_x(self,dist = 25):
+        '''
+        Moves the pipette and stage in x axis by input distance
+        '''
+
+        try:
+            self.calibrated_unit.relative_move(dist, axis=0)
+            self.calibrated_unit.wait_until_still(0)
+            self.calibrated_stage.relative_move(dist, axis=0)
+            self.calibrated_stage.wait_until_still(0)
+        finally:
+            pass
+
+    def move_group_in_y(self,dist = 500):
+        '''
+        Moves the pipette and stage in y axis by input distance
+        '''
+
+        try:
+            self.calibrated_unit.relative_move(dist, axis=1)
+            self.calibrated_unit.wait_until_still(1)
+            #rotate for pipette motion in around z
+            self.calibrated_stage.relative_move(dist, axis=1)
+            self.calibrated_stage.wait_until_still(1)
         finally:
             pass
 
@@ -1821,20 +2407,20 @@ class AutoPatcher(TaskController):
             self.info("Cleaning pipette")
             start_x, start_y, start_z = self.calibrated_unit.position()
             safe_x, safe_y, safe_z = self.safe_position
+            clean_move_order = list(self.calibrated_unit.config.clean_move_order)
+            if len(clean_move_order) != 3 or set(clean_move_order) != {"x", "y", "z"}:
+                self.warning(f"Invalid clean_move_order={clean_move_order}; falling back to ['y', 'x', 'z']")
+                clean_move_order = ["y", "x", "z"]
             # Step 1: Move to the safe space
             self.move_to_safe_space()
             clean_x, clean_y, clean_z = self.cleaning_bath_position
-            self.info(f"Moving pipette to Cleaning bath position: {clean_x}, {clean_y}, {clean_z}")
-
-            # Step 2: Move the pipette above the cleaning bath in the x and y directions
-            self.calibrated_unit.absolute_move(clean_x, axis=0)
-            self.calibrated_unit.wait_until_still(0)
-            self.calibrated_unit.absolute_move(clean_y, axis=1)
-            self.calibrated_unit.wait_until_still(1)
-            self.info("Pipette positioned above cleaning bath,moving down to clean")
-            # Step 3: Move the pipette down to the cleaning bath
-            self.calibrated_unit.absolute_move(clean_z, axis=2)
-            self.calibrated_unit.wait_until_still(2)
+            # Step 2 + 3: Move the pipette above and then down into the cleaning bath
+            clean_position = {"x": clean_x, "y": clean_y, "z": clean_z}
+            axis_map = {"x": 0, "y": 1, "z": 2}
+            for axis_name in clean_move_order:
+                axis = axis_map[axis_name]
+                self.calibrated_unit.absolute_move(clean_position[axis_name], axis=axis)
+                self.calibrated_unit.wait_until_still(axis)
 
             # Step 4: Cleaning
             self.info("starting cleaning cycle")
@@ -1850,14 +2436,12 @@ class AutoPatcher(TaskController):
                 self.sleep(0.75)
 
             # Step 5: Drying
-            # move pipette back to safe space in reverse
-            self.info("Cleaning complete, moving back to safe space for drying")
-            self.calibrated_unit.absolute_move(safe_z, axis=2)
-            self.calibrated_unit.wait_until_still(2)
-            self.calibrated_unit.absolute_move(safe_y, axis=1)
-            self.calibrated_unit.wait_until_still(1)
-            self.calibrated_unit.absolute_move(safe_x, axis=0)
-            self.calibrated_unit.wait_until_still(0)
+            # move pipette back to safe space in reverse configured axis order
+            safe_target = {"x": safe_x, "y": safe_y, "z": safe_z}
+            for axis_name in reversed(clean_move_order):
+                axis = axis_map[axis_name]
+                self.calibrated_unit.absolute_move(safe_target[axis_name], axis=axis)
+                self.calibrated_unit.wait_until_still(axis)
 
             self.pressure.set_pressure(-600)
             self.sleep(1)
@@ -1877,6 +2461,50 @@ class AutoPatcher(TaskController):
             self.calibrated_unit.wait_until_still() # Ensure movement completes
         finally:
             self.info("Pipette clean complete")
+            pass
+
+    def clean_pipette_no_move(self):
+        '''
+        Cleans the pipette without moving to cleaning bath position
+        '''
+        try:
+            # Cleaning
+            # Fill up with the Alconox
+            self.pressure.set_ATM(atm=False)
+            self.pressure.set_pressure(-600)
+            self.sleep(1)
+            # 5 cycles of tip cleaning
+            for i in range(1, 5):
+                self.pressure.set_pressure(-600)
+                self.sleep(0.75)
+                self.pressure.set_pressure(1000)
+                self.sleep(0.75)
+
+            self.pressure.set_pressure(50)
+  
+        finally:
+            pass
+
+    def clean_pipette_no_move(self):
+        '''
+        Cleans the pipette without moving to cleaning bath position
+        '''
+        try:
+            # Cleaning
+            # Fill up with the Alconox
+            self.pressure.set_ATM(atm=False)
+            self.pressure.set_pressure(-600)
+            self.sleep(1)
+            # 5 cycles of tip cleaning
+            for i in range(1, 5):
+                self.pressure.set_pressure(-600)
+                self.sleep(0.75)
+                self.pressure.set_pressure(1000)
+                self.sleep(0.75)
+
+            self.pressure.set_pressure(50)
+  
+        finally:
             pass
 
     def clean_pipette_no_move(self):
@@ -2082,101 +2710,246 @@ class AutoPatcher(TaskController):
         new_slot = current + 1
         self.lamp.set_filter(new_slot)
 
+    def run_optogenetic_protocol(self, protocol_params: dict | None = None):
+        """
+        Run optogenetic protocols based on configuration or explicit parameters.
+        """
+        if self.laser is None:
+            self.warning("No laser configured; skipping optogenetic protocol.")
+            return None
+        if not hasattr(self.daq, "getDataFromOptogeneticProtocol"):
+            self.warning("DAQ does not support optogenetic protocol capture.")
+            return None
+
+        self.info("Running optogenetic protocol")
+        self.amplifier.voltage_clamp()
+        self.sleep(0.25)
+        holding = float(self.protocol_config.vclamp_hold)
+        self.amplifier.set_holding(holding)
+        self.info(f'holding at {holding} mV')
+        self.sleep(0.25)
+
+        results = []
+
+        color_cycle = ["red", "green", "cyan", "uv", "blue", "infrared"]
+
+        def _coerce_wavelength(value):
+            if isinstance(value, str):
+                return value.strip().lower()
+            try:
+                idx = int(value)
+            except (TypeError, ValueError):
+                return value
+            if idx == 7:
+                return "off"
+            if idx <= 0:
+                idx = 1
+            return color_cycle[(idx - 1) % len(color_cycle)]
+
+        def _run_steps(steps, rate_hz):
+            result = self.daq.getDataFromOptogeneticProtocol(
+                laser=self.laser,
+                protocol_steps=steps,
+                rate_hz=rate_hz,
+            )
+            results.append(result)
+            self.sleep(0.25)
+
+        if protocol_params is not None:
+            randomize_target = protocol_params.get("randomize_target", protocol_params.get("mode", "wavelength"))
+            raw_wavelengths = list(protocol_params.get("wavelengths", ["green"]))
+            wavelengths = [_coerce_wavelength(value) for value in raw_wavelengths]
+            steps = self.laser.build_optogenetic_protocol(
+                wavelengths=wavelengths,
+                powers=list(protocol_params.get("powers", [50])),
+                randomize_target=randomize_target,
+                stabilize_time=float(protocol_params.get("stabilize_time", 1.0)),
+                off_time=float(protocol_params.get("off_time", 0.1)),
+                on_time=float(protocol_params.get("on_time", 0.01)),
+                replicates=int(protocol_params.get("replicates", 1)),
+                randomize=bool(protocol_params.get("randomize", True)),
+                power_divisor=float(protocol_params.get("power_divisor", 1.0)),
+            )
+            _run_steps(steps, int(protocol_params.get("rate_hz", 50_000)))
+        else:
+            cfg = self.protocol_config
+            stabilize_time = float(cfg.opto_stabilize_time)
+            off_time = float(cfg.opto_off_time)
+            on_time = float(cfg.opto_on_time)
+            replicates = int(cfg.opto_replicates)
+            rate_hz = 50_000
+
+            if cfg.opto_random_wavelength_protocol:
+                wavelengths = ["red", "green", "cyan", "uv", "blue", "infrared"]
+                powers = [float(cfg.opto_wavelength_power)]
+                steps = self.laser.build_optogenetic_protocol(
+                    wavelengths=wavelengths,
+                    powers=powers,
+                    randomize_target="wavelength",
+                    stabilize_time=stabilize_time,
+                    off_time=off_time,
+                    on_time=on_time,
+                    replicates=replicates,
+                    randomize=True,
+                )
+                _run_steps(steps, rate_hz)
+
+            if cfg.opto_random_power_protocol:
+                wavelengths = [_coerce_wavelength(cfg.opto_power_wavelength)]
+                powers = list(range(0, 101, 20))
+                steps = self.laser.build_optogenetic_protocol(
+                    wavelengths=wavelengths,
+                    powers=powers,
+                    randomize_target="power",
+                    stabilize_time=stabilize_time,
+                    off_time=off_time,
+                    on_time=on_time,
+                    replicates=replicates,
+                    randomize=True,
+                )
+                _run_steps(steps, rate_hz)
+
+        if not results:
+            self.warning("No optogenetic protocol flags enabled")
+
+        self.amplifier.voltage_clamp()
+        self.info("finished running optogenetic protocol")
+        if len(results) == 1:
+            return results[0]
+        return results
+
     def toggle_laser_output(self):
-        """
-        Toggle laser output using the device's excite logic.
-        """
         if self.laser is None:
             self.warning("No laser configured; skipping output toggle.")
             return
         try:
             self.laser.excite()
-            self.info(f"Laser output {self.laser.get_power_state()}.")
         except Exception as exc:
             self.error(f"Error toggling laser output: {exc}")
 
     def _step_laser_wavelength(self, step: int):
-        """
-        Step to the next/previous wavelength channel.
-        """
         if self.laser is None:
             self.warning("No laser configured; skipping wavelength change.")
             return
-
         current = self.laser.get_wavelength()
         if current is None:
             target = 1
-        elif isinstance(current, Enum):
-            channels = [c for c in type(current) if getattr(c, "name", "") != "OFF"]
-            if not channels:
-                self.warning("Laser wavelength enum has no selectable channels.")
-                return
-            try:
-                idx = channels.index(current)
-            except ValueError:
-                idx = 0
-            new_idx = max(0, min(len(channels) - 1, idx + step))
-            target = channels[new_idx]
         elif isinstance(current, int):
             target = max(1, current + step)
         else:
-            self.warning(f"Unsupported laser wavelength type: {type(current)}")
-            return
+            try:
+                from enum import Enum
+                if isinstance(current, Enum):
+                    channels = [c for c in type(current) if getattr(c, "name", "") != "OFF"]
+                    if not channels:
+                        self.warning("Laser wavelength enum has no selectable channels.")
+                        return
+                    try:
+                        idx = channels.index(current)
+                    except ValueError:
+                        idx = 0
+                    target = channels[max(0, min(len(channels) - 1, idx + step))]
+                else:
+                    self.warning(f"Unsupported laser wavelength type: {type(current)}")
+                    return
+            except Exception as exc:
+                self.error(f"Unable to step laser wavelength: {exc}")
+                return
 
         self.laser.set_wavelength(target)
-        self.info(f"Laser wavelength set to {self.laser.get_wavelength()}.")
 
     def wavelength_down(self):
-        """Step to the previous wavelength channel."""
         self._step_laser_wavelength(-1)
 
     def wavelength_up(self):
-        """Step to the next wavelength channel."""
         self._step_laser_wavelength(1)
 
-    def observe(self):
-        """
-        Collects all inputs required for the models.
-        
-        Returns:
-            list: [detected pipette position, stage position, last camera image, resistance reading].
-        """
+    def _agent_resistance_input_width(self, default_width: int = 15) -> int:
+        """Return the active policy's resistance_input width, or 0 if unused."""
+        agent = getattr(self.agenthelper, "agent", None)
+        if agent is None:
+            return 0
 
+        required_keys = ()
+        getter = getattr(agent, "get_required_obs_keys", None)
+        if callable(getter):
+            try:
+                required_keys = tuple(str(key) for key in getter())
+            except Exception:
+                required_keys = ()
+        if not required_keys:
+            required_keys = tuple(str(key) for key in getattr(agent, "obs_keys", ()) or ())
+
+        importer = getattr(agent, "importer", None)
+        obs_shapes = getattr(importer, "obs_shapes", {}) or {}
+        if "resistance_input" not in required_keys and "resistance_input" not in obs_shapes:
+            return 0
+
+        shape = obs_shapes.get("resistance_input")
+        if shape is not None:
+            try:
+                shape_tuple = tuple(int(dim) for dim in shape)
+            except Exception:
+                shape_tuple = ()
+            if shape_tuple:
+                return max(1, int(shape_tuple[-1]))
+        return max(1, int(default_width))
+
+    def _attach_agent_resistance_input(self, observation, history, width: int) -> None:
+        """Attach prior resistance samples to a live agent observation."""
+        if width <= 0 or not isinstance(observation, dict):
+            return
+
+        resistance_input = np.zeros(int(width), dtype=np.float32)
+        prior_values = list(history)[-int(width):]
+        if prior_values:
+            resistance_input[-len(prior_values):] = np.asarray(prior_values, dtype=np.float32)
+        observation["resistance_input"] = resistance_input
+
+        try:
+            current_resistance = float(np.asarray(observation.get("resistance")).reshape(-1)[0])
+        except Exception:
+            return
+        if np.isfinite(current_resistance):
+            history.append(current_resistance)
+
+    def observe(self, include_pressure_state: bool = False):
+        import time
+        t0 = time.perf_counter()
 
         _, _, _, img = self.calibrated_stage.camera._last_frame_queue[0]
-        
+        t1 = time.perf_counter()
+
         cvpi = self.calibrated_unit.pipetteCalHelper.pipetteDetector.detect_pipette(img)
-        self.info(f"detected pipette position: {cvpi}")
+        # Pass the current frame to focus estimator (it now requires an image argument)
+        cvpiz = self.calibrated_unit.pipetteFocusHelper.pipetteFocuser.get_pipette_focus_value(img)
+        cvpi = np.append(cvpi, cvpiz)
+        t2 = time.perf_counter()
+
         pi = self.calibrated_unit.position()
-        # self.info(f"pipette position: '{pi}' ")
         st = self.calibrated_stage.position()[:2]
-        stz = self._microscope_z_um()
-        st= np.append(st, stz)
-        # self.info(f"stage position: '{st}' ")
-        res = self.resistanceRamp()
-        # self.info(f"resistance: {res}")
-        
-        # Return a list instead of trying to create heterogeneous numpy array
-        return [cvpi, st, img, res]
+        stz = self.calibrated_unit.microscope.position() / self.calibrated_unit.config.microscope_units_per_um
+        st = np.append(st, stz)
+        t3 = time.perf_counter()
 
-    def info(self, msg, *args, **kwargs):
-        """Intercept info logs to update the GUI status."""
-        self._last_status_msg = str(msg)
-        self._last_error_msg = None
-        self.last_log_time = time.time()
+        res = self.resistanceRamp(num_measurements=1, interval=0.001)
+        t4 = time.perf_counter()
 
-        super().info(msg, *args, **kwargs)
-        
-    def error(self, msg, *args, **kwargs):
-        """Intercept error logs to update the GUI status."""
-        self._last_error_msg = str(msg)
-        self.last_log_time = time.time()
-        
-        super().error(msg, *args, **kwargs)
+        # self.info(f"[observe timing] frame={ (t1-t0)*1e3:.1f} ms | detect={ (t2-t1)*1e3:.1f} ms | coords={ (t3-t2)*1e3:.1f} ms | resistanceRamp={ (t4-t3):.3f} s | total={ (t4-t0):.3f} s")
+        if not include_pressure_state:
+            return [cvpi, st, img, res]
 
-    def warning(self, msg, *args, **kwargs):
-        """Intercept warning logs to update the GUI status."""
-        self._last_warning_msg = str(msg)
-        self.last_log_time = time.time()
+        actual_pressure = self.pressure.get_last_acquisition()
+        commanded_pressure = self.pressure.get_pressure()
+        pressure_atm_state = float(bool(self.pressure.get_ATM()))
 
-        super().warning(msg, *args, **kwargs)
+        observation = {
+            "pipette_positions": cvpi,
+            "stage_positions": st,
+            "camera_image": img,
+            "resistance": np.asarray([res], dtype=np.float32),
+            "pressure": np.asarray([actual_pressure], dtype=np.float32),
+            "commanded_pressure_mbar": np.asarray([commanded_pressure], dtype=np.float32),
+            "pressure_atm_state": np.asarray([pressure_atm_state], dtype=np.float32),
+        }
+        return observation

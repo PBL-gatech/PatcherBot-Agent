@@ -2,7 +2,6 @@ import os
 import sys
 import cv2
 import torch
-import yaml
 import numpy as np
 import matplotlib.pyplot as plt
 import logging
@@ -10,9 +9,9 @@ from abc import ABC, abstractmethod
 
 # ================= BASE SEGMENTOR =================
 class BaseSegmentor(ABC):
-    """Common functionality for cell image segmentation across different SAM back‑ends."""
+    """Common functionality for cell image segmentation across different SAM backends."""
 
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None, cache_image_embeddings: bool = True):
         """
         Initialize the segmentor, resolving device and loading the model.
 
@@ -20,8 +19,11 @@ class BaseSegmentor(ABC):
             device (str | None): Explicit device string (e.g., "cuda", "cpu"). If None, auto-detect.
         """
         self.device = self._resolve_device(device)
-        self.sam = None
-        self.predictor = None
+        self.cache_image_embeddings = cache_image_embeddings
+        self._raw_image_pil = None
+        self._image_embeddings = None
+        self.model = None
+        self.processor = None
         self.image = None
         self._load_model()
 
@@ -47,7 +49,124 @@ class BaseSegmentor(ABC):
     @abstractmethod
     def _load_model(self):
         """Load the SAM model and predictor. Must be implemented by subclasses."""
+
+    @abstractmethod
+    def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
+        """Child class prepares model inputs (including any wrapping or embeddings)."""
         ...
+
+    @abstractmethod
+    def _forward(self, inputs, multimask_output):
+        """Child class runs the model and returns (pred_masks, scores)."""
+        ...
+
+    @abstractmethod
+    def _post_process(self, pred_masks: torch.Tensor, inputs: dict):
+        """Child class converts raw model masks to image space."""
+        ...
+
+    @abstractmethod
+    def _normalize_masks(self, masks):
+        """Child class normalizes masks to numpy arrays."""
+        ...
+
+    @abstractmethod
+    def _normalize_scores(self, iou_scores):
+        """Child class normalizes scores to numpy arrays."""
+        ...
+
+    @abstractmethod
+    def _cache_image_embeddings(self):
+        """Child class optionally computes and stores image embeddings."""
+        ...
+
+    @staticmethod
+    def _to_pil(rgb_image):
+        from PIL import Image
+
+        if isinstance(rgb_image, Image.Image):
+            return rgb_image.convert("RGB")
+        if isinstance(rgb_image, np.ndarray):
+            if rgb_image.dtype != np.uint8:
+                rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
+            return Image.fromarray(rgb_image)
+        raise TypeError(f"Unsupported image type: {type(rgb_image)}. Expected numpy RGB array or PIL.Image.")
+
+    def _require_ready(self):
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Transformers model/processor not loaded. Check your segmentor _load_model().")
+
+    def _predict(self, *, input_points=None, input_labels=None, input_boxes=None, multimask_output=True):
+        if self.image is None or self._raw_image_pil is None:
+            raise ValueError("Image has not been set. Please call set_image() before predicting.")
+
+        self._require_ready()
+
+        inputs = self._prepare_inputs(input_points, input_labels, input_boxes, multimask_output)
+        pred_masks, iou_scores = self._forward(inputs, multimask_output)
+        masks_pp = self._post_process(pred_masks, inputs)
+        masks_np = self._normalize_masks(masks_pp)
+        scores_np = self._normalize_scores(iou_scores)
+        return masks_np, scores_np
+
+    @abstractmethod
+    def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
+        """Child class prepares model inputs (including any wrapping or embeddings)."""
+        ...
+
+    @abstractmethod
+    def _forward(self, inputs, multimask_output):
+        """Child class runs the model and returns (pred_masks, scores)."""
+        ...
+
+    @abstractmethod
+    def _post_process(self, pred_masks: torch.Tensor, inputs: dict):
+        """Child class converts raw model masks to image space."""
+        ...
+
+    @abstractmethod
+    def _normalize_masks(self, masks):
+        """Child class normalizes masks to numpy arrays."""
+        ...
+
+    @abstractmethod
+    def _normalize_scores(self, iou_scores):
+        """Child class normalizes scores to numpy arrays."""
+        ...
+
+    @abstractmethod
+    def _cache_image_embeddings(self):
+        """Child class optionally computes and stores image embeddings."""
+        ...
+
+    @staticmethod
+    def _to_pil(rgb_image):
+        from PIL import Image
+
+        if isinstance(rgb_image, Image.Image):
+            return rgb_image.convert("RGB")
+        if isinstance(rgb_image, np.ndarray):
+            if rgb_image.dtype != np.uint8:
+                rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
+            return Image.fromarray(rgb_image)
+        raise TypeError(f"Unsupported image type: {type(rgb_image)}. Expected numpy RGB array or PIL.Image.")
+
+    def _require_ready(self):
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Transformers model/processor not loaded. Check your segmentor _load_model().")
+
+    def _predict(self, *, input_points=None, input_labels=None, input_boxes=None, multimask_output=True):
+        if self.image is None or self._raw_image_pil is None:
+            raise ValueError("Image has not been set. Please call set_image() before predicting.")
+
+        self._require_ready()
+
+        inputs = self._prepare_inputs(input_points, input_labels, input_boxes, multimask_output)
+        pred_masks, iou_scores = self._forward(inputs, multimask_output)
+        masks_pp = self._post_process(pred_masks, inputs)
+        masks_np = self._normalize_masks(masks_pp)
+        scores_np = self._normalize_scores(iou_scores)
+        return masks_np, scores_np
 
     def load_image(self, image_path=None, image=None):
         """
@@ -86,6 +205,11 @@ class BaseSegmentor(ABC):
             self.predictor.set_image(self.image)
         else:
             raise ValueError("No image loaded. Please load an image first.")
+        self._require_ready()
+        self._raw_image_pil = self._to_pil(self.image)
+        self._image_embeddings = None
+        if self.cache_image_embeddings:
+            self._image_embeddings = self._cache_image_embeddings()
 
     def predict_mask(self, input_point, input_label, multimask_output=True):
         """
@@ -104,12 +228,12 @@ class BaseSegmentor(ABC):
         if self.image is None:
             raise ValueError("Image has not been set. Please call set_image() before predicting.")
         """
-        masks, scores, logits = self.predictor.predict(
-            point_coords=input_point,
-            point_labels=input_label,
+        return self._predict(
+            input_points=input_point,
+            input_labels=input_label,
+            input_boxes=None,
             multimask_output=multimask_output,
         )
-        return masks, scores
 
     def predict_mask_box(self, input_box, multimask_output=True):
         """
@@ -125,16 +249,12 @@ class BaseSegmentor(ABC):
         raises:
             ValueError: If image has not been set.
         """
-        if self.image is None:
-            raise ValueError("Image has not been set. Please call set_image() before predicting.")
-
-        masks, scores, logits = self.predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=input_box[None, :],
+        return self._predict(
+            input_points=None,
+            input_labels=None,
+            input_boxes=input_box,
             multimask_output=multimask_output,
         )
-        return masks, scores
 
     def single_prediction(self, input_point, input_label, multimask_output=False):
         """
@@ -315,9 +435,9 @@ class BaseSegmentor(ABC):
 
 # ================= MOBILE SAM SEGMENTOR (CellSegmentor1) =================
 class CellSegmentor1(BaseSegmentor):
-    """Segmentor powered by MobileSAM (Tiny‑ViT)."""
+    """Segmentor powered by MobileSAM (Transformers SamModel-compatible checkpoint)."""
 
-    def __init__(self, sam_checkpoint=None, model_type="vit_t", device=None):
+    def __init__(self, sam_checkpoint=None, model_type="vit_t", device=None, cache_image_embeddings: bool = True):
         """
         Initialize MobileSAM segmentor.
 
@@ -326,18 +446,20 @@ class CellSegmentor1(BaseSegmentor):
             model_type (str): Model type string (e.g., 'vit_t').
             device (str | None): Torch device. Auto-resolved if None.
         """
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = os.path.abspath(os.path.join(current_dir, ".."))
-        sys.path.append(os.path.join(repo_root, "patcherbot", "deepLearning", "cellModel", "MobileSAM"))
-        default_ckpt = os.path.join(repo_root, "deepLearning", "cellModel", "MobileSAM", "weights", "mobile_sam.pt")
-        self.sam_checkpoint = sam_checkpoint or default_ckpt
+        # Keep signature for compatibility with your existing code.
+        # sam_checkpoint now means "HF model id or local HF-exported folder".
+        #
+        # MobileSAM that is SamModel-compatible example:
+        # - bhllx/mobilesam has "architectures": ["SamModel"] and "model_type": "sam"
+        #   in config.json.
+        self.model_id_or_path = sam_checkpoint or "bhllx/mobilesam"
+
+        # model_type kept only so existing callers don't break; not used by Transformers loader.
         self.model_type = model_type
-        super().__init__(device)
+
+        super().__init__(device=device, cache_image_embeddings=cache_image_embeddings)
 
     def _load_model(self):
-        """
-        Load the MobileSAM model and predictor.
-        """
         from mobile_sam import sam_model_registry, SamPredictor
         self.sam = sam_model_registry[self.model_type](checkpoint=self.sam_checkpoint)
         self.sam.to(device=self.device)
@@ -349,14 +471,6 @@ class CellSegmentor2(BaseSegmentor):
     """Segmentor powered by SAM2 (v2.1 Hiera‑Tiny)."""
 
     def __init__(self, sam_checkpoint=None, model_cfg=None, device=None):
-        """
-        Initialize SAM2 segmentor.
-
-        args:
-            sam_checkpoint (str | None): Path to SAM2 checkpoint. Defaults to repo weight.
-            model_cfg (str | None): Path to YAML config. Defaults to repo config.
-            device (str | None): Torch device. Auto-resolved if None.
-        """
         current_dir = os.path.dirname(os.path.abspath(__file__))
         repo_root = os.path.abspath(os.path.join(current_dir, ".."))
         default_ckpt = os.path.join(repo_root, "deepLearning", "cellModel", "sam2", "checkpoints", "sam2.1_hiera_tiny.pt")
@@ -367,12 +481,6 @@ class CellSegmentor2(BaseSegmentor):
         super().__init__(device)
 
     def _enable_cuda_tricks(self):
-        """
-        Enable CUDA optimizations for compatible hardware.
-
-        raises:
-            RuntimeError: Only applicable if device is CUDA.
-        """
         if self.device.type == "cuda":
             torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
             if torch.cuda.get_device_properties(0).major >= 8:
@@ -380,12 +488,6 @@ class CellSegmentor2(BaseSegmentor):
                 torch.backends.cudnn.allow_tf32 = True
 
     def _load_model(self):
-        """
-        Load the SAM2 model and predictor from checkpoint and config.
-
-        raises:
-            Exception: If loading model or config fails.
-        """
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         self._enable_cuda_tricks()
@@ -409,68 +511,16 @@ from typing import Optional
 class CellSegmentor3(BaseSegmentor):
     """ONNX-based SAM2 segmentor, refactored to match BaseSegmentor interface and sam-cpp-macos reference."""
     def __init__(self, encoder_path: Optional[str] = None, decoder_path: Optional[str] = None, device: Optional[str] = None):
-        """
-        Initialize ONNX SAM2 segmentor.
-
-        args:
-            encoder_path (str | None): Path to ONNX encoder. Defaults to repo model.
-            decoder_path (str | None): Path to ONNX decoder. Defaults to repo model.
-            device (str | None): Torch device. Auto-resolved if None.
-        """
         current_dir = os.path.dirname(os.path.abspath(__file__))
         repo_root = os.path.abspath(os.path.join(current_dir, ".."))
         default_dir = os.path.join(repo_root, "deepLearning", "cellModel")
 
-        if encoder_path is None:
-            encoder_path = os.path.join(default_dir, "sam2.1_tiny_preprocess.onnx")
-        if decoder_path is None:
-            decoder_path = os.path.join(default_dir, "sam2.1_tiny.onnx")
-
-        self.encoder_path = encoder_path
-        self.decoder_path = decoder_path
-        super().__init__(device=device)
-
-    def _load_model(self):
-        """
-        Load ONNX encoder and decoder sessions and prepare inputs.
-        """
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.device.type == "cuda"
-            else ["CPUExecutionProvider"]
-        )
-        sess_options = ort.SessionOptions()
-        sess_options.log_severity_level = 3  # Suppress most warnings
-        self.enc_session = ort.InferenceSession(self.encoder_path, providers=providers, sess_options=sess_options)
-        self.dec_session = ort.InferenceSession(self.decoder_path, providers=providers, sess_options=sess_options)
-        self.enc_input_name = self.enc_session.get_inputs()[0].name
-        self.dec_input_names = [inp.name for inp in self.dec_session.get_inputs()]
-        self.image_embeddings = None
-        self.high_res_features1 = None
-        self.high_res_features2 = None
-        self._orig_shape = None
-        self._pad_shape = None
-        self.input_size = (1024, 1024)  # default model input
-        self._pad_offset = (0, 0)
-
-    def load_image(self, image_path=None, image=None):
-        """
-        Load and preprocess image for ONNX segmentor.
-
-        args:
-            image_path (str | None): Path to image file.
-            image (np.ndarray | None): Image array.
-
-        raises:
-            FileNotFoundError: If image_path is provided but cannot be read.
-            ValueError: If neither image_path nor image is provided.
-        """
-        if image_path is not None:
-            img = cv2.imread(image_path)
-            if img is None:
-                raise FileNotFoundError(f"Could not load image from {image_path}.")
-        elif image is not None:
-            img = image.copy()
+        if model_type == "sam2_video":
+            self.model = Sam2VideoModel.from_pretrained(self.model_id_or_path).to(self.device)
+            try:
+                self.processor = Sam2VideoProcessor.from_pretrained(self.model_id_or_path, use_fast=True)
+            except OSError:
+                self.processor = Sam2VideoProcessor.from_pretrained("facebook/sam2.1-hiera-tiny", use_fast=True)
         else:
             raise ValueError("Either image_path or image must be provided.")
         if img.ndim == 2:
@@ -496,12 +546,6 @@ class CellSegmentor3(BaseSegmentor):
         # print(f"[DEBUG] Padding offset: {self._pad_offset}")
 
     def set_image(self):
-        """
-        Compute image embeddings using encoder ONNX session.
-
-        raises:
-            ValueError: If image has not been loaded.
-        """
         if self.image is None:
             raise ValueError("No image loaded. Please load an image first.")
         inp = self.image.transpose(2, 0, 1)[None].astype(np.float32)
@@ -512,274 +556,209 @@ class CellSegmentor3(BaseSegmentor):
         # Debug info
         # print(f"[DEBUG] Encoder output shapes: {[x.shape for x in result]}")
 
-    def _scale_points(self, points):
+    def _cache_image_embeddings(self):
+        if hasattr(self.model, "get_image_embeddings"):
+            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                return self.model.get_image_embeddings(inputs["pixel_values"])
+        return None
+
+
+# ================= SAM2 SEGMENTOR (CellSegmentor2) =================
+class CellSegmentor2(BaseSegmentor):
+    """Segmentor powered by SAM2 via Transformers.
+
+    Note: Meta's public SAM2 checkpoints on the Hugging Face Hub are `sam2_video` models. For single-image
+    segmentation we run `Sam2VideoModel._single_frame_forward(...)` under the hood (same prompts / outputs),
+    which matches the behavior of the upstream SAM2 repo for interactive image segmentation.
+    """
+
+    def __init__(self, sam_checkpoint=None, model_cfg=None, device=None, cache_image_embeddings: bool = True):
         """
-        Scale points from original image coordinates to model input coordinates.
+        Initialize SAM2 segmentor.
 
         args:
-            points (np.ndarray): Array of (x, y) points.
-
-        returns:
-            np.ndarray: Scaled points as float32.
+            sam_checkpoint (str | None): Path to SAM2 checkpoint. Defaults to repo weight.
+            model_cfg (str | None): Path to YAML config. Defaults to repo config.
+            device (str | None): Torch device. Auto-resolved if None.
         """
-        points = np.asarray(points)
-        orig_h, orig_w = self._orig_shape
-        pad_h, pad_w = self._pad_shape
-        scale = min(1024 / orig_h, 1024 / orig_w)
-        scaled = points * scale
-        scaled = scaled + np.array([self._pad_offset[1], self._pad_offset[0]])
-        # Debug info
-        # print(f"[DEBUG] Scaling points {points} from orig shape {self._orig_shape} -> resized shape {self._pad_shape}")
-        # print(f"[DEBUG] Resulting scaled points: {scaled}")
-        return scaled.astype(np.float32)
+        # Keep signature for compatibility.
+        # sam_checkpoint now means "HF model id or local HF-exported folder".
+        # The official Facebook/Meta checkpoints are `sam2_video`, but they support single-image interactive
+        # segmentation as well (we call the model's single-frame forward).
+        self.model_id_or_path = sam_checkpoint or "facebook/sam2.1-hiera-tiny"
 
-    def _mask_to_original(self, mask_1024):
+        # model_cfg kept only so existing callers don't break; not used by Transformers loader.
+        self.model_cfg = model_cfg
+
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        super().__init__(device=device, cache_image_embeddings=cache_image_embeddings)
+
+    def _load_model(self):
         """
-        Rescale a 1024x1024 mask back to original image size.
-
-        args:
-            mask_1024 (np.ndarray): Binary mask from model input space.
-
-        returns:
-            np.ndarray: Mask rescaled to original image.
-        """
-        new_h, new_w = self._pad_shape  # size of resized image in (h, w)
-        orig_h, orig_w = self._orig_shape
-        # 1. Crop to actual content area (remove zero-padded regions)
-        cropped = mask_1024[:new_h, :new_w]
-        # 2. Resize (nearest neighbor) to the original image shape
-        mask_orig = cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        return mask_orig
-
-    def predict_mask(self, input_point=None, input_label=None, multimask_output=True):
-        """
-        Predict mask using ONNX decoder session.
-
-        args:
-            input_point (np.ndarray | None): Array of points to guide segmentation.
-            input_label (np.ndarray | None): Labels for points.
-            multimask_output (bool): Whether to output multiple masks.
-
-        returns:
-            tuple: (mask, score) where mask is np.ndarray rescaled to original image.
+        Load the SAM2 model and predictor from checkpoint and config.
 
         raises:
-            ValueError: If image embeddings are not set.
+            Exception: If loading model or config fails.
         """
-        if self.image_embeddings is None:
-            raise ValueError("Image has not been set. Please call set_image() before predicting.")
-        orig_h, orig_w = self._orig_shape
-        if input_point is not None and len(input_point):
-            scaled_points = self._scale_points(input_point)
-            point_coords = scaled_points[None, ...]
-            point_labels = np.asarray(input_label, dtype=np.float32)[None]
-        else:
-            point_coords = np.zeros((1, 0, 2), dtype=np.float32)
-            point_labels = np.zeros((1, 0), dtype=np.float32)
-        mask_input = np.zeros((1, 1, 256, 256), dtype=np.float32)
-        has_mask_input = np.array([0], dtype=np.float32)
-        orig_im_size = np.array([orig_h, orig_w], dtype=np.int64)
-        decoder_inputs = {
-            "image_embeddings": self.image_embeddings,
-            "high_res_features1": self.high_res_features1,
-            "high_res_features2": self.high_res_features2,
-            "point_coords": point_coords,
-            "point_labels": point_labels,
-            "mask_input": mask_input,
-            "has_mask_input": has_mask_input,
-            "orig_im_size": orig_im_size
-        }
-        onnx_inputs = {k: decoder_inputs[k] for k in self.dec_input_names}
-        outputs = self.dec_session.run(None, onnx_inputs)
-        masks, scores = outputs[0], outputs[1]
-        best_idx = np.argmax(scores[0])
-        mask = masks[0, best_idx]
-        mask_bin = (mask > 0).astype(np.uint8)
-        # Map mask back to original image
-        mask_orig = self._mask_to_original(mask_bin)
-        return mask_orig, scores[0, best_idx]
+        from transformers import AutoConfig, Sam2Model, Sam2Processor, Sam2VideoModel, Sam2VideoProcessor
 
-    def predict_mask_box(self, input_box, multimask_output=True):
-        """
-        Predict mask using bounding box.
+        cfg = AutoConfig.from_pretrained(self.model_id_or_path)
+        model_type = getattr(cfg, "model_type", None)
 
-        args:
-            input_box (array-like): [x0, y0, x1, y1] box.
-            multimask_output (bool): Whether to output multiple masks.
-
-        returns:
-            tuple: (mask, score)
-
-        raises:
-            ValueError: If input_box is invalid.
-        """
-        if input_box is None or len(input_box) != 4:
-            raise ValueError("Box must be [x0,y0,x1,y1]")
-        points = np.array([[input_box[0], input_box[1]], [input_box[2], input_box[3]]], dtype=np.float32)
-        labels = np.array([2, 3], dtype=np.float32)
-        return self.predict_mask(input_point=points, input_label=labels, multimask_output=multimask_output)
-    def single_prediction(self, input_point, input_label, multimask_output=False):
-        """
-        Return a single mask prediction (first mask).
-
-        args:
-            input_point (np.ndarray): Points for segmentation.
-            input_label (np.ndarray): Labels for points.
-            multimask_output (bool): Whether to output multiple masks.
-
-        returns:
-            np.ndarray: Single mask.
-        """
-        mask, score = self.predict_mask(input_point, input_label, multimask_output)
-        return mask
-
-    def show_image(self):
-        """
-        Display the currently loaded image with standard normalization.
-
-        raises:
-            ValueError: If no image has been loaded.
-        """
-        if self.image is not None:
-            plt.figure(figsize=(10, 10))
-            plt.imshow((self.image * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])).clip(0,1))
-            plt.axis('on')
-            plt.show()
+        if model_type == "sam2_video":
+            self.model = Sam2VideoModel.from_pretrained(self.model_id_or_path).to(self.device)
+            try:
+                self.processor = Sam2VideoProcessor.from_pretrained(self.model_id_or_path, use_fast=True)
+            except OSError:
+                self.processor = Sam2VideoProcessor.from_pretrained("facebook/sam2.1-hiera-tiny", use_fast=True)
         else:
             raise ValueError("No image loaded. Please load an image first.")
 
     @staticmethod
-    def show_mask(mask, ax, random_color=False, borders=True):
-        """
-        Display a segmentation mask on a given matplotlib axis.
+    def _wrap_box(input_box):
+        box = np.asarray(input_box)
+        if box.shape != (4,):
+            raise ValueError(f"input_box must be shape (4,) as [x1,y1,x2,y2]. Got {box.shape}.")
+        return [[box.astype(float).tolist()]]
 
-        args:
-            mask (np.ndarray): Binary mask to display.
-            ax (matplotlib.axes.Axes): Axis to draw the mask on.
-            random_color (bool): Whether to use a random color for the mask.
-            borders (bool): Whether to draw contour borders around mask regions.
-        """
-        if random_color:
-            color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-        else:
-            color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
-        h, w = mask.shape[-2:]
-        mask_img = mask.astype(np.uint8)
-        mask_image = mask_img.reshape(h, w, 1) * color.reshape(1, 1, -1)
-        if borders:
-            contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
-            mask_image = cv2.drawContours(mask_image, contours, -1, (1, 1, 1, 0.5), thickness=2)
-        ax.imshow(mask_image)
+    def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
+        proc_kwargs = {"images": self._raw_image_pil, "return_tensors": "pt"}
+        if input_point is not None and input_label is not None:
+            pts, lbls = self._wrap_points_labels(input_point, input_label)
+            proc_kwargs["input_points"] = pts
+            proc_kwargs["input_labels"] = lbls
+        if input_box is not None:
+            proc_kwargs["input_boxes"] = self._wrap_box(input_box)
+
+        inputs = self.processor(**proc_kwargs).to(self.device)
+
+        if self._image_embeddings is not None:
+            inputs.pop("pixel_values", None)
+            inputs["image_embeddings"] = self._image_embeddings
+
+        return inputs
+
+    def _forward(self, inputs, multimask_output):
+        with torch.inference_mode():
+            if hasattr(self.model, "_single_frame_forward"):
+                outputs = self.model._single_frame_forward(**inputs, multimask_output=multimask_output)
+            else:
+                outputs = self.model(**inputs, multimask_output=multimask_output)
+        return outputs.pred_masks, outputs.iou_scores
+
+    def _post_process(self, pred_masks: torch.Tensor, inputs: dict):
+        original_sizes = inputs.get("original_sizes", None)
+
+        if isinstance(original_sizes, torch.Tensor):
+            original_sizes = original_sizes.detach().cpu()
+
+        pred_masks = pred_masks.detach().cpu()
+        # The SAM2 image post-processor expects a 5D tensor: (B, point_batch, num_masks, H, W).
+        # Sam2VideoModel single-frame output is 4D (B, point_batch, H, W), so add the singleton mask dim.
+        if pred_masks.ndim == 4:
+            pred_masks = pred_masks.unsqueeze(2)
+
+        if hasattr(self.processor, "post_process_masks"):
+            # Sam2Processor.post_process_masks signature is (masks, original_sizes, mask_threshold=...),
+            # so passing reshaped_input_sizes positionally will break.
+            return self.processor.post_process_masks(pred_masks, original_sizes)
+
+        return self.processor.image_processor.post_process_masks(pred_masks, original_sizes)
 
     @staticmethod
-    def show_circles(coords, labels, ax, marker_size=375):
-        """
-        Display positive and negative points as colored markers.
+    def _wrap_points_labels(input_point, input_label):
+        pts = np.asarray(input_point)
+        lbl = np.asarray(input_label)
 
-        args:
-            coords (np.ndarray): Array of point coordinates of shape (N, 2).
-            labels (np.ndarray): Array of 0/1 labels corresponding to coords.
-            ax (matplotlib.axes.Axes): Axis to draw the points on.
-            marker_size (int): Size of scatter plot markers.
-        """
-        pos_points = coords[labels == 1]
-        neg_points = coords[labels == 0]
-        ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
-        ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            raise ValueError(f"input_point must be shape (N, 2). Got {pts.shape}.")
+        if lbl.ndim != 1 or lbl.shape[0] != pts.shape[0]:
+            raise ValueError(f"input_label must be shape (N,), matching input_point. Got {lbl.shape} vs {pts.shape}.")
+
+        input_points = [[pts.tolist()]]
+        input_labels = [[lbl.astype(int).tolist()]]
+        return input_points, input_labels
 
     @staticmethod
-    def show_box(box, ax):
-        """
-        Display a bounding box on a matplotlib axis.
+    def _wrap_box(input_box):
+        box = np.asarray(input_box)
+        if box.shape != (4,):
+            raise ValueError(f"input_box must be shape (4,) as [x1,y1,x2,y2]. Got {box.shape}.")
+        return [[box.astype(float).tolist()]]
 
-        args:
-            box (array-like): Bounding box [x0, y0, x1, y1].
-            ax (matplotlib.axes.Axes): Axis to draw the box on.
-        """
-        x0, y0 = box[0], box[1]
-        w, h = box[2] - box[0], box[3] - box[1]
-        ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2))
+    def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
+        proc_kwargs = {"images": self._raw_image_pil, "return_tensors": "pt"}
+        if input_point is not None and input_label is not None:
+            pts, lbls = self._wrap_points_labels(input_point, input_label)
+            proc_kwargs["input_points"] = pts
+            proc_kwargs["input_labels"] = lbls
+        if input_box is not None:
+            proc_kwargs["input_boxes"] = self._wrap_box(input_box)
 
-    def visualize_prediction(self, input_point=None, input_label=None, input_box=None, multimask_output=False, borders=True):
-        """
-        Run segmentation on the current image and display predicted mask with points or box.
+        inputs = self.processor(**proc_kwargs).to(self.device)
 
-        args:
-            input_point (np.ndarray | None): Coordinates of guidance points.
-            input_label (np.ndarray | None): Labels for guidance points.
-            input_box (array-like | None): Bounding box for segmentation.
-            multimask_output (bool): Whether to output multiple masks.
-            borders (bool): Whether to draw borders around masks.
+        if self._image_embeddings is not None:
+            inputs.pop("pixel_values", None)
+            inputs["image_embeddings"] = self._image_embeddings
 
-        raises:
-            ValueError: If neither or both of input_point and input_box are provided.
-        """
-        if input_point is None and input_box is None:
-            raise ValueError("Please provide either input_point or input_box.")
-        if input_point is not None and input_box is not None:
-            raise ValueError("Please provide only one of input_point or input_box.")
-        if input_point is not None:
-            masks, score = self.predict_mask(input_point, input_label, multimask_output)
-            plt.figure(figsize=(10, 10))
-            plt.imshow((self.image * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])).clip(0,1))
-            self.show_mask(masks, plt.gca(), borders=borders)
-            self.show_circles(input_point, input_label, plt.gca())
-            plt.title(f"Mask, Score: {score:.3f}", fontsize=18)
-            plt.axis('off')
-            plt.show()
-        else:
-            masks, score = self.predict_mask_box(input_box, multimask_output)
-            plt.figure(figsize=(10, 10))
-            plt.imshow((self.image * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])).clip(0,1))
-            self.show_mask(masks, plt.gca(), borders=borders)
-            self.show_box(input_box, plt.gca())
-            plt.title(f"Mask, Score: {score:.3f}", fontsize=18)
-            plt.axis('off')
-            plt.show()
+        return inputs
 
-    def segment(self, image=None, input_point=None, input_label=None, input_box=None, multimask_output=False):
-        """
-        Perform segmentation on an image using points or bounding box, returning mask.
-
-        args:
-            image (np.ndarray | None): Optional image to load before segmentation.
-            input_point (np.ndarray | None): Guidance points for segmentation.
-            input_label (np.ndarray | None): Labels corresponding to input points.
-            input_box (array-like | None): Bounding box for segmentation.
-            multimask_output (bool): Whether to return multiple masks.
-
-        returns:
-            np.ndarray | None: Segmentation mask(s) if successful, None if no mask found.
-
-        raises:
-            ValueError: If no image is loaded or if neither/both of input_point and input_box are provided.
-        """
-        if image is not None:
-            self.load_image(image=image)
-            self.set_image()
-        else:
-            if self.image is None:
-                raise ValueError("No image loaded. Please load an image first.")
-        if input_point is None and input_box is None:
-            raise ValueError("Please provide either input_point or input_box.")
-        if input_point is not None and input_box is not None:
-            raise ValueError("Please provide only one of input_point or input_box.")
-        if input_point is not None:
-            mask = self.single_prediction(input_point, input_label, multimask_output)
-            if mask is None:
-                # print("[DEBUG] No mask found")
-                return None
+    def _forward(self, inputs, multimask_output):
+        with torch.inference_mode():
+            if hasattr(self.model, "_single_frame_forward"):
+                outputs = self.model._single_frame_forward(**inputs, multimask_output=multimask_output)
             else:
-                return mask
-        else:
-            mask, score = self.predict_mask_box(input_box, multimask_output)
-            if mask is None:
-                # print("[DEBUG] No masks found")
-                return None
-            else:
-                return mask
+                outputs = self.model(**inputs, multimask_output=multimask_output)
+        return outputs.pred_masks, outputs.iou_scores
 
+    def _post_process(self, pred_masks: torch.Tensor, inputs: dict):
+        original_sizes = inputs.get("original_sizes", None)
+
+        if isinstance(original_sizes, torch.Tensor):
+            original_sizes = original_sizes.detach().cpu()
+
+        pred_masks = pred_masks.detach().cpu()
+        # The SAM2 image post-processor expects a 5D tensor: (B, point_batch, num_masks, H, W).
+        # Sam2VideoModel single-frame output is 4D (B, point_batch, H, W), so add the singleton mask dim.
+        if pred_masks.ndim == 4:
+            pred_masks = pred_masks.unsqueeze(2)
+
+        if hasattr(self.processor, "post_process_masks"):
+            # Sam2Processor.post_process_masks signature is (masks, original_sizes, mask_threshold=...),
+            # so passing reshaped_input_sizes positionally will break.
+            return self.processor.post_process_masks(pred_masks, original_sizes)
+
+        return self.processor.image_processor.post_process_masks(pred_masks, original_sizes)
+
+    @staticmethod
+    def _normalize_masks(masks):
+        if isinstance(masks, (list, tuple)):
+            masks = masks[0]
+        if not isinstance(masks, torch.Tensor):
+            masks = torch.as_tensor(masks)
+        while masks.ndim > 3:
+            masks = masks[0]
+        masks = masks > 0
+        return masks.detach().cpu().numpy()
+
+    @staticmethod
+    def _normalize_scores(iou_scores):
+        if not isinstance(iou_scores, torch.Tensor):
+            iou_scores = torch.as_tensor(iou_scores)
+        scores = iou_scores.detach().cpu()
+        if scores.ndim == 3:
+            scores = scores[0, 0]
+        elif scores.ndim == 2:
+            scores = scores[0]
+        return scores.numpy()
+
+    def _cache_image_embeddings(self):
+        if hasattr(self.model, "get_image_embeddings"):
+            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                return self.model.get_image_embeddings(inputs["pixel_values"])
+        return None
 
 
 
@@ -809,8 +788,8 @@ class CameraWorker(QThread):
         self.fps = fps
         self.keep_running = True
         # self.image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\deepLearning\cellModel\example pictures\before.tiff"
-        self.image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\deepLearning\cellModel\example pictures\square.png"
-        # self.image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\devices\camera\FakeMicroscopeImgs\cellsegtest.png"
+        # self.image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\deepLearning\cellModel\example pictures\square.png"
+        self.image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\devices\camera\FakeMicroscopeImgs\cellsegtest.png"
         bgr = cv2.imread(self.image_path)
         if bgr is None:
             raise FileNotFoundError(f"Could not load {self.image_path}")
@@ -818,7 +797,7 @@ class CameraWorker(QThread):
 
         self.points = []
         self.labels = []
-        self.segmentor = CellSegmentor3()
+        self.segmentor = CellSegmentor2()
 
     def run(self):
         """

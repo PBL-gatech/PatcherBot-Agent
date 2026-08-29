@@ -45,6 +45,7 @@ RESPONSE_COL = 1
 
 
 def detect_separator(path: Path) -> str:
+<<<<<<< HEAD
     """
     Detect the column separator used in a text or CSV file.
 
@@ -54,6 +55,8 @@ def detect_separator(path: Path) -> str:
     Returns:
         str: Detected separator: ',' for comma, '\\t' for tab, or 'whitespace' if neither.
     """
+=======
+>>>>>>> origin/big_update
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
             stripped = line.strip()
@@ -68,6 +71,7 @@ def detect_separator(path: Path) -> str:
 
 
 def resolve_downsample(path: Path, requested: Optional[int]) -> int:
+<<<<<<< HEAD
     """
     Determine a suitable downsampling factor for a file based on size or a requested value.
 
@@ -79,6 +83,8 @@ def resolve_downsample(path: Path, requested: Optional[int]) -> int:
     Returns:
         int: Downsampling factor (>=1), automatically scaling for files larger than ~100 MB.
     """
+=======
+>>>>>>> origin/big_update
     if requested is not None:
         return max(1, int(requested))
 
@@ -94,6 +100,7 @@ def apply_bessel_filter(
     cutoff_hz: float,
     order: int,
 ) -> np.ndarray:
+<<<<<<< HEAD
     """
     Apply a low-pass Bessel filter to a time-series signal.
 
@@ -107,6 +114,8 @@ def apply_bessel_filter(
         np.ndarray: Filtered signal. If conditions are invalid (too short, bad sampling), returns
             the original signal unmodified.
     """
+=======
+>>>>>>> origin/big_update
     if signal.size < order * 3:
         return signal
 
@@ -138,6 +147,7 @@ def load_wavelength_trace(
     downsample: int,
     chunk_rows: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+<<<<<<< HEAD
     """
     Load time, command, and response traces from a wavelength CSV file.
 
@@ -158,6 +168,8 @@ def load_wavelength_trace(
     Raises:
         ValueError: If no numeric data could be found in the file.
     """
+=======
+>>>>>>> origin/big_update
     sep = detect_separator(path)
     read_kwargs = {
         "header": None,
@@ -197,6 +209,7 @@ def load_wavelength_trace(
 def load_stim_windows(
     path: Path, active_state: str
 ) -> List[Tuple[float, float, str, Optional[float]]]:
+<<<<<<< HEAD
     """
     Load stimulation windows from a CSV and filter by active state.
 
@@ -211,6 +224,8 @@ def load_stim_windows(
             - wavelength name (str)
             - optional power (% or None)
     """
+=======
+>>>>>>> origin/big_update
     df = pd.read_csv(path)
     if df.empty:
         return []
@@ -256,6 +271,7 @@ def load_stim_windows(
 
 
 def wavelength_color(name: str) -> str:
+<<<<<<< HEAD
     """
     Map a wavelength name to a hex color code for plotting.
 
@@ -265,6 +281,8 @@ def wavelength_color(name: str) -> str:
     Returns:
         str: Hex color code as a string.
     """
+=======
+>>>>>>> origin/big_update
     name = name.lower()
     if "uv" in name or "ultraviolet" in name:
         return "#9467bd"
@@ -282,6 +300,7 @@ def wavelength_color(name: str) -> str:
 
 
 def is_data_csv(path: Path) -> bool:
+<<<<<<< HEAD
     """
     Determine if a file is a valid data CSV (excluding stimulation CSVs).
 
@@ -291,6 +310,8 @@ def is_data_csv(path: Path) -> bool:
     Returns:
         bool: True if the file matches the data CSV naming convention, False otherwise.
     """
+=======
+>>>>>>> origin/big_update
     name = path.name.lower()
     return (
         name.endswith(".csv")
@@ -300,6 +321,7 @@ def is_data_csv(path: Path) -> bool:
 
 
 def sanitize_filename(name: str) -> str:
+<<<<<<< HEAD
     """
     Clean a string to produce a safe filename.
 
@@ -310,11 +332,14 @@ def sanitize_filename(name: str) -> str:
         str: Sanitized filename containing only letters, digits, underscores, or hyphens.
              Leading/trailing underscores are removed. Defaults to 'protocol' if empty.
     """
+=======
+>>>>>>> origin/big_update
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip())
     return cleaned.strip("_") or "protocol"
 
 
 def wavelength_sort_key(name: str) -> int:
+<<<<<<< HEAD
     """
     Compute a sort key for a wavelength name based on a predefined color order.
 
@@ -325,6 +350,8 @@ def wavelength_sort_key(name: str) -> int:
         int: Index indicating order. Lower index = higher priority. Names not in the order
              receive a value after all known colors.
     """
+=======
+>>>>>>> origin/big_update
     name = name.lower()
     for idx, tokens in enumerate(COLOR_ORDER):
         if any(token in name for token in tokens):
@@ -345,6 +372,7 @@ def segment_trace(
     cutoff_hz: float,
     order: int,
 ) -> List[Segment]:
+<<<<<<< HEAD
     """
     Segment a voltage/current trace around stimulation windows and baseline-correct each segment.
 
@@ -369,6 +397,8 @@ def segment_trace(
             - wavelength name
             - optional power (%)
     """
+=======
+>>>>>>> origin/big_update
     segments: List[Segment] = []
     for start, end, wavelength, power in stim_windows:
         window_start = start - PRE_STIM_S
@@ -416,6 +446,7 @@ def gather_trace_pairs(
     order: int,
     order_by_color: bool,
 ) -> List[Tuple[Path, List[Segment]]]:
+<<<<<<< HEAD
     """
     Load and segment all data CSVs in a folder, returning trace segments sorted by wavelength or power.
 
@@ -431,6 +462,8 @@ def gather_trace_pairs(
             - data file path
             - list of segmented traces from that file
     """
+=======
+>>>>>>> origin/big_update
     data_files = sorted(path for path in folder.glob("*.csv") if is_data_csv(path))
     if not data_files:
         raise FileNotFoundError(f"No data CSV files found in {folder}")
@@ -483,6 +516,7 @@ def plot_opto(
     traces: List[Segment],
     title: Optional[str],
 ) -> Tuple[plt.Figure, plt.Axes]:
+<<<<<<< HEAD
     """
     Plot optogenetic stimulation traces with command and response signals in separate subplots.
 
@@ -497,6 +531,8 @@ def plot_opto(
     Raises:
         ValueError: If `traces` is empty.
     """
+=======
+>>>>>>> origin/big_update
     if not traces:
         raise ValueError("No traces to plot.")
 
@@ -562,6 +598,7 @@ def plot_opto(
 
 
 def find_protocol_folders(root: Path) -> List[Path]:
+<<<<<<< HEAD
     """
     Recursively find all folders containing optogenetic data CSVs.
 
@@ -571,11 +608,14 @@ def find_protocol_folders(root: Path) -> List[Path]:
     Returns:
         List[Path]: Sorted list of folders containing data CSV files.
     """
+=======
+>>>>>>> origin/big_update
     folders = {path.parent for path in root.rglob("*.csv") if is_data_csv(path)}
     return sorted(folders)
 
 
 def save_figure(fig: plt.Figure, output_path: Path) -> None:
+<<<<<<< HEAD
     """
     Save a matplotlib figure to a WEBP file.
 
@@ -586,6 +626,8 @@ def save_figure(fig: plt.Figure, output_path: Path) -> None:
     Raises:
         RuntimeError: If saving fails (e.g., Pillow not installed or unsupported format).
     """
+=======
+>>>>>>> origin/big_update
     output_path = output_path.with_suffix(".webp")
     try:
         fig.savefig(output_path, dpi=300, bbox_inches="tight", format="webp")
@@ -603,6 +645,7 @@ def process_folder(
     order: int,
     order_by_color: bool,
 ) -> None:
+<<<<<<< HEAD
     """
     Process a folder of optogenetic CSVs: segment traces, plot each trace, and save figures.
 
@@ -613,6 +656,8 @@ def process_folder(
         order (int): Bessel filter order.
         order_by_color (bool): Whether to sort traces by wavelength color.
     """
+=======
+>>>>>>> origin/big_update
     trace_pairs = gather_trace_pairs(
         folder, apply_filter, cutoff_hz, order, order_by_color
     )
@@ -637,6 +682,7 @@ def main(
     order: int,
     order_by_color: bool,
 ) -> None:
+<<<<<<< HEAD
     """
     Main entry point: process all subfolders with optogenetic protocol CSVs.
 
@@ -651,6 +697,8 @@ def main(
         NotADirectoryError: If `folder` is not a valid directory.
         FileNotFoundError: If no protocol CSVs are found in any subfolder.
     """
+=======
+>>>>>>> origin/big_update
     if not folder.is_dir():
         raise NotADirectoryError(f"{folder} is not a folder.")
 

@@ -93,12 +93,19 @@ class FileLogger(threading.Thread):
 
     def open(self):
         """Open the main log file and write headers if the file is empty."""
-        self.file = open(self.filename, 'a+')
-        if len(self.file.readlines()) == 0:
-            if self.filename == self.folder_path + "movement_recording.csv":
-                self.file.write("timestamp;st_x;st_y;st_z;pi_x;pi_y;pi_z\n")
-            if self.filename == self.folder_path + "graph_recording.csv":
-                self.file.write("timestamp;pressure;resistance;current;voltage\n")
+        self.file = open(self.filename, "a+")
+        self.file.seek(0, os.SEEK_END)
+        is_empty = self.file.tell() == 0
+
+        if is_empty:
+            headers = {
+                "movement_recording.csv": "timestamp;st_x;st_y;st_z;pi_x;pi_y;pi_z",
+                "graph_recording.csv": "timestamp;pressure;resistance;current;voltage",
+            }
+            header = headers.get(os.path.basename(self.filename))
+            if header:
+                self.file.write(f"{header}\n")
+                self.file.flush()
 
 
         print(f"Opened file at: {self.filename}")

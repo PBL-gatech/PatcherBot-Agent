@@ -8,9 +8,6 @@
                         "pipette_detector_model":  null,
                         "pipette_focuser_model":  null
                     },
-    "ai_features":  {
-                        "enabled":  true
-                    },
     "devices":  {
                     "stage_controller":  {
                                              "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",

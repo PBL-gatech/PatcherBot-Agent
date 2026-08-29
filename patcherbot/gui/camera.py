@@ -691,6 +691,8 @@ class CameraGui(QtWidgets.QMainWindow):
         self.task_success_button.setEnabled(False)
         self.task_success_button.setVisible(False)
         self.status_bar.addWidget(self.task_success_button)
+        self.status_label = QtWidgets.QLabel()
+        self.status_bar.addPermanentWidget(self.status_label)
 
         self.help_button = QtWidgets.QToolButton(clicked=self.toggle_help)
         self.help_button.setIcon(qta.icon('fa.question-circle'))
@@ -746,6 +748,14 @@ class CameraGui(QtWidgets.QMainWindow):
         self.status_bar.addPermanentWidget(self.toggle_dark_mode_button)
  
         self.setexposure_edit.setPlaceholderText('Exposure time (ms)')
+        self.status_bar.addPermanentWidget(self.setexposure_edit)
+        self.status_bar.addPermanentWidget(self.help_button)
+        # self.status_bar.addPermanentWidget(self.log_button)
+        # self.status_bar.addPermanentWidget(self.record_button)
+        self.status_bar.addPermanentWidget(self.snap_image_button)
+        self.status_bar.addPermanentWidget(self.autoexposure_button)
+        self.status_bar.addPermanentWidget(self.unnormalize_button)
+        self.status_bar.addPermanentWidget(self.autonormalize_checkbox)
 
         self.status_bar.setSizeGripEnabled(False)
         self.setStatusBar(self.status_bar)
@@ -1259,7 +1269,6 @@ class CameraGui(QtWidgets.QMainWindow):
             message (str): Status message.
         """
         if not message:
-            # TODO create custom stylesheets for error messages that depend on whether or not dark mode = true
             if self.dark_mode:
                 self.status_label.setStyleSheet('QLabel{color: white;}')
             else:
@@ -1566,6 +1575,12 @@ class CameraGui(QtWidgets.QMainWindow):
             target_width = max(self.current_tab.sizeHint().width(), 250)
             new_sizes = [current_sizes[0] - target_width, target_width]   
             self.splitter.setSizes(new_sizes)
+
+    def toggle_dark_mode(self):
+        """
+        Must be implemented by subclass.
+        """
+        pass
 
 class ElidedLabel(QtWidgets.QLabel):
     """

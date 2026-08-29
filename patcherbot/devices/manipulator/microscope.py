@@ -32,8 +32,11 @@ class Microscope(Manipulator):
         Manipulator.__init__(self)
         self.dev : Manipulator = dev
         self.axis = axis
-        self.up_direction = None # Up direction, must be provided or calculated
+        self.up_direction = -1.0 # Up is negative on microscope Z by default
         self.floor_Z = None # This is the Z coordinate of the coverslip
+        self.config = None
+        self.units_per_um = 5.0
+        self.objective_lift_um = 10000.0
         # Motor range in um; by default +- one meter
         self.min = -1e6 # This could replace floor_Z
         self.max = 1e6
@@ -106,7 +109,11 @@ class Microscope(Manipulator):
         Returns:
             Current position in micrometers (um).
         """
-        true_position = self._from_device_units(self.dev.position(self.axis))
+        if self.config is not None:
+            units_per_um = float(self.config.microscope_units_per_um)
+        else:
+            units_per_um = float(self.units_per_um)
+        true_position = float(units_per_um * self.dev.position(self.axis))
         
         return true_position
 
@@ -190,6 +197,87 @@ class Microscope(Manipulator):
         """
         self.dev.wait_until_still([self.axis])
         self.sleep(.05)
+
+
+    def get_current_objective(self):
+        return self.dev.get_current_objective()
+
+    def switch_objective(self, target):
+        try:
+            target = int(target)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f'Invalid objective target: {target}') from exc
+
+        if target not in (1, 2):
+            raise ValueError(f'Objective target must be 1 or 2, got {target}')
+
+        lift_um = getattr(self, 'objective_lift_um', None)
+        if lift_um is None:
+            lift_um = getattr(self.dev, 'objective_lift_um', None)
+        if lift_um is None and self.config is not None and hasattr(self.config, 'objective_lift_um'):
+            lift_um = self.config.objective_lift_um
+        if lift_um is None:
+            lift_um = 10000.0
+        lift_um = float(lift_um)
+
+        direction = -1.0
+        print(f'[OBJDBG] Microscope.switch_objective start target={target} axis={self.axis} lift_um={lift_um} direction={direction}')
+        try:
+            print(f'[OBJDBG] pre-lift position={self.dev.position()}')
+        except Exception as exc:
+            print(f'[OBJDBG] pre-lift position read failed: {exc}')
+
+        if lift_um > 0:
+            print(f'[OBJDBG] calling relative_move delta={direction * lift_um} axis={self.axis}')
+            self.dev.relative_move(direction * lift_um, self.axis)
+            self.dev.wait_until_still([self.axis])
+            self.sleep(.05)
+            try:
+                print(f'[OBJDBG] post-lift position={self.dev.position()}')
+            except Exception as exc:
+                print(f'[OBJDBG] post-lift position read failed: {exc}')
+
+        try:
+            try:
+                print(f'[OBJDBG] pre-OBJ position={self.dev.position()}')
+            except Exception as exc:
+                print(f'[OBJDBG] pre-OBJ position read failed: {exc}')
+            print(f'[OBJDBG] sending OBJ switch target={target}')
+            result = self.dev.switch_objective(target)
+            print(f'[OBJDBG] OBJ switch completed target={target}')
+            try:
+                print(f'[OBJDBG] post-OBJ position={self.dev.position()}')
+            except Exception as exc:
+                print(f'[OBJDBG] post-OBJ position read failed: {exc}')
+        finally:
+            if lift_um > 0:
+                print(f'[OBJDBG] calling relative_move delta={-direction * lift_um} axis={self.axis}')
+                self.dev.relative_move(-direction * lift_um, self.axis)
+                self.dev.wait_until_still([self.axis])
+                self.sleep(.05)
+                try:
+                    print(f'[OBJDBG] post-lower position={self.dev.position()}')
+                except Exception as exc:
+                    print(f'[OBJDBG] post-lower position read failed: {exc}')
+
+        self._last_objective = target
+        return result
+
+    def toggle_objective(self):
+        current = self.get_current_objective()
+        if current == 1:
+            target = 2
+        elif current == 2:
+            target = 1
+        else:
+            last = getattr(self, '_last_objective', None)
+            if last == 1:
+                target = 2
+            elif last == 2:
+                target = 1
+            else:
+                target = 1
+        return self.switch_objective(target)
 
     def stack(self, camera, z, preprocessing=lambda img:img, save = None, pause = 0.3):
         '''

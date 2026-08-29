@@ -2,3 +2,4 @@ native_zero: 1962
 native_per_mbar: 2.7836
 reader_offset: 516.72
 reader_scale: 0.3923
+use_ai_features: false

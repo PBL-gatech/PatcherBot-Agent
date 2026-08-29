@@ -4,6 +4,7 @@ reader_offset: 515.975015533536
 reader_scale: 0.327021812354884
 pipette_detector_model: BoPipetteDetectorNet.onnx
 pipette_focuser_model: regression_model2.onnx
+use_ai_features: false
 position_update: 1000
 autofocus_dist: 50
 stage_diag_move: 500

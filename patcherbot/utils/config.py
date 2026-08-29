@@ -6,7 +6,7 @@ import yaml
 import logging
 import param
 from yaml.constructor import ConstructorError
-from param import Number, Boolean, Selector, Tuple  # to make it available for import
+from param import Number, Boolean, Selector, Tuple, List  # to make it available for import
 
 try:
     import numpy as _np
@@ -51,6 +51,8 @@ def _coerce_parameter_value(parameter, value):
     """
     if isinstance(parameter, param.Tuple) and isinstance(value, list):
         return tuple(value)
+    if isinstance(parameter, param.List) and isinstance(value, tuple):
+        return list(value)
     return value
 
 class NumberWithUnit(param.Number):

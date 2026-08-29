@@ -66,6 +66,7 @@ class PcoCamera(Camera):
 
         self.last_frame_time = None
         self.fps = 0
+        self.lastFrame = None
 
 
 
@@ -137,6 +138,8 @@ class PcoCamera(Camera):
             img = self.get_16bit_image()
             # print(f"IMAGE after get_16bit_image: {img}")
             # print(type(img))
+        if img is None:
+            return
         # print(f"AFTER IMAGE: {img}")
         #is there a better way to do this?
         #maybe 2 stdevs instead?
@@ -204,7 +207,7 @@ class PcoCamera(Camera):
             # print(meta)
         except Exception as e:
             print(f"ERROR in get_16bit_image: {e}")
-            return self.last_frame # there was an error grabbing the most recent frame
+            return self.lastFrame # there was an error grabbing the most recent frame
 
         return img
 

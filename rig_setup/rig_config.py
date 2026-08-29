@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 import inspect
 from typing import Any, Dict, List, Tuple
+import yaml
 
 LOGGER = logging.getLogger(__name__)
 
@@ -145,8 +146,8 @@ def _empty_calibration() -> Dict[str, Any]:
     return {
         "pipette_detector_model": None,
         "pipette_focuser_model": None,
+        "use_ai_features": False,
     }
-
 
 def _default_ai_features() -> Dict[str, Any]:
     """
@@ -541,8 +542,12 @@ class RigConfigManager:
             data (Dict[str, Any]): Configuration data.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
+        sanitized = {
+            key: value for key, value in data.items()
+            if not (isinstance(key, str) and key.startswith("_"))
+        }
         with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(sanitized, f, indent=2)
 
     def load_config(self, path: Path, load_overlays: bool = True) -> Dict[str, Any]:
         """
@@ -689,6 +694,13 @@ class RigConfigManager:
                     camera.pipetteManip = pipette_controllers
             if hasattr(camera, "cellSorterManip") and "cell_sorter_manipulator" in base_instances:
                 camera.cellSorterManip = base_instances["cell_sorter_manipulator"]
+            calibration_cfg = config.get("_resolved_calibration")
+            if not isinstance(calibration_cfg, dict):
+                calibration_cfg = config.get("calibration")
+            ai_enabled = False
+            if isinstance(calibration_cfg, dict) and "use_ai_features" in calibration_cfg:
+                ai_enabled = bool(calibration_cfg.get("use_ai_features"))
+            setattr(camera, "use_ai_features", ai_enabled)
 
         all_devices = {**base_instances, **derived}
         LOGGER.info("Initialized devices: %s", ", ".join(sorted(all_devices.keys())))
@@ -940,154 +952,145 @@ class RigConfigManager:
         }
 
     def _load_overlay_configs(self, config: Dict[str, Any]) -> None:
-        """
-        Load calibration, patch, and protocol overlays into config.
+        calibration = None
+        calibration_fallback: Dict[str, Any] = {}
+        try:
+            from patcherbot.devices.manipulator.CalibrationConfig import CalibrationConfig
+            calibration = CalibrationConfig(name="Calibration")
+        except Exception as exc:
+            LOGGER.warning("CalibrationConfig import failed; using YAML fallback: %s", exc)
 
-        Args:
-            config (Dict[str, Any]): Configuration dictionary.
-        """
-        from patcherbot.devices.manipulator.CalibrationConfig import CalibrationConfig
-        from patcherbot.interface.patchConfig import PatchConfig
-        from patcherbot.interface.protocolConfig import ProtocolConfig
+        PatchConfig = None
+        try:
+            from patcherbot.interface.patchConfig import PatchConfig as PatchConfigType
+            PatchConfig = PatchConfigType
+        except Exception as exc:
+            LOGGER.warning("Patch overlay disabled because imports failed: %s", exc)
 
-        calibration = CalibrationConfig(name="Calibration")
+        ProtocolConfig = None
+        try:
+            from patcherbot.interface.protocolConfig import ProtocolConfig as ProtocolConfigType
+            ProtocolConfig = ProtocolConfigType
+        except Exception as exc:
+            LOGGER.warning("Protocol overlay disabled because imports failed: %s", exc)
+
+        has_pressure_overrides = False
         cal_file = config.get("calibration_file")
         if cal_file:
             cal_path = self.cal_config_dir / cal_file
             if cal_path.exists():
                 try:
-                    calibration.from_file(str(cal_path))
+                    if calibration is not None:
+                        calibration.from_file(str(cal_path))
+                    else:
+                        with cal_path.open("r", encoding="utf-8") as f:
+                            loaded = yaml.safe_load(f) or {}
+                        if isinstance(loaded, dict):
+                            calibration_fallback.update({k: v for k, v in loaded.items() if v is not None})
+                    has_pressure_overrides = True
                 except Exception as exc:
                     LOGGER.warning("Failed to load calibration file %s: %s", cal_path, exc)
             else:
                 LOGGER.warning("Calibration file not found: %s (using defaults)", cal_path)
-        else:
-            LOGGER.warning("No calibration_file specified; using defaults")
 
         inline_cal = config.get("calibration")
         if isinstance(inline_cal, dict):
             cleaned = {k: v for k, v in inline_cal.items() if v is not None}
-            calibration.from_dict(cleaned)
-
-        ai_features = config.get("ai_features")
-        if isinstance(ai_features, dict):
-            enabled = ai_features.get("enabled")
-            if enabled is not None:
-                calibration.use_ai_features = bool(enabled)
-
-        patch = PatchConfig(name="Patch")
-        patch_file = config.get("patch_file")
-        if patch_file:
-            patch_path = self.patch_config_dir / patch_file
-            if patch_path.exists():
-                try:
-                    patch.from_file(str(patch_path))
-                except Exception as exc:
-                    LOGGER.warning("Failed to load patch file %s: %s", patch_path, exc)
+            if calibration is not None:
+                calibration.from_dict(cleaned)
             else:
-                LOGGER.warning("Patch file not found: %s (using defaults)", patch_path)
-        else:
-            LOGGER.warning("No patch_file specified; using defaults")
+                calibration_fallback.update(cleaned)
+            if any(
+                key in cleaned
+                for key in ("native_zero", "native_per_mbar", "reader_offset", "reader_scale")
+            ):
+                has_pressure_overrides = True
 
-        inline_patch = config.get("patch")
-        if isinstance(inline_patch, dict):
-            cleaned = {k: v for k, v in inline_patch.items() if v is not None}
-            patch.from_dict(cleaned)
-
-        protocol = ProtocolConfig(name="Protocols")
-        protocol_file = config.get("protocol_file")
-        if protocol_file:
-            protocol_path = self.protocol_config_dir / protocol_file
-            if protocol_path.exists():
-                try:
-                    protocol.from_file(str(protocol_path))
-                except Exception as exc:
-                    LOGGER.warning("Failed to load protocol file %s: %s", protocol_path, exc)
-            else:
-                LOGGER.warning("Protocol file not found: %s (using defaults)", protocol_path)
-        else:
-            LOGGER.warning("No protocol_file specified; using defaults")
-
-        inline_protocol = config.get("protocol")
-        if isinstance(inline_protocol, dict):
-            cleaned = {k: v for k, v in inline_protocol.items() if v is not None}
-            protocol.from_dict(cleaned)
-
-        config["calibration"] = calibration.to_dict()
-        config["patch"] = patch.to_dict()
-        config["protocol"] = protocol.to_dict()
-        config["ai_features"] = _default_ai_features() | {
-            "enabled": bool(getattr(calibration, "use_ai_features", True))
-        }
-
-    def _apply_pressure_calibration(
-        self,
-        config: Dict[str, Any],
-        devices_cfg: Dict[str, Any],
-    ) -> None:
-        """
-        Apply pressure calibration parameters to all configured
-        pressure controllers.
-        """
-        calibration = config.get("calibration")
-
-        if not isinstance(calibration, dict):
-            return
-
-        pressure_cfg = devices_cfg.get("pressure")
-
-        # Multi-pipette rig
-        if isinstance(pressure_cfg, list):
-            for i, cfg in enumerate(pressure_cfg):
-                if not isinstance(cfg, dict):
-                    raise RigConfigError(
-                        f"Invalid pressure configuration at index {i}."
-                    )
-
-                self._apply_pressure_calibration_to_device(
-                    calibration,
-                    cfg,
-                )
-
-        # Single-pipette rig
-        elif isinstance(pressure_cfg, dict):
-            self._apply_pressure_calibration_to_device(
-                calibration,
-                pressure_cfg,
+        if "ai_features" in config:
+            LOGGER.warning(
+                "Rig-level 'ai_features' is ignored. Set calibration.use_ai_features in the calibration config file."
             )
 
-    def _apply_pressure_calibration_to_device(
-        self,
-        calibration: Dict[str, Any],
-        pressure_cfg: Dict[str, Any],
-    ) -> None:
-        """
-        Apply calibration values to one pressure controller config.
-        """
-        params = pressure_cfg.get("params") or {}
+        has_patch_overlay = False
+        patch = PatchConfig(name="Patch") if PatchConfig is not None else None
+        if patch is not None:
+            patch_file = config.get("patch_file")
+            if patch_file:
+                patch_path = self.patch_config_dir / patch_file
+                if patch_path.exists():
+                    try:
+                        patch.from_file(str(patch_path))
+                        has_patch_overlay = True
+                    except Exception as exc:
+                        LOGGER.warning("Failed to load patch file %s: %s", patch_path, exc)
+                else:
+                    LOGGER.warning("Patch file not found: %s (using defaults)", patch_path)
 
+            inline_patch = config.get("patch")
+            if isinstance(inline_patch, dict):
+                cleaned = {k: v for k, v in inline_patch.items() if v is not None}
+                patch.from_dict(cleaned)
+                if cleaned:
+                    has_patch_overlay = True
+
+        protocol = ProtocolConfig(name="Protocols") if ProtocolConfig is not None else None
+        if protocol is not None:
+            protocol_file = config.get("protocol_file")
+            if protocol_file:
+                protocol_path = self.protocol_config_dir / protocol_file
+                if protocol_path.exists():
+                    try:
+                        protocol.from_file(str(protocol_path))
+                    except Exception as exc:
+                        LOGGER.warning("Failed to load protocol file %s: %s", protocol_path, exc)
+                else:
+                    LOGGER.warning("Protocol file not found: %s (using defaults)", protocol_path)
+            else:
+                LOGGER.warning("No protocol_file specified; using defaults")
+
+            inline_protocol = config.get("protocol")
+            if isinstance(inline_protocol, dict):
+                cleaned = {k: v for k, v in inline_protocol.items() if v is not None}
+                protocol.from_dict(cleaned)
+
+        if calibration is not None:
+            resolved_calibration = calibration.to_dict()
+        else:
+            resolved_calibration = _empty_calibration()
+            resolved_calibration.update(calibration_fallback)
+            resolved_calibration.setdefault("use_ai_features", False)
+        config["_resolved_calibration"] = resolved_calibration
+        if has_patch_overlay and patch is not None:
+            config["_resolved_patch"] = patch.to_dict()
+        if protocol is not None:
+            config["_resolved_protocol"] = protocol.to_dict()
+        config.pop("ai_features", None)
+        config["_has_pressure_calibration_overrides"] = has_pressure_overrides
+
+    def _apply_pressure_calibration(self, config: Dict[str, Any], devices_cfg: Dict[str, Any]) -> None:
+        if not bool(config.get("_has_pressure_calibration_overrides", False)):
+            return
+        calibration = config.get("_resolved_calibration")
+        if not isinstance(calibration, dict):
+            calibration = config.get("calibration")
+        if not isinstance(calibration, dict):
+            return
+        pressure_cfg = devices_cfg.get("pressure")
+        if not isinstance(pressure_cfg, dict):
+            return
+        params = pressure_cfg.get("params") or {}
         if not isinstance(params, dict):
             params = {}
-
-        class_path = (
-            pressure_cfg.get("class")
-            or pressure_cfg.get("class_path")
-            or ""
-        )
+        class_path = pressure_cfg.get("class") or pressure_cfg.get("class_path") or ""
 
         updates: Dict[str, Any] = {}
-
         if calibration.get("native_zero") is not None:
             updates["native_zero"] = calibration["native_zero"]
-
         if calibration.get("native_per_mbar") is not None:
             updates["native_per_mbar"] = calibration["native_per_mbar"]
-
         if "IBBPressureController" not in str(class_path):
-
             if calibration.get("reader_offset") is not None:
                 updates["sensor_offset"] = calibration["reader_offset"]
-
             if calibration.get("reader_scale") is not None:
                 updates["sensor_scale"] = calibration["reader_scale"]
 

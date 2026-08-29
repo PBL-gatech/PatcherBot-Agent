@@ -184,11 +184,17 @@ class CameraInterface(TaskInterface):
         """
         try:
             frameno, frame_time, _, raw_frame = self.camera.raw_frame_queue[0]
-        except (AttributeError, IndexError, TypeError):
+        except (AttributeError, IndexError, TypeError, ValueError):
             return
         if frameno is None or raw_frame is None or frame_time is None:
             return
-        frame_to_save = raw_frame.copy() if hasattr(raw_frame, "copy") else raw_frame
+        try:
+            time_value = frame_time.timestamp()
+            frame_to_save = raw_frame.copy() if hasattr(raw_frame, "copy") else raw_frame
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return
+        if frame_to_save is None:
+            return
         recorder = self.snap_image_recorder
         if not recorder.folder_created:
             try:
@@ -198,12 +204,17 @@ class CameraInterface(TaskInterface):
             except OSError as exc:
                 logging.error("Error creating snap image folder: %s", exc)
                 return
-        time_value = frame_time.timestamp()
         image_path = os.path.join(
             recorder.camera_folder_path,
             f"{frameno}_{time_value}.{recorder.image_type}",
         )
         recorder._save_image(frame_to_save, image_path)
+        return {
+            "frame_number": frameno,
+            "captured_at": frame_time,
+            "image_path": image_path,
+            "frame": frame_to_save,
+        }
 
     @command(category='Camera',
              description='AutoNormalize the image',

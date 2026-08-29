@@ -7,6 +7,10 @@ stage_x_axis_flip: false
 stage_y_axis_flip: true
 pipette_z_rotation: -21.43
 pipette_y_rotation: 0
+clean_move_order:
+- x
+- y
+- z
 pipette_k_scale: 1.0
 microscope_units_per_um: 5.0
 home_position_delta_um: -250
@@ -17,7 +21,7 @@ reader_offset: 512.64
 reader_scale: 0.3925
 pipette_detector_model: pipetteDetectorNet.pt
 pipette_focuser_model: WaynesBoroPipetteFocuserNet.onnx
-use_ai_features: true
+use_ai_features: false
 home_position:
 - 0
 - 0

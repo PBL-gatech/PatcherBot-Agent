@@ -130,6 +130,8 @@ class GraphInterface(TaskInterface):
         Returns:
             object: Computed noise metrics.
         """
+        if not hasattr(self.daq, "compute_noise_metrics"):
+            return None
         return self.daq.compute_noise_metrics(
             timeData=timeData,
             respData=respData,
@@ -195,27 +197,11 @@ class GraphInterface(TaskInterface):
     @command(category='Laser',
               description='get laser power state')
     def get_laser_power_state(self):
-        """
-        Retrieve the current laser power state.
-
-        Returns:
-            str or None: Laser power state or None if no laser is configured.
-        """
-        if self.laser is None:
-            return None
         return self.laser.get_power_state()
 
     @command(category='Laser',
               description='get current laser wavelength')
     def get_laser_wavelength(self):
-        """
-        Retrieve and cache the current laser wavelength.
-
-        Returns:
-            object: Current wavelength or None if no laser is configured.
-        """
-        if self.laser is None:
-            return None
         wavelength = self.laser.get_wavelength()
         self._last_laser_wavelength = wavelength
         return wavelength
@@ -223,30 +209,12 @@ class GraphInterface(TaskInterface):
     @command(category='Laser',
               description='get cached laser power percent')
     def get_laser_power(self):
-        """
-        Retrieve the cached laser power percentage.
-
-        Returns:
-            int: Cached laser power value.
-        """
         return self._laser_power
 
     @command(category='Laser',
               description='set laser power percent',
               default_arg=0)
     def set_laser_power(self, power_percent):
-        """
-        Set the laser power percentage with validation and clamping.
-
-        Args:
-            power_percent (float): Desired power percentage (0–100).
-
-        Returns:
-            int or None: Applied power value, or None if invalid or unavailable.
-        """
-        if self.laser is None:
-            self.warning("No laser configured; skipping power update.")
-            return None
         try:
             power = int(round(float(power_percent)))
         except (TypeError, ValueError):
@@ -260,15 +228,6 @@ class GraphInterface(TaskInterface):
     @command(category='Laser',
               description='toggle laser output')
     def toggle_laser_output(self):
-        """
-        Toggle the laser output state, ensuring correct power level is set.
-
-        Returns:
-            str or None: Updated laser power state or None if unavailable.
-        """
-        if self.laser is None:
-            self.warning("No laser configured; skipping output toggle.")
-            return None
         power_state = self.laser.get_power_state()
         if power_state != "on":
             self.execute(self.laser.set_power_level, argument=self._laser_power)
@@ -278,14 +237,6 @@ class GraphInterface(TaskInterface):
     @command(category='Laser',
               description='get available laser wavelength options')
     def get_laser_wavelength_options(self):
-        """
-        Retrieve available wavelength options for the laser.
-
-        Returns:
-            list: Available wavelength options.
-        """
-        if self.laser is None:
-            return []
         order = getattr(self.laser, "_wavelength_order", None)
         if order:
             return list(order)
@@ -295,19 +246,6 @@ class GraphInterface(TaskInterface):
         return []
 
     def _step_laser_wavelength(self, step: int):
-        """
-        Increment or decrement the laser wavelength based on the current state.
-
-        Args:
-            step (int): Step direction and size (positive or negative).
-
-        Returns:
-            object: New wavelength value, or None if operation fails.
-        """
-        if self.laser is None:
-            self.warning("No laser configured; skipping wavelength change.")
-            return None
-
         current = self.laser.get_wavelength()
         if current is None:
             target = 1
@@ -336,23 +274,11 @@ class GraphInterface(TaskInterface):
     @command(category='Laser',
               description='step wavelength down')
     def wavelength_down(self):
-        """
-        Decrease the laser wavelength to the previous available value.
-
-        Returns:
-            object: Updated wavelength value.
-        """
         return self._step_laser_wavelength(-1)
 
     @command(category='Laser',
               description='step wavelength up')
     def wavelength_up(self):
-        """
-        Increase the laser wavelength to the next available value.
-
-        Returns:
-            object: Updated wavelength value.
-        """
         return self._step_laser_wavelength(1)
 
     

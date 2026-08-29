@@ -41,10 +41,11 @@ class PipetteInterface(TaskInterface):
         if calibration_data:
             cleaned = {k: v for k, v in calibration_data.items() if v is not None}
             self.calibration_config.from_dict(cleaned)
-        if self.microscope is not None:
-            self.microscope.set_units_per_um(self.calibration_config.microscope_units_per_um)
-        if self.camera is not None:
-            self.camera.use_ai_features = bool(getattr(self.calibration_config, "use_ai_features", True))
+        self.microscope.config = self.calibration_config
+        self.microscope.units_per_um = float(self.calibration_config.microscope_units_per_um)
+        self.microscope.objective_lift_um = float(self.calibration_config.objective_lift_um)
+        if hasattr(self.microscope, 'dev'):
+            self.microscope.dev.objective_lift_um = float(self.calibration_config.objective_lift_um)
         self.calibrated_stage = CalibratedStage(stage, None, microscope, camera,
                                                 config=self.calibration_config)
         self.calibrated_unit = CalibratedUnit(unit,
@@ -325,7 +326,8 @@ class PipetteInterface(TaskInterface):
              success_message='Cover slip position stored')
     def set_floor(self):
         """Store the current microscope position as the coverslip floor."""
-        self.microscope.floor_Z = float(self.microscope.position())
+        z_scale = self.calibrated_unit.config.microscope_units_per_um
+        self.microscope.floor_Z = self.microscope.position() / z_scale
         self.info(f'Cell plane position set to {self.microscope.floor_Z}')
 
     @command(category='Stage',
@@ -400,6 +402,12 @@ class PipetteInterface(TaskInterface):
         """Move the pipette to follow stage movements."""
         self.execute([self.calibrated_unit.follow_stage])
 
+
+    @blocking_command(category='Manipulators and Stage',
+                      description='Move pipette randomly in xyz',
+                        task_description='displacing pipette randomly in xyz...')
+    def move_pipette_random_velocity(self):
+        self.execute([self.calibrated_unit.move_pipette_random_velocity])
 
     @blocking_command(category='Manipulators and Stage',
                       description='Move pipette randomly in xyz',

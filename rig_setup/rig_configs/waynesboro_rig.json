@@ -8,9 +8,6 @@
                         "pipette_detector_model":  "pipetteDetectorNet.pt",
                         "pipette_focuser_model":  "WaynesBoroPipetteFocuserNet.onnx"
                     },
-    "ai_features":  {
-                        "enabled":  true
-                    },
     "devices":  {
                     "stage_controller":  {
                                              "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",

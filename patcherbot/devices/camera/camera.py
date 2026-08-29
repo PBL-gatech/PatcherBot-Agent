@@ -12,7 +12,6 @@ import time
 import threading
 import imageio
 import logging
-from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
 from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
 
 import numpy as np
@@ -151,9 +150,13 @@ class Camera(object):
         self.last_frame_time = None
         self.fps = 0
 
+        # Default off; RigConfigManager applies calibration.use_ai_features after instantiation.
+        self.use_ai_features = False
+
         self.Cellseg = None
         self._cellseg_error = None
-        self.pipdetector = PipetteDetectorYOLO1()
+        device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
+        self.pipdetector = PipetteDetectorYOLO1(device=device)
         # testing flag
         
 
@@ -204,31 +207,18 @@ class Camera(object):
         mask = segmentor.segment(image = img, input_point = cell, input_label = label)
         return mask
 
-    def _ai_features_enabled(self) -> bool:
-        """
-        Check whether AI-based features are enabled.
-
-        returns:
-            bool: True if AI features are enabled.
-        """
-        return bool(getattr(self, "use_ai_features", True))
-
     def _ensure_cellseg(self):
-        """
-        Ensure that the cell segmentation model is initialized.
-
-        returns:
-            CellSegmentor2: Initialized segmentation model.
-
-        raises:
-            NotImplementedError: If AI features are unavailable.
-        """
-        if not self._ai_features_enabled():
-            raise NotImplementedError("AI features disabled; SAM2 segmentation unavailable.")
+        if not self.use_ai_features:
+            raise NotImplementedError(
+                "SAM2 segmentation unavailable. AI features need to be enabled in "
+                "calibration config before use. Set calibration.use_ai_features to true."
+            )
         if self._cellseg_error is not None:
             raise NotImplementedError(f"SAM2 is not available: {self._cellseg_error}") from self._cellseg_error
         if self.Cellseg is None:
             try:
+                from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
+
                 self.Cellseg = CellSegmentor2()
             except Exception as exc:
                 self._cellseg_error = exc

@@ -128,6 +128,17 @@ class Manipulator(TaskController):
         '''
         self.absolute_move_group(array(self.position_group(axes))+array(x), axes)
 
+    def relative_move_group_velocity(self, vel, axes=None):
+        '''
+        Moves the device group continuously at velocity vel in um/s.
+        By default, this forwards to absolute velocity control.
+        '''
+        if hasattr(self, "absolute_move_group_velocity"):
+            if axes is None:
+                return self.absolute_move_group_velocity(vel)
+            return self.absolute_move_group_velocity(vel, axes)
+        raise NotImplementedError("relative_move_group_velocity is not implemented for this device.")
+
     def stop(self, axis):
         """
         Stops current movements.
@@ -182,6 +193,19 @@ class Manipulator(TaskController):
                 current_position = self.position_group(axes)
             self.sleep(0.1)  # 100 ms
             
+
+    def get_current_objective(self):
+        """
+        Return the currently selected objective, or ``None`` if unavailable.
+        """
+        return None
+
+    def switch_objective(self, target):
+        """
+        Switch to the requested objective.
+        """
+        raise RuntimeError("Objective switching is not supported for this device.")
+
     def get_max_speed(self):
         ''' returns the max speed of the device, (if possible)
         '''

@@ -34,26 +34,6 @@ class WaynesBoroPressureController(PressureController):
                  native_zero=None, native_per_mbar=None,
                  sensor_offset=None, sensor_scale=None,
                  serial_cmd_timeout=None):
-        """
-        Initialize the WaynesBoroPressureController.
-
-        Args:
-            channel (int): Channel number on the pressure box.
-            controllerSerial (serial.Serial, optional): Serial port to the controller Arduino.
-            readerSerial (serial.Serial, optional): Serial port to the pressure sensor Arduino.
-            validProducts (list[str], optional): List of valid USB product names.
-            validVIDs (list[int], optional): List of valid USB vendor IDs.
-            nativeZero (float, optional): Native units at 0 pressure.
-            nativePerMbar (float, optional): Conversion factor from mbar to native units.
-            readerOffset (float, optional): Sensor-specific offset.
-            readerScale (float, optional): Sensor-specific scale.
-            serialCmdTimeout (float, optional): Serial command timeout in seconds.
-            valid_products, valid_vids, native_zero, native_per_mbar, sensor_offset, sensor_scale, serial_cmd_timeout (optional):
-                Alternative keyword arguments to override defaults.
-
-        Raises:
-            RuntimeError: If either controllerSerial or readerSerial is not provided.
-        """
         super().__init__()
         # time.sleep(2) # wait for arduino to boot up
 
@@ -109,9 +89,6 @@ class WaynesBoroPressureController(PressureController):
     def set_pressure(self, pressure):
         '''
         Tell pressure controller to go to a given setpoint pressure in mbar
-
-        Args:
-            pressure (float): Target pressure in mBar.
         '''
         nativeUnits = self.mbarToNative(pressure)
         # self.info(f"Setting pressure to {nativeUnits} mbar")
@@ -119,13 +96,7 @@ class WaynesBoroPressureController(PressureController):
     
     def mbarToNative(self, pressure):
         '''
-        Convert from a pressure in mBar to native units
-
-        Args:
-            pressure (float): Pressure in mBar.
-
-        Returns:
-            int: DAC units clamped to 0 – (2 * nativeZero).
+        Comvert from a pressure in mBar to native units
         '''
         raw_pressure = int((pressure * self.nativePerMbar + self.nativeZero))
         return min(max(raw_pressure, 0), self.nativeZero * 2) # clamp native units to 0-3924
@@ -133,13 +104,7 @@ class WaynesBoroPressureController(PressureController):
 
     def nativeToMbar(self, raw_pressure) -> float:
         '''
-        Convert from native units to a pressure in mBar
-
-        Args:
-            raw_pressure (int): DAC units.
-
-        Returns:
-            float: Pressure in mBar.
+        Comvert from native units to a pressure in mBar
         '''
         pressure = (raw_pressure - self.nativeZero) / self.nativePerMbar
         return pressure
@@ -147,9 +112,6 @@ class WaynesBoroPressureController(PressureController):
     def set_pressure_raw(self, raw_pressure: int):
         '''
         Tell pressure controller to go to a given setpoint pressure in native DAC units
-
-        Args:
-            raw_pressure (int): Target pressure in native DAC units.
         '''
         self.setpoint_raw = raw_pressure
         self.info(f"Setting pressure to {self.nativeToMbar(raw_pressure)} mbar (raw: {raw_pressure})")
@@ -163,18 +125,12 @@ class WaynesBoroPressureController(PressureController):
     def get_pressure(self) -> float:
         '''
         Gets the current setpoint in millibar
-
-        Returns:
-            float: Setpoint pressure in mBar.
         '''
         return self.nativeToMbar(self.setpoint_raw)
 
     def measure(self) -> float:
         '''
         Read the pressure sensor value from the Arduino
-
-        Returns:
-            float: Measured pressure in mBar.
         '''
         pressureVal = self.lastVal
 
@@ -198,9 +154,6 @@ class WaynesBoroPressureController(PressureController):
     
     def pulse(self, delayMs):
         '''Tell the onboard arduino to pulse pressure for a certain period of time
-        
-        Args:
-            delayMs (int): Duration of pulse in milliseconds.
         '''
         cmd = f"pulse {self.channel} {delayMs}\n"
         self.info(f"Pulsing pressure for {delayMs} ms")
@@ -211,9 +164,6 @@ class WaynesBoroPressureController(PressureController):
         '''Send a serial command activating or deactivating the atmosphere solenoid valve
            atm = True -> pressure output is at atmospheric pressure 
            atm = False -> pressure output comes from pressure regulator
-        
-        Args:
-            atm (bool): True for atmospheric mode, False for regulated pressure.
         '''
         if atm:
             cmd = f"switchAtm {self.channel}\n" # switch to ATM command

@@ -34,12 +34,6 @@ class LumencorLaser(Laser):
     Documentation: https://cms.lumencor.com/system/uploads/fae/file/asset/150/57-10035_Spectra_X_Command_Reference.pdf
     """
     def __init__(self, com: serial.Serial):
-        """
-        Initializes the Lumencor laser with a serial connection.
-
-        Args:
-            com (serial.Serial): Serial connection to the hardware.
-        """
         # Order used for wavelength selection (1-based)
         self._wavelength_order = [
             WavelengthChannel.RED,
@@ -60,17 +54,7 @@ class LumencorLaser(Laser):
         super().__init__()
 
     def _index_to_wavelength(self, index: int | None):
-        """
-        Map a 1-based wavelength index to a WavelengthChannel, cycling through the list.
-        
-        Args:
-            index (int | None): 1-based channel index. If None, returns None.
-        
-        Returns:
-            WavelengthChannel | None: Corresponding wavelength channel,
-            cycling through the `_wavelength_order` list if the index exceeds
-            the length.
-        """
+        """Map a 1-based wavelength index to a WavelengthChannel, cycling through the list."""
         if index is None:
             return None
         if index <= 0:
@@ -79,17 +63,7 @@ class LumencorLaser(Laser):
         return self._wavelength_order[idx]
 
     def _resolve_wavelength(self, value):
-        """
-        Accept WavelengthChannel, color names, or int/str indices and return a WavelengthChannel.
-        
-        Args:
-            index (int | None): 1-based channel index. If None, returns None.
-        
-        Returns:
-            WavelengthChannel | None: Corresponding wavelength channel,
-            cycling through the `_wavelength_order` list if the index exceeds
-            the length.
-        """
+        """Accept WavelengthChannel, color names, or int/str indices and return a WavelengthChannel."""
         if value is None:
             return None
         if isinstance(value, WavelengthChannel):
@@ -120,16 +94,7 @@ class LumencorLaser(Laser):
         wavelength: WavelengthChannel | int | str | None,
         excitation_filter: ExcitationFilter | None = None,
     ):
-        """
-        Internal helper to update the selected wavelength and filter.
-        
-        Args:
-            wavelength: Desired wavelength (WavelengthChannel, int index, or string).
-            excitation_filter: Optional green/yellow filter setting.
-
-        Returns:
-            WavelengthChannel | None: Selected channel or None if invalid.
-        """
+        """Internal helper to update the selected wavelength and filter."""
         channel = self._resolve_wavelength(wavelength)
         if channel is None:
             self.info("Lumencor: No wavelength specified, skipping selection.")
@@ -152,14 +117,7 @@ class LumencorLaser(Laser):
         *,
         force: bool = False,
     ):
-        """
-        Apply output selection to the controller.
-        
-        Args:
-            wavelength: Desired wavelength channel.
-            excitation_filter: Filter selection (green/yellow).
-            force: If True, forces command even if already applied.
-        """
+        """Apply output selection to the controller."""
         if (
             not force
             and self._output_enabled_channel == wavelength
@@ -208,12 +166,7 @@ class LumencorLaser(Laser):
         self.power_state = "off"
 
     def get_power_state(self):
-        """
-        Return cached power state.
-        
-        Returns:
-            str: "on" or "off".
-        """
+        """Return cached power state."""
         return self.power_state
 
     def set_wavelength(
@@ -221,16 +174,7 @@ class LumencorLaser(Laser):
         wavelength: WavelengthChannel | int | str | None = None,
         excitation_filter: ExcitationFilter | None = None,
     ):
-        """
-        Select the output wavelength channel.
-        
-        Args:
-            wavelength: Desired channel (enum, index, or string).
-            excitation_filter: Optional green/yellow filter.
-
-        Notes:
-            If the laser is on, power will be reapplied automatically.
-        """
+        """Select the output wavelength channel."""
         channel = self._select_wavelength(wavelength, excitation_filter)
         if channel is None:
             return
@@ -253,14 +197,7 @@ class LumencorLaser(Laser):
         *,
         force: bool = False,
     ):
-        """
-        Set output power for a wavelength channel (0-100).
-        
-        Args:
-            power_percent (float): Desired power level (0–100%).
-            wavelength: Optional wavelength channel (enum, index, or string). Defaults to current channel.
-            force (bool): If True, always sends command even if power is unchanged.
-        """
+        """Set output power for a wavelength channel (0-100)."""
         if wavelength is None:
             channel = self.current_wavelength
             if channel in (None, WavelengthChannel.OFF):
@@ -316,12 +253,7 @@ class LumencorLaser(Laser):
         self.info("Lumencor: Power for {} set to {}%".format(channel.name, clamped))
 
     def get_laser_temp(self):
-        """
-        Return the internal IIC temperature in degrees C.
-        
-        Returns:
-            float: Temperature in degrees Celsius.
-        """
+        """Return the internal IIC temperature in degrees C."""
         cmd = bytearray([0x53, 0x91, 0x02, 0x50])
         self.com.write(cmd)
         time.sleep(0.1)

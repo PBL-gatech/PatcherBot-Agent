@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import threading
 from typing import Iterable, Optional, Sequence, Tuple
 
 import cv2
@@ -15,6 +16,7 @@ try:
         PatchMatcher,
     )
     from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
+    from patcherbot.deepLearning.trackModel.PointTracker import PointTracker1
 except ModuleNotFoundError:  # pragma: no cover - allow standalone execution
     import sys
 
@@ -28,6 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover - allow standalone execution
         PatchMatcher,
     )
     from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
+    from patcherbot.deepLearning.trackModel.PointTracker import PointTracker1
 
 try:
     import matplotlib.pyplot as plt
@@ -60,6 +63,9 @@ class CellTrackHelper:
         (0.0, 18.0),
         (0.0, -18.0),
     )
+    _SHARED_INIT_LOCK = threading.Lock()
+    _SHARED_SEGMENTOR: Optional[CellSegmentor2] = None
+    _SHARED_MATCHERS: dict[Tuple[Tuple[str, str], ...], PatchMatcher] = {}
 
     def __init__(
         self,
@@ -83,14 +89,209 @@ class CellTrackHelper:
         self.camera = camera
         self.width = int(getattr(camera, "width", 0) or 0)
         self.height = int(getattr(camera, "height", 0) or 0)
-        self.use_ai_features = bool(use_ai_features) if use_ai_features is not None else True
-        self.segmentor = None
-        self._segmentor_error = None
-        self._matcher = None
-        self._matcher_error = None
-        self._matcher_kwargs = dict(matcher_kwargs)
+        self.segmentor = self._get_shared_segmentor()
+        self._matcher = self._get_shared_matcher(dict(matcher_kwargs))
+        self._template_centroid_cache: dict[
+            Tuple[int, int, int, float, float], np.ndarray
+        ] = {}
+        self._fast_tracker: Optional[PointTracker1] = None
+        self._last_tracked_point: Optional[np.ndarray] = None
+        self.last_tracking_status: dict[str, object] = {"status": "idle", "method": None}
+
+    @classmethod
+    def _matcher_key(cls, matcher_kwargs: dict[str, object]) -> Tuple[Tuple[str, str], ...]:
+        if not matcher_kwargs:
+            return ()
+        return tuple(sorted((str(key), repr(value)) for key, value in matcher_kwargs.items()))
+
+    @classmethod
+    def _get_shared_segmentor(cls) -> CellSegmentor2:
+        if cls._SHARED_SEGMENTOR is not None:
+            return cls._SHARED_SEGMENTOR
+        with cls._SHARED_INIT_LOCK:
+            if cls._SHARED_SEGMENTOR is None:
+                logging.info("CellTrackHelper: initializing shared SAM2 segmentor.")
+                cls._SHARED_SEGMENTOR = CellSegmentor2()
+        return cls._SHARED_SEGMENTOR
+
+    @classmethod
+    def _get_shared_matcher(cls, matcher_kwargs: dict[str, object]) -> PatchMatcher:
+        key = cls._matcher_key(matcher_kwargs)
+        cached = cls._SHARED_MATCHERS.get(key)
+        if cached is not None:
+            return cached
+        with cls._SHARED_INIT_LOCK:
+            cached = cls._SHARED_MATCHERS.get(key)
+            if cached is None:
+                if matcher_kwargs:
+                    logging.info(
+                        "CellTrackHelper: initializing shared LightGlue matcher with kwargs=%s.",
+                        matcher_kwargs,
+                    )
+                else:
+                    logging.info("CellTrackHelper: initializing shared LightGlue matcher.")
+                cached = PatchMatcher(**matcher_kwargs)
+                cls._SHARED_MATCHERS[key] = cached
+        return cached
 
     # ------------------------------------------------------------------ #
+    def reset_tracking(self) -> None:
+        """Clear online tracking state between hunt attempts or selected cells."""
+        if self._fast_tracker is not None:
+            self._fast_tracker.reset()
+            self._fast_tracker.clear_points()
+        self._fast_tracker = None
+        self._last_tracked_point = None
+        self.last_tracking_status = {"status": "idle", "method": None}
+
+    def track_cell(
+        self,
+        cell: object,
+        image: ImageInput,
+        *,
+        expected_point: Optional[Tuple[float, float]] = None,
+        prompt_point: Optional[Tuple[float, float]] = None,
+        use_centroid: bool = True,
+        mode: str = "fast",
+        max_fast_jump_px: float = 80.0,
+        load_conf: Optional[MatcherConfig] = None,
+        offsets: Optional[Sequence[Tuple[float, float]]] = None,
+        max_refine_distance: float = 120.0,
+        **preprocess: object,
+    ) -> Optional[np.ndarray]:
+        """
+        Track a selected cell with segmentation on every frame.
+
+        Optical flow is only used to predict the next current-frame segmentation
+        prompt. The returned point always comes from the cell-body segmentation
+        path in ``find_centroid``.
+
+        ``cell`` is expected to be the queued cell tuple used by the stage:
+        ``(cell_coords, reference_image, position)``. The returned point is in
+        current-frame pixel coordinates.
+        """
+        try:
+            _cell_coords, reference_image, _position = cell  # type: ignore[misc]
+        except (TypeError, ValueError):
+            logging.error("CellTrackHelper: expected cell tuple (coords, image, position).")
+            self.last_tracking_status = {"status": "invalid_cell", "method": None}
+            return None
+
+        curr_np = self._ensure_numpy(image)
+        if curr_np is None:
+            self.last_tracking_status = {"status": "invalid_image", "method": None}
+            return None
+
+        mode = str(mode or "fast").lower()
+        if mode not in {"fast", "cellbody", "hybrid"}:
+            logging.warning("CellTrackHelper: unknown tracking mode %r; using fast.", mode)
+            mode = "fast"
+
+        flow_prompt = None
+        if mode in {"fast", "hybrid"} and self._last_tracked_point is not None:
+            flow_prompt = self._flow_prompt(curr_np, max_fast_jump_px=max_fast_jump_px)
+
+        return self._track_cell_body(
+            reference_image,
+            curr_np,
+            use_centroid=True,
+            prompt_point=prompt_point,
+            expected_point=flow_prompt if flow_prompt is not None else expected_point,
+            method="flow_prompt+cellbody" if flow_prompt is not None else "cellbody",
+            load_conf=load_conf,
+            offsets=offsets,
+            max_refine_distance=max_refine_distance,
+            **preprocess,
+        )
+
+    def _track_cell_body(
+        self,
+        reference_image: ImageInput,
+        image: np.ndarray,
+        *,
+        use_centroid: bool,
+        prompt_point: Optional[Tuple[float, float]],
+        expected_point: Optional[Tuple[float, float]],
+        method: str,
+        load_conf: Optional[MatcherConfig],
+        offsets: Optional[Sequence[Tuple[float, float]]],
+        max_refine_distance: float,
+        **preprocess: object,
+    ) -> Optional[np.ndarray]:
+        point = self.find_centroid(
+            reference_image,
+            image,
+            use_centroid=use_centroid,
+            prompt_point=prompt_point,
+            expected_point=expected_point,
+            load_conf=load_conf,
+            offsets=offsets,
+            max_refine_distance=max_refine_distance,
+            **preprocess,
+        )
+        if point is None:
+            self.last_tracking_status = {"status": "lost", "method": method}
+            return None
+
+        point = np.asarray(point, dtype=np.float32).reshape(-1)[:2]
+        if not self._valid_point(point, image.shape[1], image.shape[0]):
+            self.last_tracking_status = {"status": "invalid", "method": method}
+            return None
+
+        self._prime_fast_tracker(image, point)
+        self._last_tracked_point = point.copy()
+        self.last_tracking_status = {"status": "ok", "method": method}
+        return point.astype(np.float32, copy=False)
+
+    def _flow_prompt(
+        self,
+        image: np.ndarray,
+        *,
+        max_fast_jump_px: float,
+    ) -> Optional[np.ndarray]:
+        if self._fast_tracker is None or self._last_tracked_point is None:
+            self.last_tracking_status = {"status": "unprimed", "method": "fast"}
+            return None
+
+        try:
+            result = self._fast_tracker.update(
+                image,
+                points=self._last_tracked_point.reshape(1, 2),
+            )
+        except Exception as exc:
+            logging.error("CellTrackHelper: fast tracking failed: %s", exc)
+            self.last_tracking_status = {"status": "error", "method": "fast"}
+            return None
+
+        if result.points_px is None:
+            self.last_tracking_status = {"status": "lost", "method": "fast"}
+            return None
+
+        point = np.asarray(result.points_px, dtype=np.float32).reshape(-1, 2)[0]
+        height, width = image.shape[:2]
+        if not self._valid_point(point, width, height):
+            self.last_tracking_status = {"status": "invalid", "method": "fast"}
+            return None
+
+        jump_px = float(np.linalg.norm(point - self._last_tracked_point))
+        if jump_px > float(max_fast_jump_px):
+            self.last_tracking_status = {"status": "jump_rejected", "method": "fast"}
+            return None
+
+        return point.astype(np.float32, copy=False)
+
+    def _prime_fast_tracker(self, image: np.ndarray, point: np.ndarray) -> None:
+        self._fast_tracker = PointTracker1(compute_scores_enabled=False)
+        self._fast_tracker.set_points(point.reshape(1, 2))
+        self._fast_tracker.update(image, points=point.reshape(1, 2))
+
+    @staticmethod
+    def _valid_point(point: np.ndarray, width: int, height: int) -> bool:
+        point = np.asarray(point, dtype=np.float32).reshape(-1)
+        if point.size < 2 or not np.isfinite(point[:2]).all():
+            return False
+        return CellTrackHelper._point_within(point[:2], width, height)
+
     def find_centroid(
         self,
         reference_image: ImageInput,
@@ -159,9 +360,27 @@ class CellTrackHelper:
             expected = self._clamp_point(expected_raw[:2], curr_width, curr_height)
 
         # Step 1: Segment template to obtain the true centroid.
-        reference_centroid: Optional[np.ndarray] = (
-            self._segment_centroid(tmpl_np, prompt) if use_centroid else None
-        )
+        reference_centroid: Optional[np.ndarray] = None
+        if use_centroid:
+            cache_key = (
+                id(reference_image),
+                int(tmpl_height),
+                int(tmpl_width),
+                float(prompt[0]),
+                float(prompt[1]),
+            )
+            cached = self._template_centroid_cache.get(cache_key)
+            if cached is not None:
+                reference_centroid = np.array(cached, dtype=np.float32, copy=True)
+            else:
+                reference_centroid = self._segment_centroid(tmpl_np, prompt)
+                if reference_centroid is not None:
+                    if len(self._template_centroid_cache) > 512:
+                        self._template_centroid_cache.clear()
+                    self._template_centroid_cache[cache_key] = np.asarray(
+                        reference_centroid,
+                        dtype=np.float32,
+                    )
         if reference_centroid is None:
             reference_centroid = prompt
 

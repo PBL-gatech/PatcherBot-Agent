@@ -25,19 +25,6 @@ class ExcelitasLamp(Lamp):
         initial_slot: int | None = 1,
         dir_high_for_increase: bool = True,
     ):
-        """
-        Initializes the lamp controller and configuration parameters.
-
-        Args:
-            stepcmdChannel (str): NI-DAQ channel for step control.
-            dircmdChannel (str): NI-DAQ channel for direction control.
-            steps_per_position (int): Number of steps between filter positions.
-            time_per_step_ms (float): Delay per step in milliseconds.
-            cube_slots (int | None): Number of filter slots (wraps if set).
-            settle_ms (int): Delay after initializing tasks (ms).
-            initial_slot (int | None): Initial filter slot.
-            dir_high_for_increase (bool): Direction signal for increasing slot index.
-        """
         self.stepcmdChannel = stepcmdChannel
         self.dircmdChannel = dircmdChannel
         self.step_task = None
@@ -57,16 +44,9 @@ class ExcelitasLamp(Lamp):
         super().__init__()
 
     def _initialize(self):
-        """Initializes hardware tasks for the lamp controller."""
         self._setup_tasks()
 
     def _setup_tasks(self) -> None:
-        """
-        Creates and starts NI-DAQ tasks for step and direction control.
-
-        Raises:
-            Exception: If task setup fails.
-        """
         import nidaqmx.constants as c
 
         self._close_tasks()
@@ -92,7 +72,6 @@ class ExcelitasLamp(Lamp):
             raise
 
     def _close_tasks(self) -> None:
-        """Stops and closes all active NI-DAQ tasks."""
         for task in (self.step_task, self.dir_task):
             if task is not None:
                 try:
@@ -107,15 +86,6 @@ class ExcelitasLamp(Lamp):
         self.dir_task = None
 
     def _set_direction(self, direction: int | bool) -> None:
-        """
-        Sets the rotation direction of the filter wheel.
-
-        Args:
-            direction (int | bool): Direction signal value.
-
-        Raises:
-            RuntimeError: If the direction task is not initialized.
-        """
         if self.dir_task is None:
             raise RuntimeError("DIR task is not initialized. Call initialize() first.")
 
@@ -130,13 +100,6 @@ class ExcelitasLamp(Lamp):
           Frame 1: DAQmx Write FALSE (Digital Bool 1Line 1Point), Wait(time_per_step_ms)
 
         Note: This matches the VI wiring (time_per_step goes to BOTH waits).
-        
-        Args:
-            n_steps (int): Number of steps to execute.
-            time_per_step_ms (float): Delay between step transitions (ms).
-
-        Raises:
-            RuntimeError: If the step task is not initialized.
         """
         if self.step_task is None:
             raise RuntimeError("STEP task is not initialized. Call initialize() first.")
@@ -156,30 +119,12 @@ class ExcelitasLamp(Lamp):
             time.sleep(t)
 
     def _normalize_slot(self, slot: int) -> int:
-        """
-        Normalizes a slot index within valid range.
-
-        Args:
-            slot (int): Raw slot value.
-
-        Returns:
-            int: Normalized slot index.
-        """
         slot = int(slot)
         if self._cube_slots:
             return ((slot - 1) % self._cube_slots) + 1
         return slot
 
     def _coerce_slot(self, value):
-        """
-        Converts input into a valid slot index if possible.
-
-        Args:
-            value: Input slot value.
-
-        Returns:
-            int | None: Valid slot index or None if invalid.
-        """
         if value is None:
             return None
         if isinstance(value, str) and value.isdigit():
@@ -190,16 +135,6 @@ class ExcelitasLamp(Lamp):
         return None
 
     def _slot_delta(self, current: int, target: int) -> int:
-        """
-        Computes the shortest step difference between two slots.
-
-        Args:
-            current (int): Current slot.
-            target (int): Target slot.
-
-        Returns:
-            int: Step difference (positive or negative).
-        """
         if not self._cube_slots:
             return target - current
         forward = (target - current) % self._cube_slots
@@ -211,9 +146,6 @@ class ExcelitasLamp(Lamp):
     def set_filter(self, filter: int | None = None):
         """
         Move the wheel to the requested numeric slot.
-
-        Args:
-            filter (int | None): Target filter slot.
         """
         slot = self._coerce_slot(filter)
         if slot is None:
@@ -236,39 +168,18 @@ class ExcelitasLamp(Lamp):
         self._current_filter = slot
 
     def get_filter(self):
-        """
-        Retrieves the current filter slot.
-
-        Returns:
-            int | None: Current filter slot.
-        """
         return self._current_filter
 
     def open_shutter(self):
-        """Opens the shutter."""
         self.shutter_state = "open"
 
     def close_shutter(self):
-        """Closes the shutter."""
         self.shutter_state = "closed"
 
     def get_shutter_state(self):
-        """
-        Retrieves the shutter state.
-
-        Returns:
-            str: "open" or "closed".
-        """
         return self.shutter_state
 
     def enable(self, light=None, excitation_filter=None):
-        """
-        Enables the lamp and optionally sets the excitation filter.
-
-        Args:
-            light: Light source object.
-            excitation_filter: Desired filter slot.
-        """
         self.current_light = light
         if excitation_filter is not None:
             self.current_excitation_filter = excitation_filter
