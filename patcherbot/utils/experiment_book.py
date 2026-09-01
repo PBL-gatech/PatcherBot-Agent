@@ -1,7 +1,9 @@
 """Append-only logger for experiment book sessions."""
 
+from collections.abc import Mapping
 from datetime import datetime
 import logging
+from numbers import Integral
 import os
 from pathlib import Path
 
@@ -85,6 +87,32 @@ class ExperimentBookLogger:
         ])
         self._write_to_file(entry)
         return cleaned_path
+
+    def write_state_tally(self, counts, state_labels, timestamp=None):
+        """Append one complete, ordered state-press tally snapshot."""
+        if not isinstance(counts, Mapping) or not isinstance(state_labels, Mapping):
+            raise TypeError("State tally counts and labels must be mappings.")
+        if not state_labels or set(counts) != set(state_labels):
+            raise ValueError("State tally counts must match the configured states.")
+
+        normalized = {}
+        lines = []
+        for state_name, display_label in state_labels.items():
+            label = str(display_label).strip()
+            count = counts[state_name]
+            if not label:
+                raise ValueError("State tally labels cannot be empty.")
+            if isinstance(count, bool) or not isinstance(count, Integral) or count < 0:
+                raise ValueError("State tally counts must be non-negative integers.")
+            normalized[state_name] = int(count)
+            lines.append(f"{label}: {int(count)}")
+
+        entry = "\n".join([
+            self._entry_header("STATE TALLY", timestamp),
+            *lines,
+        ])
+        self._write_to_file(entry)
+        return normalized
 
     def _write_to_file(self, entry):
         self.create_folder()

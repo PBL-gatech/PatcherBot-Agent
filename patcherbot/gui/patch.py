@@ -58,6 +58,12 @@ class PatchGui(ManipulatorGui):
             self.patch_interface.experiment_book_config,
             gui_class=ExperimentBookTab,
         )
+        self.experiment_book_tab.attach_recording_state_manager(
+            self.recording_state_manager
+        )
+        self.patch_interface.state_press_tally_changed.connect(
+            self.experiment_book_tab.handle_state_press_tally
+        )
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
         logging.debug("Added config GUI.")
         classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task,self.interface_signals, self.recording_state_manager)

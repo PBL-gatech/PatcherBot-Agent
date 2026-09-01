@@ -24,6 +24,8 @@ class AutoPatchInterface(TaskInterface):
     '''
     A class to run automatic patch-clamp
     '''
+    state_press_tally_changed = QtCore.pyqtSignal(object)
+
     def __init__(
         self,
         amplifier: Amplifier,
@@ -73,6 +75,11 @@ class AutoPatchInterface(TaskInterface):
         self.timer.timeout.connect(self.update_camera_cell_list)
         self.timer.start(50)
 
+    def _record_state_press(self, state):
+        counts = self.recording_state_manager.increment_state_press(state)
+        self.state_press_tally_changed.emit(counts)
+        return counts
+
     def _protocol_holding_parameters(self):
         protocol_config = self.current_autopatcher.protocol_config
         voltage_hold = float("nan")
@@ -117,12 +124,14 @@ class AutoPatchInterface(TaskInterface):
                       task_description='Breaking into the cell')
     
     def break_in(self):
+        self._record_state_press("break_in")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.break_in)
 
     @blocking_command(category='Patch', description='GigaSeal the cell',
                       task_description='GigaSealing the cell')
     def gigaseal(self):
+        self._record_state_press("gigaseal")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.gigaseal)
 
@@ -310,6 +319,7 @@ class AutoPatchInterface(TaskInterface):
     @blocking_command(category='Patch', description='Move to cell and patch it',
                       task_description='Moving to cell and patching it')
     def patch(self) -> None:
+        self._record_state_press("patch")
         if not self.cells_to_patch:
             self.warning("No cells queued for patching; skipping patch command")
             return
@@ -391,6 +401,7 @@ class AutoPatchInterface(TaskInterface):
                         description='Locate the cell',
                         task_description='Moving to the cell')
     def locate_cell(self):
+        self._record_state_press("locate_cell")
         cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.locate_cell,
@@ -420,6 +431,7 @@ class AutoPatchInterface(TaskInterface):
                         description='Hunt the cell',
                         task_description='Moving to the cell and detecting it ')
     def hunt_cell(self):
+        self._record_state_press("hunt_cell")
         cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.hunt_cell,
@@ -431,6 +443,7 @@ class AutoPatchInterface(TaskInterface):
                         description='escape the cell',
                         task_description='Moving away from the cell, cleaning pipette and moving to home space')
     def escape_cell(self):
+        self._record_state_press("escape")
         self.execute(self.current_autopatcher.escape)
         time.sleep(2)
         # self.cells_to_patch = self.cells_to_patch[1:]

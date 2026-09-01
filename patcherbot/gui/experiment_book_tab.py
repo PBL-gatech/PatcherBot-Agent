@@ -35,6 +35,10 @@ class ExperimentBookTab(QtWidgets.QWidget):
         self.book_active = False
         self.active_details = None
         self.timeline_cards = []
+        self.recording_state_manager = None
+        self.state_tally_card = None
+        self.state_tally_header = None
+        self.state_tally_body = None
 
         self._build_ui()
         self.config._value_changed = self._config_value_changed
@@ -111,7 +115,12 @@ class ExperimentBookTab(QtWidgets.QWidget):
         notes_layout.addWidget(self.send_button, alignment=QtCore.Qt.AlignRight)
         layout.addWidget(notes_group)
 
+    def attach_recording_state_manager(self, recording_state_manager):
+        """Attach the shared manager that owns the experiment's press counts."""
+        self.recording_state_manager = recording_state_manager
+
     def save_details(self):
+        was_active = self.book_active
         details = {
             name: str(getattr(self.config, name)).strip()
             for name in self.detail_edits
@@ -141,8 +150,81 @@ class ExperimentBookTab(QtWidgets.QWidget):
             f"Age: {normalized['age']}",
         ])
         self._add_text_card("Details", detail_text, timestamp)
-        self._set_status("Experiment details saved.")
+        tally_initialized = True
+        if not was_active:
+            tally_initialized = self._initialize_state_press_tally(timestamp)
+        if tally_initialized:
+            self._set_status("Experiment details saved.")
         return True
+
+    def _initialize_state_press_tally(self, timestamp):
+        if self.recording_state_manager is None:
+            return True
+        try:
+            snapshot = self.recording_state_manager.reset_state_press_counts()
+        except Exception:
+            logging.getLogger(__name__).exception("Unable to reset state press tally")
+            self._set_status("The state tally could not be initialized.", error=True)
+            return False
+        return self._record_state_press_tally(snapshot, timestamp)
+
+    @QtCore.pyqtSlot(object)
+    def handle_state_press_tally(self, snapshot):
+        """Persist a manager snapshot and refresh the one live tally card."""
+        return self._record_state_press_tally(
+            snapshot,
+            datetime.now().astimezone(),
+        )
+
+    def _record_state_press_tally(self, snapshot, timestamp):
+        if not self.book_active or self.recording_state_manager is None:
+            return False
+        state_labels = getattr(
+            self.recording_state_manager,
+            "STATE_PRESS_LABELS",
+            None,
+        )
+        if not isinstance(snapshot, Mapping) or not isinstance(state_labels, Mapping):
+            return False
+        try:
+            normalized = self.logger.write_state_tally(
+                snapshot,
+                state_labels,
+                timestamp,
+            )
+        except (TypeError, ValueError):
+            return False
+        except OSError:
+            logging.getLogger(__name__).exception("Unable to save state press tally")
+            self._set_status("The state tally could not be saved.", error=True)
+            return False
+
+        self._update_state_tally_card(normalized, state_labels, timestamp)
+        self._set_status("State tally updated.")
+        return True
+
+    def _update_state_tally_card(self, counts, state_labels, timestamp):
+        tally_text = "\n".join(
+            f"{state_labels[state_name]}: {counts[state_name]}"
+            for state_name in state_labels
+        )
+        if self.state_tally_card is None:
+            card, card_layout = self._new_card("State Tally", timestamp)
+            body = QtWidgets.QLabel(tally_text)
+            body.setTextFormat(QtCore.Qt.PlainText)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            card_layout.addWidget(body)
+            self.state_tally_card = card
+            self.state_tally_header = card_layout.itemAt(0).widget()
+            self.state_tally_body = body
+            self._append_card(card)
+            return
+
+        self.state_tally_header.setText(
+            f"State Tally  |  {timestamp.strftime('%H:%M:%S')}"
+        )
+        self.state_tally_body.setText(tally_text)
 
     def send_note(self):
         text = self.config.general_notes.strip()

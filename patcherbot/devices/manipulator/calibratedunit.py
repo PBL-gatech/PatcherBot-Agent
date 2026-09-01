@@ -626,7 +626,7 @@ class CalibratedUnit(ManipulatorUnit):
             self.stop()
             self.wait_until_still()
 
-    def move_pipette_random_velocity(self, movement = 100, speed = 200):
+    def move_pipette_random_velocity(self, movement = 500, speed = 200):
         '''
         Moves the pipette randomly in xy plane, method used for testing/calibration/data collection.
         For speeds below 1000 um/s, this uses velocity commands instead of
@@ -690,7 +690,7 @@ class CalibratedUnit(ManipulatorUnit):
             self.info("Finished random pipette movement.")
 
 
-    def move_pipette_random(self, movement=100):
+    def move_pipette_random(self, movement=500):
         '''
         Moves pipette randomly in xyz. This is used for testing find_pipette.
         '''
