@@ -170,7 +170,7 @@ class AdaptiveSlidingModeController:
         )
 
         
-        #currently not updating thetas to debug the presets, they are essentially negligible compared to the k1 and k2 gains
+        #This function can be commented out and it really doesn't change much but then it wouldn't be adaptive
         self._update_adaptive_estimates(
             measured_length_m,
             measured_length_rate_m_per_s,
@@ -196,15 +196,17 @@ class AdaptiveSlidingModeController:
         '''
 
         sign_surface = self._sign(sliding_surface)
-        ugh = 1.005
-        u1 = ugh*(
+        
+        #I think that having additional gains multiplying the thetas and deltas would be a much more effective method of tuning the behavior than the current function for updating the nominal values in line with some physical ideal
+        #Also, the simulated behavior is very sensitive to the exact time step and minute changes in a kind of global gain, multiplying u1 and u2 by some number
+        u1 = (
             -self.k1 * sliding_surface
             - self.theta_hat[0] * measured_length_rate_m_per_s
             - self.theta_hat[1] * measured_length_m
             - self.theta_hat[2] * trajectory_feedforward_m_per_s2
             - self.delta_hat_1 * sign_surface
         )
-        u2 = ugh*(
+        u2 = (
             -self.k2 * sliding_surface
             - self.theta_hat[3] * measured_length_rate_m_per_s
             - self.theta_hat[4] * measured_length_m

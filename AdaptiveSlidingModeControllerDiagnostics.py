@@ -19,10 +19,10 @@ from simple_pid import PID
 
 
 # User-facing simulation controls.
-TIME_STEP_S = 0.2
+TIME_STEP_S = 0.01
 SIMULATION_DURATION_S = 60.0
 BASELINE_RESISTANCE_MOHM = 10.0
-TARGET_RESISTANCE_MOHM = 1000.0
+TARGET_RESISTANCE_MOHM = 1200.0
 
 MODULE_PATH = Path(__file__).parents[0] / "patcherbot" / "deepLearning" / "AdaptiveSlidingModeController.py"
 
@@ -133,13 +133,13 @@ def simulate():
             resistance_mohm=resistances["ASMC"][-1] if resistances["ASMC"] else BASELINE_RESISTANCE_MOHM,
             measurement_window_s=TIME_STEP_S,
         )
-        si_pid.setpoint = desired_length_m
-        di_pressure_pid.setpoint = desired_length_m
-        di_voltage_pid.setpoint = desired_length_m
+        si_pid.setpoint = desired_length_m* 1e9 / model_controller._resistance_to_length_Mohm_to_nm
+        di_pressure_pid.setpoint = desired_length_m* 1e9 / model_controller._resistance_to_length_Mohm_to_nm
+        di_voltage_pid.setpoint = desired_length_m* 1e9 / model_controller._resistance_to_length_Mohm_to_nm
         
-        si_pressure_mbar = si_pid(states["SI-PID"][0], dt=TIME_STEP_S)
-        di_pressure_mbar = di_pressure_pid(states["DI-PID"][0], dt=TIME_STEP_S)
-        di_voltage_v = di_voltage_pid(states["DI-PID"][0], dt=TIME_STEP_S)
+        si_pressure_mbar = si_pid(states["SI-PID"][0]* 1e9 / model_controller._resistance_to_length_Mohm_to_nm, dt=TIME_STEP_S)
+        di_pressure_mbar = di_pressure_pid(states["DI-PID"][0]* 1e9 / model_controller._resistance_to_length_Mohm_to_nm, dt=TIME_STEP_S)
+        di_voltage_v = di_voltage_pid(states["DI-PID"][0]* 1e9 / model_controller._resistance_to_length_Mohm_to_nm, dt=TIME_STEP_S)
 
         commands = {
             "SI-PID": (si_pressure_mbar, 0.0),
