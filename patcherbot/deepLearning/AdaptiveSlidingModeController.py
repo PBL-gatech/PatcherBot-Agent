@@ -13,6 +13,7 @@ implementation detail.
 import copy
 import json
 import math
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,8 +28,15 @@ class SealControlCommand:
     holding_enabled: bool | None = None
 
 
-class AdaptiveSlidingModeController:
-    """Discretized dual-input ASMC using resistance feedback."""
+class AdaptiveSlidingModeControllerBase(ABC):
+    """Abstract base for resistance/length-based ASMC implementations.
+
+    The base class owns the shared parameter loading, model derivation,
+    trajectory bookkeeping, state reset, resistance-to-length conversion,
+    sign and actuator clipping helpers, and the command container contract.
+    A concrete subclass can then define the pressure/voltage control law and
+    adaptive estimator policy that is unique to a particular implementation.
+    """
 
     def __init__(self, target_resistance_mohm, parameters=None, parameter_path=None):
         self.parameters = self._load_parameters(parameters, parameter_path)
@@ -50,8 +58,8 @@ class AdaptiveSlidingModeController:
         self.voltage_min_v = float(controller["voltage_min_v"])
         self.voltage_max_v = float(controller["voltage_max_v"])
         model = self.parameters["model"]
-        self.pipette_radius_um = float(model["pipette_radius_um"]) #formerly converted to meters for SI but once again this does not mix with the paper and thus the tuned constants
-        self.liquid_layer_thickness_nm = float(model["liquid_layer_thickness_nm"]) #formerly converted to meters for SI but once again this does not mix with the paper and thus the tuned constants
+        self.pipette_radius_um = float(model["pipette_radius_um"])
+        self.liquid_layer_thickness_nm = float(model["liquid_layer_thickness_nm"])
         self.seal_media_resistivity_ohm_m = float(model["seal_media_resistivity_ohm_m"])
         self._resistance_to_length_Mohm_to_nm = (
             2.0 * math.pi * self.pipette_radius_um * self.liquid_layer_thickness_nm
@@ -60,35 +68,30 @@ class AdaptiveSlidingModeController:
         self._derive_nominal_model_parameters(model)
         self.reset()
 
+    @staticmethod
+    def _load_parameters(parameters, parameter_path):
+        if parameters is not None:
+            return copy.deepcopy(parameters)
+        path = Path(parameter_path) if parameter_path else Path(__file__).with_name("asmcModel") / "asmc_parameters.json"
+        with path.open("r", encoding="utf-8") as parameter_file:
+            return json.load(parameter_file)
+
     def _derive_nominal_model_parameters(self, model):
         """Calculate a,b,c,d from the physical model in the paper."""
         epsilon_0 = 8.854e-12
         epsilon_r = float(model["relative_permittivity"])
-        mass_g = float(model["membrane_mass_g"]) #in the paper they used mass in grams, no need to convert to kg but it was in previous version of code
+        mass_g = float(model["membrane_mass_g"])
         elastic_n_per_m = float(model["elastic_coefficient_n_per_m"])
         viscous_kg_per_s = float(model["viscous_coefficient_kg_per_s"])
         adhesion_n_per_m2 = float(model["adhesion_friction_n_per_m2"])
 
-        #the following were all converted to V and the last converted nm -> m, this is all counter to the paper and has thus been deconverted
         membrane_potential_mv = float(model["membrane_surface_potential_mv"])
         pipette_potential_mv = float(model["pipette_surface_potential_mv"])
         potential_gradient_mv_per_nm = float(model["surface_potential_gradient_mv_per_nm"])
 
-        '''
-        length of aspirated membrane in meters, speed of that in meters per second, pressure in mbar, voltage in mV
-        '''
-        #grams to kg conversion to get final units in 1/s
-        self.model_a = -viscous_kg_per_s / (mass_g * 1e-3) 
-
-        #there is a conversion factor of 1e-6 because you can't mix meters and micrometers without accounting for that
-        #there is also a conversion factor of 1e-3 because the mass is in grams and the force is in newtons, so you have to convert to kg to get s^-2*m^-1 as final units
+        self.model_a = -viscous_kg_per_s / (mass_g * 1e-3)
         self.model_b = -(adhesion_n_per_m2 * 2.0 * math.pi * self.pipette_radius_um * 1e-6 + elastic_n_per_m) / (mass_g * 1e-3)
-
-        #conversion factors for mass to kg and pipette radius to meters, final units in m^2/kg
         self.model_c = math.pi * self.pipette_radius_um ** 2 * 1e-12 / (mass_g * 1e-3)
-
-        #conversion factors for um->m, g->kg, mV->V, nm->m
-        #final units in C/m*kg = A*s/m*kg
         self.model_d = (
             2.0 * math.pi * self.pipette_radius_um * 1e-6 * epsilon_0 * epsilon_r / (mass_g * 1e-3)
             * ((membrane_potential_mv - pipette_potential_mv) / self.liquid_layer_thickness_nm
@@ -102,14 +105,6 @@ class AdaptiveSlidingModeController:
             self.model_b / (2.0 * self.model_d),
             1.0 / (2.0 * self.model_d),
         ]
-
-    @staticmethod
-    def _load_parameters(parameters, parameter_path):
-        if parameters is not None:
-            return copy.deepcopy(parameters)
-        path = Path(parameter_path) if parameter_path else Path(__file__).with_name("asmcModel") / "asmc_parameters.json"
-        with path.open("r", encoding="utf-8") as parameter_file:
-            return json.load(parameter_file)
 
     def reset(self, initial_resistance_mohm=None, initial_pressure_mbar=-5.0, initial_voltage_v=0.0):
         """Reset estimates, trajectory, and actuator state for a seal attempt."""
@@ -128,6 +123,60 @@ class AdaptiveSlidingModeController:
         initial_deltas = self.parameters["controller"].get("initial_disturbance_estimates", [0.0, 0.0])
         self.delta_hat_1, self.delta_hat_2 = (float(value) for value in initial_deltas)
         self.inputs_stopped = False
+
+    @abstractmethod
+    def update(self, resistance_mohm, measurement_window_s):
+        """Advance the model and return bounded pressure/voltage commands."""
+
+    @abstractmethod
+    def _update_trajectory(self, dt_s):
+        """Generate the accelerated-then-constant-rate trajectory in the paper."""
+
+    @abstractmethod
+    def _update_adaptive_estimates(
+        self,
+        measured_length_m,
+        measured_length_rate_m_per_s,
+        measured_length_acceleration_m_per_s2,
+        sliding_surface,
+        measurement_window_s,
+    ):
+        """Update control estimator state for the implementation."""
+
+    @abstractmethod
+    def _remember_measurement(self, resistance, rate, length_rate):
+        """Remember the last measurement for derivative estimation."""
+
+    def resistance_to_length(self, resistance_mohm):
+        """
+        Implement equation (16): L = R * 2*pi*Rp*h / rho.
+        The error in for the control signal was given in terms of length,
+        but we can only measure resistance.
+        """
+        return float(resistance_mohm) * 1e-9 * self._resistance_to_length_Mohm_to_nm
+
+    @staticmethod
+    def _sign(value):
+        if value > 0:
+            return 1.0
+        if value < 0:
+            return -1.0
+        return 0.0
+
+    def _clip_pressure(self, pressure_mbar):
+        return max(self.pressure_min_mbar, min(self.pressure_max_mbar, float(pressure_mbar)))
+
+    def _clip_voltage(self, voltage_v):
+        return max(self.voltage_min_v, min(self.voltage_max_v, float(voltage_v)))
+
+
+class AdaptiveSlidingModeController(AdaptiveSlidingModeControllerBase):
+    """Concrete dual-input ASMC using the current resistance/length control law.
+
+    This class preserves the existing logic in the repository: it uses the
+    paper's trajectory, the dual-input control surface, and the adaptive
+    estimate-update law encoded by the current `asmc_parameters.json` gains.
+    """
 
     def update(self, resistance_mohm, measurement_window_s):
         """Advance (S1)-(S4) and return bounded pressure/voltage commands.
@@ -169,8 +218,6 @@ class AdaptiveSlidingModeController:
             - self.desired_length_acceleration_m_per_s2
         )
 
-        
-        #This function can be commented out and it really doesn't change much but then it wouldn't be adaptive
         self._update_adaptive_estimates(
             measured_length_m,
             measured_length_rate_m_per_s,
@@ -178,27 +225,8 @@ class AdaptiveSlidingModeController:
             sliding_surface,
             measurement_window_s,
         )
-        
-
-        '''
-        This is clearly a check to see if it reached the gigaseal
-        There is a universal gigaseal check for all the methods in the gigaseal function
-        I have commented this out for the time being as I think it is extraneous
-        if resistance_mohm >= self.target_resistance_mohm:
-            self.inputs_stopped = True
-            self._remember_measurement(resistance_mohm, measured_rate_mohm_per_s, measured_length_rate_m_per_s)
-            return SealControlCommand(
-                pressure_mbar=None,
-                holding_voltage_v=0.0,
-                atmospheric=True,
-                holding_enabled=False,
-            )
-        '''
 
         sign_surface = self._sign(sliding_surface)
-        
-        #I think that having additional gains multiplying the thetas and deltas would be a much more effective method of tuning the behavior than the current function for updating the nominal values in line with some physical ideal
-        #Also, the simulated behavior is very sensitive to the exact time step and minute changes in a kind of global gain, multiplying u1 and u2 by some number
         u1 = (
             -self.k1 * sliding_surface
             - self.theta_hat[0] * measured_length_rate_m_per_s
@@ -214,11 +242,8 @@ class AdaptiveSlidingModeController:
             - self.delta_hat_2 * sign_surface
         )
 
-        #this clipping thing, are u1 and u2 setting the pressure and voltage directly or are they meant to be addative?
-        #i might be misremembering, but I think there was a previous version of this code that had them incremint rather that absolute
-        #also check if the units are right on voltage, right now its defintely volts but there seems to be some confusion if this code base wants mV or V
-        self.current_pressure_mbar = self._clip_pressure(-0.01 * u1) #0.01 multiple converts from Pascals to mbar, the agent wanted to work in SI units even though all tunable constants are arbitrary
-        self.current_voltage_v = self._clip_voltage(-u2)  #converting from mV to V for compatibility with other patcherbot commands
+        self.current_pressure_mbar = self._clip_pressure(-0.01 * u1)
+        self.current_voltage_v = self._clip_voltage(-u2)
         self._remember_measurement(resistance_mohm, measured_rate_mohm_per_s, measured_length_rate_m_per_s)
         return SealControlCommand(
             pressure_mbar=self.current_pressure_mbar,
@@ -257,8 +282,8 @@ class AdaptiveSlidingModeController:
     ):
         """
         Update control gains from equation S4.
-        Agent made a mistake here, parsing the equations is hard becuase the dots are not clearly over a particular variable in the supplement
-        I used my best judgement to figure out what derivative is being taken and have the corresponding variable in place
+        Agent made a mistake here, parsing the equations is hard because the dots are not clearly over a particular variable in the supplement.
+        I used my best judgement to figure out what derivative is being taken and have the corresponding variable in place.
         """
         regressors = (
             measured_length_rate_m_per_s,
@@ -287,32 +312,3 @@ class AdaptiveSlidingModeController:
         self.previous_resistance_mohm = resistance
         self.previous_rate_mohm_per_s = rate
         self.previous_length_rate_m_per_s = length_rate
-
-    def resistance_to_length(self, resistance_mohm):
-        """
-        Implement equation (16): L = R * 2*pi*Rp*h / rho.
-        The error in for the control signal was given in terms of length
-        But we can only measure resistance
-        They have it as a linear multiple of aspirated membrane length, which I (Dom) am skeptical of
-        But it is pretty core to their theory and this function saves a lot of conversion elsewhere if we did it just based on resistance
-
-        Additional note, formerly there was a conversion factor of 10e6 but I have changed to 10e9 because I think that that is the proper converion factor to get to meters
-        They mix units of length all over the place so I might be getting confused, but I think the LLM that did this was the confused one
-        """
-        return float(resistance_mohm) * 1e-9 * self._resistance_to_length_Mohm_to_nm
-
-    @staticmethod
-    def _sign(value):
-        if value > 0:
-            return 1.0
-        if value < 0:
-            return -1.0
-        return 0.0
-
-    #TODO: ask Ben if these limits should be taken from some global config or if they can be in the amsc_parameters file
-    #related to that, how should I be structuring that file, idk if it should be rolled in with something else
-    def _clip_pressure(self, pressure_mbar):
-        return max(self.pressure_min_mbar, min(self.pressure_max_mbar, float(pressure_mbar)))
-
-    def _clip_voltage(self, voltage_v):
-        return max(self.voltage_min_v, min(self.voltage_max_v, float(voltage_v)))
