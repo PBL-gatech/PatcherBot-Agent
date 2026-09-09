@@ -1,5 +1,7 @@
 # patch_gui.py
 import faulthandler
+
+from patcherbot.utils import FileLogger
 faulthandler.enable()
 # faulthandler.dump_traceback_later(5)
 
@@ -23,6 +25,8 @@ from patcherbot.gui.patch import PatchGui
 from rig_setup.rig_config import RigConfigError, RigConfigManager
 from rig_setup.rig_selector import RigSelectorDialog
 from patcherbot.devices.camera.FakeCalCamera import FakeCalCamera
+from patcherbot.utils.CameraRecordingSession import CameraRecordingSession
+from patcherbot.utils.GraphRecorder import GraphRecorder
 
 setup_logging()  # Log to the standard console as well
 
@@ -117,6 +121,24 @@ def main():
 
     recording_state_manager = RecordingStateManager()
 
+    rig_recorder = FileLogger(
+        recording_state_manager,
+        folder_path="experiments/Data/rig_recorder_data/",
+        recorder_filename="rig_recording",
+    )
+
+    movement_recorder = FileLogger(
+        recording_state_manager,
+        folder_path="experiments/Data/rig_recorder_data/",
+        recorder_filename="movement_recording",
+    )
+
+    camera_recording_session = CameraRecordingSession(
+        recording_state_manager=recording_state_manager,
+        main_camera=camera,
+        pipette_cameras=pipette_camera,
+    )
+
     calibration_data = config_data.get("calibration") if isinstance(config_data, dict) else None
     patch_data = config_data.get("patch") if isinstance(config_data, dict) else None
     protocol_data = config_data.get("protocol") if isinstance(config_data, dict) else None
@@ -128,6 +150,7 @@ def main():
         pipette_controllers = {}
         graph_interface = {}
         protocol_graphs = {}
+
         for i, id in enumerate(unit.keys()):
 
             curr_amplifier = list(amplifier.values())[i]
@@ -148,7 +171,22 @@ def main():
             graph_interface[id] = GraphInterface(curr_amplifier, curr_daq, curr_pressure, recording_state_manager, laser)
 
             protocol_graphs[id] = create_protocol_graphs(graph_interface[id], recording_state_manager)
+
+            # graph_recorders[id] = FileLogger(
+            #     recording_state_manager,
+            #     folder_path="experiments/Data/rig_recorder_data/",
+            #     recorder_filename=f"graph_recording_{id}",
+            # )
+
+        graph_recorder = GraphRecorder(
+                        recording_state_manager,
+                        pipette_ids=graph_interface.keys(),
+                    )
     else:
+        graph_recorder = GraphRecorder(
+            recording_state_manager,
+            pipette_ids=["pipette_0"],
+        )
         pipette_controllers = PipetteInterface(
             stage, microscope, camera, unit, cellSorterManip, cellSorterController,
             calibration_data=calibration_data,
@@ -164,15 +202,23 @@ def main():
 
         protocol_graphs = create_protocol_graphs(graph_interface, recording_state_manager)
 
-    gui = PatchGui(camera, pipette_camera, pipette_controllers, patch_controllers, recording_state_manager)
-    graphs = EPhysGUI(graph_interface, recording_state_manager)
+        graph_recorder = GraphRecorder(
+            recording_state_manager,
+            pipette_ids=["pipette_0"]
+        )
+
+    gui = PatchGui(camera, pipette_camera, pipette_controllers, patch_controllers, recording_state_manager, camera_recording_session, movement_recorder, rig_recorder, graph_recorder)
+    graphs = EPhysGUI(graph_interface, recording_state_manager, graph_recorder)
     # graphs.location_on_the_screen()
     graphs.show()
 
 
     gui.initialize()
     gui.show()
-    ret = app.exec_()
+    try:
+        ret = app.exec_()
+    finally:
+        graph_recorder.close()
     sys.exit(ret)
 
 if __name__ == "__main__":

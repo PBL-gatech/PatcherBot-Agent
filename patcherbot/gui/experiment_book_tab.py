@@ -11,12 +11,12 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from patcherbot.utils.experiment_book import ExperimentBookLogger
 
+class ExperimentBookSession(QtCore.QObject):
+    """Shared state and behavior for one Experiment Book session."""
 
-class ExperimentBookTab(QtWidgets.QWidget):
-    """Experiment detail form with an append-only chat-style timeline."""
-
-    THUMBNAIL_SIZE = QtCore.QSize(160, 120)
-    config_value_changed_signal = QtCore.pyqtSignal(str, object)
+    event_added = QtCore.pyqtSignal(object)
+    status_changed = QtCore.pyqtSignal(str, bool)
+    active_changed = QtCore.pyqtSignal(bool)
 
     def __init__(
         self,
@@ -26,19 +26,254 @@ class ExperimentBookTab(QtWidgets.QWidget):
         session_time=None,
         parent=None,
     ):
-        super().__init__(parent=parent)
+        super().__init__(parent)
+
         self.config = config
         self.logger = logger if logger is not None else ExperimentBookLogger(
             folder_path=storage_root,
             session_time=session_time,
         )
+
         self.book_active = False
         self.active_details = None
+        self.timeline_events = []
+
+    def save_details(self):
+        details = {
+            "experiment_name": str(self.config.experiment_name).strip(),
+            "strain_culture": str(self.config.strain_culture).strip(),
+            "gender": str(self.config.gender).strip(),
+            "age": str(self.config.age).strip(),
+        }
+
+        if not details["experiment_name"]:
+            self.status_changed.emit(
+                "Experiment name is required.",
+                True,
+            )
+            return False
+
+        timestamp = datetime.now().astimezone()
+
+        try:
+            normalized = self.logger.write_details(
+                details,
+                timestamp,
+            )
+        except OSError:
+            logging.getLogger(__name__).exception(
+                "Unable to save experiment details"
+            )
+            self.status_changed.emit(
+                "Experiment details could not be saved.",
+                True,
+            )
+            return False
+
+        self.active_details = normalized
+
+        if not self.book_active:
+            self.book_active = True
+            self.active_changed.emit(True)
+
+        detail_text = "\n".join([
+            f"Experiment name: {normalized['experiment_name']}",
+            f"Strain/Culture: {normalized['strain_culture']}",
+            f"Gender: {normalized['gender']}",
+            f"Age: {normalized['age']}",
+        ])
+
+        self._add_event({
+            "type": "text",
+            "entry_type": "Details",
+            "text": detail_text,
+            "timestamp": timestamp,
+        })
+
+        self.status_changed.emit(
+            "Experiment details saved.",
+            False,
+        )
+
+        return True
+
+    def send_note(self):
+        text = self.config.general_notes.strip()
+
+        if not self.book_active:
+            self.status_changed.emit(
+                "Save experiment details before adding notes.",
+                True,
+            )
+            return False
+
+        if not text:
+            self.status_changed.emit(
+                "Enter a note before sending.",
+                True,
+            )
+            return False
+
+        timestamp = datetime.now().astimezone()
+
+        try:
+            cleaned = self.logger.write_note(
+                text,
+                timestamp,
+            )
+        except OSError:
+            logging.getLogger(__name__).exception(
+                "Unable to save experiment note"
+            )
+            self.status_changed.emit(
+                "The note could not be saved.",
+                True,
+            )
+            return False
+
+        self._add_event({
+            "type": "text",
+            "entry_type": "Note",
+            "text": cleaned,
+            "timestamp": timestamp,
+        })
+
+        # Shared config update automatically clears every view.
+        self.config.general_notes = ""
+
+        self.status_changed.emit(
+            "Note saved.",
+            False,
+        )
+
+        return True
+
+    @QtCore.pyqtSlot(object)
+    def handle_snapshot(self, payload):
+        if not self.book_active:
+            return False
+
+        if not isinstance(payload, Mapping):
+            return False
+
+        image_path = payload.get("image_path")
+        camera_role = payload.get("camera_role")
+        frame = payload.get("frame")
+        frame_number = payload.get("frame_number")
+        captured_at = payload.get("captured_at")
+        camera_id = payload.get("camera_id")
+
+        if (
+            not image_path
+            or camera_role not in ("main", "pipette")
+            or frame is None
+            or frame_number is None
+            or not isinstance(captured_at, datetime)
+        ):
+            return False
+
+        try:
+            self.logger.write_snapshot(
+                image_path,
+                camera_role,
+                captured_at,
+            )
+            
+            display_camera = (
+                camera_id
+                if camera_id is not None
+                else camera_role
+            )
+
+            self._add_snapshot_card(
+                frame,
+                display_camera,
+                captured_at,
+            )
+        except OSError:
+            logging.getLogger(__name__).exception(
+                "Unable to log experiment snapshot"
+            )
+            self.status_changed.emit(
+                "The snapshot could not be added to the experiment log.",
+                True,
+            )
+            return False
+
+        self._add_event({
+            "type": "snapshot",
+            "frame": frame,
+            "image_path": image_path,
+            "camera_role": camera_role,
+            "frame_number": frame_number,
+            "timestamp": captured_at,
+        })
+
+        self.status_changed.emit(
+            "Snapshot added to the experiment timeline.",
+            False,
+        )
+
+        return True
+
+    def _add_event(self, event):
+        self.timeline_events.append(event)
+        self.event_added.emit(event)
+
+class ExperimentBookTab(QtWidgets.QWidget):
+    """Experiment detail form with an append-only chat-style timeline."""
+
+    THUMBNAIL_SIZE = QtCore.QSize(160, 120)
+    config_value_changed_signal = QtCore.pyqtSignal(str, object)
+
+    def __init__(
+        self,
+        session,
+        parent=None,
+    ):
+        super().__init__(parent=parent)
+
+        self.session = session
+        self.config = session.config
+
+        # Widgets themselves still belong to this individual view.
         self.timeline_cards = []
 
         self._build_ui()
-        self.config._value_changed = self._config_value_changed
-        self.config_value_changed_signal.connect(self._display_config_value)
+
+        self.config_value_changed_signal.connect(
+            self._display_config_value
+        )
+
+        for param_name in (
+            "experiment_name",
+            "strain_culture",
+            "gender",
+            "age",
+            "general_notes",
+        ):
+            self.config.param.watch(
+                self._config_param_changed,
+                param_name,
+            )
+
+        self.session.event_added.connect(
+            self._display_event
+        )
+        self.session.status_changed.connect(
+            self._set_status
+        )
+        self.session.active_changed.connect(
+            self.send_button.setEnabled
+        )
+
+        self.send_button.setEnabled(
+            self.session.book_active
+        )
+
+        # Allows a newly-created view to catch up to the current book.
+        for event in self.session.timeline_events:
+            self._display_event(event)
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -112,59 +347,10 @@ class ExperimentBookTab(QtWidgets.QWidget):
         layout.addWidget(notes_group)
 
     def save_details(self):
-        details = {
-            name: str(getattr(self.config, name)).strip()
-            for name in self.detail_edits
-        }
-        if not details["experiment_name"]:
-            self._set_status("Experiment name is required.", error=True)
-            return False
-        for name, value in details.items():
-            if getattr(self.config, name) != value:
-                setattr(self.config, name, value)
-
-        timestamp = datetime.now().astimezone()
-        try:
-            normalized = self.logger.write_details(details, timestamp)
-        except OSError:
-            logging.getLogger(__name__).exception("Unable to save experiment details")
-            self._set_status("Experiment details could not be saved.", error=True)
-            return False
-
-        self.active_details = normalized
-        self.book_active = True
-        self.send_button.setEnabled(True)
-        detail_text = "\n".join([
-            f"Experiment name: {normalized['experiment_name']}",
-            f"Strain/Culture: {normalized['strain_culture']}",
-            f"Gender: {normalized['gender']}",
-            f"Age: {normalized['age']}",
-        ])
-        self._add_text_card("Details", detail_text, timestamp)
-        self._set_status("Experiment details saved.")
-        return True
+        return self.session.save_details()
 
     def send_note(self):
-        text = self.config.general_notes.strip()
-        if not self.book_active:
-            self._set_status("Save experiment details before adding notes.", error=True)
-            return False
-        if not text:
-            self._set_status("Enter a note before sending.", error=True)
-            return False
-
-        timestamp = datetime.now().astimezone()
-        try:
-            cleaned = self.logger.write_note(text, timestamp)
-        except OSError:
-            logging.getLogger(__name__).exception("Unable to save experiment note")
-            self._set_status("The note could not be saved.", error=True)
-            return False
-
-        self._add_text_card("Note", cleaned, timestamp)
-        self.config.general_notes = ""
-        self._set_status("Note saved.")
-        return True
+        return self.session.send_note()
 
     def _set_config_value(self, name, value):
         if getattr(self.config, name) != value:
@@ -173,8 +359,11 @@ class ExperimentBookTab(QtWidgets.QWidget):
     def _notes_changed(self):
         self._set_config_value("general_notes", self.notes_edit.toPlainText())
 
-    def _config_value_changed(self, name, value):
-        self.config_value_changed_signal.emit(name, value)
+    def _config_param_changed(self, event):
+        self.config_value_changed_signal.emit(
+            event.name,
+            event.new,
+        )
 
     @QtCore.pyqtSlot(str, object)
     def _display_config_value(self, name, value):
@@ -286,6 +475,30 @@ class ExperimentBookTab(QtWidgets.QWidget):
         color = "#b00020" if error else "#2e7d32"
         self.status_label.setStyleSheet(f"color: {color};")
 
+    def _config_param_changed(self, event):
+        self.config_value_changed_signal.emit(
+            event.name,
+            event.new,
+        )
+
+    @QtCore.pyqtSlot(object)
+    def _display_event(self, event):
+        event_type = event.get("type")
+
+        if event_type == "text":
+            self._add_text_card(
+                event["entry_type"],
+                event["text"],
+                event["timestamp"],
+            )
+
+        elif event_type == "snapshot":
+            self._add_snapshot_card(
+                event["frame"],
+                event["camera_role"],
+                event["timestamp"],
+            )
+
     @classmethod
     def _frame_to_pixmap(cls, frame):
         array = np.asarray(frame)
@@ -339,3 +552,4 @@ class ExperimentBookTab(QtWidgets.QWidget):
                 (numeric[finite] - minimum) / (maximum - minimum) * 255.0
             )
         return normalized.astype(np.uint8)
+

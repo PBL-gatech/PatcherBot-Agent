@@ -90,7 +90,7 @@ class PipetteCalHelper():
         self.microscope: Microscope = microscope
         self.camera = camera
         self.config = config
-        device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
+        device = os.getenv("PIPETTE_DETECTOR_DEVICE")
         model_name = getattr(self.config, "pipette_detector_model", None) if self.config is not None else None
         model_path = _resolve_model_path(model_name)
         try:

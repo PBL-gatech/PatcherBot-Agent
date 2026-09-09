@@ -706,6 +706,9 @@ class CalibratedUnit(ManipulatorUnit):
         Moves the pipette randomly in xy plane, method used for testing/calibration/data collection.
         For speeds below 1000 um/s, this uses velocity commands instead of
         relative moves to avoid firmware speed clamping.
+
+        Args:
+            movement (float, optional): Movement magnitude.
         '''
         orig = self.get_max_speed()
         self.info(f"Moving pipette randomly for testing/calibration, original speed is: {orig} um/s")

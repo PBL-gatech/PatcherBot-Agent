@@ -71,6 +71,7 @@ class DAQAcquisitionThread(threading.Thread):
         self._last_data_queue = collections.deque(maxlen=1)
         self._fail_streak = 0           # consecutive bad-fit counter
         self._fail_limit  = 3           # restart after 3 misses
+        self._acquisition_id = 0
 
     def run(self):
         """
@@ -117,14 +118,20 @@ class DAQAcquisitionThread(threading.Thread):
                     self._fail_streak = 0     # reset on success
 
                 # ---------- enqueue for GUI / callback ---------------------
+                self._acquisition_id += 1
+                acquisition_timestamp = time.time()
                 packet = {
-                    "timeData":            t_r,
-                    "respData":            respData,
-                    "readData":            readData,
-                    "totalResistance":     totalR,
-                    "membraneResistance":  memR,
-                    "accessResistance":    accR,
-                    "membraneCapacitance": memC
+                    "acquisition_id": self._acquisition_id,
+                    "timestamp": acquisition_timestamp,
+
+                    "timeData": t_r,
+                    "respData": respData,
+                    "readData": readData,
+
+                    "totalResistance": totalR,
+                    "membraneResistance": memR,
+                    "accessResistance": accR,
+                    "membraneCapacitance": memC,
                 }
                 self._last_data_queue.append(packet)
 

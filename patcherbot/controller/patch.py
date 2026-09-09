@@ -3,7 +3,7 @@ import csv
 from enum import Enum
 import numpy as np
 from patcherbot.devices.amplifier.amplifier import Amplifier
-from patcherbot.devices.amplifier.DAQ import DAQ, FakeDAQ
+from patcherbot.devices.amplifier.DAQ import DAQ, FakeDAQ, NiDAQ
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.pressurecontroller import PressureController

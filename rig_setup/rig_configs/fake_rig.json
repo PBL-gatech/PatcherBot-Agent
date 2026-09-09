@@ -100,7 +100,7 @@
           ]
         }
       },
-       {
+      {
         "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
         "params": {
           "max": [

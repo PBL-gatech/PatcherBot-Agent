@@ -45,18 +45,6 @@ RESPONSE_COL = 1
 
 
 def detect_separator(path: Path) -> str:
-<<<<<<< HEAD
-    """
-    Detect the column separator used in a text or CSV file.
-
-    Args:
-        path (Path): Path to the file to inspect.
-
-    Returns:
-        str: Detected separator: ',' for comma, '\\t' for tab, or 'whitespace' if neither.
-    """
-=======
->>>>>>> origin/big_update
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
             stripped = line.strip()
@@ -71,20 +59,6 @@ def detect_separator(path: Path) -> str:
 
 
 def resolve_downsample(path: Path, requested: Optional[int]) -> int:
-<<<<<<< HEAD
-    """
-    Determine a suitable downsampling factor for a file based on size or a requested value.
-
-    Args:
-        path (Path): Path to the file whose size is checked.
-        requested (Optional[int]): User-requested downsampling factor. If provided, it is used
-            and clamped to at least 1.
-
-    Returns:
-        int: Downsampling factor (>=1), automatically scaling for files larger than ~100 MB.
-    """
-=======
->>>>>>> origin/big_update
     if requested is not None:
         return max(1, int(requested))
 
@@ -100,22 +74,6 @@ def apply_bessel_filter(
     cutoff_hz: float,
     order: int,
 ) -> np.ndarray:
-<<<<<<< HEAD
-    """
-    Apply a low-pass Bessel filter to a time-series signal.
-
-    Args:
-        time_s (np.ndarray): 1D array of timestamps (seconds).
-        signal (np.ndarray): 1D array of signal values to filter.
-        cutoff_hz (float): Cutoff frequency in Hz.
-        order (int): Filter order.
-
-    Returns:
-        np.ndarray: Filtered signal. If conditions are invalid (too short, bad sampling), returns
-            the original signal unmodified.
-    """
-=======
->>>>>>> origin/big_update
     if signal.size < order * 3:
         return signal
 
@@ -147,29 +105,6 @@ def load_wavelength_trace(
     downsample: int,
     chunk_rows: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-<<<<<<< HEAD
-    """
-    Load time, command, and response traces from a wavelength CSV file.
-
-    The file is read in chunks to handle large files, non-numeric rows are ignored, and the
-    data can be downsampled. Column separator is auto-detected.
-
-    Args:
-        path (Path): Path to the CSV/wavelength data file.
-        downsample (int): Factor by which to subsample the data (e.g., 2 keeps every other row).
-        chunk_rows (int): Number of rows to read per chunk (memory-efficient processing).
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray]: Concatenated arrays of
-            - time_s: timestamps
-            - command: command values
-            - response: response values
-
-    Raises:
-        ValueError: If no numeric data could be found in the file.
-    """
-=======
->>>>>>> origin/big_update
     sep = detect_separator(path)
     read_kwargs = {
         "header": None,
@@ -209,23 +144,6 @@ def load_wavelength_trace(
 def load_stim_windows(
     path: Path, active_state: str
 ) -> List[Tuple[float, float, str, Optional[float]]]:
-<<<<<<< HEAD
-    """
-    Load stimulation windows from a CSV and filter by active state.
-
-    Args:
-        path (Path): Path to the CSV file containing stimulation windows.
-        active_state (str): The state to keep (e.g., "on", "active"). Comparison is case-insensitive.
-
-    Returns:
-        List[Tuple[float, float, str, Optional[float]]]: Each tuple contains:
-            - start time (s)
-            - end time (s)
-            - wavelength name (str)
-            - optional power (% or None)
-    """
-=======
->>>>>>> origin/big_update
     df = pd.read_csv(path)
     if df.empty:
         return []
@@ -271,18 +189,6 @@ def load_stim_windows(
 
 
 def wavelength_color(name: str) -> str:
-<<<<<<< HEAD
-    """
-    Map a wavelength name to a hex color code for plotting.
-
-    Args:
-        name (str): Wavelength or light type name (e.g., "UV", "red").
-
-    Returns:
-        str: Hex color code as a string.
-    """
-=======
->>>>>>> origin/big_update
     name = name.lower()
     if "uv" in name or "ultraviolet" in name:
         return "#9467bd"
@@ -300,18 +206,6 @@ def wavelength_color(name: str) -> str:
 
 
 def is_data_csv(path: Path) -> bool:
-<<<<<<< HEAD
-    """
-    Determine if a file is a valid data CSV (excluding stimulation CSVs).
-
-    Args:
-        path (Path): File path to check.
-
-    Returns:
-        bool: True if the file matches the data CSV naming convention, False otherwise.
-    """
-=======
->>>>>>> origin/big_update
     name = path.name.lower()
     return (
         name.endswith(".csv")
@@ -321,37 +215,11 @@ def is_data_csv(path: Path) -> bool:
 
 
 def sanitize_filename(name: str) -> str:
-<<<<<<< HEAD
-    """
-    Clean a string to produce a safe filename.
-
-    Args:
-        name (str): Input string to sanitize.
-
-    Returns:
-        str: Sanitized filename containing only letters, digits, underscores, or hyphens.
-             Leading/trailing underscores are removed. Defaults to 'protocol' if empty.
-    """
-=======
->>>>>>> origin/big_update
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip())
     return cleaned.strip("_") or "protocol"
 
 
 def wavelength_sort_key(name: str) -> int:
-<<<<<<< HEAD
-    """
-    Compute a sort key for a wavelength name based on a predefined color order.
-
-    Args:
-        name (str): Wavelength or light type name.
-
-    Returns:
-        int: Index indicating order. Lower index = higher priority. Names not in the order
-             receive a value after all known colors.
-    """
-=======
->>>>>>> origin/big_update
     name = name.lower()
     for idx, tokens in enumerate(COLOR_ORDER):
         if any(token in name for token in tokens):
@@ -372,33 +240,6 @@ def segment_trace(
     cutoff_hz: float,
     order: int,
 ) -> List[Segment]:
-<<<<<<< HEAD
-    """
-    Segment a voltage/current trace around stimulation windows and baseline-correct each segment.
-
-    Args:
-        path (Path): Path to the source CSV file.
-        time_s (np.ndarray): Time points in seconds.
-        command_v (np.ndarray): Command voltage trace.
-        response_a (np.ndarray): Response current trace.
-        stim_windows (List[Tuple[float, float, str, Optional[float]]]): Each stimulation window as
-            (start_s, end_s, wavelength, optional power).
-        apply_filter (bool): Whether to apply a Bessel low-pass filter.
-        cutoff_hz (float): Filter cutoff frequency in Hz.
-        order (int): Filter order.
-
-    Returns:
-        List[Segment]: Each segment contains:
-            - file path
-            - time relative to stimulus start
-            - baseline-corrected command voltage
-            - baseline-corrected response current
-            - stimulus duration
-            - wavelength name
-            - optional power (%)
-    """
-=======
->>>>>>> origin/big_update
     segments: List[Segment] = []
     for start, end, wavelength, power in stim_windows:
         window_start = start - PRE_STIM_S
@@ -446,24 +287,6 @@ def gather_trace_pairs(
     order: int,
     order_by_color: bool,
 ) -> List[Tuple[Path, List[Segment]]]:
-<<<<<<< HEAD
-    """
-    Load and segment all data CSVs in a folder, returning trace segments sorted by wavelength or power.
-
-    Args:
-        folder (Path): Folder containing data CSVs and corresponding `_stim.csv` files.
-        apply_filter (bool): Whether to apply a Bessel filter to each segment.
-        cutoff_hz (float): Filter cutoff frequency in Hz.
-        order (int): Filter order.
-        order_by_color (bool): If True, sort segments by wavelength color order; otherwise, by power if available.
-
-    Returns:
-        List[Tuple[Path, List[Segment]]]: Each tuple contains:
-            - data file path
-            - list of segmented traces from that file
-    """
-=======
->>>>>>> origin/big_update
     data_files = sorted(path for path in folder.glob("*.csv") if is_data_csv(path))
     if not data_files:
         raise FileNotFoundError(f"No data CSV files found in {folder}")
@@ -516,23 +339,6 @@ def plot_opto(
     traces: List[Segment],
     title: Optional[str],
 ) -> Tuple[plt.Figure, plt.Axes]:
-<<<<<<< HEAD
-    """
-    Plot optogenetic stimulation traces with command and response signals in separate subplots.
-
-    Args:
-        traces (List[Segment]): List of segmented traces as returned by `segment_trace`.
-        title (Optional[str]): Optional figure title.
-
-    Returns:
-        Tuple[plt.Figure, plt.Axes]: Matplotlib figure and the first axes object 
-            (left-side command subplot) for further customization.
-    
-    Raises:
-        ValueError: If `traces` is empty.
-    """
-=======
->>>>>>> origin/big_update
     if not traces:
         raise ValueError("No traces to plot.")
 
@@ -598,36 +404,11 @@ def plot_opto(
 
 
 def find_protocol_folders(root: Path) -> List[Path]:
-<<<<<<< HEAD
-    """
-    Recursively find all folders containing optogenetic data CSVs.
-
-    Args:
-        root (Path): Root directory to search.
-
-    Returns:
-        List[Path]: Sorted list of folders containing data CSV files.
-    """
-=======
->>>>>>> origin/big_update
     folders = {path.parent for path in root.rglob("*.csv") if is_data_csv(path)}
     return sorted(folders)
 
 
 def save_figure(fig: plt.Figure, output_path: Path) -> None:
-<<<<<<< HEAD
-    """
-    Save a matplotlib figure to a WEBP file.
-
-    Args:
-        fig (plt.Figure): Figure to save.
-        output_path (Path): Target file path (suffix will be replaced with '.webp').
-
-    Raises:
-        RuntimeError: If saving fails (e.g., Pillow not installed or unsupported format).
-    """
-=======
->>>>>>> origin/big_update
     output_path = output_path.with_suffix(".webp")
     try:
         fig.savefig(output_path, dpi=300, bbox_inches="tight", format="webp")
@@ -645,19 +426,6 @@ def process_folder(
     order: int,
     order_by_color: bool,
 ) -> None:
-<<<<<<< HEAD
-    """
-    Process a folder of optogenetic CSVs: segment traces, plot each trace, and save figures.
-
-    Args:
-        folder (Path): Folder containing data CSVs.
-        apply_filter (bool): Whether to apply Bessel filtering to traces.
-        cutoff_hz (float): Low-pass filter cutoff frequency (Hz).
-        order (int): Bessel filter order.
-        order_by_color (bool): Whether to sort traces by wavelength color.
-    """
-=======
->>>>>>> origin/big_update
     trace_pairs = gather_trace_pairs(
         folder, apply_filter, cutoff_hz, order, order_by_color
     )
@@ -682,23 +450,6 @@ def main(
     order: int,
     order_by_color: bool,
 ) -> None:
-<<<<<<< HEAD
-    """
-    Main entry point: process all subfolders with optogenetic protocol CSVs.
-
-    Args:
-        folder (Path): Root folder to search for protocol folders.
-        apply_filter (bool): Apply Bessel filter to traces if True.
-        cutoff_hz (float): Filter cutoff frequency (Hz).
-        order (int): Filter order.
-        order_by_color (bool): Sort traces by wavelength color if True.
-
-    Raises:
-        NotADirectoryError: If `folder` is not a valid directory.
-        FileNotFoundError: If no protocol CSVs are found in any subfolder.
-    """
-=======
->>>>>>> origin/big_update
     if not folder.is_dir():
         raise NotADirectoryError(f"{folder} is not a folder.")
 

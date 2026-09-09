@@ -658,20 +658,46 @@ class NoiseGraph(QWidget):
             self.fftPlot.plot(freqs, fft_magnitude, pen="k")
 
 class EPhysGUI(QWidget):
-    def __init__(self, ephys_interfaces, recording_state_manager):
+    def __init__(self, ephys_interfaces, recording_state_manager, graph_recorder):
         super().__init__()
         self.setWindowTitle("Electrophysiology")
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
         self.ephys_interfaces = ephys_interfaces
+        self.graph_recorder = graph_recorder
+        if self.graph_recorder is None:
+            raise ValueError(
+                "EPhysGraph requires a graph recorder."
+            )
         self.tabs = QTabWidget()
         if isinstance(ephys_interfaces, dict):
             for id, interface in ephys_interfaces.items():
-                ephys_graph = EPhysGraph(interface, recording_state_manager)
-                self.tabs.addTab(ephys_graph, f"{id}")
+
+                ephys_graph = EPhysGraph(
+                    interface,
+                    recording_state_manager,
+                    graph_recorder,
+                    id
+                )
+
+                self.tabs.addTab(
+                    ephys_graph,
+                    f"{id}",
+                )
+
         else:
-            ephys_graph = EPhysGraph(ephys_interfaces, recording_state_manager)
-            self.tabs.addTab(ephys_graph, "Pipette")
+            ephys_graph = EPhysGraph(
+                ephys_interfaces,
+                recording_state_manager,
+                graph_recorder,
+                "pipette_0"
+            )
+
+            self.tabs.addTab(
+                ephys_graph,
+                "Pipette",
+            )
+
         self.layout.addWidget(self.tabs)
         self.show()
         self.raise_()
@@ -694,7 +720,7 @@ class EPhysGraph(QWidget):
         "infrared": ("Infrared", "#000000"),
     }
 
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager, graph_recorder, pipette_id):
         """
         Initialize the electrophysiology GUI.
         
@@ -706,6 +732,20 @@ class EPhysGraph(QWidget):
         self.setWindowTitle("Electrophysiology")
         self.recording_state_manager = recording_state_manager
         self.graph_interface = graph_interface  # ONLY import GraphInterface!
+
+        self.recording_state_manager = (
+            recording_state_manager
+        )
+
+        self.graph_interface = graph_interface
+
+        if graph_recorder is None:
+            raise ValueError(
+                "EPhysGraph requires a shared graph_recorder"
+            )
+
+        self.graph_recorder = graph_recorder
+        self.pipette_id = str(pipette_id)
 
         # Initialize plots.
         self.cmdPlot = PlotWidget()
@@ -862,13 +902,6 @@ class EPhysGraph(QWidget):
         self.lastReadData = None
         self.lastrespData = None
 
-        # Recorder for saving data.
-        self.recorder = FileLogger(
-            recording_state_manager,
-            folder_path="experiments/Data/rig_recorder_data/",
-            recorder_filename="graph_recording"
-        )
-
         # cellMode type switch
         self.modelType.clicked.connect(self.toggleModeType)
 
@@ -949,23 +982,72 @@ class EPhysGraph(QWidget):
                 self.membraneResistanceLabel.setText(f"Membrane Resistance: {membraneResistance:.2f} MΩ")
             if membraneCapacitance is not None:
                 self.membraneCapacitanceLabel.setText(f"Membrane Capacitance: {membraneCapacitance:.2f} pF")
+
+            self._record_latest_graph_sample()
             
             # --- Cell Mode ---
             self.updateModeType()
 
 
             # --- Data Recording ---
+            import json
             if self.recording_state_manager.is_recording_enabled():
                 timestamp = datetime.now().timestamp()
                 currentPressure = pressure if pressure is not None else 0
+
                 try:
-                    self.recorder.write_graph_data(
-                        timestamp,
-                        currentPressure,
-                        totalResistance,
-                        list(self.lastrespData) if self.lastrespData is not None else [],
-                        list(self.lastReadData) if self.lastReadData is not None else []
+                    current_value = (
+                        float(np.mean(self.lastrespData))
+                        if self.lastrespData is not None
+                        and len(self.lastrespData) > 0
+                        else None
                     )
+
+                    voltage_value = (
+                        float(np.mean(self.lastReadData))
+                        if self.lastReadData is not None
+                        and len(self.lastReadData) > 0
+                        else None
+                    )
+
+                    daq = getattr(
+                        self.graph_interface,
+                        "daq",
+                        None,
+                    )
+
+                    if daq is not None:
+                        packet = daq.get_last_acquisition()
+                    else:
+                        packet = None
+
+                    if packet:
+                        self.graph_recorder.record_sample(
+                            pipette_id=self.pipette_id,
+
+                            timestamp=packet.get(
+                                "timestamp",
+                                time.time(),
+                            ),
+
+                            acquisition_id=packet.get(
+                                "acquisition_id"
+                            ),
+
+                            pressure=pressure,
+
+                            resistance=packet.get(
+                                "totalResistance"
+                            ),
+
+                            current=packet.get(
+                                "respData"
+                            ),
+
+                            voltage=packet.get(
+                                "readData"
+                            ),
+                        )
                 except Exception as e:
                     logging.error(f"Error writing graph data: {e}")
 
@@ -1194,3 +1276,68 @@ class EPhysGraph(QWidget):
     def handle_laser_toggle(self):
         self.graph_interface.toggle_laser_output()
         self.update_laser_controls()
+
+    def _record_latest_graph_sample(self):
+        """
+        Record the newest DAQ acquisition exactly once.
+
+        The GUI timer may process the same acquisition multiple times,
+        so GraphRecorder deduplicates using acquisition_id.
+        """
+
+        if not (
+            self.recording_state_manager
+            .is_recording_enabled()
+        ):
+            return
+
+        daq = getattr(
+            self.graph_interface,
+            "daq",
+            None,
+        )
+
+        if daq is None:
+            return
+
+        packet = daq.get_last_acquisition()
+
+        if not packet:
+            return
+
+        acquisition_id = packet.get(
+            "acquisition_id"
+        )
+
+        timestamp = packet.get(
+            "timestamp"
+        )
+
+        if timestamp is None:
+            timestamp = time.time()
+
+        pressure = (
+            self.graph_interface
+            .get_last_pressure()
+        )
+
+        self.graph_recorder.record_sample(
+            pipette_id=self.pipette_id,
+
+            timestamp=timestamp,
+            acquisition_id=acquisition_id,
+
+            pressure=pressure,
+
+            resistance=packet.get(
+                "totalResistance"
+            ),
+
+            current=packet.get(
+                "respData"
+            ),
+
+            voltage=packet.get(
+                "readData"
+            ),
+        )

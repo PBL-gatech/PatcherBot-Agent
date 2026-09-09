@@ -13,8 +13,10 @@ from PyQt5.QtWidgets import QFileDialog, QTabWidget, QWidget,QMessageBox
 import qtawesome as qta
 
 from patcherbot.controller import TaskController
-from patcherbot.gui.experiment_book_tab import ExperimentBookTab
+from patcherbot.gui.camera import ConfigGui
+from patcherbot.gui.experiment_book_tab import ExperimentBookSession, ExperimentBookTab
 from patcherbot.gui.manipulator import ManipulatorGui
+from patcherbot.interface.experimentBookConfig import ExperimentBookConfig
 from patcherbot.interface.patch import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
@@ -165,7 +167,7 @@ class PatchGui(ManipulatorGui):
     and configurable controls for manual and automated patching tasks.
     """
 
-    def __init__(self, camera, aux_camera, pipette_interfaces, patch_interfaces, recording_state_manager: RecordingStateManager, with_tracking=False):
+    def __init__(self, camera, pipette_cameras, pipette_interfaces, patch_interfaces, recording_state_manager: RecordingStateManager, camera_recording_session=None, rig_recorder=None, movement_recorder=None, graph_recorder=None, with_tracking=False):
         """
         Initialize the patch GUI.
 
@@ -177,7 +179,7 @@ class PatchGui(ManipulatorGui):
             recording_state_manager (RecordingStateManager): Manager for recording state and sessions.
             with_tracking (bool, optional): Whether to enable tracking features. Defaults to False.
         """
-        super(PatchGui, self).__init__(camera, aux_camera, pipette_interfaces, with_tracking=with_tracking, recording_state_manager=recording_state_manager)
+        super(PatchGui, self).__init__(camera, pipette_cameras, pipette_interfaces, with_tracking=with_tracking, recording_state_manager=recording_state_manager)
 
         self.setWindowTitle("Patch GUI")
         self.resize(1200, 1000)
@@ -189,6 +191,8 @@ class PatchGui(ManipulatorGui):
             self.pipette_interfaces = pipette_interfaces
             self.patch_interfaces = patch_interfaces
         self.recording_state_manager = recording_state_manager
+        self.camera_recording_sessiong = camera_recording_session
+        self.graph_recorder = graph_recorder
 
         self._cell_list_signature = None
         self.cell_list_window = CellListWindow(self)
@@ -223,14 +227,52 @@ class PatchGui(ManipulatorGui):
         self.patch_toolbar.addWidget(self.switch_manipulator_box)
         # self.status_bar.insertPermanentWidget(1, self.switch_manipulator_box)
 
-        self.classic_tabs = []
+        self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
+        self.experiment_book_session = ExperimentBookSession(self.experiment_book_config)
+        self.snapshot_captured.connect(self.experiment_book_session.handle_snapshot)
+
+        self.config_tabs = QtWidgets.QTabWidget()
+        self.config_tabs.setTabBar(
+            NoWheelTabBar(self.config_tabs)
+        )
+
+        self.classic_tab = PipetteStackTab()
+        self.calibration_tab = PipetteStackTab()
+        self.patch_config_tab = PipetteStackTab()
+        self.protocol_tab = PipetteStackTab()
+
+        self.classic_tabs = {}
+        self.calibration_guis = {}
+        self.patch_config_guis = {}
+        self.protocol_guis = {}
+
+        # Experiment book is currently a shared session, so only
+        # construct one GUI for it.
+        self.experiment_book_tab = ExperimentBookTab(
+            self.experiment_book_session
+        )
+
         self._unique_patch_signals = {}
 
-        for id, curr_pipette_interface in self.pipette_interfaces.items():
-            widget = QtWidgets.QTabWidget()
-            self.config_tabs[id] = widget
-            curr_config_tab = self.config_tabs[id]
+        self.rig_recorder = rig_recorder
+        if movement_recorder is None:
+            raise ValueError(
+                "PatchGui requires a shared movement_recorder"
+            )
 
+        self.movement_recorder = movement_recorder
+
+        self.shared_rig_controls = SharedRigControls(
+            pipette_interfaces=self.pipette_interfaces,
+            patch_interfaces=self.patch_interfaces,
+            start_task=self.start_task,
+            interface_signals=self.interface_signals,
+            recording_state_manager=self.recording_state_manager,
+            movement_recorder=self.movement_recorder,
+            graph_recorder=self.graph_recorder,
+        )
+
+        for id, curr_pipette_interface in self.pipette_interfaces.items():
             curr_patch_interface = self.patch_interfaces[id]
 
             self.switch_manipulator_box.addItem(f"{id}")
@@ -240,21 +282,114 @@ class PatchGui(ManipulatorGui):
             self._unique_patch_signals[id] = signals
             self.interface_signals[curr_patch_interface] = (signals.command, signals.reset)
 
-            self.add_config_gui(curr_pipette_interface.calibration_config, curr_config_tab)
-            self.add_config_gui(curr_patch_interface.config, curr_config_tab)
-            self.add_config_gui(curr_patch_interface.protocol_config, curr_config_tab)
-            self.add_config_gui(curr_patch_interface.experiment_book_config, curr_config_tab)
-            # self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
             logging.debug("Added config GUI.")
-            classic_patching_tab = ClassicPatchButtons(curr_patch_interface, curr_pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
-            self.classic_tabs.append(classic_patching_tab)
-            self.add_tab(classic_patching_tab, 'Classic Auto Patching', curr_config_tab, index = 0)
-        
-        self.current_tab = list(self.config_tabs.values())[0]
 
-        self.config_scroll_area = QtWidgets.QScrollArea() # Made it 'self.' just in case you need to access it later
+            classic_gui = ClassicPatchButtons(
+                curr_patch_interface,
+                curr_pipette_interface,
+                self.start_task,
+                self.interface_signals,
+                self.recording_state_manager,
+                self.movement_recorder,
+                self.shared_rig_controls,
+            )
+
+            self.classic_tabs[id] = classic_gui
+
+            self.classic_tab.add_pipette_widget(
+                id,
+                classic_gui,
+            )
+
+            calibration_gui = ConfigGui(
+                curr_pipette_interface.calibration_config
+            )
+
+            self.calibration_guis[id] = calibration_gui
+
+            self.calibration_tab.add_pipette_widget(
+                id,
+                calibration_gui,
+            )
+
+            patch_config_gui = ConfigGui(
+                curr_patch_interface.config
+            )
+
+            self.patch_config_guis[id] = patch_config_gui
+
+            self.patch_config_tab.add_pipette_widget(
+                id,
+                patch_config_gui,
+            )
+
+            protocol_gui = ConfigGui(
+                curr_patch_interface.protocol_config
+            )
+
+            self.protocol_guis[id] = protocol_gui
+
+            self.protocol_tab.add_pipette_widget(
+                id,
+                protocol_gui,
+            )
+
+        self.config_tabs.addTab(
+            self.classic_tab,
+            "Classic Patching",
+        )
+
+        self.config_tabs.addTab(
+            self.calibration_tab,
+            "Calibration",
+        )
+
+        self.config_tabs.addTab(
+            self.patch_config_tab,
+            "Patch Config",
+        )
+
+        self.config_tabs.addTab(
+            self.protocol_tab,
+            "Protocols",
+        )
+
+        self.config_tabs.addTab(
+            self.experiment_book_tab,
+            "Experiment Book",
+        )
+
+        self.current_tab = self.config_tabs
+
+        # Container that remains constant when pipettes switch.
+        self.config_panel = QtWidgets.QWidget()
+
+        config_panel_layout = QtWidgets.QVBoxLayout(
+            self.config_panel
+        )
+
+        config_panel_layout.setContentsMargins(
+            0, 0, 0, 0
+        )
+
+        # Always-visible shared rig controls.
+        config_panel_layout.addWidget(
+            self.shared_rig_controls
+        )
+
+        # Existing per-pipette tab sets temporarily live here.
+        config_panel_layout.addWidget(
+            self.config_tabs,
+            1,
+        )
+
+        self.config_scroll_area = QtWidgets.QScrollArea()
         self.config_scroll_area.setWidgetResizable(True)
-        self.config_scroll_area.setWidget(self.current_tab)
+
+        self.config_scroll_area.setWidget(
+            self.config_panel
+        )
+
         self.config_scroll_area.setMinimumWidth(100) 
         
         self.splitter.addWidget(self.config_scroll_area)
@@ -263,12 +398,13 @@ class PatchGui(ManipulatorGui):
         self.splitter.setStretchFactor(1, 0)
 
         self.switch_manipulator_box.currentTextChanged.connect(self.switch_active_pipette)
+        self.switch_manipulator_box.currentIndexChanged.connect(self.set_active_pipette_camera_index)
 
         self.active_patch_interface = list(self.patch_interfaces.values())[0] if isinstance(patch_interfaces, dict) else patch_interfaces
 
         self.main_toolbar_default_style = self.main_toolbar.styleSheet()
         self.patch_toolbar_default_style = self.patch_toolbar.styleSheet()
-        self.config_tab_default_style = list(self.config_tabs.values())[0].styleSheet()
+        # self.config_tab_default_style = list(self.config_tabs.values())[0].styleSheet()
         self.cell_list_window_default_style = self.cell_list_window.styleSheet()
         self.pipette_status_window_default_style = self.pipette_status_window.styleSheet()
 
@@ -283,9 +419,9 @@ class PatchGui(ManipulatorGui):
         # self.register_mouse_action(Qt.LeftButton, Qt.ShiftModifier,
         #                            self.active_patch_interface.patch_with_move)
         self.register_mouse_action(Qt.LeftButton, Qt.NoModifier,
-                                   self.patch_interface.add_cell)
+                                   self.active_patch_interface.add_cell)
         self.register_mouse_action(Qt.RightButton, Qt.ShiftModifier,
-                                   self.patch_interface.handle_corner_right_click)
+                                   self.active_patch_interface.handle_corner_right_click)
         self.register_key_action(Qt.Key_B, None,
                                  self.active_patch_interface.break_in)
         self.register_key_action(Qt.Key_F2, None,
@@ -381,66 +517,121 @@ class PatchGui(ManipulatorGui):
         """
         Toggle the dark mode for the GUI.
         """
-        if not self.dark_mode:
-            self.apply_theme("dark")
-            self.dark_mode = True
-            for config_tab in list(self.config_tabs.values()):
-                    for i in range(config_tab.count()):
-                        curr_tab = config_tab.widget(i)
+        self.dark_mode = not self.dark_mode
 
-                        for box in curr_tab.findChildren(CollapsibleGroupBox):
-                            if hasattr(box, 'dark_style_sheet'):
-                                box.setStyleSheet(box.dark_style_sheet)
-                        if hasattr(curr_tab, "save_button"):
-                            curr_tab.save_button.setIcon(qta.icon('fa.download', color='white'))
-                            curr_tab.load_button.setIcon(qta.icon('fa.upload', color='white'))
+        theme = "dark" if self.dark_mode else "light"
+        icon_color = "white" if self.dark_mode else "black"
 
-            self.task_progress.setStyleSheet("""
+        self.apply_theme(theme)
+
+        for box in self.findChildren(CollapsibleGroupBox):
+
+            if self.dark_mode:
+                if hasattr(box, "dark_style_sheet"):
+                    box.setStyleSheet(
+                        box.dark_style_sheet
+                    )
+
+            else:
+                if hasattr(box, "default_style_sheet"):
+                    box.setStyleSheet(
+                        box.default_style_sheet
+                    )
+
+        for config_gui in self.config_tabs.findChildren(ConfigGui):
+
+            if hasattr(config_gui, "save_button"):
+                config_gui.save_button.setIcon(
+                    qta.icon(
+                        "fa.download",
+                        color=icon_color,
+                    )
+                )
+
+            if hasattr(config_gui, "load_button"):
+                config_gui.load_button.setIcon(
+                    qta.icon(
+                        "fa.upload",
+                        color=icon_color,
+                    )
+                )
+
+        if self.dark_mode:
+            self.task_progress.setStyleSheet(
+                """
                 QProgressBar {
                     background-color: #121212;
-                    border: 1px solid #444444; 
+                    border: 1px solid #444444;
                     border-radius: 3px;
                     text-align: center;
-                    color: white;       
+                    color: white;
                 }
+
                 QProgressBar::chunk {
                     background-color: #0078D7;
                     border-radius: 2px;
                 }
-            """)
+                """
+            )
 
-            self.task_abort_button.setIcon(qta.icon('fa.ban', color='white'))
-            self.task_success_button.setIcon(qta.icon('fa.check', color='white'))
-            self.help_button.setIcon(qta.icon('fa.question-circle', color='white'))
-            self.log_button.setIcon(qta.icon('fa.file', color='white'))
-            self.record_button.setIcon(qta.icon('fa.video-camera', color='white'))
-            self.snap_image_button.setIcon(qta.icon('fa.camera', color='white'))
-            self.config_button.setIcon(qta.icon('fa.cogs', color='white'))
-            
         else:
-            self.apply_theme("light")
-            self.dark_mode = False
-            
-            for config_tab in list(self.config_tabs.values()):
-                                for i in range(config_tab.count()):
-                                    curr_tab = config_tab.widget(i)
-            
-                                    for box in curr_tab.findChildren(CollapsibleGroupBox):
-                                        if hasattr(box, 'default_style_sheet'):
-                                            box.setStyleSheet(box.default_style_sheet)
-                                    if hasattr(curr_tab, "save_button"):
-                                        curr_tab.save_button.setIcon(qta.icon('fa.download', color='black'))
-                                        curr_tab.load_button.setIcon(qta.icon('fa.upload', color='black'))
-
             self.task_progress.setStyleSheet("")
 
-            self.task_abort_button.setIcon(qta.icon('fa.ban', color='black'))
-            self.task_success_button.setIcon(qta.icon('fa.check', color='black'))
-            self.help_button.setIcon(qta.icon('fa.question-circle', color='black'))
-            self.log_button.setIcon(qta.icon('fa.file', color='black'))
-            self.record_button.setIcon(qta.icon('fa.video-camera', color='black'))
-            self.snap_image_button.setIcon(qta.icon('fa.camera', color='black'))
-            self.config_button.setIcon(qta.icon('fa.cogs', color='black'))
+        self.task_abort_button.setIcon(
+            qta.icon(
+                "fa.ban",
+                color=icon_color,
+            )
+        )
+
+        self.task_success_button.setIcon(
+            qta.icon(
+                "fa.check",
+                color=icon_color,
+            )
+        )
+
+        self.help_button.setIcon(
+            qta.icon(
+                "fa.question-circle",
+                color=icon_color,
+            )
+        )
+
+        self.log_button.setIcon(
+            qta.icon(
+                "fa.file",
+                color=icon_color,
+            )
+        )
+
+        self.snap_image_button.setIcon(
+            qta.icon(
+                "fa.camera",
+                color=icon_color,
+            )
+        )
+
+        self.config_button.setIcon(
+            qta.icon(
+                "fa.cogs",
+                color=icon_color,
+            )
+        )
+
+        if (
+            hasattr(self, "shared_rig_controls")
+            and hasattr(
+                self.shared_rig_controls,
+                "record_button",
+            )
+        ):
+            self.shared_rig_controls.record_button.setIcon(
+                qta.icon(
+                    "fa.video-camera",
+                    color=icon_color,
+                )
+            )
 
     def apply_theme(self, theme: str):
         qdarktheme.setup_theme(
@@ -452,25 +643,25 @@ class PatchGui(ManipulatorGui):
 
     def switch_active_pipette(self, id):
         """
-        Switch the currently active pipette
+        Switch the globally active pipette.
 
-        Args:
-            pipette (PipetteInterface): The pipette to switch to.
+        Shared rig controls are unaffected.
         """
-        self.active_pipette = self.pipette_interfaces[id]
-        self.active_patch_interface = self.patch_interfaces[id]
+        if id not in self.pipette_interfaces:
+            return
+
+        self.active_pipette = (
+            self.pipette_interfaces[id]
+        )
+
+        self.active_patch_interface = (
+            self.patch_interfaces[id]
+        )
 
         self.key_actions.clear()
         self.mouse_actions.clear()
+
         self.register_commands()
-
-        old_tab = self.config_scroll_area.takeWidget()
-        if old_tab is not None:
-            old_tab.hide()
-
-        self.current_tab = self.config_tabs[id]
-        self.config_scroll_area.setWidget(self.current_tab)
-        self.current_tab.show()
 
     def complete_task(self):
         """Overrides parent method to target the active patch interface."""
@@ -684,6 +875,128 @@ class CollapsibleGroupBox(QtWidgets.QGroupBox):
         else:
             self.dark_mode = False
             self.setStyleSheet(self.dark_style_sheet)
+
+class PipetteStackTab(QtWidgets.QWidget):
+    """
+    Displays one pipette-specific widget at a time.
+
+    Each pipette widget is constructed once and stored in a
+    QStackedWidget. The selector only changes visibility.
+    """
+
+    pipette_changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.widgets = {}
+        self.index_by_id = {}
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # -------------------------
+        # Pipette selector
+        # -------------------------
+
+        selector_layout = QtWidgets.QHBoxLayout()
+
+        selector_layout.addWidget(
+            QtWidgets.QLabel("Pipette:")
+        )
+
+        self.selector = NoWheelComboBox()
+
+        selector_layout.addWidget(
+            self.selector
+        )
+
+        selector_layout.addStretch()
+
+        layout.addLayout(
+            selector_layout
+        )
+
+        # -------------------------
+        # Pipette-specific contents
+        # -------------------------
+
+        self.stack = QtWidgets.QStackedWidget()
+
+        layout.addWidget(
+            self.stack,
+            1,
+        )
+
+        self.selector.currentIndexChanged.connect(
+            self._selection_changed
+        )
+
+    def add_pipette_widget(
+        self,
+        pipette_id,
+        widget,
+    ):
+        pipette_id = str(pipette_id)
+
+        if pipette_id in self.widgets:
+            raise ValueError(
+                f"Duplicate pipette ID: {pipette_id}"
+            )
+
+        index = self.stack.addWidget(widget)
+
+        self.widgets[pipette_id] = widget
+        self.index_by_id[pipette_id] = index
+
+        self.selector.addItem(
+            pipette_id,
+            pipette_id,
+        )
+
+        if len(self.widgets) == 1:
+            self.stack.setCurrentIndex(index)
+
+    def _selection_changed(self, selector_index):
+        pipette_id = self.selector.itemData(
+            selector_index
+        )
+
+        if pipette_id is None:
+            return
+
+        pipette_id = str(pipette_id)
+
+        stack_index = self.index_by_id.get(
+            pipette_id
+        )
+
+        if stack_index is None:
+            return
+
+        self.stack.setCurrentIndex(
+            stack_index
+        )
+
+        self.pipette_changed.emit(
+            pipette_id
+        )
+
+    def set_pipette(self, pipette_id):
+        pipette_id = str(pipette_id)
+
+        index = self.selector.findData(
+            pipette_id
+        )
+
+        if index < 0:
+            return False
+
+        self.selector.setCurrentIndex(index)
+        return True
+
+    def current_pipette_id(self):
+        return self.selector.currentData()
 
 
 class PipetteStatusWindow(QtWidgets.QWidget):
@@ -1018,7 +1331,7 @@ class ButtonTabWidget(QtWidgets.QWidget):
         """Dummy function for buttons that are not yet implemented."""
         pass  # a dummy function for buttons that aren't implemented yet
     
-    def run_sequential_commands(self, cmds, button=None, section=None, button_name=None):
+    def run_sequential_commands(self, cmds, button=None, section=None, button_name=None, repeat=1):
         """
         Executes a list of commands sequentially, handling both synchronous and asynchronous commands.
 
@@ -1288,7 +1601,7 @@ class ButtonTabWidget(QtWidgets.QWidget):
         self.pos_update_timers.append(pos_timer)
 
     def addButtonList(self, box_name: str, layout: QtWidgets.QVBoxLayout, buttonNames: list[list[str]], 
-                    cmds, sequential=False, change_color_on_complete=False, 
+                    cmds, freq=None, sequential=False, change_color_on_complete=False, 
                     completion_color="rgba(0, 0, 255, 0.3)",
                     change_color_during=None):
         """
@@ -1328,7 +1641,7 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 button = QtWidgets.QPushButton(button_name)
                 button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
                 button.setMinimumWidth(50)
-                button.setMinimumHeight(50)
+                button.setMinimumHeight(30)
 
                 button_freq = 1
                 if freq is not None and i < len(freq) and j < len(freq[i]):
@@ -1408,7 +1721,7 @@ class ClassicPatchButtons(ButtonTabWidget):
     GUI widget that provides grouped controls for calibration, movement,
     testing, lighting, patching, and recording in an automated patch-clamp system.
     """
-    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager):
+    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager, movement_recorder, shared_rig_controls):
         """
         Initializes the ClassicPatchButtons GUI and sets up all control sections.
 
@@ -1429,29 +1742,19 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         self.recording_state_manager = recording_state_manager
 
+        self.shared_rig_controls = shared_rig_controls
+
         layout = QtWidgets.QVBoxLayout()
         layout.setAlignment(Qt.AlignTop)
 
-        self.stage_xy = [0, 0]
-        self.stage_z = 0
         self.pipette_xyz = [0, 0, 0]
         self.tare_pipette_pos = [0, 0, 0]
-
-        self.currx_stage_pos = [0, 0, 0]
-        self.curry_stage_pos = [0, 0, 0]
-        self.currz_stage_pos = [0, 0, 0]
 
         self.file_selector = FileSelector()
 
 
-        self.recorder = FileLogger(self.recording_state_manager, folder_path="experiments/Data/rig_recorder_data/", recorder_filename="movement_recording")
+        self.recorder = movement_recorder
 
-        self.positionAndTareBox(
-            'stage position (um)',
-            layout,
-            self.update_stage_pos_labels,
-            tare_funcs=[self.tare_stage_x, self.tare_stage_y, self.tare_stage_z]
-        )
         self.addPositionBox(
             'pipette position (um)',
             layout,
@@ -1459,48 +1762,121 @@ class ClassicPatchButtons(ButtonTabWidget):
             tare_func=self.tare_pipette
         )
 
-        self.stage_calibration = [
-            self.pipette_interface.set_floor,
-            self.pipette_interface.calibrate_stage,
-            lambda: self.pipette_interface.move_microscope(
-                float(self.pipette_interface.calibrated_unit.config.home_position_delta_um)
-            ),
-        ]
         self.pipette_calibration = [self.pipette_interface.calibrate_manipulator, self.patch_interface.store_calibration_positions, self.patch_interface.move_to_safe_space]
         self.pipette_calibration_no_move = [self.pipette_interface.calibrate_manipulator, self.patch_interface.store_calibration_positions]
         self.pipette_cleaning_calibration = [self.patch_interface.store_cleaning_position,self.patch_interface.move_pipette_up,self.patch_interface.move_to_safe_space]
 
 
-        # Add a box for calibration setup
-        buttonList = [['Calibrate Stage','Calibrate Pipette'],['Store Cleaning Position','Clear Calibration']]
-        # buttonList = [['Calibrate Stage','Calibrate Pipette'],['Store Cleaning Position'],['Load Calibration','Clear Calibration']]
-        cmds = [[self.stage_calibration, self.pipette_calibration],
-                # [self.patch_interface.store_home_position, self.patch_interface.store_safe_position],
-                [[self.pipette_cleaning_calibration],[self.load_calibration, self.patch_interface.clear_positions]]
-        ]
-        self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
-                        change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)")
-
-        # Add a box for movement commands 
         buttonList = [
-            ['Move to Safe Position','Move to Home Position'],
-            ['Move to cell plane','Focus Stage'],
-            ['Store corners', 'Start Scan'],
-            ['Move group up', 'Move group down'],
-            ['Center Pipette','Clean pipette','Focus Pipette'],
+            ["Calibrate Pipette"],
+            [
+                "Store Cleaning Position",
+                "Clear Calibration",
+            ],
         ]
-        cmds = [
-            [self.patch_interface.move_to_safe_space, self.patch_interface.move_to_home_space],
 
-            [self.pipette_interface.go_to_floor,self.pipette_interface.focus_stage],
+        cmds = [
+            [
+                self.pipette_calibration,
+            ],
+            [
+                [
+                    self.pipette_cleaning_calibration
+                ],
+                [
+                    self.load_calibration,
+                    self.patch_interface.clear_positions,
+                ],
+            ],
+        ]
+
+        self.addButtonList(
+            "Pipette Calibration",
+            layout,
+            buttonList,
+            cmds,
+            sequential=True,
+            change_color_on_complete=True,
+            completion_color="rgba(173, 216, 230, 0.5)",
+        )
+
+        # --------------------------------------------------
+        # Coordinated Rig Movement
+        #
+        # Selected pipette matters, but these actions may
+        # also move or depend on the shared stage.
+        # --------------------------------------------------
+
+        buttonList = [
+            [
+                "Move to Safe Position",
+                "Move to Home Position",
+            ],
+            [
+                "Store Corners",
+                "Start Scan",
+            ],
+            [
+                "Move Group Up",
+                "Move Group Down",
+            ],
+        ]
+
+        cmds = [
+            [
+                self.patch_interface.move_to_safe_space,
+                self.patch_interface.move_to_home_space,
+            ],
             [
                 self.patch_interface.start_selecting_corners,
-                [[self.patch_interface.move_to_scan_start, self.start_recording, self.patch_interface.start_scan, self.stop_recording]],
+                [[
+                    self.patch_interface.move_to_scan_start,
+                    self.shared_rig_controls.start_recording,
+                    self.patch_interface.start_scan,
+                    self.shared_rig_controls.stop_recording,
+                ]],
             ],
-            [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
-            [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
+            [
+                self.patch_interface.move_group_up,
+                self.patch_interface.move_group_down,
+            ],
         ]
-        self.addButtonList('movement', layout, buttonList, cmds, sequential=True)
+
+        self.addButtonList(
+            "Coordinated Rig Movement",
+            layout,
+            buttonList,
+            cmds,
+            sequential=True,
+        )
+
+        # --------------------------------------------------
+        # Pipette-only movement
+        # --------------------------------------------------
+
+        buttonList = [
+            [
+                "Center Pipette",
+                "Clean Pipette",
+                "Focus Pipette",
+            ],
+        ]
+
+        cmds = [
+            [
+                self.pipette_interface.center_pipette,
+                self.patch_interface.clean_pipette,
+                self.pipette_interface.focus_pipette,
+            ],
+        ]
+
+        self.addButtonList(
+            "Pipette Movement",
+            layout,
+            buttonList,
+            cmds,
+            sequential=True,
+        )
 
         # Find Pipette path
         self.pipette_location = [self.pipette_interface.center_pipette,self.pipette_interface.focus_pipette,self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
@@ -1508,14 +1884,7 @@ class ClassicPatchButtons(ButtonTabWidget):
         buttonList = [['Find Pipette','Test Pipette Movement']]
         cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity]]
         freq = [[1, 3]]
-        self.addButtonList('testing', layout, buttonList, cmds, freq=freq, sequential=True)
-
-        # # Add a box for lamp commands
-        buttonList = [['toggle shutter', 'toggle fluorescense'],['move cube left','move cube right']]
-        cmds = [[ self.patch_interface.toggle_shutter, self.patch_interface.toggle_fluorescence],
-                [self.patch_interface.move_cube_left, self.patch_interface.move_cube_right]
-        ]
-        self.addButtonList('fluorescence', layout, buttonList, cmds, sequential=True)
+        self.addButtonList('Testing', layout, buttonList, cmds, freq=freq, sequential=True)
 
         # Add a box for patching commands
         buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
@@ -1524,13 +1893,13 @@ class ClassicPatchButtons(ButtonTabWidget):
                       ['Patch Cell','Run Protocols']]
         cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell],
                 [self.patch_interface.locate_cell,
-                 [self.start_recording,self.patch_interface.hunt_cell],[self.patch_interface.gigaseal]],
+                 [self.shared_rig_controls.start_recording,self.patch_interface.hunt_cell],[self.patch_interface.gigaseal]],
                 [[ self.patch_interface.break_in],
-                 [self.stop_recording,  self.patch_interface.escape_cell]],
-                [[self.start_recording,  self.patch_interface.patch, self.stop_recording],
-                 [self.stop_recording,  self.patch_interface.run_protocols]]
-]
-        self.addButtonList('patching', layout, buttonList, cmds, sequential=True, change_color_during={
+                 [self.shared_rig_controls.stop_recording,  self.patch_interface.escape_cell]],
+                [[self.shared_rig_controls.start_recording,  self.patch_interface.patch, self.shared_rig_controls.stop_recording],
+                 [self.shared_rig_controls.stop_recording,  self.patch_interface.run_protocols]]
+                ]
+        self.addButtonList('Patching', layout, buttonList, cmds, sequential=True, change_color_during={
             'Locate Cell',
             'Hunt Cell',
             'Gigaseal',
@@ -1538,14 +1907,6 @@ class ClassicPatchButtons(ButtonTabWidget):
             'Escape Cell',
             'Run Protocols',
         })
-
-        # Add a box for Rig Recorder
-        self.record_button = QtWidgets.QPushButton("Start Recording")
-        self.record_button.clicked.connect(self.toggle_recording)
-        self.record_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.record_button.setMinimumWidth(30)
-        self.record_button.setMinimumHeight(30)
-        layout.addWidget(self.record_button)
 
         self.setLayout(layout)
 
@@ -1576,7 +1937,7 @@ class ClassicPatchButtons(ButtonTabWidget):
             self.file_selector.open_file_dialog()
         else:
             # if not recording then start recording
-            self.toggle_recording()
+            self.shared_rig_controls.start_recording()
             # Opens the file selector dialog without blocking the main thread
             self.file_selector.open_file_dialog()
         
@@ -1590,29 +1951,6 @@ class ClassicPatchButtons(ButtonTabWidget):
         logging.info(f"Loading movement file: {file_path}")
         # # send file to the pipette interface
         self.patch_interface.send_movement_file(file_path)
-
-        
-    def toggle_recording(self):
-        """Toggles the recording state on or off."""
-        if self.recording_state_manager.is_recording_enabled():
-            self.stop_recording()
-        else:
-            self.start_recording()
-
-    def start_recording(self):
-        """Enables recording and updates UI state."""
-        self.recording_state_manager.set_recording(True)
-        self.record_button.setText("Stop Recording")
-        self.record_button.setStyleSheet("background-color: red; color: white;border-radius: 5px; padding: 5px;")
-        logging.info("Recording started")
-
-    def stop_recording(self):
-        """Disables recording, finalizes logging, and updates UI state."""
-        self.recording_state_manager.set_recording(False)
-        self.recorder.handle_recording_stopped()
-        self.record_button.setText("Start Recording")
-        self.record_button.setStyleSheet("")
-        logging.info("Recording stopped")
 
     def _update_cell_sorter_led_button_style(self, enabled: bool):
         """
@@ -1672,7 +2010,6 @@ class ClassicPatchButtons(ButtonTabWidget):
 
     def close(self):
         """Closes the widget and releases recorder resources."""
-        self.recorder.close()
         super(ClassicPatchButtons, self).close()
 
     def closeEvent(self, event):
@@ -1682,7 +2019,6 @@ class ClassicPatchButtons(ButtonTabWidget):
         Args:
             event (QCloseEvent): Close event.
         """
-        self.recorder.close()
         super(ClassicPatchButtons, self).closeEvent(event)
 
     def tare_pipette(self):
@@ -1711,12 +2047,12 @@ class ClassicPatchButtons(ButtonTabWidget):
             # logging.info(f"the current time is {timestamp}")
             self.recorder.write_movement_data_batch(
                 timestamp,
-                self.stage_xy[0],
-                self.stage_xy[1],
-                self.stage_z,
+                self.shared_rig_controls.stage_xy[0],
+                self.shared_rig_controls.stage_xy[1],
+                self.shared_rig_controls.stage_z,
                 recPos[0],
                 recPos[1],
-                recPos[2]
+                recPos[2],
             )
 
         self.pipette_xyz = currPos
@@ -1725,34 +2061,6 @@ class ClassicPatchButtons(ButtonTabWidget):
         for i, ind in enumerate(indices):
             label = self.pos_labels[ind]
             label.setText(f'{label.text().split(":")[0]}: {currPos[i]:.2f}')
-
-    def tare_stage_x(self):
-        """Sets the current stage X position as the zero reference."""
-        xPos = self.pipette_interface.calibrated_stage.position(0)
-        self.currx_stage_pos = [xPos, 0, 0]
-        # update pipette controller stage tare at x position as a numpy array
-        self.pipette_interface.tare_stage[0] = xPos
-        print("Tare stage x: ", self.currx_stage_pos)
-        self.pipette_interface.write_tare()
-
-    def tare_stage_y(self):
-        """Sets the current stage Y position as the zero reference."""
-        yPos = self.pipette_interface.calibrated_stage.position(1)
-        self.curry_stage_pos = [0, yPos, 0]
-        # update pipette controller stage tare at y position as a numpy array
-        self.pipette_interface.tare_stage[1] = yPos
-        print("Tare stage y: ", self.curry_stage_pos)
-        self.pipette_interface.write_tare()
-
-    def tare_stage_z(self):
-        """Sets the current stage Z position as the zero reference."""
-        zPos = self.pipette_interface.microscope.position()
-        self.currz_stage_pos = [0, 0, zPos]
-        # update pipette controller stage tare at z position as a numpy array
-        z_scale = self.pipette_interface.calibrated_unit.config.microscope_units_per_um
-        self.pipette_interface.tare_stage[2] = zPos / z_scale
-        print("Tare stage z: ", self.currz_stage_pos)
-        self.pipette_interface.write_tare()
 
     def update_stage_pos_labels(self, indices):
         """
@@ -1776,4 +2084,373 @@ class ClassicPatchButtons(ButtonTabWidget):
                 z_scale = self.pipette_interface.calibrated_unit.config.microscope_units_per_um
                 label.setText(f'{label.text().split(":")[0]}: {zPos / z_scale:.2f}')
 
+class SharedRigControls(ButtonTabWidget):
+    """
+    Controls hardware/state shared by the entire rig.
 
+    Owns:
+        - stage position display / stage tare
+        - fluorescence controls
+        - global recording state
+
+    Does not depend on the currently selected pipette.
+    """
+
+    def __init__(
+        self,
+        pipette_interfaces,
+        patch_interfaces,
+        start_task,
+        interface_signals,
+        recording_state_manager,
+        movement_recorder,
+        graph_recorder,
+    ):
+        super().__init__()
+
+        if not isinstance(pipette_interfaces, dict):
+            pipette_interfaces = {
+                "pipette": pipette_interfaces
+            }
+
+        if not isinstance(patch_interfaces, dict):
+            patch_interfaces = {
+                next(iter(pipette_interfaces)): patch_interfaces
+            }
+
+        self.pipette_interfaces = pipette_interfaces
+        self.patch_interfaces = patch_interfaces
+
+        # All PipetteInterfaces reference the same physical stage/microscope.
+        self.stage_interface = next(
+            iter(self.pipette_interfaces.values())
+        )
+
+        # All AutoPatchInterfaces reference the same fluorescence hardware.
+        self.shared_patch_interface = next(
+            iter(self.patch_interfaces.values())
+        )
+
+        self.start_task = start_task
+        self.interface_signals = interface_signals
+
+        self.recording_state_manager = (
+            recording_state_manager
+        )
+        self.movement_recorder = movement_recorder
+        self.graph_recorder = graph_recorder
+
+        self.stage_xy = [0, 0]
+        self.stage_z = 0
+
+        self.currx_stage_pos = [0, 0, 0]
+        self.curry_stage_pos = [0, 0, 0]
+        self.currz_stage_pos = [0, 0, 0]
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.setAlignment(Qt.AlignTop)
+
+        title = QtWidgets.QLabel("Shared Rig Controls")
+        title.setStyleSheet(
+            "font-weight: bold; font-size: 14px;"
+        )
+        layout.addWidget(title)
+
+        # ---------------------------------
+        # Shared stage position
+        # ---------------------------------
+
+        self.positionAndTareBox(
+            "Stage Position (um)",
+            layout,
+            self.update_stage_pos_labels,
+            tare_funcs=[
+                self.tare_stage_x,
+                self.tare_stage_y,
+                self.tare_stage_z,
+            ],
+        )
+
+        # --------------------------------------------------
+        # Shared Stage Actions
+        # --------------------------------------------------
+
+        self.stage_calibration = [
+            self.stage_interface.set_floor,
+            self.stage_interface.calibrate_stage,
+            lambda: self.stage_interface.move_microscope(
+                float(
+                    self.stage_interface
+                    .calibrated_unit
+                    .config
+                    .home_position_delta_um
+                )
+            ),
+        ]
+
+        stage_buttons = [
+            ["Calibrate Stage"],
+            ["Move to Cell Plane", "Focus Stage"],
+        ]
+
+        stage_cmds = [
+            [
+                self.stage_calibration,
+            ],
+            [
+                self.stage_interface.go_to_floor,
+                self.stage_interface.focus_stage,
+            ],
+        ]
+
+        self.addButtonList(
+            "Stage Controls",
+            layout,
+            stage_buttons,
+            stage_cmds,
+            sequential=True,
+            change_color_on_complete=True,
+            completion_color="rgba(173, 216, 230, 0.5)",
+        )
+
+        # ---------------------------------
+        # Shared fluorescence
+        # ---------------------------------
+
+        button_list = [
+            ["Toggle Shutter", "Toggle Fluorescence"],
+            ["Move Cube Left", "Move Cube Right"],
+        ]
+
+        commands = [
+            [
+                self.shared_patch_interface.toggle_shutter,
+                self.shared_patch_interface.toggle_fluorescence,
+            ],
+            [
+                self.shared_patch_interface.move_cube_left,
+                self.shared_patch_interface.move_cube_right,
+            ],
+        ]
+
+        self.addButtonList(
+            "Fluorescence",
+            layout,
+            button_list,
+            commands,
+            sequential=True,
+        )
+
+        # ---------------------------------
+        # Shared recording
+        # ---------------------------------
+
+        self.record_button = QtWidgets.QPushButton(
+            "Start Recording"
+        )
+
+        self.record_button.clicked.connect(
+            self.toggle_recording
+        )
+
+        self.record_button.setMinimumHeight(30)
+
+        layout.addWidget(self.record_button)
+
+        self.setLayout(layout)
+        
+
+    # =========================================================
+    # Recording
+    # =========================================================
+
+    def toggle_recording(self):
+        if self.recording_state_manager.is_recording_enabled():
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        if self.recording_state_manager.is_recording_enabled():
+            return
+
+        self.recording_state_manager.set_recording(True)
+
+        self.record_button.setText(
+            "Stop Recording"
+        )
+
+        self.record_button.setStyleSheet(
+            "background-color: red; "
+            "color: white; "
+            "border-radius: 5px; "
+            "padding: 5px;"
+        )
+
+        logging.info("Recording started")
+
+    def stop_recording(self):
+        if (
+            self.recording_state_manager
+            .is_recording_enabled()
+        ):
+            self.recording_state_manager.set_recording(
+                False
+            )
+
+            if self.graph_recorder is not None:
+                self.graph_recorder.handle_recording_stopped()
+
+            if self.movement_recorder is not None:
+                self.movement_recorder.handle_recording_stopped()
+
+        self.record_button.setText(
+            "Start Recording"
+        )
+
+        self.record_button.setStyleSheet("")
+
+        logging.info(
+            "Recording stopped"
+        )
+
+    # =========================================================
+    # Shared stage position
+    # =========================================================
+
+    def update_stage_pos_labels(self, indices):
+        xy_rec_pos = (
+            self.stage_interface.calibrated_stage.position()
+        )
+
+        z_rec_pos = (
+            self.stage_interface.microscope.position()
+        )
+
+        xy_pos = (
+            xy_rec_pos
+            - self.currx_stage_pos[0:2]
+            - self.curry_stage_pos[0:2]
+        )
+
+        z_pos = (
+            z_rec_pos
+            - self.currz_stage_pos[2]
+        )
+
+        # Raw stage coordinates used by movement logging.
+        self.stage_xy = xy_rec_pos
+        self.stage_z = z_rec_pos
+
+        for i, ind in enumerate(indices):
+            label = self.pos_labels[ind]
+            name = label.text().split(":")[0]
+
+            if i < 2:
+                label.setText(
+                    f"{name}: {xy_pos[i]:.2f}"
+                )
+            else:
+                z_scale = (
+                    self.stage_interface
+                    .calibrated_unit
+                    .config
+                    .microscope_units_per_um
+                )
+
+                label.setText(
+                    f"{name}: {z_pos / z_scale:.2f}"
+                )
+
+    def tare_stage_x(self):
+        x_pos = (
+            self.stage_interface
+            .calibrated_stage
+            .position(0)
+        )
+
+        self.currx_stage_pos = [
+            x_pos,
+            0,
+            0,
+        ]
+
+        self._set_stage_tare_for_all(
+            axis=0,
+            value=x_pos,
+        )
+
+    def tare_stage_y(self):
+        y_pos = (
+            self.stage_interface
+            .calibrated_stage
+            .position(1)
+        )
+
+        self.curry_stage_pos = [
+            0,
+            y_pos,
+            0,
+        ]
+
+        self._set_stage_tare_for_all(
+            axis=1,
+            value=y_pos,
+        )
+
+    def tare_stage_z(self):
+        z_pos = (
+            self.stage_interface
+            .microscope
+            .position()
+        )
+
+        self.currz_stage_pos = [
+            0,
+            0,
+            z_pos,
+        ]
+
+        z_scale = (
+            self.stage_interface
+            .calibrated_unit
+            .config
+            .microscope_units_per_um
+        )
+
+        self._set_stage_tare_for_all(
+            axis=2,
+            value=z_pos / z_scale,
+        )
+
+    def _set_stage_tare_for_all(
+        self,
+        axis,
+        value,
+    ):
+        """
+        Keep every PipetteInterface synchronized with the
+        shared physical stage tare.
+        """
+        for interface in self.pipette_interfaces.values():
+            interface.tare_stage[axis] = value
+            interface.write_tare()
+
+        logging.info(
+            "Shared stage axis %s tared to %s",
+            axis,
+            value,
+        )
+
+class NoWheelComboBox(QtWidgets.QComboBox):
+    """QComboBox that ignores mouse-wheel input."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelTabBar(QtWidgets.QTabBar):
+    """QTabBar that ignores mouse-wheel input."""
+
+    def wheelEvent(self, event):
+        event.ignore()

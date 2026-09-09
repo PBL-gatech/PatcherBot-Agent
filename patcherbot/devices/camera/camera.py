@@ -12,6 +12,7 @@ import time
 import threading
 import imageio
 import logging
+import torch
 from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
 
 import numpy as np
@@ -155,7 +156,11 @@ class Camera(object):
 
         self.Cellseg = None
         self._cellseg_error = None
-        device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
+
+        device = os.getenv(
+            "PIPETTE_DETECTOR_DEVICE",
+            "0" if torch.cuda.is_available() else "cpu"
+        )
         self.pipdetector = PipetteDetectorYOLO1(device=device)
         # testing flag
         

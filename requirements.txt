@@ -24,10 +24,7 @@ pymmcore==11.1.1.71.0
 sensapex==1.400.0
 param==2.2.0
 tqdm>=4.67.0
-<<<<<<< HEAD
 pyqtdarktheme==2.1.0
-=======
->>>>>>> origin/big_update
 
 # Optional:
 # - onnxruntime (CPU) can be used instead of onnxruntime-gpu if you do not have CUDA.

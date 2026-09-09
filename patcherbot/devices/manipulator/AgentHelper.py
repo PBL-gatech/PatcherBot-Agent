@@ -21,7 +21,7 @@ _REPLAY_MODEL_TYPES = {"find_pipette_replay", "hunt_replay"}
 
 class AgentHelper:
     """Helper class for managing agent instantiation, demo data loading, and inference execution."""
-    def __init__(self):
+    def __init__(self, use_ai_features=False):
         """Track the active agent instance and its configuration."""
         self._use_ai_features = bool(use_ai_features)
         self._agent_classes: Optional[Dict[str, Any]] = None

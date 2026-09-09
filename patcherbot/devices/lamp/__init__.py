@@ -6,4 +6,4 @@ except Exception:  # pragma: no cover - optional nidaq dependency
     ExcelitasLamp = None
 from .lamp import Lamp, FakeLamp
 
-__all__ = ['Lumencore', 'OlympusLamp', 'ExcelitasLamp', 'Lamp', 'FakeLamp']
+__all__ = ['OlympusLamp', 'ExcelitasLamp', 'Lamp', 'FakeLamp']

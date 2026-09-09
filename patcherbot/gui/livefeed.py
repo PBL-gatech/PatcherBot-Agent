@@ -8,8 +8,6 @@ import numpy as np
 import logging
 import time
 
-from patcherbot.utils.FileLogger import FileLogger
-from patcherbot.utils.RecordingStateManager import RecordingStateManager
 from patcherbot.devices.camera.camera import Camera
 
 
@@ -21,17 +19,21 @@ class LiveFeedQt(QtWidgets.QLabel):
     A QLabel-based widget that displays live camera feed, optionally logs frames,
     and allows custom image and display editing functions.
     """
-    def __init__(self, camera, recording_state_manager: RecordingStateManager, image_edit=None, display_edit=None, mouse_handler=None, parent=None, log_processed_frames=False, frame_folder_name: str = "camera_frames"):
+    def __init__(
+            self,
+            camera: Camera,
+            image_edit=None,
+            display_edit=None,
+            mouse_handler=None,
+            parent=None,
+        ):        
         """
         Args:
             camera (Camera): The camera object providing frames.
-            recording_state_manager (RecordingStateManager): Manager for controlling recording state.
             image_edit (callable, optional): Function to modify raw numpy frames before display. Defaults to identity.
             display_edit (callable, optional): Function to modify QPixmap frames for GUI overlay. Defaults to identity.
             mouse_handler (callable, optional): Function to handle mouse events on the widget. Defaults to None.
             parent (QWidget, optional): Parent Qt widget. Defaults to None.
-            log_processed_frames (bool, optional): Whether to log processed frames or raw frames. Defaults to False.
-            frame_folder_name (str, optional): Subfolder name for storing frames. Defaults to "camera_frames".
         """
         super(LiveFeedQt, self).__init__(parent=parent)
         # The image_edit function (does nothing by default) gets the raw
@@ -81,11 +83,6 @@ class LiveFeedQt(QtWidgets.QLabel):
         self.setMinimumSize(640, 480)
         self.setAlignment(Qt.AlignCenter)
 
-        self.recording_state_manager = recording_state_manager
-        self.recorder = FileLogger(recording_state_manager, folder_path="experiments/Data/rig_recorder_data/", isVideo=True, filetype="csv", recorder_filename="camera_frames", frame_folder_name=frame_folder_name)
-        self._uses_aux_folder = frame_folder_name == self.recorder.aux_frame_folder_name
-        self.log_processed_frames = bool(log_processed_frames)
-
         # Remember the last frame that we displayed, to not unnecessarily
         # process/show the same frame for slow input sources
         self._last_frameno = None
@@ -130,15 +127,6 @@ class LiveFeedQt(QtWidgets.QLabel):
             logging.info(f"FPS in LIVEFEED: {self.fps:.2f}")
         self.last_frame_time = current_time
 
-    def set_log_processed_frames(self, value: bool) -> None:
-        """
-        Enable or disable logging of processed frames.
-
-        Args:
-            value (bool): True to log processed frames, False to log raw frames.
-        """
-        self.log_processed_frames = bool(value)
-
     def set_active_camera(self, index: int) -> None:
         """
         Switch the live feed to another configured pipette camera.
@@ -164,27 +152,11 @@ class LiveFeedQt(QtWidgets.QLabel):
         Args:
             camera (Camera): New camera object to use.
         """
-        if isinstance(camera, dict):
-            if not camera:
-                raise ValueError(
-                    "LiveFeedQt received an empty camera dictionary."
-                )
+        self.camera = camera
+        self.width = camera.width
+        self.height = camera.height
 
-            self.cameras = camera
-            self.active_camera_index = 0
-
-            self.camera = list(
-                self.cameras.values()
-            )[0]
-
-        else:
-            self.cameras = None
-            self.active_camera_index = 0
-            self.camera = camera
-
-        self.width = self.camera.width
-        self.height = self.camera.height
-
+        # New physical camera = new frame-number namespace.
         self._last_frameno = None
         self._last_edited_frame = None
 
@@ -234,17 +206,8 @@ class LiveFeedQt(QtWidgets.QLabel):
             else:
                 frame = self._last_edited_frame
 
-            frame_to_log = frame
-            if not self.log_processed_frames and raw_frame is not None:
-                frame_to_log = raw_frame.copy() if hasattr(raw_frame, "copy") else raw_frame
-            # * Where you place this function is important, relative to repeated frames and such. Either you check in this file
-            # * or in the FileLogger file
-            if self._uses_aux_folder:
-                self.recorder.write_aux_camera_frames(frame_time.timestamp(), frame_to_log, frameno)
-            else:
-                self.recorder.write_camera_frames(frame_time.timestamp(), frame_to_log, frameno)
-            # self.log_frame_rate()
-            # print(f"FRAME SHAPE: {frame.shape}")
+            if frame is None:
+                return
 
             if len(frame.shape) == 2:
                 # Grayscale image via MicroManager

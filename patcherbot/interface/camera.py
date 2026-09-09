@@ -7,8 +7,7 @@ from numpy import *
 from patcherbot.interface import TaskInterface, command, blocking_command
 import os
 import logging
-from patcherbot.utils.RecordingStateManager import RecordingStateManager
-from patcherbot.utils.FileLogger import FileLogger
+
 
 
 class CameraInterface(TaskInterface):
@@ -18,27 +17,25 @@ class CameraInterface(TaskInterface):
     """
     updated_exposure = QtCore.pyqtSignal('QString', 'QString')
 
-    def __init__(self, camera, with_tracking=False, status_category='Camera'):
-        """
-        Initialize the CameraInterface with a camera object and configuration.
-
-        Args:
-            camera (object): Camera object providing imaging functionality.
-            with_tracking (bool, optional): Whether to enable tracking-related features.
-            status_category (str, optional): Label used for GUI status updates.
-        """
+    def __init__(
+        self,
+        camera,
+        snap_image_recorder,
+        source_id,
+        with_tracking=False,
+        status_category="Camera",
+    ):
         super().__init__()
+
+        if snap_image_recorder is None:
+            raise ValueError(
+                "CameraInterface requires a shared snap_image_recorder"
+            )
+
         self.camera = camera
+        self.snap_image_recorder = snap_image_recorder
+        self.source_id = str(source_id)
         self.with_tracking = with_tracking
-        self.recording_state_manager = RecordingStateManager()
-        self.snap_image_recorder = FileLogger(
-            self.recording_state_manager,
-            folder_path="experiments/Data/snap_image_data/",
-            isVideo=True,
-            filetype="csv",
-            recorder_filename="snap_images",
-            frame_batch_size=2,
-        )
         self.status_category = status_category
         self._is_active = False
 
@@ -198,18 +195,22 @@ class CameraInterface(TaskInterface):
         recorder = self.snap_image_recorder
         if not recorder.folder_created:
             try:
-                os.makedirs(recorder.camera_folder_path, exist_ok=True)
-                os.makedirs(recorder.aux_camera_folder_path, exist_ok=True)
-                recorder.folder_created = True
+                recorder.create_folder()
             except OSError as exc:
-                logging.error("Error creating snap image folder: %s", exc)
+                logging.error(
+                    "Error creating snap image folder: %s",
+                    exc,
+                )
                 return
         image_path = os.path.join(
             recorder.camera_folder_path,
-            f"{frameno}_{time_value}.{recorder.image_type}",
+            f"{self.source_id}_{frameno}_{time_value}.{recorder.image_type}",
         )
+
         recorder._save_image(frame_to_save, image_path)
+
         return {
+            "source_id": self.source_id,
             "frame_number": frameno,
             "captured_at": frame_time,
             "image_path": image_path,

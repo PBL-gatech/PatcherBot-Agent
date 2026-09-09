@@ -2,6 +2,9 @@
 from __future__ import absolute_import
 
 import collections
+
+from patcherbot.interface.experimentBookConfig import ExperimentBookConfig
+from patcherbot.utils.FileLogger import FileLogger
 # Support older versions of Python
 try:
     from collections.abc import Sequence
@@ -585,6 +588,9 @@ class RecordingDialog(QDialog):
         if dialog.exec_():
             return dialog.selectedFiles()[0]
 
+class CameraSignals(QtCore.QObject):
+    command = QtCore.pyqtSignal(MethodType, object)
+    reset = QtCore.pyqtSignal(TaskController)
 
 class CameraGui(QtWidgets.QMainWindow):
     '''
@@ -610,11 +616,11 @@ class CameraGui(QtWidgets.QMainWindow):
     log_signal = QtCore.pyqtSignal('QString')
     camera_signal = QtCore.pyqtSignal(MethodType, object)
     camera_reset_signal = QtCore.pyqtSignal(TaskController)
-    aux_camera_signal = QtCore.pyqtSignal(MethodType, object)
-    aux_camera_reset_signal = QtCore.pyqtSignal(TaskController)
+    snapshot_captured = QtCore.pyqtSignal(object)
 
 
-    def __init__(self, camera, aux_camera=None, recording_state_manager=None,
+    def __init__(self, camera, pipette_cameras=None, recording_state_manager=None,
+                 camera_recording_session=None,
                  image_edit=None, display_edit=None,
                  with_tracking=False, base_directory='.'):
         """
@@ -634,10 +640,38 @@ class CameraGui(QtWidgets.QMainWindow):
         """
         super().__init__()
         self.main_camera = camera
-        self.aux_camera = aux_camera
+
+        # Normalize pipette cameras to a keyed collection.
+        if pipette_cameras is None:
+            self.pipette_cameras = {}
+
+        elif isinstance(pipette_cameras, dict):
+            self.pipette_cameras = dict(pipette_cameras)
+
+        else:
+            # Single-pipette backwards compatibility.
+            self.pipette_cameras = {
+                "pipette_camera_0": pipette_cameras
+            }
+
+        self.active_pipette_camera_id = (
+            next(iter(self.pipette_cameras))
+            if self.pipette_cameras
+            else None
+        )
+
         self.recording_state_manager = recording_state_manager
+        self.camera_recording_session = camera_recording_session
         if self.recording_state_manager is None:
             raise ValueError("RecordingStateManager must be provided")
+        self.snap_image_recorder = FileLogger(
+                    self.recording_state_manager,
+                    folder_path="experiments/Data/snap_image_data/",
+                    isVideo=True,
+                    filetype="csv",
+                    recorder_filename="snap_images",
+                    frame_batch_size=2,
+                )
         self.base_directory = base_directory
         self.with_tracking = with_tracking
         self.show_overlay = True
@@ -645,19 +679,41 @@ class CameraGui(QtWidgets.QMainWindow):
 
         self.main_interface = None
         if self.main_camera is not None:
-            self.main_interface = CameraInterface(self.main_camera,
-                                                  with_tracking=with_tracking,
-                                                  status_category='Main Camera')
-        self.aux_interface = None
-        if self.aux_camera is not None:
-            self.aux_interface = CameraInterface(self.aux_camera,
-                                                 with_tracking=False,
-                                                 status_category='Aux Camera')
+            self.main_interface = CameraInterface(
+                self.main_camera,
+                self.snap_image_recorder,
+                source_id="main_camera",
+                with_tracking=with_tracking,
+                status_category="Main Camera",
+            )
+        self.pipette_camera_interfaces = {}
 
-        self.active_camera_role = 'main' if self.main_camera is not None else 'aux'
-        self.active_camera = self.main_camera if self.active_camera_role == 'main' else self.aux_camera
+        for camera_id, pipette_camera in self.pipette_cameras.items():
+            self.pipette_camera_interfaces[camera_id] = CameraInterface(
+                pipette_camera,
+                self.snap_image_recorder,
+                source_id=camera_id,
+                with_tracking=False,
+                status_category=f"Pipette Camera {camera_id}",
+            )
+
+
+        if self.main_camera is not None:
+            self.active_camera_role = "main"
+            self.active_camera = self.main_camera
+            self.active_interface = self.main_interface
+
+        elif self.selected_pipette_camera is not None:
+            self.active_camera_role = "pipette"
+            self.active_camera = self.selected_pipette_camera
+            self.active_interface = self.selected_pipette_camera_interface
+
+        else:
+            self.active_camera_role = None
+            self.active_camera = None
+            self.active_interface = None
+
         self.camera = self.active_camera
-        self.active_interface = self.main_interface if self.active_camera_role == 'main' else self.aux_interface
         self.camera_interface = self.active_interface
 
         self.main_toolbar = QtWidgets.QToolBar("Main Controls")
@@ -731,7 +787,7 @@ class CameraGui(QtWidgets.QMainWindow):
 
         self.switch_view_button = QtWidgets.QPushButton()
         self.switch_view_button.clicked.connect(self.toggle_camera_view)
-        self.switch_view_button.setEnabled(self.aux_camera is not None)
+        self.switch_view_button.setEnabled(self.main_camera is not None and bool(self.pipette_cameras))
         self._update_switch_button_text()
 
         self.setexposure_edit = QtWidgets.QLineEdit()
@@ -813,23 +869,21 @@ class CameraGui(QtWidgets.QMainWindow):
                                          image_edit=self.image_edit,
                                          display_edit=self.display_edit,
                                          mouse_handler=self.video_mouse_press,
-                                         recording_state_manager=self.recording_state_manager,
-                                         frame_folder_name='camera_frames')
-        self.aux_video = None
-        if self.aux_camera is not None:
-            self.aux_video = LiveFeedQt(self.aux_camera,
+                                         )
+        self.pipette_video = None
+        if self.selected_pipette_camera is not None:
+            self.pipette_video = LiveFeedQt(self.selected_pipette_camera,
                                         image_edit=self.image_edit,
                                         display_edit=self.display_edit,
                                         mouse_handler=self.video_mouse_press,
-                                        recording_state_manager=self.recording_state_manager,
-                                        frame_folder_name='aux_camera_frames')
+                                        )
 
         self.video_stack = QtWidgets.QStackedWidget()
         if self.main_video is not None:
             self.video_stack.addWidget(self.main_video)
-        if self.aux_video is not None:
-            self.video_stack.addWidget(self.aux_video)
-        self.active_video = self.main_video if self.active_camera_role == 'main' else self.aux_video
+        if self.pipette_video is not None:
+            self.video_stack.addWidget(self.pipette_video)
+        self.active_video = self.main_video if self.active_camera_role == 'main' else self.pipette_video
         if self.active_video is not None:
             self.video_stack.setCurrentWidget(self.active_video)
         self.video_stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -838,12 +892,25 @@ class CameraGui(QtWidgets.QMainWindow):
         self.recording_settings = {}
         self.setFocus()  # Need this to handle arrow keys, etc.
         self.interface_signals = {}
+        self._pipette_camera_signals = {}
+
         if self.main_interface is not None:
-            self.interface_signals[self.main_interface] = (self.camera_signal,
-                                                           self.camera_reset_signal)
-        if self.aux_interface is not None:
-            self.interface_signals[self.aux_interface] = (self.aux_camera_signal,
-                                                          self.aux_camera_reset_signal)
+            self.interface_signals[self.main_interface] = (
+                self.camera_signal,
+                self.camera_reset_signal,
+            )
+
+        for camera_id, interface in (
+            self.pipette_camera_interfaces.items()
+        ):
+            signals = CameraSignals()
+
+            self._pipette_camera_signals[camera_id] = signals
+
+            self.interface_signals[interface] = (
+                signals.command,
+                signals.reset,
+            )
             
         self.splitter = QtWidgets.QSplitter()
         self.splitter.addWidget(self.video_stack)
@@ -868,15 +935,26 @@ class CameraGui(QtWidgets.QMainWindow):
 
     def _update_switch_button_text(self):
         """Updates the label of the switch view button based on the current active camera."""
-        if not hasattr(self, 'switch_view_button') or self.switch_view_button is None:
+        if (
+            not hasattr(self, "switch_view_button")
+            or self.switch_view_button is None
+        ):
             return
-        if self.aux_camera is None:
-            self.switch_view_button.setText('Switch View')
+
+        if not self.pipette_cameras:
+            self.switch_view_button.setText(
+                "Switch View"
+            )
             return
-        if self.active_camera_role == 'main':
-            self.switch_view_button.setText('Switch to Pipette View')
+
+        if self.active_camera_role == "main":
+            self.switch_view_button.setText(
+                "Switch to Pipette View"
+            )
         else:
-            self.switch_view_button.setText('Switch to Microscope View')
+            self.switch_view_button.setText(
+                "Switch to Microscope View"
+            )
 
     def normalize_active_camera(self):
         """Normalize the active camera’s image."""
@@ -894,7 +972,19 @@ class CameraGui(QtWidgets.QMainWindow):
         """Take a snapshot from the active camera."""
         if self.active_interface is None:
             return
-        self.active_interface.snap_image()
+        snapshot = self.active_interface.snap_image()
+        if snapshot is None:
+            return
+        snapshot = dict(snapshot)
+        snapshot["camera_role"] = self.active_camera_role
+
+        snapshot["camera_id"] = (
+            self.active_pipette_camera_id
+            if self.active_camera_role == "pipette"
+            else "main_camera"
+        )
+        self.snapshot_captured.emit(snapshot)
+        return snapshot
 
     def handle_autonormalize_change(self, state):
         """
@@ -922,44 +1012,74 @@ class CameraGui(QtWidgets.QMainWindow):
 
     def toggle_camera_view(self):
         """Switch between main and auxiliary camera views."""
-        if self.aux_camera is None:
+        if not self.pipette_cameras:
             return
-        target_role = 'aux' if self.active_camera_role == 'main' else 'main'
+
+        target_role = (
+            "pipette"
+            if self.active_camera_role == "main"
+            else "main"
+        )
+
         self._set_active_camera(target_role)
 
     def _set_active_camera(self, role):
         """
-        Sets the active camera and updates all associated interfaces and views.
-
-        Args:
-            role (str): Target camera role ('main' or 'aux').
+        Switch between the microscope camera and selected pipette camera.
         """
-        if role not in ('main', 'aux'):
+        if role not in ("main", "pipette"):
             return
-        if role == 'main' and self.main_camera is None:
+
+        if role == "main":
+            camera = self.main_camera
+            interface = self.main_interface
+            video = self.main_video
+
+        else:
+            camera = self.selected_pipette_camera
+            interface = self.selected_pipette_camera_interface
+            video = self.pipette_video
+
+        if camera is None or interface is None:
             return
-        if role == 'aux' and self.aux_camera is None:
-            return
+
         if role == self.active_camera_role:
             return
+
         self.active_camera_role = role
-        self.active_camera = self.main_camera if role == 'main' else self.aux_camera
-        self.camera = self.active_camera
-        self.active_interface = self.main_interface if role == 'main' else self.aux_interface
-        self.camera_interface = self.active_interface
-        self.active_video = self.main_video if role == 'main' else self.aux_video
-        if self.active_video is not None:
-            self.video_stack.setCurrentWidget(self.active_video)
+
+        self.active_camera = camera
+        self.camera = camera
+
+        self.active_interface = interface
+        self.camera_interface = interface
+
+        self.active_video = video
+
+        if video is not None:
+            self.video_stack.setCurrentWidget(video)
+
         self._update_switch_button_text()
         self._rebind_camera_key_actions()
         self._sync_interface_activity()
 
     def _sync_interface_activity(self):
-        """Synchronizes the active state of camera interfaces with the selected camera."""
+        """
+        Enable only the currently selected camera interface.
+        """
         if self.main_interface is not None:
-            self.main_interface.set_active(self.active_camera_role == 'main')
-        if self.aux_interface is not None:
-            self.aux_interface.set_active(self.active_camera_role == 'aux')
+            self.main_interface.set_active(
+                self.active_camera_role == "main"
+            )
+
+        for camera_id, interface in (
+            self.pipette_camera_interfaces.items()
+        ):
+            interface.set_active(
+                self.active_camera_role == "pipette"
+                and camera_id
+                == self.active_pipette_camera_id
+            )
 
     def _rebind_camera_key_actions(self):
         """Rebinds stored camera key actions to the currently active camera interface."""
@@ -1083,56 +1203,105 @@ class CameraGui(QtWidgets.QMainWindow):
         """Closes the application."""
         self.close()
 
-    @command(category='Camera',
-             description='Toggle recording image files to disk')
+    @command(
+        category="Camera",
+        description="Toggle recording image files to disk",
+    )
     def toggle_recording(self, *args):
-        """
-        Starts or stops recording for all available cameras.
 
-        Args:
-            *args: Additional arguments (unused).
-        """
+        if self.camera_recording_session is None:
+            logging.error(
+                "CameraRecordingSession is not configured."
+            )
+            return
+
         if self.is_recording:
-            for cam in filter(None, [self.main_camera, self.aux_camera]):
-                stop_method = getattr(cam, 'stop_recording', None)
-                if stop_method is not None:
-                    stop_method()
-            if self.recording_state_manager is not None:
-                self.recording_state_manager.set_recording(False)
-            if self.main_video is not None:
-                self.main_video.recorder.handle_recording_stopped()
-            if self.aux_video is not None:
-                self.aux_video.recorder.handle_recording_stopped()
+            self.camera_recording_session.stop_recording()
+
             self.is_recording = False
-        else:
-            active_cam = self.active_camera or self.main_camera or self.aux_camera
-            if active_cam is None:
+            self.record_button.setChecked(False)
+            return
+
+        active_cam = self.active_camera
+
+        if active_cam is None:
+            cameras = self._all_cameras()
+
+            if not cameras:
                 return
-            frame_rate = getattr(active_cam, 'get_frame_rate', lambda: 0)()
-            pixels = getattr(active_cam, 'width', 0) * getattr(active_cam, 'height', 0)
-            dlg = RecordingDialog(self.base_directory, frame_rate=frame_rate,
-                                  pixels=pixels,
-                                  settings=self.recording_settings, parent=self)
-            if dlg.exec_():
-                directory = os.path.abspath(dlg.directory_edit.text())
-                prefix = dlg.prefix_edit.text()
-                self.recording_settings['prefix'] = prefix
-                memory = dlg.memory_spin.value()
-                self.recording_settings['memory'] = memory
-                skip_frames = dlg.skip_spin.value()
-                self.recording_settings['skip_frames'] = skip_frames
-                for cam in filter(None, [self.main_camera, self.aux_camera]):
-                    width = getattr(cam, 'width', getattr(active_cam, 'width', 1))
-                    height = getattr(cam, 'height', getattr(active_cam, 'height', 1))
-                    queue_size = int(memory * 1e6 / (width * height)) + 1 if width and height else 1
-                    start_method = getattr(cam, 'start_recording', None)
-                    if start_method is not None:
-                        start_method(directory=directory, file_prefix=prefix,
-                                     skip_frames=skip_frames, queue_size=queue_size)
-                if self.recording_state_manager is not None:
-                    self.recording_state_manager.set_recording(True)
-                self.is_recording = True
-        self.record_button.setChecked(self.is_recording)
+
+            active_cam = cameras[0]
+
+        frame_rate = getattr(
+            active_cam,
+            "get_frame_rate",
+            lambda: 0,
+        )()
+
+        pixels = (
+            getattr(active_cam, "width", 0)
+            * getattr(active_cam, "height", 0)
+        )
+
+        dlg = RecordingDialog(
+            self.base_directory,
+            frame_rate=frame_rate,
+            pixels=pixels,
+            settings=self.recording_settings,
+            parent=self,
+        )
+
+        if not dlg.exec_():
+            self.record_button.setChecked(False)
+            return
+
+        directory = os.path.abspath(
+            dlg.directory_edit.text()
+        )
+
+        prefix = dlg.prefix_edit.text()
+        memory = dlg.memory_spin.value()
+        skip_frames = dlg.skip_spin.value()
+
+        self.recording_settings["prefix"] = prefix
+        self.recording_settings["memory"] = memory
+        self.recording_settings["skip_frames"] = skip_frames
+
+        self.camera_recording_session.start_recording(
+            directory=directory,
+            file_prefix=prefix,
+            skip_frames=skip_frames,
+            memory_mb=memory,
+        )
+
+        self.is_recording = True
+        self.record_button.setChecked(True)
+
+    def _all_cameras(self):
+        cameras = []
+
+        if self.main_camera is not None:
+            cameras.append(self.main_camera)
+
+        cameras.extend(
+            camera
+            for camera in self.pipette_cameras.values()
+            if camera is not None
+        )
+
+        unique_cameras = []
+        seen = set()
+
+        for camera in cameras:
+            identity = id(camera)
+
+            if identity in seen:
+                continue
+
+            seen.add(identity)
+            unique_cameras.append(camera)
+
+        return unique_cameras
 
     def register_commands(self):
         '''
@@ -1159,35 +1328,45 @@ class CameraGui(QtWidgets.QMainWindow):
                                  self.toggle_recording)
 
     def close(self):
-        '''
-        Close the GUI.
-        '''
-        logging.info('closing GUI')
-        for attr_name in ('main_camera', 'aux_camera'):
-            cam = getattr(self, attr_name, None)
-            if cam is None:
-                continue
-            stop_acq = getattr(cam, 'stop_acquisition', None)
+        logging.info("closing GUI")
+
+        if self.camera_recording_session is not None:
+            self.camera_recording_session.close()
+
+        if self.movement_recorder is not None:
+            self.movement_recorder.close()
+
+        for cam in self._all_cameras():
+            stop_acq = getattr(
+                cam,
+                "stop_acquisition",
+                None,
+            )
+
             if stop_acq is not None:
                 stop_acq()
-            stop_recording = getattr(cam, 'stop_recording', None)
-            if stop_recording is not None:
-                stop_recording()
-            close_cam = getattr(cam, 'close', None)
+
+            close_cam = getattr(
+                cam,
+                "close",
+                None,
+            )
+
             if close_cam is not None:
                 close_cam()
-            setattr(self, attr_name, None)
-        for video_attr in ('main_video', 'aux_video'):
-            video_widget = getattr(self, video_attr, None)
-            if video_widget is not None:
-                video_widget.recorder.close()
-        if self.recording_state_manager is not None:
-            self.recording_state_manager.set_recording(False)
+
+        self.main_camera = None
+        self.pipette_cameras.clear()
+        self.pipette_camera_interfaces.clear()
+
+        self.active_pipette_camera_id = None
+
         self.camera = None
         self.active_camera = None
         self.active_interface = None
         self.camera_interface = None
         self.active_video = None
+
         super(CameraGui, self).close()
 
     def register_mouse_action(self, click_type, modifier, command,
@@ -1524,7 +1703,7 @@ class CameraGui(QtWidgets.QMainWindow):
         else:
             self.config_button.setChecked(True)
 
-    def add_config_gui(self, config, config_tab):
+    def add_config_gui(self, config, config_tab, gui_class=None):
         """
         Adds a configuration GUI tab for the given config object.
 
@@ -1532,9 +1711,10 @@ class CameraGui(QtWidgets.QMainWindow):
             config (Config): Configuration object.
         """
         logging.debug('Adding config GUI for {}'.format(config.name))
-        config_gui = ConfigGui(config)
+        config_gui = ConfigGui(config) if gui_class is None else gui_class(config)
         config_tab.addTab(config_gui, config.name)
         logging.debug('Config GUI added')
+        return config_gui
 
     def add_tab(self, tab, name, config_tab, index=None):
         """
@@ -1576,11 +1756,76 @@ class CameraGui(QtWidgets.QMainWindow):
             new_sizes = [current_sizes[0] - target_width, target_width]   
             self.splitter.setSizes(new_sizes)
 
-    def toggle_dark_mode(self):
+    def set_active_pipette_camera(self, camera_id):
         """
-        Must be implemented by subclass.
+        Select which pipette camera is represented by the auxiliary view.
         """
-        pass
+        if camera_id not in self.pipette_cameras:
+            logging.warning(
+                "Unknown pipette camera id: %s",
+                camera_id,
+            )
+            return False
+
+        if camera_id == self.active_pipette_camera_id:
+            return True
+
+        self.active_pipette_camera_id = camera_id
+
+        camera = self.selected_pipette_camera
+        interface = self.selected_pipette_camera_interface
+
+        # Retarget the single pipette display widget.
+        if self.pipette_video is not None:
+            self.pipette_video.set_camera_metadata(
+                camera
+            )
+
+        # If we're currently viewing a pipette camera,
+        # immediately switch active control to the newly
+        # selected pipette.
+        if self.active_camera_role == "pipette":
+            self.active_camera = camera
+            self.camera = camera
+
+            self.active_interface = interface
+            self.camera_interface = interface
+
+            self.active_video = self.pipette_video
+
+        self._rebind_camera_key_actions()
+        self._sync_interface_activity()
+
+        return True
+
+    def set_active_pipette_camera_index(self, index):
+        camera_ids = list(self.pipette_cameras.keys())
+
+        if not 0 <= index < len(camera_ids):
+            return False
+
+        return self.set_active_pipette_camera(
+            camera_ids[index]
+        )
+
+    @property
+    def selected_pipette_camera(self):
+        if self.active_pipette_camera_id is None:
+            return None
+
+        return self.pipette_cameras.get(
+            self.active_pipette_camera_id
+        )
+
+
+    @property
+    def selected_pipette_camera_interface(self):
+        if self.active_pipette_camera_id is None:
+            return None
+
+        return self.pipette_camera_interfaces.get(
+            self.active_pipette_camera_id
+        )
 
 class ElidedLabel(QtWidgets.QLabel):
     """

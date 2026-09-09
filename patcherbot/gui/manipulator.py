@@ -30,13 +30,13 @@ class ManipulatorGui(CameraGui):
     pipette_command_signal = QtCore.pyqtSignal(MethodType, object)
     pipette_reset_signal = QtCore.pyqtSignal(TaskController)
 
-    def __init__(self, camera, aux_camera, pipette_interfaces, with_tracking=False, recording_state_manager: RecordingStateManager = None):
+    def __init__(self, camera, pipette_cameras, pipette_interfaces, with_tracking=False, recording_state_manager: RecordingStateManager = None):
         """
         Initialize the manipulator GUI.
 
         Attributes:
             microscope_camera: The main microscope camera.
-            pipette_camera: Auxiliary camera for pipette view.
+            pipette_cameras: Auxiliary cameras for pipette view.
             pipette_interfaces: Manipulator interfaces for pipettes.
             control_thread: Thread in which the manipulator interfaces run.
             image_save_number (int): Counter for saved images.
@@ -44,13 +44,13 @@ class ManipulatorGui(CameraGui):
             tip_x, tip_y: Coordinates of pipette tip.
             tip_t0: Timestamp when tip display started.
         """
-        super(ManipulatorGui, self).__init__(camera, aux_camera=aux_camera, with_tracking=with_tracking, recording_state_manager=recording_state_manager)
+        super(ManipulatorGui, self).__init__(camera, pipette_cameras=pipette_cameras, with_tracking=with_tracking, recording_state_manager=recording_state_manager)
         self.control_threads = {} # Keep track of multiple threads
         self._unique_pipette_signals = {}
         
         self.setWindowTitle("Pipette GUI")
         self.microscope_camera = camera
-        self.pipette_camera = aux_camera
+        self.pipette_cameras = pipette_cameras
         self.interfaces = pipette_interfaces
         if not isinstance(self.interfaces, dict):
             self.control_threads["pipette"] = QtCore.QThread()
