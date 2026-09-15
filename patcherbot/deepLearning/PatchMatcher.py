@@ -42,6 +42,7 @@ class PatchMatcher:
         **preprocess: object,
     ) -> Dict[str, Tuple[float, float]]:
         """Return the target point computed from the center displacement."""
+        preprocess.setdefault("include_overlay", False)
         result = self._matcher.match(reference_image, current_image, load_conf=load_conf, **preprocess)
         shift = result.get("center_shift")
         if not shift:

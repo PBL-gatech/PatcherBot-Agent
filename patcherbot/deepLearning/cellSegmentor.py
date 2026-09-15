@@ -375,9 +375,15 @@ class CellSegmentor2(BaseSegmentor):
 
         # model_cfg kept only so existing callers don't break; not used by Transformers loader.
         self.model_cfg = model_cfg
+        self._image_original_sizes = None
 
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         super().__init__(device=device, cache_image_embeddings=cache_image_embeddings)
+
+    def set_image(self):
+        # Sizes and embeddings belong to the same image, even when a camera reuses its buffer.
+        self._image_original_sizes = None
+        return super().set_image()
 
     def _load_model(self):
         from transformers import AutoConfig, Sam2Model, Sam2Processor, Sam2VideoModel, Sam2VideoProcessor
@@ -424,7 +430,11 @@ class CellSegmentor2(BaseSegmentor):
         return [[box.astype(float).tolist()]]
 
     def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
-        proc_kwargs = {"images": self._raw_image_pil, "return_tensors": "pt"}
+        proc_kwargs = {"return_tensors": "pt"}
+        if self._image_embeddings is not None and self._image_original_sizes is not None:
+            proc_kwargs["original_sizes"] = self._image_original_sizes
+        else:
+            proc_kwargs["images"] = self._raw_image_pil
         if input_point is not None and input_label is not None:
             pts, lbls = self._wrap_points_labels(input_point, input_label)
             proc_kwargs["input_points"] = pts
@@ -491,9 +501,15 @@ class CellSegmentor2(BaseSegmentor):
 
     def _cache_image_embeddings(self):
         if hasattr(self.model, "get_image_embeddings"):
-            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt").to(self.device)
+            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt")
+            original_sizes = inputs.get("original_sizes")
+            if isinstance(original_sizes, torch.Tensor):
+                original_sizes = original_sizes.detach().cpu().clone()
+            inputs = inputs.to(self.device)
             with torch.inference_mode():
-                return self.model.get_image_embeddings(inputs["pixel_values"])
+                embeddings = self.model.get_image_embeddings(inputs["pixel_values"])
+            self._image_original_sizes = original_sizes
+            return embeddings
         return None
 
 
