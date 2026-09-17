@@ -103,6 +103,34 @@ class AgentHelper:
             self.agent.allow_goal_placeholders = bool(allow_goal_placeholders)
         self.requires_goal = bool(getattr(self.agent, "goal_required", False))
 
+    def observation_input_width(self, input_name: str, default_width: int = 15) -> int:
+        """Return an active policy input's final dimension, or zero if unused."""
+        if self.agent is None:
+            return 0
+        required_keys = ()
+        getter = getattr(self.agent, "get_required_obs_keys", None)
+        if callable(getter):
+            try:
+                required_keys = tuple(str(key) for key in getter())
+            except Exception:
+                required_keys = ()
+        if not required_keys:
+            required_keys = tuple(str(key) for key in getattr(self.agent, "obs_keys", ()) or ())
+
+        importer = getattr(self.agent, "importer", None)
+        obs_shapes = getattr(importer, "obs_shapes", {}) or {}
+        if input_name not in required_keys and input_name not in obs_shapes:
+            return 0
+        shape = obs_shapes.get(input_name)
+        if shape is not None:
+            try:
+                shape_tuple = tuple(int(dim) for dim in shape)
+            except Exception:
+                shape_tuple = ()
+            if shape_tuple:
+                return max(1, shape_tuple[-1])
+        return max(1, int(default_width))
+
     def load_demo(self, actions: np.ndarray) -> None:
         """Store demo actions for later replay and pass them to an active replay agent."""
         replay = np.asarray(actions, dtype=np.float32)

@@ -4,6 +4,7 @@ import threading
 class RecordingStateManager:
     STATE_PRESS_LABELS = {
         "locate_cell": "Locate Cell",
+        "approach_cell": "Approach Cell",
         "hunt_cell": "Hunt Cell",
         "gigaseal": "Gigaseal",
         "break_in": "Break-in",

@@ -757,19 +757,20 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         # Add a box for patching commands
         buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
-                      ['Locate Cell','Hunt Cell','Gigaseal'],
-                      ['Break-in','Escape Cell'],
+                      ['Locate Cell','Approach Cell','Hunt Cell'],
+                      ['Gigaseal','Break-in','Escape Cell'],
                       ['Patch Cell','Run Protocols']]
         cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell],
-                [self.patch_interface.locate_cell,
-                 [self.start_recording,self.patch_interface.hunt_cell],[self.patch_interface.gigaseal]],
-                [[ self.patch_interface.break_in],
+                [self.patch_interface.locate_cell, self.patch_interface.approach_cell,
+                 [self.start_recording,self.patch_interface.hunt_cell]],
+                [[self.patch_interface.gigaseal], [self.patch_interface.break_in],
                  [self.stop_recording,  self.patch_interface.escape_cell]],
                 [[self.start_recording,  self.patch_interface.patch, self.stop_recording],
                  [self.stop_recording,  self.patch_interface.run_protocols]]
 ]
         self.addButtonList('patching', layout, buttonList, cmds, sequential=True, change_color_during={
             'Locate Cell',
+            'Approach Cell',
             'Hunt Cell',
             'Gigaseal',
             'Break-in',

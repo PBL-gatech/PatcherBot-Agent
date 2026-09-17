@@ -408,6 +408,17 @@ class AutoPatchInterface(TaskInterface):
                       argument = (cell, img,pos))
         time.sleep(2)
  
+    @blocking_command(category='Patch',
+                      description='Approach the cell',
+                      task_description='Approaching the cell')
+    def approach_cell(self):
+        self._record_state_press("approach_cell")
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
+        self.recording_state_manager.increment_sample_number()
+        self.execute(self.current_autopatcher.approach_cell,
+                     argument=(cell, img, pos))
+        time.sleep(2)
+
     @blocking_command(category='Stage',
                      description = 'Center the stage on cell',
                       task_description='Centering the stage on cell')
