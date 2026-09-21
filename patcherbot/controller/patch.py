@@ -703,6 +703,115 @@ class AutoPatcher(TaskController):
         self.success_requested = True
         self.success_if_requested()
 
+    @record_state("constant_disturbance")
+    def constant_disturbance(self, speed=None, distance=1e6):
+        '''
+        Moves the pipette and stage together in -X at a constant speed until stopped.
+        '''
+        if not self.calibrated_unit.calibrated:
+            raise AutopatchError("Pipette not calibrated")
+        if not self.calibrated_stage.calibrated:
+            raise AutopatchError("Stage not calibrated")
+
+        disturbance_speed = float(self.config.constant_disturbance_speed if speed is None else speed)
+        self._constant_disturbance_prior_stage_speed = self._constant_disturbance_restore_target(
+            self.calibrated_stage, disturbance_speed
+        )
+        self._constant_disturbance_prior_pipette_speed = self._constant_disturbance_restore_target(
+            self.calibrated_unit, disturbance_speed
+        )
+        self._constant_disturbance_active = True
+
+        try:
+            self.info(f"Starting Constant Disturbance in -X at {disturbance_speed} um/s")
+            stage_velocity = np.array([-disturbance_speed, 0, 0], dtype=float)
+            pipette_velocity = self.calibrated_unit.rotate(stage_velocity, [2])
+            self._constant_velocity_move(self.calibrated_unit, pipette_velocity)
+            self._constant_velocity_move(self.calibrated_stage, stage_velocity)
+
+            while self._constant_disturbance_active:
+                self.sleep(0.1)
+        finally:
+            self.stop_constant_disturbance()
+
+    def _constant_velocity_move(self, mover, velocity):
+        try:
+            mover.absolute_move_group_velocity(velocity)
+        except TypeError:
+            if hasattr(mover, "dev") and hasattr(mover, "axes"):
+                mover.dev.absolute_move_group_velocity(velocity, mover.axes)
+            else:
+                raise
+
+    def _read_max_speed(self, mover):
+        for target in (mover, getattr(mover, "dev", None)):
+            if target is None:
+                continue
+            try:
+                if hasattr(target, "get_max_speed"):
+                    speed = target.get_max_speed()
+                    if speed is not None:
+                        return speed
+            except Exception:
+                pass
+            for attr in ("_max_speed", "max_speed", "DEFAULT_MAX_SPEED"):
+                if hasattr(target, attr):
+                    speed = getattr(target, attr)
+                    if speed is not None:
+                        return speed
+        return None
+
+    def _default_max_speed(self, mover):
+        for target in (getattr(mover, "dev", None), mover):
+            if target is None:
+                continue
+            if hasattr(target, "DEFAULT_MAX_SPEED"):
+                speed = getattr(target, "DEFAULT_MAX_SPEED")
+                if speed is not None:
+                    return speed
+        return None
+
+    def _constant_disturbance_restore_target(self, mover, disturbance_speed):
+        current_speed = self._read_max_speed(mover)
+        default_speed = self._default_max_speed(mover)
+        if current_speed is None:
+            return default_speed
+
+        try:
+            current_speed_float = float(current_speed)
+            disturbance_speed_float = abs(float(disturbance_speed))
+        except (TypeError, ValueError):
+            return current_speed
+
+        contaminated_limit = max(disturbance_speed_float * 2, 10)
+        if default_speed is not None and current_speed_float <= contaminated_limit:
+            return default_speed
+        return current_speed
+
+    def _restore_max_speed(self, mover, speed, label):
+        if speed is None:
+            logging.warning(f"No previous {label} max speed was available to restore")
+            return
+        try:
+            mover.set_max_speed(speed)
+        except Exception:
+            logging.warning(f"Failed to restore {label} max speed after Constant Disturbance", exc_info=True)
+
+    def stop_constant_disturbance(self):
+        self._constant_disturbance_active = False
+        for mover in (self.calibrated_unit, self.calibrated_stage):
+            try:
+                mover.stop()
+            except Exception:
+                logging.warning("Failed to stop mover during Constant Disturbance", exc_info=True)
+
+        prior_stage_speed = getattr(self, "_constant_disturbance_prior_stage_speed", None)
+        prior_pipette_speed = getattr(self, "_constant_disturbance_prior_pipette_speed", None)
+        self._restore_max_speed(self.calibrated_stage, prior_stage_speed, "stage")
+        self._restore_max_speed(self.calibrated_unit, prior_pipette_speed, "pipette")
+        self._constant_disturbance_prior_stage_speed = None
+        self._constant_disturbance_prior_pipette_speed = None
+
     @record_state("locate_cell") 
     def locate_cell(self, cell):
         '''

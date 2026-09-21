@@ -46,6 +46,7 @@ class PatchConfig(Config):
     cell_type = Selector(default='Plate',objects = ['Plate', 'Slice'], doc='Cell type for protocol selection')
     mode = Selector( default='Classic', objects =['Manual', 'Classic', 'Agent'], doc='Mode for AutoPatch algorithm')
     auto_clean_pipette = Boolean(True, doc='Automatically clean pipette after attempt')
+    constant_disturbance_speed = Number(100, bounds=(0.1, 1000), doc='Constant disturbance speed in -X (um/s)')
     lamp = Selector(default= '2', objects = ['1', '2', '3','4','5','6'], doc='default fluorescence cube slot')
     auto_capture_fluo = Boolean(False, doc='Capture fluorescence image on cell selection')
     categories = [
@@ -58,7 +59,8 @@ class PatchConfig(Config):
                      'pressure_ramp_increment', 'pressure_ramp_max']),
         ('Break-in', ['zap', 'pulse_pressure_break_in', 'pulse_pressure_duration',
                       'max_cell_R', 'max_access_R', 'min_cell_C']),
-        ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette']),
+        ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette',
+                          'constant_disturbance_speed']),
         ('Fluorescence', ['lamp', 'auto_capture_fluo'])  
     ]
 

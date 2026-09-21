@@ -66,11 +66,11 @@
                                 "class":  "patcherbot.devices.amplifier.DAQ.NiDAQ",
                                 "params":  {
                                                "readDev":  "Dev1",
-                                               "readChannel":  "ai17",
+                                               "readChannel":  "ai19",
                                                "cmdDev":  "Dev1",
                                                "cmdChannel":  "ao0",
                                                "respDev":  "Dev1",
-                                               "respChannel":  "ai19"
+                                               "respChannel":  "ai17"
                                            }
                             },
                     "amplifier":  {
