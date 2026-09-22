@@ -19,7 +19,7 @@ native_zero: 1962
 native_per_mbar: 2.7836
 reader_offset: 516.72
 reader_scale: 0.3923
-pipette_detector_model: 'PipetteDetectorNet5.pt'
+pipette_detector_model: 'PipetteDetectorNetX.pt'
 pipette_focuser_model: 'PipetteFocuserNet.pt'
 pipette_focus_crop_feature: false
 use_ai_features: true

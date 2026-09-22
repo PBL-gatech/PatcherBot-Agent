@@ -144,6 +144,7 @@ class Camera(object):
 
         self.stop_show_time = 0
         self.point_to_show = None
+        self._transient_circles = ((), 0.0)
         self.cell_list = []
         self._frame_pair_lock = threading.Lock()
         self._last_frame_pair = None
@@ -178,6 +179,14 @@ class Camera(object):
         """
         self.point_to_show = [point, radius, color, show_center]
         self.stop_show_time = time.time() + duration
+        self.show_circles([point], color, radius, duration, show_center)
+
+    def show_circles(self, points, color=(255, 255, 255), radius=10, duration=1.5, show_center=False):
+        circles = tuple((tuple(map(int, p)), int(radius), color, bool(show_center)) for p in points)
+        stop_show_time = time.time() + duration if circles else 0.0
+        self._transient_circles = (circles, stop_show_time)
+        self.point_to_show = list(circles[0]) if len(circles) == 1 else None
+        self.stop_show_time = stop_show_time
 
     def start_acquisition(self):
         """Start the background acquisition thread."""
@@ -267,11 +276,16 @@ class Camera(object):
         """
         img = input_img.copy()
 
-        # Draw pipette location if needed.
-        if self.point_to_show and time.time() - self.stop_show_time < 0:
-            img = cv2.circle(img, self.point_to_show[0], self.point_to_show[1], self.point_to_show[2], -1)
-            if self.point_to_show[3]:
-                img = cv2.circle(img, self.point_to_show[0], 2, self.point_to_show[2], 3)
+        circles, stop_show_time = self._transient_circles
+        if circles and time.time() < stop_show_time:
+            for point, radius, color, show_center in circles:
+                img = cv2.circle(img, point, radius, color, -1)
+                if show_center:
+                    img = cv2.circle(img, point, 2, color, 3)
+        elif circles:
+            self._transient_circles = ((), 0.0)
+            self.point_to_show = None
+            self.stop_show_time = 0.0
 
         # Process each cell's segmentation.
         for cell_coords, _, cell_img in self.cell_list:

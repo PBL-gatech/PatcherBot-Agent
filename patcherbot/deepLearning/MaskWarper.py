@@ -86,6 +86,7 @@ class MaskWarper:
             tmask = tmask[0]
         tmask = tmask.astype(np.uint8)
 
+        preprocess.setdefault("include_overlay", False)
         res = self._matcher.match(
             self._to_lightglue_tensor(tmpl_img),
             self._to_lightglue_tensor(cur_img),
@@ -107,10 +108,11 @@ class MaskWarper:
             max_iters,
             confidence,
         )
+        cur_bgr = self._ensure_bgr(cur_img)
         warped_template, warped_mask = self._warp_images(
             tmpl_img,
             tmask,
-            cur_img,
+            cur_bgr,
             H,
         )
         centroid_template = self._compute_centroid(tmask)
@@ -118,7 +120,7 @@ class MaskWarper:
         if centroid_template is not None:
             centroid_current = self._transform_point(centroid_template, H)
 
-        overlay = self._build_overlay(cur_img, warped_template, warped_mask, centroid_current)
+        overlay = self._build_overlay(cur_bgr, warped_template, warped_mask, centroid_current)
 
         return {
             "warped_mask": warped_mask,
@@ -171,8 +173,6 @@ class MaskWarper:
         if mi is None or mi.ndim != 2 or mi.shape[1] != 2 or mi.numel() == 0:
             return None, None
         valid = (mi >= 0).all(dim=1)
-        if not valid.any().item():
-            return None, None
         mi = mi[valid].to(device=feats0["keypoints"].device, dtype=torch.long)
         p0 = feats0["keypoints"][mi[:, 0]]  # (N,2)
         p1 = feats1["keypoints"][mi[:, 1]]  # (N,2)

@@ -85,6 +85,7 @@ class PointMatcher:
         image1: Union[PathLike, torch.Tensor],
         *,
         load_conf: Optional[Dict] = None,
+        include_overlay: bool = True,
         **preprocess,
     ) -> Dict[str, object]:
         """Match two images and report latency.
@@ -93,6 +94,7 @@ class PointMatcher:
             image0/image1: Either file paths or pre-loaded ``torch.Tensor`` images.
             load_conf: Extra kwargs forwarded to the internal image loader when the
                 inputs are file paths. Example: ``{\"resize\": 1024}``.
+            include_overlay: Render the aligned image overlay; otherwise return None.
             **preprocess: Additional preprocessing configuration for the extractor.
 
         Returns:
@@ -107,7 +109,11 @@ class PointMatcher:
 
         keypoints_pair = self._get_matched_keypoints(feats0, feats1, matches)
         center_shift = self._calculate_shift(keypoints_pair, feats0, feats1)
-        overlay = self._match_patch(image0_tensor, image1_tensor, keypoints_pair)
+        overlay = None
+        if include_overlay:
+            overlay = self._match_patch(
+                image0_tensor.to(self.device), image1_tensor.to(self.device), keypoints_pair
+            )
 
         return {
             "feats0": feats0,
@@ -139,7 +145,7 @@ class PointMatcher:
 
         if tensor.dtype == torch.uint8:
             tensor = tensor.to(dtype=torch.float32) / 255.0
-        return tensor.to(self.device)
+        return tensor
 
     @staticmethod
     def _load_image(path: str, resize: Optional[Union[int, Tuple[int, int]]] = None, **kwargs: object) -> torch.Tensor:
@@ -216,9 +222,6 @@ class PointMatcher:
             return None
 
         valid = (match_indices >= 0).all(dim=1)
-        if not valid.any().item():
-            return None
-
         match_indices = match_indices[valid].to(device=feats0["keypoints"].device, dtype=torch.long)
         if match_indices.numel() == 0:
             return None

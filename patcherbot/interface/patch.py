@@ -41,6 +41,20 @@ class AutoPatchInterface(TaskInterface):
             config_data (dict, optional): Configuration values for patching.
             protocol_data (dict, optional): Configuration values for protocols.
         """
+    state_press_tally_changed = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        amplifier: Amplifier,
+        daq: NiDAQ,
+        pressure: PressureController,
+        pipette_interface: PipetteInterface,
+        recording_state_manager: RecordingStateManager,
+        lamp: Lamp,
+        laser=None,
+        config_data=None,
+        protocol_data=None,
+    ):
         super().__init__()
         self.config = PatchConfig(name='Patch')
         if config_data:
@@ -89,6 +103,11 @@ class AutoPatchInterface(TaskInterface):
             float: Current Z position.
         """
         return float(self.pipette_controller.calibrated_unit.microscope.position())
+    
+    def _record_state_press(self, state):
+        counts = self.recording_state_manager.increment_state_press(state)
+        self.state_press_tally_changed.emit(counts)
+        return counts
 
     def _protocol_holding_parameters(self):
         """
@@ -149,6 +168,7 @@ class AutoPatchInterface(TaskInterface):
     
     def break_in(self):
         """Perform membrane break-in for a patched cell."""
+        self._record_state_press("break_in")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.break_in)
 
@@ -156,12 +176,19 @@ class AutoPatchInterface(TaskInterface):
                       task_description='GigaSealing the cell')
     def gigaseal(self):
         """Attempt to form a gigaohm seal with the cell membrane."""
+        self._record_state_press("gigaseal")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.gigaseal)
 
     def start_selecting_cells(self):
         """Enable cell selection mode for adding cells to the patch queue."""
         self.is_selecting_cells = True
+
+    @blocking_command(category='Patch',
+                      description='Detect cells',
+                      task_description='Detecting cells')
+    def detect_cells(self):
+        self.execute(self.pipette_controller.calibrated_stage.detect_cells)
 
     def start_selecting_corners(self):
         self.is_selecting_corners = True
@@ -372,6 +399,7 @@ class AutoPatchInterface(TaskInterface):
                       task_description='Moving to cell and patching it')
     def patch(self) -> None:
         """Execute the full patching procedure on the first queued cell."""
+        self._record_state_press("patch")
         if not self.cells_to_patch:
             self.warning("No cells queued for patching; skipping patch command")
             return
@@ -455,12 +483,24 @@ class AutoPatchInterface(TaskInterface):
                         task_description='Moving to the cell')
     def locate_cell(self):
         """Move the system to locate the selected cell."""
+        self._record_state_press("locate_cell")
         cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.locate_cell,
                       argument = (cell, img, pos))
         time.sleep(2)
  
+    @blocking_command(category='Patch',
+                      description='Approach the cell',
+                      task_description='Approaching the cell')
+    def approach_cell(self):
+        self._record_state_press("approach_cell")
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
+        self.recording_state_manager.increment_sample_number()
+        self.execute(self.current_autopatcher.approach_cell,
+                     argument=(cell, img, pos))
+        time.sleep(2)
+
     @blocking_command(category='Stage',
                      description = 'Center the stage on cell',
                       task_description='Centering the stage on cell')
@@ -498,6 +538,7 @@ class AutoPatchInterface(TaskInterface):
                         task_description='Moving to the cell and detecting it ')
     def hunt_cell(self):
         """Move toward the cell and attempt detection."""
+        self._record_state_press("hunt_cell")
         cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.hunt_cell,
@@ -511,6 +552,8 @@ class AutoPatchInterface(TaskInterface):
     def escape_cell(self):
         """Move away from the cell and perform cleanup actions."""
         self.execute(self.autopatcher.escape)
+        self._record_state_press("escape")
+        self.execute(self.current_autopatcher.escape)
         time.sleep(2)
         # self.cells_to_patch = self.cells_to_patch[1:]
         self.remove_last_cell()

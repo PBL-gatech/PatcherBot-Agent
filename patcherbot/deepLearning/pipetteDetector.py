@@ -414,7 +414,7 @@ class PipetteDetectorYOLO1(PipetteDetector):
         from ultralytics import YOLO
 
         cur_file = Path(__file__).parent.absolute()
-        default_model = cur_file / "pipetteModel" / "pipetteDetectorNet5.pt"
+        default_model = cur_file / "pipetteModel" / "pipetteDetectorNet7.pt"
         self.model_path = Path(model_path) if model_path is not None else default_model
 
         self.yolo_model = YOLO(str(self.model_path))
@@ -517,12 +517,131 @@ class PipetteDetectorYOLO1(PipetteDetector):
             return None
         return x_pix, y_pix
     
+class PipetteDetector4(PipetteDetector):
+    """Canonical 384px U-Net + MobileNetV4 boxes pipette detector.
+
+    Loads the canonical 384px grayscale+Sobel pipette checkpoint through
+    PDModelFactory (loaded by path, mirroring the CellModel pattern). The
+    default model path is the verified best checkpoint at the repository root:
+    training/Pipette_Fresh_384_001_Patience10/Fresh_384_pipettes_Patience10/epoch_0030.pt
+    (schema canonical_checkpoint_v1, family unet_mobilenetv4_boxes,
+    input_mode grayscale_sobel_magnitude, resolution 384).
+
+    CUDA uses BF16 and a captured model/decoder-preparation graph by default;
+    CPU uses FP32. Pass cuda_graph=False for eager execution.
+    """
+
+    def __init__(self, model_path: Optional[str] = None, device: Optional[str] = None,
+                 *, threshold: float = 0.001, cuda_graph: bool = True,
+                 precision: Optional[str] = None) -> None:
+        super().__init__()
+        model_root = Path(__file__).parent.absolute()
+        if model_path is None:
+            model_path = str(model_root / "pipetteModel" / "PipetteDetectorNetX.pt")
+        adapter_module = _import_module_from_path(
+            "pipette_detector_model_factory", model_root / "pipetteModel" / "PDModelFactory.py"
+        )
+        self.adapter = adapter_module.PDModelFactory.create(
+            model_type="unet_mobilenetv4_boxes",
+            model_path=model_path,
+            device=device,
+            threshold=threshold,
+            cuda_graph=cuda_graph,
+            precision=precision,
+        )
+
+    @staticmethod
+    def _to_uint8_grayscale(img: np.ndarray) -> np.ndarray:
+        """Normalize family inputs (2D/1ch/3-4ch, float or uint8) to uint8 grayscale."""
+        if img.ndim == 3:
+            if img.shape[2] == 1:
+                img = img[:, :, 0]
+            else:
+                img = PipetteDetector._ensure_grayscale(img)
+        if img.dtype != np.uint8:
+            img = np.asarray(img, dtype=np.float64)
+            if img.size == 0:
+                raise ValueError("Expected a nonempty image")
+            peak = float(img.max())
+            if peak > 1.0:
+                if peak > 255.0:
+                    raise ValueError("Image intensity exceeds uint8 range")
+                img = img
+            else:
+                img = img * 255.0
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    def detect_pipette_details(self, img: np.ndarray) -> dict:
+        """Return XY, depth in microns, box confidence and optional Z confidence.
+
+        Uses one inference pass. Missing/invalid predictions are None; box
+        confidence is not a substitute for the optional Z-confidence head.
+        """
+        prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None)
+        if img is None:
+            return prediction
+        try:
+            gray = self._to_uint8_grayscale(img)
+            result = self.adapter.predict(gray, native_mask=False)
+            tip = result["tip_xy"]
+            if tip is None:
+                return prediction
+            prediction["tip_xy"] = tuple(int(round(v)) for v in tip)
+            for key in ("z_um", "box_confidence", "z_confidence"):
+                value = result.get(key)
+                if value is not None and np.isfinite(value):
+                    prediction[key] = float(value)
+            if result.get("z_um") is not None and prediction["z_um"] is None:
+                logger.warning("PipetteDetector4 Z prediction is nonfinite; returning tip only")
+            return prediction
+        except Exception as exc:
+            logger.warning("PipetteDetector4 inference failed: %s", exc)
+            return dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None)
+
+    def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Preserve the existing integer XY-only detection interface."""
+        return self.detect_pipette_details(img)["tip_xy"]
+
+    def get_pipette_z(self, img: np.ndarray) -> Optional[float]:
+        """Infer depth in microns, or None when unavailable."""
+        return self.detect_pipette_details(img)["z_um"]
+
+    def get_pipette_confidence(self, img: np.ndarray) -> Optional[float]:
+        """Infer box detection confidence, or None when unavailable."""
+        return self.detect_pipette_details(img)["box_confidence"]
+
+    def get_pipette_z_confidence(self, img: np.ndarray) -> Optional[float]:
+        """Infer Z confidence, or None if the checkpoint has no such head."""
+        return self.detect_pipette_details(img)["z_confidence"]
+
+
+_DEFAULT_DETECTOR = None
+
+
+def configure_pipette_detector(detector):
+    """Select a loaded detector for the optional module-level point API."""
+    if not callable(getattr(detector, "detect_pipette", None)):
+        raise TypeError("detector must implement detect_pipette(image)")
+    global _DEFAULT_DETECTOR
+    _DEFAULT_DETECTOR = detector
+
+
+def detect_pipette(img):
+    """Return a tip or None using the detector selected at application startup."""
+    if _DEFAULT_DETECTOR is None:
+        raise RuntimeError("Call configure_pipette_detector with a loaded detector first")
+    return _DEFAULT_DETECTOR.detect_pipette(img)
 
 
 
 if __name__ == '__main__':
-    detector = PipetteDetectorYOLO1()
-    path = r"C:\Users\sa-forest\GaTech Dropbox\Benjamin Magondu\YOLOretrainingdata\Pipette CNN Training Data\20191016\3654098923.png"
+    detector = PipetteDetector4()
+    # path = r"C:\Users\sa-forest\Documents\GitHub\Neuron_Detection\codex_training\personal_training\combined_net6\test\images\2026_08_26-16_43__2298_1787777086.380385.webp"
+    # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\3333_1787864986.209094.webp"
+    # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\8352_1787865160.058934.webp"
+    path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-18_41\camera_frames\1864_1787870571.912273.webp"
+    
     img = cv2.imread(path)
 
     values = detector._test_detector(img,10)

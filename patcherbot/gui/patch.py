@@ -409,6 +409,16 @@ class PatchGui(ManipulatorGui):
         self.pipette_status_window_default_style = self.pipette_status_window.styleSheet()
 
         self.apply_theme("light")
+        self.experiment_book_tab.attach_recording_state_manager(
+            self.recording_state_manager
+        )
+        self.patch_interface.state_press_tally_changed.connect(
+            self.experiment_book_tab.handle_state_press_tally
+        )
+        self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
+        logging.debug("Added config GUI.")
+        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task,self.interface_signals, self.recording_state_manager)
+        self.add_tab(classic_patching_tab, 'Classic Auto Patching', index = 0)
 
     def register_commands(self):
         """
@@ -1885,11 +1895,25 @@ class ClassicPatchButtons(ButtonTabWidget):
         cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity]]
         freq = [[1, 3]]
         self.addButtonList('Testing', layout, buttonList, cmds, freq=freq, sequential=True)
+        buttonList = [['Find Pipette','Test Pipette Movement'],
+                      ['Detect Pipette','Detect Cells']]
+        cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity],
+                [self.pipette_interface.detect_pipette, self.patch_interface.detect_cells]]
+        freq = [[1, 3],
+                [1, 1]]
+        self.addButtonList('testing', layout, buttonList, cmds, freq=freq, sequential=True)
+
+        # # Add a box for lamp commands
+        buttonList = [['toggle shutter', 'toggle fluorescense'],['move cube left','move cube right']]
+        cmds = [[ self.patch_interface.toggle_shutter, self.patch_interface.toggle_fluorescence],
+                [self.patch_interface.move_cube_left, self.patch_interface.move_cube_right]
+        ]
+        self.addButtonList('fluorescence', layout, buttonList, cmds, sequential=True)
 
         # Add a box for patching commands
         buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
-                      ['Locate Cell','Hunt Cell','Gigaseal'],
-                      ['Break-in','Escape Cell'],
+                      ['Locate Cell','Approach Cell','Hunt Cell'],
+                      ['Gigaseal','Break-in','Escape Cell'],
                       ['Patch Cell','Run Protocols']]
         cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell],
                 [self.patch_interface.locate_cell,
@@ -1900,7 +1924,16 @@ class ClassicPatchButtons(ButtonTabWidget):
                  [self.shared_rig_controls.stop_recording,  self.patch_interface.run_protocols]]
                 ]
         self.addButtonList('Patching', layout, buttonList, cmds, sequential=True, change_color_during={
+                [self.patch_interface.locate_cell, self.patch_interface.approach_cell,
+                 [self.start_recording,self.patch_interface.hunt_cell]],
+                [[self.patch_interface.gigaseal], [self.patch_interface.break_in],
+                 [self.stop_recording,  self.patch_interface.escape_cell]],
+                [[self.start_recording,  self.patch_interface.patch, self.stop_recording],
+                 [self.stop_recording,  self.patch_interface.run_protocols]]
+]
+        self.addButtonList('patching', layout, buttonList, cmds, sequential=True, change_color_during={
             'Locate Cell',
+            'Approach Cell',
             'Hunt Cell',
             'Gigaseal',
             'Break-in',

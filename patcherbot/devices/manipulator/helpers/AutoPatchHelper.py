@@ -10,7 +10,7 @@ import numpy as np
 from patcherbot.deepLearning.autoPatcher import CellHunter, GigaSealer, Burglar, PipetteFinder
 
 
-DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parents[3] / "experiments" / "Datasets" / "average_calibration_full.pickle"
+DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parents[4] / "experiments" / "Datasets" / "average_calibration_full.pickle"
 
 
 
