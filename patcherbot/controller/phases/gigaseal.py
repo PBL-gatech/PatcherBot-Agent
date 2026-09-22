@@ -1,6 +1,5 @@
 """Implementation of the gigaseal patch phase."""
 
-import collections
 import time
 
 from dataclasses import dataclass
@@ -44,26 +43,26 @@ class GigasealPhase(PhaseController):
         """Coordinate the original sampling, pressure, holding, and success order."""
         state = GigasealState()
         self.prepare(state)
-        sampling = {"resistance": {
-            "num_measurements": state.num_slope_samples,
-            "interval": state.sample_interval,
-        }}
         while not self.controller.abort_requested:
             self.failure_gate(state)
+            state.sample_interval = float(self.controller.config.measurement_speed)
             observation = self.observe(
-                fields=["resistance"], sampling=sampling, raw_measurements=True,
+                fields=["resistance"], num_measurements=state.num_slope_samples,
+                interval=state.sample_interval, raw_measurements=True,
             )
             self.calculate(observation, state)
             agent_observation = self.observe(include_pressure_state=True) if state.agentPressure else observation
             if state.agentPressure:
-                self.calculate(agent_observation, state)
+                agent_observation = self.calculate(agent_observation, state)
             command = self.decide(agent_observation, state)
             if command is not None:
                 self.act(command, state)
                 if command.get("check_pressure_release"):
                     self.act({"atm": True, "wait_after": 5})
+                    state.sample_interval = float(self.controller.config.measurement_speed)
                     self.failure_gate(state, self.observe(
-                        fields=["resistance"], sampling=sampling, raw_measurements=True,
+                        fields=["resistance"], num_measurements=state.num_slope_samples,
+                        interval=state.sample_interval, raw_measurements=True,
                     ))
                     state.currPressure = -5
                     self.act({"pressure": state.currPressure, "atm": False})
@@ -91,7 +90,7 @@ class GigasealPhase(PhaseController):
                 }
         # Each Agent input follows a separate averaged loop observation.
         # Retain N prior inputs plus the current one, including interleaving.
-        self.observation_deck = collections.deque(maxlen=max(
+        self.controller.observation_helper.reset_history(self, max(
             OBSERVATION_HISTORY_SIZE, 2 * width + 1,
         ))
         self.controller.info(f"{self.controller.config.mode}: Attempting to form gigaseal...")
@@ -104,14 +103,16 @@ class GigasealPhase(PhaseController):
         state.num_slope_samples = 5
         state.sample_interval = float(self.controller.config.measurement_speed)
 
-        state.avg_resistance = self.observe(
-            fields=["resistance"],
-            sampling={"resistance": {
-                "num_measurements": state.num_slope_samples,
-                "interval": state.sample_interval,
-            }},
-            raw_measurements=True,
-        )["resistance"]
+        baseline_observation = self.observe(
+            fields=["resistance"], num_measurements=state.num_slope_samples,
+            interval=state.sample_interval, raw_measurements=True,
+        )
+        state.avg_resistance = baseline_observation["resistance"]
+        self.controller.observation_helper.record_calculations(self, baseline_observation, {
+            "num_measurements": state.num_slope_samples,
+            "sample_interval_s": state.sample_interval,
+            "baseline_resistance_mohm": state.avg_resistance,
+        })
         state.consecutive_success = 0
 
         self.controller.pressure.set_ATM(atm=True)
@@ -147,6 +148,12 @@ class GigasealPhase(PhaseController):
         if observation is not None:
             testresistance = observation["resistance"]
             difference = testresistance - state.avg_resistance
+            self.controller.observation_helper.record_calculations(self, observation, {
+                "num_measurements": state.num_slope_samples,
+                "sample_interval_s": state.sample_interval,
+                "reference_resistance_mohm": state.avg_resistance,
+                "resistance_difference_mohm": difference,
+            })
             self.controller.info(f"Test resistance: {testresistance} MΩ; difference: {difference} MΩ")
             if difference < 0:
                 state.bad_cell_count += 1
@@ -157,21 +164,48 @@ class GigasealPhase(PhaseController):
             raise AutopatchError(f"Seal attempt failed: resistance did not improve by at least {self.controller.config.gigaseal_min_delta_R} MegaOhms by the {self.controller.config.seal_deadline} second deadline.")
 
     def calculate(self, observation, state):
-        """Calculate progress, slope thresholds, or Agent decision context."""
+        """Calculate and record progress, slope thresholds, or Agent context."""
         if state.agentPressure and "pressure_atm_state" in observation:
             observation["observations_since_last_action"] = np.asarray(
                 [state.observations_since_last_action], dtype=np.float32,
             )
-            return observation
-        delta_resistance = observation["resistance"] - state.avg_resistance
+            self.controller.observation_helper.record_calculations(self, observation, {
+                "observations_since_last_action": state.observations_since_last_action,
+            })
+            return {key: value for key, value in observation.items() if key != "calculations"}
+        previous_resistance = state.avg_resistance
+        delta_resistance = observation["resistance"] - previous_resistance
         state.avg_resistance = observation["resistance"]
         state.rate_mohm_per_sec = delta_resistance / (state.num_slope_samples * state.sample_interval)
-        if delta_resistance >= self.controller.config.gigaseal_min_delta_R:
+        minimum_delta = self.controller.config.gigaseal_min_delta_R
+        if delta_resistance >= minimum_delta:
             state.last_progress_time = time.time()
+        calculations = {
+            "num_measurements": state.num_slope_samples,
+            "sample_interval_s": state.sample_interval,
+            "previous_resistance_mohm": previous_resistance,
+            "delta_resistance_mohm": delta_resistance,
+            "rate_mohm_per_sec": state.rate_mohm_per_sec,
+            "gigaseal_min_delta_R": minimum_delta,
+        }
         if state.autoPressure or state.adaptivePressure:
-            state.increase_thresh = self.controller.config.gigaseal_R / self.controller.config.increase_slope_gate
-            state.constant_thresh = self.controller.config.gigaseal_R / self.controller.config.constant_slope_gate
-            state.decrease_thresh = self.controller.config.gigaseal_R / self.controller.config.decrease_slope_gate
+            target_resistance = self.controller.config.gigaseal_R
+            increase_slope_gate = self.controller.config.increase_slope_gate
+            constant_slope_gate = self.controller.config.constant_slope_gate
+            decrease_slope_gate = self.controller.config.decrease_slope_gate
+            state.increase_thresh = target_resistance / increase_slope_gate
+            state.constant_thresh = target_resistance / constant_slope_gate
+            state.decrease_thresh = target_resistance / decrease_slope_gate
+            calculations.update(
+                gigaseal_R=target_resistance,
+                increase_slope_gate=increase_slope_gate,
+                constant_slope_gate=constant_slope_gate,
+                decrease_slope_gate=decrease_slope_gate,
+                increase_threshold_mohm_per_sec=state.increase_thresh,
+                constant_threshold_mohm_per_sec=state.constant_thresh,
+                decrease_threshold_mohm_per_sec=state.decrease_thresh,
+            )
+        self.controller.observation_helper.record_calculations(self, observation, calculations)
         return observation
 
     def decide(self, observation, state):

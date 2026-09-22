@@ -22,10 +22,10 @@ from patcherbot.devices.manipulator import *
 
 from numpy.linalg import inv, pinv, norm
 from threading import Thread
-from .StageCalHelper import FocusHelper, StageCalHelper
-from .StageScanHelper import StageScanHelper
-from .PipetteCalHelper import PipetteCalHelper, PipetteFocusHelper
-from .CellDetectHelper import CellDetectHelper
+from .helpers.StageCalHelper import FocusHelper, StageCalHelper
+from .helpers.StageScanHelper import StageScanHelper
+from .helpers.PipetteCalHelper import PipetteCalHelper, PipetteFocusHelper
+from .helpers.CellDetectHelper import CellDetectHelper
 
 __all__ = ['CalibratedUnit', 'CalibrationError', 'CalibratedStage']
 
@@ -91,7 +91,9 @@ class CalibratedUnit(ManipulatorUnit):
 
         #setup pipette calibration helper class
         self.pipetteCalHelper = PipetteCalHelper(unit, self.microscope, camera, stage, config=self.config)
-        self.pipetteFocusHelper = PipetteFocusHelper(unit, camera, config=self.config)
+        self.pipetteFocusHelper = PipetteFocusHelper(
+            unit, camera, config=self.config, detector=self.pipetteCalHelper.pipetteDetector
+        )
 
     def detect_pipette(self):
         try:
@@ -748,7 +750,7 @@ class CalibratedStage(CalibratedUnit):
         self.cellDetectHelper = CellDetectHelper(camera)
         self.cellTrackHelper = None
         if self.config.use_ai_features:
-            from .CellTrackHelper import CellTrackHelper
+            from .helpers.CellTrackHelper import CellTrackHelper
             self.cellTrackHelper = CellTrackHelper(self, camera)
         self.pipette_cal_position = np.zeros(2)
         self.unit = unit
@@ -766,7 +768,7 @@ class CalibratedStage(CalibratedUnit):
                 "Cell tracking is disabled. Set calibration.use_ai_features to true before use."
             )
         if self.cellTrackHelper is None:
-            from .CellTrackHelper import CellTrackHelper
+            from .helpers.CellTrackHelper import CellTrackHelper
             self.cellTrackHelper = CellTrackHelper(self, self.camera)
         return self.cellTrackHelper
 

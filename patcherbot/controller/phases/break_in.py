@@ -1,6 +1,5 @@
 """Implementation of the break_in patch phase."""
 
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -39,7 +38,6 @@ class BreakInPhase(PhaseController):
                 "pipette_positions", "stage_positions", "camera_image",
                 "pressure", "commanded_pressure_mbar", "pressure_atm_state",
             ]
-        sampling = {"resistance": {"num_measurements": 5, "interval": 0.200}}
         self.controller.info(
             f"Target Resistance: {self.controller.config.max_cell_R}; "
             f"Target Capacitance: {self.controller.config.min_cell_C}, "
@@ -47,7 +45,7 @@ class BreakInPhase(PhaseController):
 
         while True:
             observation = self.observe(
-                fields=fields, sampling=sampling, raw_measurements=True,
+                fields=fields, num_measurements=5, interval=0.200, raw_measurements=True,
             )
             self.controller.info(
                 f"Pre-action Resistance: {observation['resistance']}; "
@@ -68,7 +66,7 @@ class BreakInPhase(PhaseController):
 
     def prepare(self, state):
         """Prepare the rig and agent state for this break-in attempt."""
-        self.observation_deck = deque(maxlen=30)
+        self.controller.observation_helper.reset_history(self, 30)
         self.observation_windows = {}
         state.mode = self.controller.config.mode
         if state.mode == "Training":
@@ -81,7 +79,7 @@ class BreakInPhase(PhaseController):
             self.controller.info("Agent break-in mode detected; preparing break-in policy.")
             self.controller.agenthelper.prepare_model("break_in")
             width = self.controller.agenthelper.observation_input_width("resistance_input")
-            self.observation_deck = deque(maxlen=max(30, width + 1))
+            self.controller.observation_helper.reset_history(self, max(30, width + 1))
             if width > 0:
                 self.observation_windows["resistance_input"] = {
                     "field": "resistance",
@@ -112,11 +110,20 @@ class BreakInPhase(PhaseController):
         if state.mode in ("Classic", "Adaptive"):
             if state.trials % 5 == 0:
                 state.speed = 2 * self.controller.config.pulse_pressure_duration
+        self.controller.observation_helper.record_calculations(self, observation, {
+            "access_resistance_threshold": state.threshold_AR,
+            "consecutive_success": state.good_count,
+            "trial": state.trials,
+            "wait_period_s": state.wait_period,
+            "wait_s": state.wait,
+            "pressure_pulse_speed": state.speed,
+        })
+        if state.mode in ("Classic", "Adaptive"):
             return observation
 
         agent_observation = {
             key: value for key, value in observation.items()
-            if key not in ("access_resistance", "capacitance")
+            if key not in ("access_resistance", "capacitance", "calculations")
         }
         agent_observation["resistance"] = np.asarray(
             observation["resistance"], dtype=np.float32,
@@ -203,6 +210,10 @@ class BreakInPhase(PhaseController):
             state.good_count += 1
         else:
             state.good_count = 0
+        self.controller.observation_helper.record_calculations(self, observation, {
+            "access_resistance_threshold": state.threshold_AR,
+            "consecutive_success": state.good_count,
+        })
         self.controller.debug(
             f"Access-R check: {observation['access_resistance']:.2f} Ohm "
             f"(good_count={state.good_count})")

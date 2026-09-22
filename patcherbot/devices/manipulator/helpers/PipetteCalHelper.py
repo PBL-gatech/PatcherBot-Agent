@@ -6,8 +6,8 @@ from pathlib import Path
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.manipulator import Manipulator
 from patcherbot.devices.camera import Camera
-from patcherbot.deepLearning.pipetteDetector import PipetteDetector, PipetteDetectorYOLO1
-from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser
+from patcherbot.deepLearning.pipetteDetector import PipetteDetector, PipetteDetectorYOLO1, PipetteDetector4
+from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser2
 from threading import Thread
 import logging
 
@@ -37,7 +37,7 @@ def _resolve_model_path(model_name):
     if path.is_absolute():
         return path
 
-    model_dir = Path(__file__).resolve().parents[2] / "deepLearning" / "pipetteModel"
+    model_dir = Path(__file__).resolve().parents[3] / "deepLearning" / "pipetteModel"
     return model_dir / path
 
 
@@ -72,17 +72,21 @@ class PipetteCalHelper():
         model_name = getattr(self.config, "pipette_detector_model", None) if self.config is not None else None
         model_path = _resolve_model_path(model_name)
         try:
-            self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(
+            # self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(
+            #     model_path=model_path,
+            #     device=device,
+            # )
+            self.pipetteDetector: PipetteDetector = PipetteDetector4(
                 model_path=model_path,
                 device=device,
             )
         except Exception as exc:
             logging.warning(
-                "Failed to initialize PipetteDetectorYOLO1 with model '%s' (%s); using default model path",
+                "Failed to initialize PipetteDetector4 with model '%s' (%s); using default model path",
                 model_name,
                 exc,
             )
-            self.pipetteDetector = PipetteDetectorYOLO1(device=device)
+            self.pipetteDetector = PipetteDetector4(device=device)
         self.calibrated_stage = calibrated_stage
         # Each calibration point will be a tuple:
         #   (image_x, image_y, encoder_x, encoder_y)
@@ -209,21 +213,11 @@ class PipetteCalHelper():
         return mat3x4
 
 class PipetteFocusHelper():
-    def __init__(self, pipette: Manipulator, camera: Camera, config=None):
+    def __init__(self, pipette: Manipulator, camera: Camera, config=None, *, detector):
         self.pipette = pipette
         self.camera = camera
         self.config = config
-        model_name = getattr(self.config, "pipette_focuser_model", None) if self.config is not None else None
-        model_path = _resolve_model_path(model_name)
-        try:
-            self.pipetteFocuser: PipetteFocuser = PipetteFocuser(model_path=model_path)
-        except Exception as exc:
-            logging.warning(
-                "Failed to initialize PipetteFocuser with model '%s' (%s); using default model path",
-                model_name,
-                exc,
-            )
-            self.pipetteFocuser = PipetteFocuser()
+        self.pipetteFocuser = PipetteFocuser2(detector)
     
     def focus(self,frame=None):
         """
