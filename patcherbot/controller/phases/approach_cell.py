@@ -8,16 +8,13 @@ class ApproachCellPhase(PhaseController):
     def run(self, cell=None):
         """Prepare, choose, and execute one approach, then signal completion."""
         state = {"cell": cell}
-        self.prepare(state)
+        self.controller.calibrated_stage.set_max_speed(self.controller.config.max_locate_speed)
+        self.controller.calibrated_unit.set_max_speed(self.controller.config.max_locate_speed)
+
         command = self.decide(state=state)
         completed = self.act(command)
         if self.success_gate(completed, state):
             self.complete_success()
-
-    def prepare(self, state=None):
-        """Set the existing movement speeds for the approach."""
-        self.controller.calibrated_stage.set_max_speed(self.controller.config.max_locate_speed)
-        self.controller.calibrated_unit.set_max_speed(self.controller.config.max_locate_speed)
 
     def decide(self, observation=None, state=None):
         """Choose approach distances from the cell type without moving hardware."""

@@ -31,7 +31,36 @@ class BreakInPhase(PhaseController):
         Training only observes and logs until manual Success or Abort.
         """
         state = BreakInState()
-        self.prepare(state)
+        self.controller.observation_helper.reset_history(self, 30)
+        self.observation_windows = {}
+        state.mode = self.controller.config.mode
+        if state.mode == "Training":
+            self.controller.info("Training mode: observing only. Click Success or Abort to finish.")
+        else:
+            # ---------- initial setup ----------
+            self.controller.daq.setCellMode(True)
+            if state.mode == "Agent":
+                self.controller.info("Agent break-in mode detected; preparing break-in policy.")
+                self.controller.agenthelper.prepare_model("break_in")
+                width = self.controller.agenthelper.observation_input_width("resistance_input")
+                self.controller.observation_helper.reset_history(self, max(30, width + 1))
+                if width > 0:
+                    self.observation_windows["resistance_input"] = {
+                        "field": "resistance",
+                        "width": width,
+                        "predicate": lambda sample: not float(np.asarray(
+                            sample.get("access_resistance", np.nan),
+                        ).reshape(-1)[0]) <= state.threshold_AR,
+                        "finite_only": True,
+                        "fill_value": 0.0,
+                    }
+            self.controller.info(f"{self.controller.config.mode}: Attempting Break in...")
+            self.controller.sleep(3)
+            self.controller.pressure.set_pressure(self.controller.config.pulse_pressure_break_in)
+            self.controller.amplifier.set_zap_duration(25 * 1e-6)
+            state.speed = self.controller.config.pulse_pressure_duration
+            state.threshold_AR = self.controller.config.max_access_R
+
         fields = ["access_resistance", "resistance", "capacitance"]
         if state.mode == "Agent":
             fields += [
@@ -61,41 +90,6 @@ class BreakInPhase(PhaseController):
                 continue
             self.act(command)
             self.failure_gate(state)
-
-
-
-    def prepare(self, state):
-        """Prepare the rig and agent state for this break-in attempt."""
-        self.controller.observation_helper.reset_history(self, 30)
-        self.observation_windows = {}
-        state.mode = self.controller.config.mode
-        if state.mode == "Training":
-            self.controller.info("Training mode: observing only. Click Success or Abort to finish.")
-            return
-
-        # ---------- initial setup ----------
-        self.controller.daq.setCellMode(True)
-        if state.mode == "Agent":
-            self.controller.info("Agent break-in mode detected; preparing break-in policy.")
-            self.controller.agenthelper.prepare_model("break_in")
-            width = self.controller.agenthelper.observation_input_width("resistance_input")
-            self.controller.observation_helper.reset_history(self, max(30, width + 1))
-            if width > 0:
-                self.observation_windows["resistance_input"] = {
-                    "field": "resistance",
-                    "width": width,
-                    "predicate": lambda sample: not float(np.asarray(
-                        sample.get("access_resistance", np.nan),
-                    ).reshape(-1)[0]) <= state.threshold_AR,
-                    "finite_only": True,
-                    "fill_value": 0.0,
-                }
-        self.controller.info(f"{self.controller.config.mode}: Attempting Break in...")
-        self.controller.sleep(3)
-        self.controller.pressure.set_pressure(self.controller.config.pulse_pressure_break_in)
-        self.controller.amplifier.set_zap_duration(25 * 1e-6)
-        state.speed = self.controller.config.pulse_pressure_duration
-        state.threshold_AR = self.controller.config.max_access_R
 
     def action_gate(self, observation, state):
         """Allow an action only while access resistance has not qualified."""

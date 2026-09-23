@@ -29,31 +29,56 @@ class ObservationHelper:
         self._pipette_models_enabled = False
         self.deep_learning_error = None
         self.observation_decks = {}
+        self._history_options = {}
         self._recorded_observations = {}
         self._latest = {}
 
-    def reset_history(self, phase, maxlen):
-        """Start an empty bounded history for this phase attempt."""
-        self.observation_decks[phase] = deque(maxlen=maxlen)
+    def reset_history(self, phase, maxlen, *, include_images=True):
+        """Reset attempt history; None retains all rows, optionally without images."""
+        deck = getattr(phase, "observation_deck", None)
+        if not isinstance(deck, deque) or deck.maxlen != maxlen:
+            deck = deque(maxlen=maxlen)
+        else:
+            deck.clear()
+        self.observation_decks[phase] = deck
+        if hasattr(phase, "observation_deck"):
+            phase.observation_deck = deck
+        self._history_options[phase] = {"include_images": bool(include_images), "fields": set()}
         self._recorded_observations.pop(phase, None)
 
     def record_observation(self, phase, observation):
-        """Store one independent phase snapshot before derived windows are added."""
+        """Store independent measurements; image retention is selected per attempt."""
         deck = self.observation_decks.get(phase)
-        if deck is not None:
-            snapshot = deepcopy(observation)
-            if isinstance(snapshot, dict):
-                # Learn fields from this run; missing measurements are never
-                # carried forward from an earlier observation.
-                previous = [entry for entry in deck if isinstance(entry, dict)]
-                fields = set(snapshot)
-                for entry in previous:
-                    fields.update(entry)
-                for entry in [*previous, snapshot]:
-                    for field in fields:
-                        entry.setdefault(field, float("nan"))
-            deck.append(snapshot)
-            self._recorded_observations[phase] = (observation, snapshot)
+        if deck is None:
+            return
+        options = self._history_options.setdefault(phase, {"include_images": True, "fields": set()})
+        source = observation
+        if not options["include_images"]:
+            if isinstance(observation, dict):
+                source = dict(observation)
+                if "camera_image" in source:
+                    source["camera_image"] = None
+            elif isinstance(observation, list) and len(observation) >= 3:
+                source = list(observation)
+                source[2] = None
+        snapshot = deepcopy(source)
+        if isinstance(snapshot, dict):
+            if not options["include_images"] and "camera_image" in snapshot:
+                metadata = snapshot.setdefault("field_metadata", {})
+                metadata.setdefault("camera_image", {})["history_omitted"] = True
+            # Only new field names require revisiting earlier rows. Ordinary
+            # recording remains bounded in cost even for whole-attempt history.
+            new_fields = set(snapshot) - options["fields"]
+            if new_fields:
+                for entry in deck:
+                    if isinstance(entry, dict):
+                        for field in new_fields:
+                            entry.setdefault(field, float("nan"))
+                options["fields"].update(new_fields)
+            for field in options["fields"]:
+                snapshot.setdefault(field, float("nan"))
+        deck.append(snapshot)
+        self._recorded_observations[phase] = (observation, snapshot)
 
     def record_calculations(self, phase, observation, calculations):
         """Enrich this exact recorded sample without adding a second deck row."""
@@ -66,11 +91,17 @@ class ObservationHelper:
         if not isinstance(observation, dict) or not isinstance(snapshot, dict):
             raise TypeError("Calculation storage requires a dictionary observation")
         # Keep both the returned observation and helper-owned history independent.
-        observation["calculations"] = deepcopy(calculations)
-        snapshot["calculations"] = deepcopy(calculations)
-        for entry in deck:
-            if isinstance(entry, dict):
-                entry.setdefault("calculations", float("nan"))
+        existing = observation.get("calculations")
+        merged = deepcopy(existing) if isinstance(existing, dict) else {}
+        merged.update(deepcopy(calculations))
+        observation["calculations"] = deepcopy(merged)
+        snapshot["calculations"] = deepcopy(merged)
+        options = self._history_options.setdefault(phase, {"include_images": True, "fields": set()})
+        if "calculations" not in options["fields"]:
+            for entry in deck:
+                if isinstance(entry, dict):
+                    entry.setdefault("calculations", float("nan"))
+            options["fields"].add("calculations")
 
     def observation_window(
         self, phase, field, width, *, predicate=None, finite_only=False,
@@ -94,7 +125,10 @@ class ObservationHelper:
             if not isinstance(sample, dict) or (predicate is not None and not predicate(sample)):
                 continue
             try:
-                value = np.asarray(sample.get(field, np.nan), dtype=dtype).reshape(shape)
+                value = sample
+                for key in field.split("."):
+                    value = value.get(key, np.nan) if isinstance(value, dict) else np.nan
+                value = np.asarray(value, dtype=dtype).reshape(shape)
             except (TypeError, ValueError):
                 value = np.full(shape, np.nan, dtype=dtype)
             if finite_only and not np.isfinite(value).all():
@@ -107,7 +141,8 @@ class ObservationHelper:
 
     def _cache_reading(self, field, value):
         self._latest[field] = dict(value=deepcopy(value), acquired_at=time.monotonic(),
-                                   confidence=None, source="hardware")
+                                   confidence=None, source="hardware",
+                                   timestamp_basis="hardware_read_complete")
         return value
 
     def get_cached_observation(self, field, *, max_age=1.0):
@@ -136,8 +171,17 @@ class ObservationHelper:
                 available_at = None
             elif available_at > 100000000:
                 available_at = time.monotonic() - (time.time() - available_at)
+        camera = self.controller.calibrated_stage.camera
+        timing_reader = getattr(camera, "get_frame_timing", None)
+        timing = timing_reader(frame_id, frame_time) if callable(timing_reader) else None
+        acquired_at = None if timing is None else timing.get("acquisition_started_at")
+        if timing is not None:
+            available_at = timing.get("available_at", available_at)
         self._latest["camera_image"].update(
-            acquired_at=available_at, source_frame=frame_id, source="camera_availability")
+            acquired_at=acquired_at if acquired_at is not None else available_at,
+            frame_acquired_at=acquired_at, frame_available_at=available_at,
+            source_frame=frame_id, source="camera",
+            timestamp_basis="camera_snap_start" if acquired_at is not None else "camera_availability")
         return image
 
     def get_manipulator_position(self):
@@ -174,16 +218,32 @@ class ObservationHelper:
         return self._cache_reading("capacitance", capacitance)
 
     def get_pressure(self):
-        return self._cache_reading("pressure", np.asarray(
-            [self.controller.pressure.get_last_acquisition()], dtype=np.float32))
+        pressure = self.controller.pressure
+        sample_reader = getattr(pressure, "get_last_acquisition_sample", None)
+        acquired_at = None
+        if callable(sample_reader):
+            value, acquired_at = sample_reader()
+        else:
+            read = getattr(pressure, "get_last_acquisition", None)
+            value = read() if callable(read) else np.nan
+        reading = self._cache_reading("pressure", np.asarray([value], dtype=np.float32))
+        metadata = self._latest["pressure"]
+        metadata.update(read_at=metadata["acquired_at"], acquired_at=acquired_at,
+                        source="pressure_acquisition_cache",
+                        timestamp_basis="pressure_acquisition" if acquired_at is not None else "cache_read_complete",
+                        measurement_acquired_at=acquired_at, freshness_known=acquired_at is not None)
+        return reading
 
     def get_commanded_pressure_mbar(self):
-        return self._cache_reading("commanded_pressure_mbar", np.asarray(
-            [self.controller.pressure.get_pressure()], dtype=np.float32))
+        read = getattr(self.controller.pressure, "get_pressure", None)
+        value = read() if callable(read) else np.nan
+        return self._cache_reading("commanded_pressure_mbar", np.asarray([value], dtype=np.float32))
 
     def get_pressure_atm_state(self):
-        return self._cache_reading("pressure_atm_state", np.asarray(
-            [float(bool(self.controller.pressure.get_ATM()))], dtype=np.float32))
+        read = getattr(self.controller.pressure, "get_ATM", None)
+        raw = read() if callable(read) else None
+        value = np.nan if raw is None or not np.isfinite(float(raw)) else float(bool(raw))
+        return self._cache_reading("pressure_atm_state", np.asarray([value], dtype=np.float32))
 
     def start_deep_learning(self, cell=None, interval=0.1):
         """Start one independent inference loop; ordinary getters only read its cache.
@@ -258,7 +318,7 @@ class ObservationHelper:
                 self.deep_learning_error = str(error)
             stop.wait(interval)
 
-    def get_deep_learning(self, *, deep_learning=False, cell=None):
+    def get_deep_learning(self, *, deep_learning=False, cell=None, _include_image=False):
         """False reads the cache; True explicitly refreshes the shared model batch.
 
         A separate caller loop can call refresh_deep_learning. Cache reads never
@@ -269,16 +329,23 @@ class ObservationHelper:
         if deep_learning:
             self.refresh_deep_learning(cell=cell)
         cached = self._deep_learning_observation
-        evidence = None if cached is None or (cell is not None and cached[0] is not cell) else deepcopy(cached[1])
+        accepted = cached is not None and (cell is None or cached[0] is cell)
+        evidence = deepcopy({key: value for key, value in cached[1].items()
+                             if key != "_source_image"}) if accepted else None
+        source_image = cached[1].get("_source_image") if accepted else None
         if evidence is None:
-            evidence = dict(source_frame=None, frame_available_at=None, confidence=None,
+            evidence = dict(source_frame=None, frame_available_at=None, frame_acquired_at=None, confidence=None,
                             status="not_available", pipette_position=None, pipette_focus=None,
                             cell_detections=None, tracked_cell_position=None)
         now = time.monotonic()
         available_at = evidence["frame_available_at"]
-        age = None if available_at is None else now - available_at
+        acquired_at = evidence.get("frame_acquired_at")
+        freshness_at = acquired_at if acquired_at is not None else available_at
+        age = None if freshness_at is None else now - freshness_at
         evidence.update(observed_at=now, age_s=age,
                         stale=age is None or age < 0 or age > self.deep_learning_max_age)
+        if _include_image:
+            evidence["_source_image"] = None if source_image is None else source_image.copy()
         return evidence
 
     def get_pipette_positions(self, *, deep_learning=False, cell=None):
@@ -309,6 +376,7 @@ class ObservationHelper:
                 if generation != self._producer_generation:
                     return
             frame_id, frame_time, frame = self._camera_frame() if _frame is None else _frame
+            source_image = None if frame is None else frame.copy()
             started_at = time.monotonic()
             stamp = frame_time.timestamp() if hasattr(frame_time, "timestamp") else frame_time
             available_at = None
@@ -316,16 +384,26 @@ class ObservationHelper:
                 available_at = float(stamp)
                 if available_at > 100000000:
                     available_at = started_at - (time.time() - available_at)
+            camera = self.controller.calibrated_stage.camera
+            timing_reader = getattr(camera, "get_frame_timing", None)
+            timing = timing_reader(frame_id, frame_time) if callable(timing_reader) else None
+            acquired_at = None if timing is None else timing.get("acquisition_started_at")
+            if timing is not None:
+                available_at = timing.get("available_at", available_at)
             models = ("pipette_detector", "pipette_focuser", "cell_detector", "cell_tracker")
             result = dict(source_frame=frame_id, frame_available_at=available_at,
-                          timestamp_basis="camera_availability", started_at=started_at,
+                          frame_acquired_at=acquired_at,
+                          timestamp_basis="camera_snap_start" if acquired_at is not None else "camera_availability",
+                          started_at=started_at,
+                          producer_session=session, producer_generation=generation,
+                          target_identity=None if cell is None else id(cell),
                           pipette_position=None, pipette_focus=None, cell_detections=None,
                           tracked_cell_position=None, tracking_status=None,
                           confidence={name: None for name in models},
                           status={name: "no_frame" for name in models}, errors={},
                           enabled_models={"cell": cell_models, "pipette": pipette_models},
                           source_image_shape=None if frame is None else tuple(frame.shape),
-                          source_positions={}, positions_sampled_at=started_at,
+                          source_positions={}, source_position_metadata={}, positions_sampled_at=started_at,
                           position_timestamp_basis="inference_start")
             for name in models:
                 enabled = cell_models if name.startswith("cell") else pipette_models
@@ -341,9 +419,15 @@ class ObservationHelper:
             }
             for name, read in position_readers.items():
                 try:
-                    result["source_positions"][name] = deepcopy(read())
+                    position = deepcopy(read())
+                    result["source_positions"][name] = position
+                    result["source_position_metadata"][name] = dict(
+                        acquired_at=time.monotonic(), timestamp_basis="hardware_read_complete",
+                        valid=bool(np.isfinite(np.asarray(position, dtype=float)).all()))
                 except Exception as error:
                     result["source_positions"][name] = None
+                    result["source_position_metadata"][name] = dict(
+                        acquired_at=time.monotonic(), timestamp_basis="hardware_read_complete", valid=False)
                     result["errors"][name + "_position"] = str(error)
 
             def read_model(name, read):
@@ -392,10 +476,15 @@ class ObservationHelper:
                         result["tracked_cell_position"] = read_model("cell_tracker", track_selected_cell)
             result["completed_at"] = time.monotonic()
             result["inference_latency_s"] = result["completed_at"] - started_at
-            # Publish the completed batch atomically; readers own their copies.
+            # Retain exactly the image used by this batch, privately. Public
+            # evidence excludes it; observe exposes one independently owned image.
+            published = deepcopy(result)
+            published["_source_image"] = source_image
+            if published["_source_image"] is not None:
+                published["_source_image"].flags.writeable = False
             with self._producer_lock:
                 if generation == self._producer_generation:
-                    self._deep_learning_observation = (cell, deepcopy(result))
+                    self._deep_learning_observation = (cell, published)
 
     def _validate_request(self, include_pressure_state, fields, sampling):
         legacy = fields is None
@@ -413,6 +502,7 @@ class ObservationHelper:
             "pressure", "commanded_pressure_mbar", "pressure_atm_state",
             "access_resistance", "capacitance", "manipulator_position",
             "deep_learning", "cell_detections", "tracked_cell_position", "pipette_focus",
+            "pipette_image_xy", "pipette_defocus_um",
         }
         if isinstance(fields, str):
             raise TypeError("fields must be an iterable of names, not a string")
@@ -476,15 +566,22 @@ class ObservationHelper:
             self._validate_sampling(access_count, access_interval)
         if "capacitance" in requested:
             self._validate_sampling(capacitance_count, capacitance_interval)
-        values = {}
+        if not legacy and "pipette_positions" in requested:
+            requested = tuple(dict.fromkeys((*requested, "pipette_image_xy", "pipette_defocus_um")))
+        values, metadata = {}, {}
         if deep_learning:
-            frame = self._camera_frame()
-            self.refresh_deep_learning(cell=cell, _frame=frame)
-            if "camera_image" in requested:
-                values["camera_image"] = self.get_camera_image(_frame=frame)
+            self.refresh_deep_learning(cell=cell, _frame=self._camera_frame())
+        visual_fields = {"pipette_positions", "pipette_focus", "cell_detections",
+                         "tracked_cell_position", "deep_learning", "pipette_image_xy", "pipette_defocus_um"}
+        evidence = self.get_deep_learning(cell=cell, _include_image="camera_image" in requested) if visual_fields.intersection(requested) else None
+        source_image = None if evidence is None else evidence.pop("_source_image", None)
+        visual_models = {
+            "pipette_positions": ("pipette_detector", "pipette_focuser"),
+            "pipette_focus": ("pipette_focuser",), "cell_detections": ("cell_detector",),
+            "pipette_image_xy": ("pipette_detector",), "pipette_defocus_um": ("pipette_focuser",),
+            "tracked_cell_position": ("cell_tracker",),
+        }
         for field in requested:
-            if field in values:
-                continue
             if field == "resistance":
                 value = self.get_resistance(resistance_count, resistance_interval)
             elif field == "access_resistance":
@@ -496,7 +593,10 @@ class ObservationHelper:
             elif field == "stage_positions":
                 value = self.get_stage_positions()
             elif field == "camera_image":
-                value = self.get_camera_image()
+                if source_image is not None and not (legacy and not deep_learning):
+                    value = source_image
+                else:
+                    value = self.get_camera_image()
             elif field == "pressure":
                 value = self.get_pressure()
             elif field == "commanded_pressure_mbar":
@@ -504,19 +604,90 @@ class ObservationHelper:
             elif field == "pressure_atm_state":
                 value = self.get_pressure_atm_state()
             elif field == "pipette_positions":
-                value = self.get_pipette_positions(cell=cell)
+                point, focus = evidence["pipette_position"], evidence["pipette_focus"]
+                value = np.append([np.nan, np.nan] if point is None else point,
+                                  np.nan if focus is None else focus)
+            elif field == "pipette_image_xy":
+                point = evidence["pipette_position"]
+                value = np.asarray([np.nan, np.nan] if point is None else point, dtype=float)
+            elif field == "pipette_defocus_um":
+                focus = evidence["pipette_focus"]
+                value = np.nan if focus is None else float(focus)
             elif field == "pipette_focus":
-                value = self.get_pipette_focus(cell=cell)
+                value = evidence["pipette_focus"]
             elif field == "cell_detections":
-                value = self.get_cell_detections(cell=cell)
+                value = evidence["cell_detections"]
             elif field == "tracked_cell_position":
-                value = self.get_tracked_cell_position(cell=cell)
+                value = evidence["tracked_cell_position"]
             elif field == "deep_learning":
-                value = self.get_deep_learning(cell=cell)
+                value = evidence
             if field in ("resistance", "access_resistance", "capacitance"):
                 if not raw_measurements and not (legacy and not include_pressure_state):
                     value = np.asarray([value], dtype=np.float32)
             values[field] = value
+            frame_image = field == "camera_image" and value is source_image and source_image is not None
+            if field in visual_fields or frame_image:
+                statuses = evidence.get("status")
+                statuses = statuses if isinstance(statuses, dict) else {}
+                models = visual_models.get(field, ())
+                if field == "deep_learning":
+                    valid = evidence.get("source_frame") is not None and any(
+                        status in ("ok", "no_detection") for status in statuses.values())
+                elif frame_image:
+                    valid = True
+                else:
+                    try:
+                        valid = value is not None and bool(np.isfinite(np.asarray(value, dtype=float)).all())
+                    except (TypeError, ValueError):
+                        valid = False
+                    valid = valid and all(statuses.get(model) in ("ok", "no_detection") for model in models)
+                confidences = evidence.get("confidence")
+                confidences = confidences if isinstance(confidences, dict) else {}
+                metadata[field] = dict(
+                    acquired_at=(evidence.get("frame_acquired_at") if evidence.get("frame_acquired_at") is not None
+                                 else evidence.get("frame_available_at")), read_at=time.monotonic(),
+                    frame_acquired_at=evidence.get("frame_acquired_at"),
+                    frame_available_at=evidence.get("frame_available_at"),
+                    source="camera" if frame_image else "inference", source_frame=evidence.get("source_frame"),
+                    timestamp_basis=evidence.get("timestamp_basis", "camera_availability"), valid=bool(valid),
+                    stale=bool(evidence.get("stale", True)), age_s=evidence.get("age_s"),
+                    confidence={model: deepcopy(confidences.get(model)) for model in models},
+                    status={model: statuses.get(model, "not_available") for model in models},
+                    producer_session=evidence.get("producer_session"),
+                    producer_generation=evidence.get("producer_generation"))
+            else:
+                cached = self._latest.get(field) or {}
+                entry = deepcopy({key: item for key, item in cached.items() if key != "value"})
+                acquired = entry.get("acquired_at")
+                now = time.monotonic()
+                age = None if acquired is None else now - acquired
+                try:
+                    valid = value is not None and bool(np.isfinite(np.asarray(value, dtype=float)).all())
+                except (TypeError, ValueError):
+                    valid = False
+                entry.update(read_at=now, valid=bool(valid), source_frame=entry.get("source_frame"),
+                             age_s=age, stale=age is None or age < 0 or age > 1.0)
+                if field == "pressure" and not entry.get("freshness_known", False):
+                    # A legacy controller may expose a value but no acquisition time.
+                    entry.update(stale=None, age_s=None)
+                metadata[field] = entry
+        observed_at = time.monotonic()
+        if evidence is not None:
+            acquired = evidence.get("frame_acquired_at")
+            if acquired is None:
+                acquired = evidence.get("frame_available_at")
+            age = None if acquired is None else observed_at - acquired
+            evidence.update(observed_at=observed_at, age_s=age,
+                            stale=age is None or age < 0 or age > self.deep_learning_max_age)
+        for entry in metadata.values():
+            acquired = entry.get("acquired_at")
+            age = None if acquired is None else observed_at - acquired
+            limit = self.deep_learning_max_age if entry.get("source") in ("camera", "inference") else 1.0
+            entry.update(age_s=age, stale=age is None or age < 0 or age > limit)
+            if entry.get("source") == "pressure_acquisition_cache" and not entry.get("freshness_known", False):
+                entry.update(age_s=None, stale=None)
         if legacy and not include_pressure_state:
             return [values[field] for field in requested]
-        return {field: values[field] for field in requested}
+        values["observed_at"] = observed_at
+        values["field_metadata"] = metadata
+        return values

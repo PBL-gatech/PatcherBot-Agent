@@ -62,6 +62,7 @@ class AcquisitionThread(threading.Thread):
         last_frame = 0
         while self.running:
             snap_time = time.time()
+            acquisition_started_at = time.monotonic()
             try:
                 raw, processed = self.camera.snap()
                 time.sleep(0.02)  # Simulate processing time
@@ -77,7 +78,8 @@ class AcquisitionThread(threading.Thread):
             raw_image = raw.copy() if hasattr(raw, "copy") else raw
             processed_entry = (last_frame, frame_time, elapsed, processed_image)
             raw_entry = (last_frame, frame_time, elapsed, raw_image)
-            self.camera._update_frame_pair(processed_entry, raw_entry)
+            self.camera._update_frame_pair(
+                processed_entry, raw_entry, acquisition_started_at=acquisition_started_at)
             # Put image into queues for disk storage and display
             for queue in self.queues:
                 queue.append(processed_entry)
@@ -124,6 +126,7 @@ class Camera(object):
         self.cell_list = []
         self._frame_pair_lock = threading.Lock()
         self._last_frame_pair = None
+        self._frame_timings = collections.deque(maxlen=8)
         
         self.last_frame_time = None
         self.fps = 0
@@ -272,9 +275,22 @@ class Camera(object):
         raw = self.raw_snap()
         return raw, self.preprocess(raw)
 
-    def _update_frame_pair(self, processed_entry, raw_entry) -> None:
+    def _update_frame_pair(self, processed_entry, raw_entry, *, acquisition_started_at=None) -> None:
         with self._frame_pair_lock:
             self._last_frame_pair = (processed_entry, raw_entry)
+            self._frame_timings.append((raw_entry[0], raw_entry[1], {
+                "acquisition_started_at": acquisition_started_at,
+                "available_at": time.monotonic(),
+                "timestamp_basis": "camera_snap_start",
+            }))
+
+    def get_frame_timing(self, frame_id, frame_time):
+        """Read matching capture-request timing without acquiring another image."""
+        with self._frame_pair_lock:
+            for saved_id, saved_time, timing in reversed(self._frame_timings):
+                if saved_id == frame_id and saved_time == frame_time:
+                    return dict(timing)
+        return None
 
     def raw_snap(self):
         return None

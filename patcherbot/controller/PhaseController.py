@@ -1,21 +1,20 @@
 """Common interface for phases that share an AutoPatcher controller."""
 
 from abc import ABC, abstractmethod
+import collections
 
 
 class PhaseController(ABC):
     def __init__(self, controller):
+        """Store shared dependencies; attempt setup belongs at the start of run()."""
         self.controller = controller
         self.observation_windows = {}
+        self.observation_deck = collections.deque()
 
     @abstractmethod
     def run(self, cell=None):
         """Execute this phase; concrete phases retain their input contracts."""
         raise NotImplementedError
-
-    def prepare(self, state=None):
-        """Prepare a phase attempt; override when preparation is needed."""
-        pass
 
     def action_gate(self, observation=None, state=None):
         """Determine whether the observation permits an action."""

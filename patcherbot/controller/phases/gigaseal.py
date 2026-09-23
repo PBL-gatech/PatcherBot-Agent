@@ -42,35 +42,6 @@ class GigasealPhase(PhaseController):
     def run(self, cell=None):
         """Coordinate the original sampling, pressure, holding, and success order."""
         state = GigasealState()
-        self.prepare(state)
-        while not self.controller.abort_requested:
-            self.failure_gate(state)
-            state.sample_interval = float(self.controller.config.measurement_speed)
-            observation = self.observe(
-                fields=["resistance"], num_measurements=state.num_slope_samples,
-                interval=state.sample_interval, raw_measurements=True,
-            )
-            self.calculate(observation, state)
-            agent_observation = self.observe(include_pressure_state=True) if state.agentPressure else observation
-            if state.agentPressure:
-                agent_observation = self.calculate(agent_observation, state)
-            command = self.decide(agent_observation, state)
-            if command is not None:
-                self.act(command, state)
-                if command.get("check_pressure_release"):
-                    self.act({"atm": True, "wait_after": 5})
-                    state.sample_interval = float(self.controller.config.measurement_speed)
-                    self.failure_gate(state, self.observe(
-                        fields=["resistance"], num_measurements=state.num_slope_samples,
-                        interval=state.sample_interval, raw_measurements=True,
-                    ))
-                    state.currPressure = -5
-                    self.act({"pressure": state.currPressure, "atm": False})
-            self.success_gate(observation["resistance"], state)
-        raise AutopatchError("Seal attempt failed: gigaseal criteria not met.")
-
-    def prepare(self, state):
-        """Initialize the rig, baseline, mode, and per-attempt state in order."""
         state.autoPressure = (self.controller.config.mode == 'Classic')
         state.adaptivePressure = (self.controller.config.mode == 'Adaptive')
         state.agentPressure = (self.controller.config.mode == 'Agent')
@@ -142,6 +113,32 @@ class GigasealPhase(PhaseController):
         state.last_progress_time = time.time()
         state.last_agent_action = None
         state.observations_since_last_action = 0
+
+        while not self.controller.abort_requested:
+            self.failure_gate(state)
+            state.sample_interval = float(self.controller.config.measurement_speed)
+            observation = self.observe(
+                fields=["resistance"], num_measurements=state.num_slope_samples,
+                interval=state.sample_interval, raw_measurements=True,
+            )
+            self.calculate(observation, state)
+            agent_observation = self.observe(include_pressure_state=True) if state.agentPressure else observation
+            if state.agentPressure:
+                agent_observation = self.calculate(agent_observation, state)
+            command = self.decide(agent_observation, state)
+            if command is not None:
+                self.act(command, state)
+                if command.get("check_pressure_release"):
+                    self.act({"atm": True, "wait_after": 5})
+                    state.sample_interval = float(self.controller.config.measurement_speed)
+                    self.failure_gate(state, self.observe(
+                        fields=["resistance"], num_measurements=state.num_slope_samples,
+                        interval=state.sample_interval, raw_measurements=True,
+                    ))
+                    state.currPressure = -5
+                    self.act({"pressure": state.currPressure, "atm": False})
+            self.success_gate(observation["resistance"], state)
+        raise AutopatchError("Seal attempt failed: gigaseal criteria not met.")
 
     def failure_gate(self, state, observation=None):
         """Check the deadline before a loop, or evaluate a supplied pressure-release test."""

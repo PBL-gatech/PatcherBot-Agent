@@ -347,12 +347,6 @@ class AutoPatcher(TaskController):
         '''
         return self.approach_cell_phase.clear_to_cell(cell)
         
-    def track_cell(self, cell):
-        '''
-        Track the cell during hunting and return its current position in pixels.
-        '''
-        return self.hunt_cell_phase.track_cell(cell)
-    
     def _isCellDetected(self, lastResDeque, cellThreshold = 0.15):
         '''Given a list of three resistance readings, do we think there is a cell where the pipette is?
         '''
