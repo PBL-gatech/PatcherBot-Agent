@@ -46,24 +46,6 @@ class ManipulatorUnit(Manipulator):
         else:
             return self.dev.position(self.axes[axis])
 
-    def start_absolute_move(self, target, *, context=None):
-        """Send one absolute command using the observation's device context."""
-        target = np.asarray(target, dtype=float)
-        if target.shape != (len(self.axes),) or not np.isfinite(target).all():
-            raise ValueError("Move target must contain one finite value per axis")
-        return self.dev.start_move(target.tolist(), self.axes, context=context)
-
-    def start_relative_move(self, delta, *, position, context=None):
-        """Use a supplied observation; this command never samples position."""
-        delta, position = np.asarray(delta, dtype=float), np.asarray(position, dtype=float)
-        if delta.shape != (len(self.axes),) or position.shape != delta.shape:
-            raise ValueError("Move delta and observed position must match device axes")
-        return self.start_absolute_move(position + delta, context=context)
-
-    def read_motion_state(self):
-        """Read one passive backend snapshot for ObservationHelper."""
-        return self.dev.read_motion_state()
-
     def absolute_move(self, x, axis = None, blocking=False, speed=None):
         '''
         Moves the device axis to position x in um.
@@ -130,16 +112,6 @@ class ManipulatorUnit(Manipulator):
         '''
         self.dev.relative_move_group(x, self.axes,speed)
 
-
-
-    def start_velocity(self, velocity, *, relative=False):
-        """Explicit supervised velocity dispatch; backend failures propagate."""
-        velocity = np.asarray(velocity, dtype=float)
-        if velocity.shape != (len(self.axes),) or not np.isfinite(velocity).all():
-            raise ValueError("Velocity must contain one finite value per axis")
-        if not callable(getattr(self.dev, "start_velocity", None)):
-            raise NotImplementedError("This backend does not support supervised velocity")
-        self.dev.start_velocity(velocity.tolist(), self.axes, relative=relative)
 
     def absolute_move_group_velocity(self, vel):
         '''

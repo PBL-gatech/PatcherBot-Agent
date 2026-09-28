@@ -141,7 +141,10 @@ class FileLogger(threading.Thread):
             self.write_event.clear()
             threading.Thread(target=self._write_to_file_batch, args=(contents,)).start()
 
-    def _save_image(self, frame, path):
+    def _save_image(self, frame, path, wait=False):
+        if wait:
+            self._write_image(frame, path)
+            return
         self.batch_frames.append((frame, path))
         if len(self.batch_frames) >= self.frame_batch_limit:
             # logging.info(f"Batch size reached for FRAMES. Writing to disk at {datetime.now() - self.time_truth} seconds after start")
@@ -153,11 +156,14 @@ class FileLogger(threading.Thread):
             self.write_frame.clear()
             threading.Thread(target=self._write_batch_to_disk).start()
 
+    def _write_image(self, frame, path):
+        imageio.imwrite(path, frame, format=self.image_type)
+
     def _write_batch_to_disk(self):
         while self.batch_frames:
             frame, path = self.batch_frames.popleft()
             # imwrite(path, frame)
-            imageio.imwrite(path, frame, format=self.image_type)
+            self._write_image(frame, path)
             # qoi.write(path, frame)
         self.write_frame.set()  # Signal that image saving is done
 

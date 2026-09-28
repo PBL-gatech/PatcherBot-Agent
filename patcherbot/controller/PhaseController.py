@@ -1,7 +1,8 @@
 """Common interface for phases that share an AutoPatcher controller."""
 
 from abc import ABC, abstractmethod
-import collections
+from uuid import uuid4
+import numpy as np
 
 
 class PhaseController(ABC):
@@ -9,7 +10,9 @@ class PhaseController(ABC):
         """Store shared dependencies; attempt setup belongs at the start of run()."""
         self.controller = controller
         self.observation_windows = {}
-        self.observation_deck = collections.deque()
+        self.frame_context = {}
+        self.observation_run = None
+        self._observation_attempt = None
 
     @abstractmethod
     def run(self, cell=None):
@@ -42,49 +45,64 @@ class PhaseController(ABC):
         """Evaluate this phase's completion condition."""
         raise NotImplementedError
 
-    def observation_window(self, field, width, **options):
-        """Delegate this phase's numeric history window to the shared helper."""
-        return self.controller.observation_helper.observation_window(self, field, width, **options)
+    def begin_observations(self):
+        self.observation_run = uuid4().hex
+        self._observation_attempt = self.controller.observer.attempt_token
 
-    def observe(self, include_pressure_state: bool = False, *, fields=None, sampling=None, raw_measurements=False,
-                deep_learning=False, cell=None, target_cell=None, num_measurements=None, interval=None):
-        """Read through controller overrides and record into helper-owned history."""
-        if target_cell is not None:
-            observation = self.controller.observe(
-                include_pressure_state, fields=fields, sampling=sampling,
-                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell,
-                target_cell=target_cell, num_measurements=num_measurements, interval=interval)
-        elif num_measurements is not None or interval is not None:
-            observation = self.controller.observe(
-                include_pressure_state, fields=fields, sampling=sampling,
-                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell,
-                num_measurements=num_measurements, interval=interval,
-            )
-        elif deep_learning or cell is not None:
-            observation = self.controller.observe(
-                include_pressure_state, fields=fields, sampling=sampling,
-                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell,
-            )
-        elif raw_measurements:
-            observation = self.controller.observe(
-                include_pressure_state, fields=fields, sampling=sampling,
-                raw_measurements=True,
-            )
-        elif fields is None and sampling is None:
-            if include_pressure_state:
-                observation = self.controller.observe(include_pressure_state=True)
-            else:
-                observation = self.controller.observe()
-        else:
-            observation = self.controller.observe(
-                include_pressure_state, fields=fields, sampling=sampling
-            )
-        self.controller.observation_helper.record_observation(self, observation)
-        if isinstance(observation, dict):
-            for output, contract in self.observation_windows.items():
-                predicate = contract.get("predicate")
-                if predicate is None or predicate(observation):
-                    observation[output] = self.observation_window(**contract)
+    def enrich_observation(self, observation):
+        return observation
+
+    def observation_window(
+        self, field, width, *, predicate=None, finite_only=False,
+        fill_value=np.nan, dtype=np.float32, shape=(), include_current=False,
+    ):
+        """Read a configured numeric field window from this phase's deck.
+
+        Values are oldest first, left-padded, and exclude the current snapshot
+        unless requested. Scalar and explicitly shaped vector fields use the
+        same reader. Selection and formatting never mutate stored observations.
+        """
+        width, shape = int(width), tuple(shape)
+        result = np.full((width, *shape), fill_value, dtype=dtype)
+        if width == 0 or self._observation_attempt is not self.controller.observer.attempt_token:
+            return result
+        samples = [row for row in self.controller.observer.deck
+                   if row.get("phase_run") == self.observation_run]
+        if not include_current:
+            samples = samples[:-1]
+        values = []
+        for sample in samples:
+            if not isinstance(sample, dict) or (predicate is not None and not predicate(sample)):
+                continue
+            try:
+                value = sample
+                for key in field.split("."):
+                    value = value.get(key, np.nan) if isinstance(value, dict) else np.nan
+                value = np.asarray(value, dtype=dtype).reshape(shape)
+            except (TypeError, ValueError):
+                value = np.full(shape, np.nan, dtype=dtype)
+            if finite_only and not np.isfinite(value).all():
+                continue
+            values.append(value)
+        values = values[-width:]
+        if values:
+            result[-len(values):] = np.asarray(values, dtype=dtype)
+        return result
+
+    def observe(self, *, fields=None, num_measurements=None, interval=None, evidence=None):
+        if self._observation_attempt is not self.controller.observer.attempt_token:
+            self.begin_observations()
+        observation = self.controller.observe(fields=fields, num_measurements=num_measurements,
+                                              interval=interval, phase=self, evidence=evidence)
+        acquired_fields = set(observation)
+        self.enrich_observation(observation)
+        derived = {key: value for key, value in observation.items() if key not in acquired_fields}
+        if derived:
+            self.controller.observer.annotate(self, observation, fields=derived)
+        for output, contract in self.observation_windows.items():
+            predicate = contract.get("predicate")
+            if predicate is None or predicate(observation):
+                observation[output] = self.observation_window(**contract)
         return observation
 
     def complete_success(self):

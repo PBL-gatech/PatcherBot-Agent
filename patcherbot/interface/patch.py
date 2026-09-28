@@ -25,6 +25,7 @@ class AutoPatchInterface(TaskInterface):
     A class to run automatic patch-clamp
     '''
     state_press_tally_changed = QtCore.pyqtSignal(object)
+    origin_saved = QtCore.pyqtSignal(object, object)
 
     def __init__(
         self,
@@ -68,12 +69,34 @@ class AutoPatchInterface(TaskInterface):
         self.is_selecting_cells = False
         self.is_selecting_corners = False
         self.cells_to_patch = []
+        self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
 
-        #call update_camera_cell_list every 0.05 seconds using a QTimer
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_camera_cell_list)
-        self.timer.start(50)
+
+    @blocking_command(category='Calibration', description='Save X origin',
+                      task_description='Saving X origin and microscope image')
+    def save_x_origin(self, request):
+        self._save_origin("x", request)
+
+    @blocking_command(category='Calibration', description='Save Y origin',
+                      task_description='Saving Y origin and microscope image')
+    def save_y_origin(self, request):
+        self._save_origin("y", request)
+
+    def _save_origin(self, axis, request):
+        if (self._current_controller is not None
+                or self.pipette_controller._current_controller is not None):
+            raise ValueError("Wait for the current movement/task to finish.")
+        capture = dict(request)
+        capture.update(
+            axis=axis, origins_um=dict(self.origins),
+            movement_busy=lambda: self.pipette_controller._current_controller is not None,
+            completed=self.origin_saved.emit)
+        self.execute(self.current_autopatcher.save_origin, argument=capture)
+
+    def accept_origin(self, record):
+        """Commit a successful save after the GUI confirms its experiment."""
+        self.origins = dict(record["origins_um"])
 
     def _record_state_press(self, state):
         counts = self.recording_state_manager.increment_state_press(state)
@@ -295,13 +318,32 @@ class AutoPatchInterface(TaskInterface):
             self.cells_to_patch.append((np.array(stage_pos_pixels), img, stage_pos_um, img_fluo))
             self.is_selecting_cells = False
 
-    # Update the cell list to store both cell coordinates and image.
     def update_camera_cell_list(self) -> None:
-        self.current_autopatcher.calibrated_unit.camera.cell_list = []
-        for cell, img, pos, _img_fluo in self.cells_to_patch:
-            camera_pos = -cell + self.current_autopatcher.calibrated_stage.reference_position()
-            self.current_autopatcher.calibrated_unit.camera.cell_list.append((camera_pos[0:2].astype(int), img,pos))
-            
+        """Publish calibrated display coordinates from the devices' cached positions."""
+        controller = self.current_autopatcher
+        unit, stage = controller.calibrated_unit, controller.calibrated_stage
+        camera = unit.camera
+        self.pipette_controller.display_positions = None
+        camera.cell_list = []
+        if not stage.calibrated or getattr(stage, "must_be_recalibrated", False):
+            return
+        try:
+            stage_pixels = np.asarray(stage.reference_position(), dtype=float)
+            if not np.isfinite(stage_pixels).all():
+                return
+            camera.cell_list = [
+                ((stage_pixels - cell)[:2].astype(int), image, position)
+                for cell, image, position, _ in tuple(self.cells_to_patch)]
+            if not unit.calibrated or getattr(unit, "must_be_recalibrated", False):
+                return
+            tip = np.asarray(unit.reference_position(), dtype=float)[:2]
+            if np.isfinite(tip).all():
+                self.pipette_controller.display_positions = dict(
+                    pipette_xy=tip.copy(), at=time.monotonic(),
+                    image_shape=(camera.height, camera.width))
+        except (RuntimeError, ValueError, TypeError, OSError):
+            return
+
     @command(category='Test', 
              description='Send movement file to the autopatcher', 
              success_message='Path sent')

@@ -1,5 +1,6 @@
 import time
 import csv
+from numbers import Integral, Real
 import numpy as np
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.devices.amplifier.DAQ import NiDAQ
@@ -8,11 +9,13 @@ from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.pressurecontroller import PressureController
 from patcherbot.devices.lamp import Lamp
 from patcherbot.devices.manipulator.helpers.AgentHelper import AgentHelper
-from patcherbot.devices.manipulator.helpers.ObservationHelper import ObservationHelper
+from patcherbot.devices.manipulator.helpers.Observer import Observer
+from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser2
 from patcherbot.utils.StateMachineLogger import StateMachineLogger, record_state
 import collections
 import logging
 from datetime import datetime
+from uuid import uuid4
 import pickle
 import os
 from patcherbot.interface.patchConfig import PatchConfig
@@ -86,9 +89,7 @@ class AutoPatcher(TaskController):
         # False -> interpret model output as displacement (xy px, z um) and use relative moves.
         # True  -> interpret model output as velocity (xy px/s, z um/s) and stream velocity commands.
         self.velocity_prediction = False
-        self._track_cell_ai_disabled_logged = False
-        self._last_track_cell_status = None
-        self.observation_helper = ObservationHelper(self)
+        self.observer = Observer(self)
 
         # Phases share this controller's hardware, configuration, and request state.
         self.find_pipette_phase = FindPipettePhase(self)
@@ -97,9 +98,61 @@ class AutoPatcher(TaskController):
         self.gigaseal_phase = GigasealPhase(self)
         self.break_in_phase = BreakInPhase(self)
 
+    def _origin_position(self):
+        xy = np.asarray(self.calibrated_stage.position(), dtype=float).reshape(-1)
+        scale = float(self.calibrated_unit.config.microscope_units_per_um)
+        z = float(self.microscope.position()) / scale
+        position = np.array([xy[0], xy[1], z])
+        if not np.isfinite(position).all():
+            raise ValueError("Stage position is unavailable.")
+        return position
+
+    def save_origin(self, request):
+        """Validate and save a stationary microscope frame using the snapshot recorder."""
+        position = self._origin_position()
+        stable_since = time.monotonic()
+        while time.monotonic() - stable_since < 0.5:
+            self.sleep(0.05)
+            if request["movement_busy"]():
+                raise ValueError("Wait for the current movement/task to finish.")
+            if not np.allclose(position, self._origin_position(), rtol=0, atol=0.1):
+                raise ValueError("Wait for the stage to stop before saving.")
+        camera_interface = request["camera_interface"]
+        try:
+            number, captured_at, _, raw = camera_interface.camera.raw_frame_queue[0]
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("A fresh microscope frame is required.") from exc
+        now = datetime.now().astimezone()
+        if number is None or raw is None or captured_at is None:
+            raise ValueError("A fresh microscope frame is required.")
+        age = now.timestamp() - captured_at.timestamp()
+        if not 0 <= age <= 1.0:
+            raise ValueError("A fresh microscope frame is required.")
+        if age > time.monotonic() - stable_since:
+            raise ValueError("Wait for a microscope frame after the stage stops.")
+        frame = np.asarray(raw).copy()
+        if (not frame.size or request["movement_busy"]()
+                or not np.allclose(position, self._origin_position(), rtol=0, atol=0.1)):
+            raise ValueError("Stage moved during capture; try again when stationary.")
+        self.abort_if_requested()
+        axis = request["axis"]
+        origins = dict(request["origins_um"])
+        origins[axis] = float(position[0 if axis == "x" else 1])
+        snapshot = camera_interface.save_snapshot(number, captured_at, frame, wait=True)
+        record = dict(
+            origin_id=uuid4().hex, axis=axis, stage_xyz_um=position.tolist(),
+            origins_um=origins, saved_at=now.isoformat(),
+            captured_at=captured_at.isoformat(), frame_number=int(number),
+            camera_role="main", experiment=dict(request["experiment"]),
+            session_id=str(request["logger"].session_dir),
+            image_path=snapshot["image_path"])
+        record = request["logger"].write_origin(record)
+        request["completed"](record, frame)
+
     def _get_state_recorder(self) -> StateMachineLogger:
         if self._state_recorder is None:
             self.attempt_counter += 1
+            self.observer.reset_attempt(self.attempt_counter)
             self._state_recorder = StateMachineLogger(
                 base_path="experiments/Data/state_recorder_data/",
                 attempt_id=self.attempt_counter
@@ -802,30 +855,95 @@ class AutoPatcher(TaskController):
     # endregion
 
     # region Observations and measurements
-    def observe(self, include_pressure_state: bool = False, *, fields=None, sampling=None,
-                raw_measurements=False, deep_learning=False, cell=None, target_cell=None,
-                num_measurements=None, interval=None):
-        """Delegate observation collection and cached model readings to the helper."""
-        if num_measurements is not None or interval is not None:
-            return self.observation_helper.observe(
-                include_pressure_state=include_pressure_state, fields=fields, sampling=sampling,
-                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell, target_cell=target_cell,
-                num_measurements=num_measurements, interval=interval)
-        return self.observation_helper.observe(
-            include_pressure_state=include_pressure_state, fields=fields, sampling=sampling,
-            raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell, target_cell=target_cell)
+    def observe(self, *, fields=None, num_measurements=None, interval=None, phase=None, evidence=None):
+        """Call requested models directly, then collect and record requested telemetry."""
+        requested = tuple(dict.fromkeys(Observer.default_fields if fields is None else fields))
+        if isinstance(fields, str) or set(requested) - Observer.available_fields:
+            raise ValueError("Unknown observation fields")
+        if num_measurements is not None and (isinstance(num_measurements, bool)
+                or not isinstance(num_measurements, Integral) or num_measurements < 1):
+            raise ValueError("num_measurements must be a positive integer")
+        if interval is not None and (isinstance(interval, bool) or not isinstance(interval, Real)
+                or not np.isfinite(interval) or interval < 0):
+            raise ValueError("interval must be finite and non-negative")
+        if evidence is None:
+            evidence = self.infer_frame(requested, frame_context=getattr(phase, "frame_context", None))
+        evidence = dict(evidence)
+        at = evidence.get("frame_retrieval_started_at")
+        if at is None:
+            at = evidence.get("frame_available_at")
+        age = None if at is None else time.monotonic() - at
+        evidence.update(age_s=age, stale=age is None or not 0 <= age <= 1.)
+        return self.observer.observe(fields=requested, num_measurements=num_measurements,
+                                     interval=interval, phase=phase, evidence=evidence)
 
-    def invalidate_tracking_anchor(self, reason, *, stage=False):
-        """Notify a physical pipette replacement or encoder reset.
-
-        Stage resets invalidate both tracks. Estimates remain unavailable until
-        the corresponding stored home or calibration identity changes.
-        """
-        self.observation_helper.invalidate_tracking(reason, pipette=True, cell=stage)
-
-    def _observe_legacy(self, include_pressure_state: bool = False):
-        """Compatibility entry point; model readings now come from the cache."""
-        return self.observe(include_pressure_state=include_pressure_state)
+    def infer_frame(self, fields, frame_context=None):
+        """Evaluate requested existing models on one frame; Hunt may schedule this call."""
+        requested = set(fields)
+        evidence = {}
+        visual = set(requested) & {"pipette_image_xy", "pipette_defocus_um", "cell_detections", "deep_learning"}
+        if visual or "camera_image" in requested:
+            stage, unit = self.calibrated_stage, self.calibrated_unit
+            camera = stage.camera
+            frame_id, stamp, frame, timing = camera.last_raw_frame_data(include_timing=True) or (None, None, None, {})
+            evidence = dict(source_frame=frame_id, frame_acquired_at=timing.get("acquired_at"),
+                frame_retrieval_started_at=timing.get("retrieval_started_at"),
+                frame_available_at=timing.get("available_at"), source_image_shape=None if frame is None else frame.shape,
+                _source_image=frame, source_positions={}, source_position_metadata={}, positions_sampled_at=None,
+                pipette_position=None, pipette_focus=None, cell_detections=None, status={}, confidence={}, errors={})
+            if visual and frame is not None:
+                image = np.asarray(frame).copy()
+                evidence["_source_image"] = image
+                context = frame_context or {}
+                if context:
+                    evidence["positions_sampled_at"] = time.monotonic()
+                for name, read in context.items():
+                    evidence["source_positions"][name] = read()
+                    evidence["source_position_metadata"][name] = dict(acquired_at=None,
+                        read_completed_at=time.monotonic(), timestamp_basis="inference_time_context")
+                readers = {}
+                if visual & {"pipette_image_xy", "pipette_defocus_um", "deep_learning"}:
+                    detector = unit.pipetteCalHelper.pipetteDetector
+                    focus_requested = bool(visual & {"pipette_defocus_um", "deep_learning"})
+                    focuser = unit.pipetteFocusHelper.pipetteFocuser if focus_requested else None
+                    shared_depth = (focuser is not None and getattr(focuser, "detector", None) is detector
+                        and getattr(focuser.get_pipette_focus_value, "__func__", None)
+                        is PipetteFocuser2.get_pipette_focus_value)
+                    if visual & {"pipette_image_xy", "deep_learning"} or shared_depth:
+                        readers["pipette_detector"] = detector.detect_pipette_details
+                    if focus_requested and not shared_depth:
+                        readers["pipette_focuser"] = focuser.get_pipette_focus_value
+                        evidence["confidence"]["pipette_focuser"] = None
+                if visual & {"cell_detections", "deep_learning"}:
+                    readers["cell_detector"] = stage.cellDetectHelper._ensure_detector
+                for name, read in readers.items():
+                    try:
+                        if name == "cell_detector":
+                            read = read().detect_cells
+                        result = read(image.copy())
+                        if name == "pipette_detector":
+                            result = result or {}
+                            evidence["pipette_position"] = result.get("tip_xy")
+                            evidence["confidence"]["pipette_detector"] = result.get("box_confidence")
+                            if shared_depth:
+                                evidence["pipette_focus"] = result.get("z_um")
+                                evidence["confidence"]["pipette_focuser"] = result.get("z_confidence")
+                                evidence["status"]["pipette_focuser"] = "ok" if result.get("z_um") is not None else "no_detection"
+                            result = result.get("tip_xy")
+                        elif name == "pipette_focuser":
+                            evidence["pipette_focus"] = result
+                        else:
+                            evidence["cell_detections"] = result
+                        evidence["status"][name] = "ok" if result is not None else "no_detection"
+                    except Exception as error:
+                        evidence["status"][name], evidence["errors"][name] = "error", str(error)
+                        if name == "pipette_focuser":
+                            evidence["pipette_focus"] = None
+                        elif name == "pipette_detector" and shared_depth:
+                            evidence["status"]["pipette_focuser"] = "error"
+                            evidence["errors"]["pipette_focuser"] = str(error)
+                            evidence["confidence"]["pipette_focuser"] = None
+        return evidence
 
     def resistanceRamp(self, num_measurements=5, interval=0.200):
         return self._safe_average(
@@ -945,7 +1063,6 @@ class AutoPatcher(TaskController):
 
         self.calibrated_stage.set_max_speed(10000)
         self.calibrated_unit.set_max_speed(100000)
-        self.observe(fields=["manipulator_position", "stage_positions", "deep_learning"], target_cell=cell)
         self.info("Located Cell")
         self.success_requested = True
         self.success_if_requested()

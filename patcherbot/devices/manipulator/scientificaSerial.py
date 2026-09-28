@@ -4,7 +4,6 @@ from .manipulator import Manipulator
 import time
 import threading
 import re
-import math
 
 __all__ = ['ScientificaSerial']
 
@@ -314,47 +313,6 @@ class ScientificaSerialEncoder(Manipulator):
         '''
         self._encoder_acq.run_loop(freq=freq)
 
-    def start_move(self, target, axes, *, context=None):
-        """Send one command; observation supplies coordinates and encoder context."""
-        target, axes = list(map(float, target)), list(axes)
-        if (len(target) != len(axes) or not axes or len(set(axes)) != len(axes)
-                or any(isinstance(axis, bool) or axis not in (1, 2, 3) for axis in axes)
-                or not all(map(math.isfinite, target))):
-            raise ValueError("Invalid movement target")
-        values = dict(zip(axes, target))
-        context = context or {}
-        if hasattr(self, 'DEFAULT_Z_CORRECTION_MAX_RETRIES') and 3 in axes:
-            encoder, stage_z = float(context['encoder_z']), float(context['stage_z'])
-            if not all(map(math.isfinite, (encoder, stage_z))):
-                raise ValueError("Invalid observed encoder context")
-            values[3] = stage_z + values[3] - encoder
-        if axes == [3]:
-            command = SerialCommands.SET_Z_POS.format(int(values[3] * 10))
-        else:
-            position = context.get('native_position', ())
-            x = values[1] if 1 in values else position[0]
-            y = values[2] if 2 in values else position[1]
-            if not all(map(math.isfinite, (x, y))):
-                raise ValueError("Invalid observed stage position")
-            command = (SerialCommands.SET_X_Y_Z_POS_ABS.format(int(x * 10), int(y * 10), int(values[3] * 10))
-                       if 3 in values else SerialCommands.SET_X_Y_POS_ABS.format(int(x * 10), int(y * 10)))
-        response = self._sendCmd(command).strip()
-        if not response or response.startswith('E,'):
-            raise RuntimeError("Movement command rejected: " + response)
-
-
-
-    def read_motion_state(self):
-        """Read busy once and expose cached encoder values; never retry movement."""
-        response = self._sendCmd(SerialCommands.GET_IS_BUSY).strip()
-        if response not in ('0', '1'):
-            raise RuntimeError("Invalid device busy response: " + response)
-        result = dict(busy=response == '1', native_position=list(self.current_pos), velocity_failed=False)
-        if hasattr(self, '_encoder_acq'):
-            encoder, sequence = self._encoder_acq.get_encoder_state()
-            result.update(encoder_z=encoder, encoder_sequence=sequence, stage_z=self._encoder_acq.get_stage_z())
-        return result
-
     def absolute_move(self, pos, axis):
         print(f'[OBJDBG] {self.__class__.__name__}.absolute_move axis={axis} pos_um={pos}')
 
@@ -413,7 +371,7 @@ class ScientificaSerialEncoder(Manipulator):
     
     def relative_move_group(self, x, axes, speed=None):
         """
-        Relative multiâ€‘axis move using Scientifica's `rel` command.
+        Relative multi‑axis move using Scientifica's `rel` command.
         Mirrors absolute_move_group but sends deltas instead of targets.
         """
         x = list(x)
@@ -433,26 +391,10 @@ class ScientificaSerialEncoder(Manipulator):
         elif 1 in axes and 2 in axes:
             self._sendCmd(SerialCommands.SET_X_Y_POS_REL.format(dx, dy))
         elif 3 in axes:
-            # Only Z move; still use the 3â€‘axis relative command for consistency
+            # Only Z move; still use the 3‑axis relative command for consistency
             self._sendCmd(SerialCommands.SET_X_Y_Z_POS_REL.format(0, 0, dz))
         else:
             print(f'unimplemented move group {x} {axes}')
-
-
-    def start_velocity(self, velocity, axes, *, relative=False):
-        """Opt-in velocity dispatch with validation and visible serial failures."""
-        velocity, axes = list(map(float, velocity)), list(axes)
-        if (len(velocity) != len(axes) or not axes or len(set(axes)) != len(axes)
-                or any(isinstance(axis, bool) or axis not in (1, 2, 3) for axis in axes)
-                or not all(map(math.isfinite, velocity))):
-            raise ValueError("Invalid supervised velocity")
-        values = [0., 0., 0.]
-        for value, axis in zip(velocity, axes):
-            values[int(axis) - 1] = value
-        response = self._sendCmd(SerialCommands.SET_X_Y_Z_VEL.format(*values)).strip()
-        if not response or response.startswith('E,'):
-            raise RuntimeError("Velocity command rejected: " + response)
-
 
     def absolute_move_group_velocity(self,vel,axes):   
         try: 
@@ -642,10 +584,6 @@ class ScientificaSerialNoEncoder(Manipulator):
             if sleepTime > 0:
                 time.sleep(sleepTime)
 
-    start_move = ScientificaSerialEncoder.start_move
-    read_motion_state = ScientificaSerialEncoder.read_motion_state
-    start_velocity = ScientificaSerialEncoder.start_velocity
-
     def absolute_move(self, pos, axis, speed=None):
         print(f'[OBJDBG] {self.__class__.__name__}.absolute_move axis={axis} pos_um={pos}')
         '''Moves the device to an absolute position in um.
@@ -719,7 +657,7 @@ class ScientificaSerialNoEncoder(Manipulator):
         
     def relative_move_group(self, x, axes, speed=None):
         """
-        Relative multiâ€‘axis move using the 2â€‘ or 3â€‘axis `rel` commands.
+        Relative multi‑axis move using the 2‑ or 3‑axis `rel` commands.
         Mirrors absolute_move_group but sends deltas instead of targets.
         """
         x = list(x)

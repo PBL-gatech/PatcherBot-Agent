@@ -63,8 +63,6 @@ class SensapexManip(Manipulator):
 
         # Velocity emulation state
         self._vel = [0.0, 0.0, 0.0]
-        self._velocity_generation = 0
-        self._velocity_error = None
         self._vel_enabled = True
         self._vel_dt = 0.05
         self._vel_thread = threading.Thread(target=self._velocity_worker, daemon=True)
@@ -210,36 +208,6 @@ class SensapexManip(Manipulator):
         return mv
 
     # ---- Motion primitives ----
-    def start_move(self, target, axes, *, context=None):
-        """Send one SDK command using the position already sampled by observation."""
-        target, axes = list(map(float, target)), list(axes)
-        if (len(target) != len(axes) or not axes or len(set(axes)) != len(axes)
-                or any(isinstance(axis, bool) or axis not in (1, 2, 3) for axis in axes)
-                or not all(map(math.isfinite, target))):
-            raise ValueError("Invalid movement target")
-        position = list((context or {})['native_position'])
-        if len(position) < 3 or not all(map(math.isfinite, position)):
-            raise ValueError("Invalid observed device position")
-        for value, axis in zip(target, axes):
-            position[int(axis) - 1] = value
-        if not math.isfinite(self._max_speed) or self._max_speed <= 0:
-            raise ValueError("Invalid movement speed")
-        with self._lock:
-            return id(self._issue_move(position, self._max_speed, gate=False))
-
-    def read_motion_state(self):
-        """Expose one SDK/cache snapshot; completion policy belongs to the controller."""
-        with self._lock:
-            move = self._last_move
-            event = getattr(move, 'finished_event', None)
-            error = getattr(self, '_velocity_error', None)
-            return dict(busy=bool(self.dev.is_busy() or (event is not None and not event.is_set())),
-                        native_position=self._convert_coords(self.dev.get_pos(0), self.tilt_angle_deg, False),
-                        command_id=None if move is None else id(move),
-                        command_failed=bool(move is not None and (getattr(move, 'interrupted', False)
-                                            or getattr(move, '_last_pos_exception', None) is not None)),
-                        velocity_failed=error is not None and error[0] == self._velocity_generation)
-
     def absolute_move(self, pos, axis, speed=None):
         self.absolute_move_group([pos], [axis], speed=speed)
 
@@ -304,21 +272,6 @@ class SensapexManip(Manipulator):
         target = [cur[0] + delta[0], cur[1] + delta[1], cur[2] + delta[2]]
         return self.absolute_move_group(target, [1, 2, 3], speed=speed)
 
-
-    def start_velocity(self, velocity, axes, *, relative=False):
-        """Validate and queue velocity through the existing SDK worker."""
-        velocity, axes = list(map(float, velocity)), list(axes)
-        if (len(velocity) != len(axes) or not axes or len(set(axes)) != len(axes)
-                or any(isinstance(axis, bool) or axis not in (1, 2, 3) for axis in axes)
-                or not all(map(math.isfinite, velocity))):
-            raise ValueError("Invalid supervised velocity")
-        if not self._lock.acquire(blocking=False):
-            raise RuntimeError("Device is busy")
-        try:
-            self.absolute_move_group_velocity(velocity, axes)
-        finally:
-            self._lock.release()
-
     def absolute_move_group_velocity(self, vel, axes=None):
         """
         Emulates continuous velocity commands by integrating a requested velocity vector.
@@ -335,8 +288,6 @@ class SensapexManip(Manipulator):
                 if 0 <= ax_i < 3:
                     v3[ax_i] = float(v)
         with self._lock:
-            self._velocity_generation += 1
-            self._velocity_error = None
             self._vel = v3
 
     def relative_move_group_velocity(self, vel, axes=None):
@@ -422,15 +373,11 @@ class SensapexManip(Manipulator):
         Stops current movements.
         """
         with self._lock:
-            supervised = self._last_move is not None or any(self._vel)
-            self._velocity_generation += 1
-            self._velocity_error = None
             self._vel = [0.0, 0.0, 0.0]
-            try:
-                self.dev.stop()
-            except Exception:
-                if supervised:
-                    raise
+        try:
+            self.dev.stop()
+        except Exception:
+            pass
 
     # ---- Internals ----
     def _get_axis_angle(self):
@@ -451,7 +398,6 @@ class SensapexManip(Manipulator):
 
             with self._lock:
                 v = list(self._vel)
-                generation = self._velocity_generation
 
             if v[0] == 0.0 and v[1] == 0.0 and v[2] == 0.0:
                 time.sleep(0.02)
@@ -466,21 +412,10 @@ class SensapexManip(Manipulator):
             sp = min(max(requested, 1.0), float(self._max_speed))
 
             try:
-                with self._lock:
-                    if generation != self._velocity_generation:
-                        continue
-                    mv = self._issue_move(target, sp, gate=False)
+                mv = self._issue_move(target, sp, gate=False)
                 try:
-                    finished = mv.finished_event.wait(dt)
-                    failure = getattr(mv, '_last_pos_exception', None)
-                    if finished and (getattr(mv, 'interrupted', False) or failure is not None):
-                        with self._lock:
-                            if generation == self._velocity_generation:
-                                self._velocity_error = (generation, failure or RuntimeError("Velocity movement interrupted"))
+                    mv.finished_event.wait(dt)
                 except Exception:
                     time.sleep(dt)
-            except Exception as error:
-                with self._lock:
-                    if generation == self._velocity_generation:
-                        self._velocity_error = (generation, error)
+            except Exception:
                 time.sleep(dt)

@@ -18,43 +18,21 @@ class CellDetectHelper:
             self.cellDetector = CellDetector2(model_type="pidnet")
         return self.cellDetector
 
-    def _latest_raw_frame(self):
-        try:
-            frame = self.camera.raw_frame_queue[0][3]
-        except (AttributeError, IndexError, TypeError):
-            return None
-        if frame is None:
-            return None
-        return frame.copy()
-
     def detect_cells(self) -> List[Tuple[int, int, float]]:
-        frame = self._latest_raw_frame()
-        if frame is None:
-            logging.info("Cell detector: no raw camera frame is available.")
+        frame = self.camera.last_raw_frame_data()
+        if frame is None or frame[2] is None:
             self.camera.show_circles([])
             return []
-
-        detections = self._ensure_detector().detect_cells(frame)
-        height, width = frame.shape[:2]
-        valid_detections: List[Tuple[int, int, float]] = []
-
-        for detection in detections or []:
+        detections = self._ensure_detector().detect_cells(frame[2])
+        height, width = frame[2].shape[:2]
+        valid_detections = []
+        for detection in detections if detections is not None else []:
             try:
-                x, y, confidence = detection
-                x = float(x)
-                y = float(y)
-                confidence = float(confidence)
+                x, y, confidence = map(float, detection)
             except (TypeError, ValueError):
                 continue
-            if not np.all(np.isfinite([x, y, confidence])):
-                continue
-
-            x_int = int(round(x))
-            y_int = int(round(y))
-            if not (0 <= x_int < width and 0 <= y_int < height):
-                continue
-            valid_detections.append((x_int, y_int, confidence))
-
+            if np.isfinite([x, y, confidence]).all() and 0 <= round(x) < width and 0 <= round(y) < height:
+                valid_detections.append((int(round(x)), int(round(y)), confidence))
         self.camera.show_circles([(x, y) for x, y, _ in valid_detections])
         if valid_detections:
             logging.info("Cell detector locations: %s", valid_detections)

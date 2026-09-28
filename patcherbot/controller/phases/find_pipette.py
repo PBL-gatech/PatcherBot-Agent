@@ -9,6 +9,7 @@ from ..PhaseController import PhaseController
 
 class FindPipettePhase(PhaseController):
     def run(self, cell=None):
+        self.begin_observations()
         self.controller.info("Finding pipette")
         # Only load the agent policy when running in Agent mode.
         if self.controller.config.mode == 'Agent':
@@ -110,9 +111,10 @@ class FindPipettePhase(PhaseController):
 
         while True:
             obs_start = time.perf_counter()
-            observation = self.observe()
+            observation = self.observe(fields=["manipulator_position", "pipette_image_xy", "pipette_defocus_um",
+                                               "stage_positions", "camera_image", "resistance"])
             # _log_timing("observation", time.perf_counter() - obs_start)
-            curr_point = observation[0]
+            curr_point = np.r_[observation["pipette_image_xy"], observation["pipette_defocus_um"]]
 
             if curr_point is None:
                 self.controller.warning("Pipette detector did not return a location; waiting for next frame")
@@ -238,7 +240,7 @@ class FindPipettePhase(PhaseController):
                     agent = getattr(self.controller.agenthelper, "agent", None)
                     if agent is not None:
                         try:
-                            image = observation[2]
+                            image = observation["camera_image"]
                             if image is not None and hasattr(agent, "_compute_frame_params"):
                                 frame_shape = np.asarray(image).shape[:2]
                                 frame_params = agent._compute_frame_params(frame_shape)

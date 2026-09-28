@@ -11,7 +11,6 @@ from ..errors import AutopatchError
 from ..PhaseController import PhaseController
 
 
-OBSERVATION_HISTORY_SIZE = 30
 
 
 @dataclass
@@ -41,6 +40,7 @@ class GigasealState:
 class GigasealPhase(PhaseController):
     def run(self, cell=None):
         """Coordinate the original sampling, pressure, holding, and success order."""
+        self.begin_observations()
         state = GigasealState()
         state.autoPressure = (self.controller.config.mode == 'Classic')
         state.adaptivePressure = (self.controller.config.mode == 'Adaptive')
@@ -59,11 +59,6 @@ class GigasealPhase(PhaseController):
                     ).all(),
                     "finite_only": True, "fill_value": 0.0,
                 }
-        # Each Agent input follows a separate averaged loop observation.
-        # Retain N prior inputs plus the current one, including interleaving.
-        self.controller.observation_helper.reset_history(self, max(
-            OBSERVATION_HISTORY_SIZE, 2 * width + 1,
-        ))
         self.controller.info(f"{self.controller.config.mode}: Attempting to form gigaseal...")
         self.controller.amplifier.auto_fast_compensation()
         self.controller.sleep(1)
@@ -76,10 +71,10 @@ class GigasealPhase(PhaseController):
 
         baseline_observation = self.observe(
             fields=["resistance"], num_measurements=state.num_slope_samples,
-            interval=state.sample_interval, raw_measurements=True,
+            interval=state.sample_interval,
         )
         state.avg_resistance = baseline_observation["resistance"]
-        self.controller.observation_helper.record_calculations(self, baseline_observation, {
+        self.controller.observer.annotate(self, baseline_observation, calculations={
             "num_measurements": state.num_slope_samples,
             "sample_interval_s": state.sample_interval,
             "baseline_resistance_mohm": state.avg_resistance,
@@ -119,10 +114,13 @@ class GigasealPhase(PhaseController):
             state.sample_interval = float(self.controller.config.measurement_speed)
             observation = self.observe(
                 fields=["resistance"], num_measurements=state.num_slope_samples,
-                interval=state.sample_interval, raw_measurements=True,
+                interval=state.sample_interval,
             )
             self.calculate(observation, state)
-            agent_observation = self.observe(include_pressure_state=True) if state.agentPressure else observation
+            agent_observation = self.observe(fields=[
+                "manipulator_position", "pipette_image_xy", "pipette_defocus_um", "stage_positions", "camera_image",
+                "resistance", "pressure", "commanded_pressure_mbar", "pressure_atm_state",
+            ]) if state.agentPressure else observation
             if state.agentPressure:
                 agent_observation = self.calculate(agent_observation, state)
             command = self.decide(agent_observation, state)
@@ -133,7 +131,7 @@ class GigasealPhase(PhaseController):
                     state.sample_interval = float(self.controller.config.measurement_speed)
                     self.failure_gate(state, self.observe(
                         fields=["resistance"], num_measurements=state.num_slope_samples,
-                        interval=state.sample_interval, raw_measurements=True,
+                        interval=state.sample_interval,
                     ))
                     state.currPressure = -5
                     self.act({"pressure": state.currPressure, "atm": False})
@@ -145,7 +143,7 @@ class GigasealPhase(PhaseController):
         if observation is not None:
             testresistance = observation["resistance"]
             difference = testresistance - state.avg_resistance
-            self.controller.observation_helper.record_calculations(self, observation, {
+            self.controller.observer.annotate(self, observation, calculations={
                 "num_measurements": state.num_slope_samples,
                 "sample_interval_s": state.sample_interval,
                 "reference_resistance_mohm": state.avg_resistance,
@@ -163,10 +161,8 @@ class GigasealPhase(PhaseController):
     def calculate(self, observation, state):
         """Calculate and record progress, slope thresholds, or Agent context."""
         if state.agentPressure and "pressure_atm_state" in observation:
-            observation["observations_since_last_action"] = np.asarray(
-                [state.observations_since_last_action], dtype=np.float32,
-            )
-            self.controller.observation_helper.record_calculations(self, observation, {
+            observation["observations_since_last_action"] = state.observations_since_last_action
+            self.controller.observer.annotate(self, observation, calculations={
                 "observations_since_last_action": state.observations_since_last_action,
             })
             return {key: value for key, value in observation.items() if key != "calculations"}
@@ -202,7 +198,7 @@ class GigasealPhase(PhaseController):
                 constant_threshold_mohm_per_sec=state.constant_thresh,
                 decrease_threshold_mohm_per_sec=state.decrease_thresh,
             )
-        self.controller.observation_helper.record_calculations(self, observation, calculations)
+        self.controller.observer.annotate(self, observation, calculations=calculations)
         return observation
 
     def decide(self, observation, state):
@@ -212,11 +208,11 @@ class GigasealPhase(PhaseController):
         if state.agentPressure:
             self.controller.info(
                 "Gigaseal agent observation collected: "
-                f"resistance={float(observation['resistance'][0]):.3f} MΩ, "
-                f"actual_pressure={float(observation['pressure'][0]):.3f} mbar, "
-                f"setpoint={float(observation['commanded_pressure_mbar'][0]):.3f} mbar, "
-                f"atm={bool(observation['pressure_atm_state'][0])}, "
-                f"observations_since_last_action={int(observation['observations_since_last_action'][0])}"
+                f"resistance={float(observation['resistance']):.3f} MΩ, "
+                f"actual_pressure={float(observation['pressure']):.3f} mbar, "
+                f"setpoint={float(observation['commanded_pressure_mbar']):.3f} mbar, "
+                f"atm={bool(observation['pressure_atm_state'])}, "
+                f"observations_since_last_action={int(observation['observations_since_last_action'])}"
             )
             action = self.controller.agenthelper.run_inference(observation=observation, is_demo=False)
             self.controller.info(f"Gigaseal agent raw action: {action}")

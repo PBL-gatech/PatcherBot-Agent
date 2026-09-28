@@ -8,7 +8,6 @@ TODO:
 '''
 from patcherbot.devices.manipulator import Manipulator
 import time
-import math
 import warnings
 try:
     import cv2
@@ -59,21 +58,6 @@ class Microscope(Manipulator):
         
         return true_position
 
-    def start_absolute_move(self, target, *, context=None):
-        """Send one absolute command using the observation's device context."""
-        target = float(target)
-        if not math.isfinite(target):
-            raise ValueError("Microscope target must be finite")
-        return self.dev.start_move([target], [self.axis], context=context)
-
-    def start_relative_move(self, delta, *, position, context=None):
-        """Use a supplied observation; this command never samples position."""
-        return self.start_absolute_move(float(position) + float(delta), context=context)
-
-    def read_motion_state(self):
-        """Read one passive backend snapshot for ObservationHelper."""
-        return self.dev.read_motion_state()
-
     def absolute_move(self, x):
         '''
         Moves the device axis to position x in um.
@@ -86,16 +70,6 @@ class Microscope(Manipulator):
         self.dev.absolute_move(x, self.axis)
         self.sleep(.05)
 
-
-    def start_velocity(self, velocity, *, relative=False):
-        """Dispatch microscope velocity explicitly, preserving micron units."""
-        velocity = float(velocity)
-        if not math.isfinite(velocity):
-            raise ValueError("Microscope velocity must be finite")
-        if not callable(getattr(self.dev, "start_velocity", None)):
-            raise NotImplementedError("This backend does not support supervised velocity")
-        self.dev.start_velocity([velocity], [self.axis], relative=relative)
-
     def absolute_move_velocity(self, vel):
         '''
         Moves the device axis at velocity vel in um/s.
@@ -105,11 +79,8 @@ class Microscope(Manipulator):
         vel : velocity in um/s.
         '''
         ###self.abort_if_requested()
-        velarr = [0, 0, vel]
-        try:
-            self.dev.absolute_move_group_velocity(velarr)
-        except TypeError:
-            self.dev.absolute_move_group_velocity(velarr, [1, 2, 3])
+        velarr = [0,0,vel]
+        self.dev.absolute_move_group_velocity(velarr)
 
         # self.sleep(.05)
 

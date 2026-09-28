@@ -436,7 +436,7 @@ class CellTrackHelper:
         *,
         max_refine_distance: float,
     ) -> Optional[np.ndarray]:
-        """Try segmentation with jittered seeds and keep the closest valid centroid."""
+        """Return the closest valid centroid around the coarse prediction."""
         try:
             self._prime_segmentor(image)
         except Exception as exc:
@@ -486,7 +486,7 @@ class CellTrackHelper:
         self.segmentor.set_image()
 
     def _segment_from_seed(self, seed_point: np.ndarray) -> Optional[np.ndarray]:
-        """Run SAM2 with a single positive seed and return the centroid."""
+        """Run SAM2 once and return its centroid."""
         point = np.asarray(seed_point, dtype=np.float32)
         if point.shape != (2,):
             point = point.reshape(2)

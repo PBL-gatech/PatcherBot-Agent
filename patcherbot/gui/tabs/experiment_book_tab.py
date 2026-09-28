@@ -307,6 +307,45 @@ class ExperimentBookTab(QtWidgets.QWidget):
         self._set_status("Snapshot added to the experiment timeline.")
         return True
 
+    def add_origin_entry(self, record, frame):
+        """Append one already-persisted origin card without further disk writes."""
+        timestamp = datetime.fromisoformat(record["saved_at"])
+        axis = record["axis"].upper()
+        card, card_layout = self._new_card(f"Origin {axis}", timestamp)
+        xyz = record["stage_xyz_um"]
+        origins = record["origins_um"]
+        origin_text = ", ".join(
+            f"{name.upper()}: {origins[name]:.2f} um"
+            if origins.get(name) is not None else f"{name.upper()}: not saved"
+            for name in ("x", "y")
+        )
+        body = QtWidgets.QLabel(
+            f"Saved {axis} origin\n"
+            f"Stage X: {xyz[0]:.2f}, Y: {xyz[1]:.2f}, Z: {xyz[2]:.2f} um\n"
+            f"Origins: {origin_text}\n"
+            f"Image: {record['image_path']}"
+        )
+        body.setTextFormat(QtCore.Qt.PlainText)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        card_layout.addWidget(body)
+        preview = QtWidgets.QLabel()
+        preview.setObjectName("origin_thumbnail")
+        preview.setAlignment(QtCore.Qt.AlignCenter)
+        try:
+            preview.setPixmap(self._frame_to_pixmap(frame).scaled(
+                self.THUMBNAIL_SIZE,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            ))
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Origin snapshot saved but preview unavailable", exc_info=True
+            )
+            preview.setText("Preview unavailable")
+        card_layout.addWidget(preview)
+        self._append_card(card)
+
     def _add_text_card(self, entry_type, text, timestamp):
         card, card_layout = self._new_card(entry_type, timestamp)
         body = QtWidgets.QLabel(text)

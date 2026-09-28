@@ -7,13 +7,13 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import PyQt5.QtGui as QtGui
 import numpy as np
 import logging
-import math
-import time
 
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 
 from patcherbot.controller import TaskController
-from patcherbot.gui.experiment_book_tab import ExperimentBookTab
+from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
+from patcherbot.gui.tabs.atlas_widget import AtlasWindow
+from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.patch import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
@@ -46,11 +46,22 @@ class PatchGui(ManipulatorGui):
         self.show_cells_button.setCheckable(True)
         self.show_cells_button.clicked.connect(self.toggle_cell_list_window)
         self.status_bar.insertPermanentWidget(0, self.show_cells_button)
+        self.atlas_window = AtlasWindow(self)
+        self.atlas_window.finished.connect(self._atlas_window_closed)
+        self.show_atlas_button = QtWidgets.QPushButton("Show Atlas")
+        self.show_atlas_button.setCheckable(True)
+        self.show_atlas_button.clicked.connect(self.toggle_atlas_window)
+        self.status_bar.insertPermanentWidget(1, self.show_atlas_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
         self._cell_list_timer.timeout.connect(self._refresh_cell_list_window)
 
         self.patch_interface.moveToThread(pipette_interface.thread())
+        self._display_position_timer = QtCore.QTimer(self)
+        self._display_position_timer.setInterval(50)
+        self._display_position_timer.timeout.connect(
+            lambda: self.patch_interface.update_camera_cell_list())
+        self._display_position_timer.start()
         self.interface_signals[self.patch_interface] = (self.patch_command_signal,
                                                         self.patch_reset_signal)
         self.add_config_gui(self.patch_interface.config)
@@ -66,14 +77,81 @@ class PatchGui(ManipulatorGui):
             self.experiment_book_tab.handle_state_press_tally
         )
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
+        self._origin_busy = False
+        self.patch_interface.origin_saved.connect(self._origin_saved)
+        self.patch_interface.task_finished.connect(self._origin_task_finished)
         logging.debug("Added config GUI.")
-        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task,self.interface_signals, self.recording_state_manager)
+        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
+        self.classic_patching_tab = classic_patching_tab
+        classic_patching_tab.origin_requested.connect(self._request_origin)
         self.add_tab(classic_patching_tab, 'PatcherBot Agent', index = 0)
+        self.record_button.clicked.disconnect(self.toggle_recording)
+        self.record_button.clicked.connect(classic_patching_tab.toggle_recording)
+        self.record_button.setToolTip('Start/stop recording')
+        self._recording_indicator_timer = QtCore.QTimer(self)
+        self._recording_indicator_timer.timeout.connect(
+            lambda: self.record_button.setChecked(self.recording_state_manager.is_recording_enabled())
+        )
+        self._recording_indicator_timer.start(100)
+
+    def close(self):
+        self._display_position_timer.stop()
+        self.pipette_interface.display_positions = None
+        return super(PatchGui, self).close()
+
+    def _origin_experiment_details(self):
+        book = self.experiment_book_tab
+        if book.active_details is not None:
+            return dict(book.active_details)
+        return {key: str(getattr(book.config, key, "")) for key in
+                ("experiment_name", "strain_culture", "gender", "age")}
+
+    @QtCore.pyqtSlot(str)
+    def _request_origin(self, axis):
+        if self._origin_busy:
+            return
+        if (getattr(self, "running_task", None) is not None
+                or self.patch_interface._current_controller is not None
+                or self.pipette_interface._current_controller is not None):
+            self.classic_patching_tab.set_origin_status(
+                "Wait for the current movement/task to finish.", error=True)
+            return
+        request = {
+            "experiment": self._origin_experiment_details(),
+            "logger": self.experiment_book_tab.logger,
+            "camera_interface": self.main_interface,
+        }
+        command = (self.patch_interface.save_x_origin if axis == "x"
+                   else self.patch_interface.save_y_origin)
+        self._origin_busy = True
+        self.classic_patching_tab.set_origin_busy(True)
+        self.classic_patching_tab.set_origin_status("Saving origin and microscope image...")
+        self.start_task(command.task_description, self.patch_interface)
+        self.patch_command_signal.emit(command, request)
+
+    @QtCore.pyqtSlot(object, object)
+    def _origin_saved(self, record, frame):
+        if self._origin_experiment_details() != record["experiment"]:
+            self.classic_patching_tab.set_origin_status(
+                "Origin recorded for the previous experiment; current origin unchanged.", error=True)
+            return
+        self.patch_command_signal.emit(self.patch_interface.accept_origin, record)
+        self.experiment_book_tab.add_origin_entry(record, frame)
+        self.classic_patching_tab.set_origin_status(
+            record["axis"].upper() + " origin saved to Experiment Book.")
+
+    @QtCore.pyqtSlot(int, object)
+    def _origin_task_finished(self, exit_code, result):
+        if not self._origin_busy:
+            return
+        self._origin_busy = False
+        self.classic_patching_tab.set_origin_busy(False)
+        if exit_code:
+            self.classic_patching_tab.set_origin_status(
+                "Origin not saved; see the task error for details.", error=True)
 
     def register_commands(self):
         super(PatchGui, self).register_commands()
-        self.register_key_action(Qt.Key_R, Qt.ControlModifier | Qt.AltModifier, self.toggle_raw_tracking)
-        self.register_key_action(Qt.Key_P, Qt.ControlModifier | Qt.AltModifier, self.toggle_calibration_tracking)
         # self.register_mouse_action(Qt.LeftButton, Qt.ShiftModifier,
         #                            self.patch_interface.patch_with_move)
         self.register_mouse_action(Qt.LeftButton, Qt.NoModifier,
@@ -89,152 +167,20 @@ class PatchGui(ManipulatorGui):
         self.register_key_action(Qt.Key_F4, None,
                                  self.patch_interface.clean_pipette)
 
-    @command(category='General', description='Show/hide raw tracking detections')
-    def toggle_raw_tracking(self):
-        self.show_raw_tracking = not getattr(self, "show_raw_tracking", False)
+    def toggle_atlas_window(self, checked=None):
+        if checked is None:
+            checked = self.show_atlas_button.isChecked()
+        if checked:
+            self.show_atlas_button.setText("Hide Atlas")
+            self.atlas_window.show()
+            self.atlas_window.raise_()
+            self.atlas_window.activateWindow()
+        else:
+            self.atlas_window.close()
 
-    @command(category='General', description='Show/hide calibration-only tracking predictions')
-    def toggle_calibration_tracking(self):
-        self.show_calibration_tracking = not getattr(self, "show_calibration_tracking", False)
-
-    def tracking_display(self, pixmap, *, camera, frame_id, acquired_at, image_shape):
-        """Draw only evidence belonging to the image currently displayed."""
-        if not self.show_overlay:
-            return
-        interface = getattr(self, "patch_interface", None)
-        controller = getattr(interface, "current_autopatcher", None)
-        stage = getattr(controller, "calibrated_stage", None)
-        if getattr(stage, "camera", None) is not camera:
-            return
-        helper = getattr(controller, "observation_helper", None)
-        frame_reader = getattr(helper, "tracking_for_frame", None)
-        observation = (frame_reader(frame_id, acquired_at, image_shape, camera=camera)
-                       if callable(frame_reader) else getattr(helper, "latest_tracking_observation", None))
-        if observation is None:
-            observation = {"pipette_tracking": {"valid": False}, "cell_tracking": {"valid": False}}
-        now = time.monotonic()
-        show_raw = getattr(self, "show_raw_tracking", False)
-        show_prediction = getattr(self, "show_calibration_tracking", False)
-        max_age = 1.0
-        markers = []
-        if not isinstance(observation, dict):
-            return
-        height, width = image_shape[:2]
-        if width <= 0 or height <= 0:
-            return
-        evidence = observation.get("deep_learning") or {}
-        for name in ("pipette", "cell"):
-            track = observation.get(name + "_tracking") or {}
-            if not track.get("valid"):
-                raw = evidence.get("pipette_position") if name == "pipette" else (
-                    observation.get("target_cell_image_xy") if observation.get("target_cell_valid") else None)
-                try:
-                    raw_match = (raw is not None and not evidence.get("stale", True)
-                                 and evidence.get("source_frame") == frame_id
-                                 and acquired_at is not None and evidence.get("frame_acquired_at") == acquired_at
-                                 and 0 <= now - float(acquired_at) <= max_age
-                                 and (evidence.get("status") or {}).get(name + "_detector") not in
-                                     ("error", "no_detection", "disabled", "no_frame"))
-                except (TypeError, ValueError):
-                    raw_match = False
-                if not raw_match:
-                    continue
-                track = dict(valid=True, display_valid=True, display_acquired_at=acquired_at,
-                             source_frame=frame_id, image_shape=evidence.get("source_image_shape", ()),
-                             image_xy=raw, status="raw")
-            stamp = track.get("display_acquired_at")
-            try:
-                age = now - float(stamp)
-                matched = (track.get("display_valid") and acquired_at is not None
-                           and frame_id == track.get("source_frame")
-                           and float(acquired_at) == float(stamp)
-                           and tuple(track["image_shape"][:2]) == tuple(image_shape[:2])
-                           and 0 <= age <= max_age)
-            except (KeyError, TypeError, ValueError, OverflowError):
-                matched, age = False, float("inf")
-            if not matched:
-                continue
-            status = str(track.get("status") or "prediction_only")
-            color = ("#ff7080" if status == "raw" else "#ffba45" if status == "prediction_only"
-                     else "#44e08a" if name == "pipette" else "#64caff")
-            candidates = [(track.get("image_xy"), status, color, track.get("covariance_pixels"))]
-            if show_prediction and track.get("source_predicted_xy") is not None:
-                candidates.append((track["source_predicted_xy"], "calibration", "#c893ff", None))
-            if (show_raw and status != "raw" and not evidence.get("stale", True)
-                    and evidence.get("source_frame") == frame_id
-                    and evidence.get("frame_acquired_at") == acquired_at
-                    and (evidence.get("status") or {}).get(name + "_detector") not in
-                        ("error", "no_detection", "disabled", "no_frame")):
-                point = evidence.get("pipette_position") if name == "pipette" else track.get("measurement_xy")
-                if name == "cell" and point is None and observation.get("target_cell_valid"):
-                    point = observation.get("target_cell_image_xy")
-                if point is not None:
-                    candidates.append((point, "raw", "#ff7080", None))
-            for point, style, color, covariance in candidates:
-                try:
-                    point = np.asarray(point, dtype=float).reshape(2)
-                    if not np.isfinite(point).all():
-                        continue
-                    outside = not (0 <= point[0] < width and 0 <= point[1] < height)
-                    if outside and style == "raw":
-                        continue
-                    visible = point.copy()
-                    arrow = None
-                    if outside:
-                        center = np.array([width / 2., height / 2.])
-                        direction = point - center
-                        distance = np.linalg.norm(direction)
-                        unit = direction / distance
-                        fraction = min(max(0., center[i] - 12.) / abs(direction[i])
-                                       for i in range(2) if direction[i] != 0)
-                        visible = center + fraction * direction
-                        side = np.array([-unit[1], unit[0]])
-                        arrow = [visible, visible - 12 * unit + 6 * side, visible - 12 * unit - 6 * side]
-                    ellipse = None
-                    if covariance is not None and not outside:
-                        try:
-                            covariance = np.asarray(covariance, dtype=float).reshape(2, 2)
-                            if np.isfinite(covariance).all():
-                                values, vectors = np.linalg.eigh(covariance)
-                                if min(values) >= 0:
-                                    ellipse = (np.sqrt(values), math.degrees(math.atan2(vectors[1, 0], vectors[0, 0])))
-                        except (TypeError, ValueError, np.linalg.LinAlgError):
-                            pass
-                    markers.append(dict(name=name, xy=point.copy(), display_xy=visible,
-                                                   style=style, color=color, arrow=arrow, ellipse=ellipse))
-                except (TypeError, ValueError, IndexError, np.linalg.LinAlgError):
-                    continue
-
-        painter = QtGui.QPainter(pixmap)
-        try:
-            painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            painter.save()
-            painter.scale(pixmap.width() / image_shape[1], pixmap.height() / image_shape[0])
-            for marker in markers:
-                pen = QtGui.QPen(QtGui.QColor(marker["color"]), 2)
-                pen.setCosmetic(True)
-                pen.setStyle(QtCore.Qt.DashLine if marker["style"] == "prediction_only" else QtCore.Qt.SolidLine)
-                painter.setPen(pen)
-                painter.setBrush(QtCore.Qt.NoBrush)
-                point = marker["display_xy"]
-                if marker["arrow"] is not None:
-                    painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(*p) for p in marker["arrow"]]))
-                elif marker["style"] in ("raw", "calibration"):
-                    painter.drawLine(QtCore.QPointF(point[0]-5, point[1]), QtCore.QPointF(point[0]+5, point[1]))
-                    painter.drawLine(QtCore.QPointF(point[0], point[1]-5), QtCore.QPointF(point[0], point[1]+5))
-                else:
-                    painter.drawEllipse(QtCore.QPointF(*point), 6, 6)
-                if marker["ellipse"] is not None:
-                    radii, angle = marker["ellipse"]
-                    painter.save()
-                    painter.translate(*point)
-                    painter.rotate(angle)
-                    painter.drawEllipse(QtCore.QPointF(0, 0), float(radii[0]), float(radii[1]))
-                    painter.restore()
-            painter.restore()
-        finally:
-            painter.end()
-
+    def _atlas_window_closed(self, _result=None):
+        self.show_atlas_button.setChecked(False)
+        self.show_atlas_button.setText("Show Atlas")
 
     def toggle_cell_list_window(self, checked=None):
         if checked is None:
@@ -362,133 +308,6 @@ class CollapsibleGroupBox(QtWidgets.QGroupBox):
         self.content_layout.addLayout(layout)
 
 
-class CellListWindow(QtWidgets.QDialog):
-    closed = QtCore.pyqtSignal()
-
-    def __init__(self, parent=None, thumbnail_size=96):
-        super().__init__(parent=parent)
-        self.setWindowTitle("Selected Cells")
-        self.setWindowFlags(self.windowFlags() | Qt.Tool)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-
-        self.thumbnail_size = thumbnail_size
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels([
-            "Image",
-            "Fluo Image",
-            "Cell",
-            "Stage (px)",
-            "Stage (um)",
-        ])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.setWordWrap(False)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.table.verticalHeader().setDefaultSectionSize(self.thumbnail_size + 12)
-
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.table)
-        self.setLayout(layout)
-
-    def closeEvent(self, event):
-        self.closed.emit()
-        super().closeEvent(event)
-
-    def update_cells(self, cells, stage_reference=None, full_refresh=True):
-        if self.table.rowCount() != len(cells):
-            self.table.setRowCount(len(cells))
-            full_refresh = True
-
-        for row, cell in enumerate(cells):
-            stage_px, img, stage_um, img_fluo = self._unpack_cell(cell)
-
-            if full_refresh:
-                self._set_image_cell(row, 0, img)
-                self._set_image_cell(row, 1, img_fluo, empty_text="N/A")
-                self._set_item(row, 2, str(row + 1))
-                self._set_item(row, 3, self._format_vec(stage_px))
-                self._set_item(row, 4, self._format_vec(stage_um))
-
-    def _unpack_cell(self, cell):
-        if cell is None:
-            return None, None, None, None
-        if len(cell) >= 4:
-            return cell[0], cell[1], cell[2], cell[3]
-        if len(cell) == 3:
-            return cell[0], cell[1], cell[2], None
-        return None, None, None, None
-
-    def _set_item(self, row, col, text):
-        item = self.table.item(row, col)
-        if item is None:
-            item = QtWidgets.QTableWidgetItem()
-            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
-            self.table.setItem(row, col, item)
-        item.setText(text)
-
-    def _set_image_cell(self, row, col, image, empty_text=""):
-        if image is None:
-            self.table.removeCellWidget(row, col)
-            item = QtWidgets.QTableWidgetItem(empty_text)
-            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
-            self.table.setItem(row, col, item)
-            return
-
-        pixmap = self._image_to_pixmap(image)
-        label = QtWidgets.QLabel()
-        label.setAlignment(Qt.AlignCenter)
-        if pixmap is not None:
-            label.setPixmap(
-                pixmap.scaled(
-                    self.thumbnail_size,
-                    self.thumbnail_size,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-            )
-        self.table.setCellWidget(row, col, label)
-
-    def _image_to_pixmap(self, image):
-        if image is None:
-            return None
-        img = np.array(image)
-        if img.ndim == 2:
-            img8 = self._normalize_to_uint8(img)
-            q_image = QtGui.QImage(
-                img8.data,
-                img8.shape[1],
-                img8.shape[0],
-                img8.strides[0],
-                QtGui.QImage.Format_Grayscale8,
-            ).copy()
-        else:
-            img8 = self._normalize_to_uint8(img[..., 0])
-            q_image = QtGui.QImage(
-                img8.data,
-                img8.shape[1],
-                img8.shape[0],
-                img8.strides[0],
-                QtGui.QImage.Format_Grayscale8,
-            ).copy()
-        return QtGui.QPixmap.fromImage(q_image)
-
-    def _normalize_to_uint8(self, img):
-        img = img.astype(np.float32)
-        min_val = float(np.min(img))
-        max_val = float(np.max(img))
-        if max_val > min_val:
-            img = (img - min_val) / (max_val - min_val) * 255.0
-        else:
-            img = np.zeros_like(img, dtype=np.float32)
-        return img.astype(np.uint8)
-
-    def _format_vec(self, vec):
-        if vec is None:
-            return "N/A"
-        arr = np.array(vec).astype(float).ravel()
-        return ", ".join(f"{v:.1f}" for v in arr)
 
 class ButtonTabWidget(QtWidgets.QWidget):
     def __init__(self):
@@ -725,7 +544,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
 
     def addButtonList(self, box_name: str, layout: QtWidgets.QVBoxLayout, buttonNames: list[list[str]], 
                     cmds, freq=None, sequential=False, change_color_on_complete=False, 
-                    completion_color="rgba(0, 0, 255, 0.3)", change_color_during=None):
+                    completion_color="rgba(0, 0, 255, 0.3)", change_color_during=None,
+                    extra_widget=None):
         # Use CollapsibleGroupBox instead of QGroupBox
         box = CollapsibleGroupBox(box_name)
         rows = QtWidgets.QVBoxLayout()
@@ -782,6 +602,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 active_names = set(change_color_during)
             self.active_buttons_by_section[box_name] = active_names
 
+        if extra_widget is not None:
+            rows.addWidget(extra_widget)
         box.setContentLayout(rows)
         layout.addWidget(box)
         return section_buttons
@@ -809,6 +631,8 @@ class FileSelector(QWidget):
             # Emit the signal with the selected file path
             self.fileSelected.emit(file_name)
 class ClassicPatchButtons(ButtonTabWidget):
+    origin_requested = QtCore.pyqtSignal(str)
+
     def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager):
         super().__init__()
         self.patch_interface = patch_interface
@@ -855,6 +679,24 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.pipette_cleaning_calibration = [self.patch_interface.store_cleaning_position,self.patch_interface.move_pipette_up,self.patch_interface.move_to_safe_space]
 
 
+        origin_controls = QtWidgets.QWidget()
+        origin_layout = QtWidgets.QVBoxLayout(origin_controls)
+        origin_layout.setContentsMargins(0, 0, 0, 0)
+        origin_row = QtWidgets.QHBoxLayout()
+        self.origin_buttons = {}
+        for axis in ("x", "y"):
+            button = QtWidgets.QPushButton(axis.upper() + " Origin")
+            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            button.setMinimumSize(50, 50)
+            button.clicked.connect(lambda checked, a=axis: self.origin_requested.emit(a))
+            self.origin_buttons[axis] = button
+            origin_row.addWidget(button)
+        origin_layout.addLayout(origin_row)
+        self.origin_status = QtWidgets.QLabel()
+        self.origin_status.setWordWrap(True)
+        self.origin_status.hide()
+        origin_layout.addWidget(self.origin_status)
+
         # Add a box for calibration setup
         # buttonList = [['Calibrate Stage','Calibrate Pipette'],['set home space','set safe space'],['Store Cleaning Position'],['Clear Calibration']]
         buttonList = [['Calibrate Stage','Calibrate Pipette'],['Store Cleaning Position'],['Load Calibration','Clear Calibration']]
@@ -864,7 +706,8 @@ class ClassicPatchButtons(ButtonTabWidget):
                 [self.load_calibration, self.patch_interface.clear_positions]
         ]
         self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
-                        change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)")
+                        change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)",
+                        extra_widget=origin_controls)
 
         # Add a box for movement commands 
         buttonList = [
@@ -937,6 +780,16 @@ class ClassicPatchButtons(ButtonTabWidget):
         layout.addWidget(self.record_button)
 
         self.setLayout(layout)
+
+    def set_origin_busy(self, busy):
+        for button in self.origin_buttons.values():
+            button.setEnabled(not busy)
+
+    def set_origin_status(self, message, error=False):
+        self.origin_status.setText(message)
+        self.origin_status.setVisible(error)
+        for button in self.origin_buttons.values():
+            button.setToolTip(message)
 
     def load_calibration(self):
         self.file_selector.fileSelected.connect(self.load_calibration_file)  # Connect the signal to the slot

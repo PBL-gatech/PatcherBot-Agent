@@ -46,7 +46,6 @@ class ApproachCellPhase(PhaseController):
         if command["clear_distance"] is not None:
             self.controller.clear_to_cell(cell)
             self.controller.align(cell, command["clear_distance"], command["use_centroid"])
-        self.controller.observe(fields=["manipulator_position", "stage_positions", "deep_learning"], target_cell=cell)
         return True
 
     def success_gate(self, observation=None, state=None):

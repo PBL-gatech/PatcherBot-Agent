@@ -482,6 +482,12 @@ class CameraGui(QtWidgets.QMainWindow):
         self.log_button.setCheckable(True)
         self.log_button.setToolTip('Toggle log window display')
 
+        self.overlay_button = QtWidgets.QToolButton(clicked=self.toggle_overlay)
+        self.overlay_button.setIcon(qta.icon('fa.bullseye'))
+        self.overlay_button.setCheckable(True)
+        self.overlay_button.setChecked(self.show_overlay)
+        self.overlay_button.setToolTip('Show/hide overlays (does not enable overlay recording)')
+
         self.record_button = QtWidgets.QToolButton(clicked=self.toggle_recording)
         self.record_button.setIcon(qta.icon('fa.video-camera'))
         self.record_button.setCheckable(True)
@@ -522,6 +528,7 @@ class CameraGui(QtWidgets.QMainWindow):
         self.status_bar.addPermanentWidget(self.setexposure_edit)
         self.status_bar.addPermanentWidget(self.help_button)
         self.status_bar.addPermanentWidget(self.log_button)
+        self.status_bar.addPermanentWidget(self.overlay_button)
         self.status_bar.addPermanentWidget(self.record_button)
         self.status_bar.addPermanentWidget(self.snap_image_button)
         self.status_bar.addPermanentWidget(self.autoexposure_button)
@@ -568,7 +575,6 @@ class CameraGui(QtWidgets.QMainWindow):
             self.main_video = LiveFeedQt(self.main_camera,
                                          image_edit=self.image_edit,
                                          display_edit=functools.partial(self.display_edit, camera=self.main_camera),
-                                         frame_overlay=getattr(self, "tracking_display", None),
                                          mouse_handler=self.video_mouse_press,
                                          recording_state_manager=self.recording_state_manager,
                                          frame_folder_name='camera_frames')
@@ -577,7 +583,6 @@ class CameraGui(QtWidgets.QMainWindow):
             self.aux_video = LiveFeedQt(self.aux_camera,
                                         image_edit=self.image_edit,
                                         display_edit=functools.partial(self.display_edit, camera=self.aux_camera),
-                                         frame_overlay=getattr(self, "tracking_display", None),
                                         mouse_handler=self.video_mouse_press,
                                         recording_state_manager=self.recording_state_manager,
                                         frame_folder_name='aux_camera_frames')
@@ -1200,8 +1205,9 @@ class CameraGui(QtWidgets.QMainWindow):
 
     @command(category='General',
              description='Show/hide the overlay information on the image')
-    def toggle_overlay(self):
+    def toggle_overlay(self, checked=None):
         self.show_overlay = not self.show_overlay
+        self.overlay_button.setChecked(self.show_overlay)
 
     def toggle_configuration_display(self):
         current_sizes = self.splitter.sizes()

@@ -32,6 +32,7 @@ class PipetteInterface(TaskInterface):
         super().__init__()
         self.microscope = microscope
         self.camera = camera
+        self.display_positions = None
         # Create a common calibration configuration for all stages/manipulators
         self.calibration_config = CalibrationConfig(name='Calibration')
         if calibration_data:

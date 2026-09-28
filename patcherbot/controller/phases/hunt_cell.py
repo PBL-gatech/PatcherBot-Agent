@@ -1,6 +1,7 @@
 """Hunt modes and persistent operations supervised by one observation loop."""
 
 import collections
+from concurrent.futures import ThreadPoolExecutor
 import math
 import sys
 import time
@@ -29,10 +30,17 @@ class HuntCellPhase(PhaseController):
         mode, cell_type = self.controller.config.mode, self.controller.config.cell_type
         try:
             state = self.prepare(cell, mode=mode, cell_type=cell_type)
+            state.update(vision_executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="hunt-vision"),
+                         vision_future=None, vision_result={})
+            self.act(state=state)
             while True:
                 self.controller.abort_if_requested()
                 self.controller.success_if_requested()
-                observation = self.observe(**state["observe"])
+                future = state["vision_future"]
+                if future is not None and future.done():
+                    state["vision_result"] = future.result()
+                    state["vision_future"] = None
+                observation = self.observe(**state["observe"], evidence=state["vision_result"])
                 self.controller.abort_if_requested()
                 self.controller.success_if_requested()
                 self.calculate(observation, state)
@@ -56,6 +64,11 @@ class HuntCellPhase(PhaseController):
                 if mode == "Training" and state["electrical_confirmed"]:
                     contact["latched"] = True
                 if self.success_gate(observation, state, mode=mode):
+                    self.controller.observer.annotate(self, observation, calculations={
+                        "hunt_state": state["active_state"], "hunt_state_id": state["state_id"],
+                        "hunt_sample_interval_s": state["sample_interval_s"],
+                        "hunt_decision": dict(outcome="success", state_id=state["state_id"],
+                            reason="requested_success" if self.controller.success_requested else "contact_confirmed")})
                     self.complete_success()
                     return
                 if self.failure_gate(state, mode=mode, cell_type=cell_type):
@@ -79,7 +92,8 @@ class HuntCellPhase(PhaseController):
                         state["progress_cycles"] += 1
                         baseline = state["progress_baseline_um"]
                         progress = 100.0 * (baseline - gap) / baseline if baseline else 0.0
-                        observation.update(pipette_cell_gap_um=gap, progress_percent=progress)
+                        self.controller.observer.annotate(self, observation, fields={
+                            "pipette_cell_gap_um": gap, "progress_percent": progress})
                         if progress >= state["required_progress"]:
                             state.update(progress_baseline_um=gap, progress_cycles=0)
                         elif state["progress_cycles"] >= state["progress_cycle_limit"]:
@@ -96,17 +110,18 @@ class HuntCellPhase(PhaseController):
                                       evidence=decision.get("evidence"))
                     state.update(active_state=destination, state_id=state["state_id"] + 1,
                                  state_context={}, pending_transition=None)
-                    observation["hunt_transition"] = transition
+                    self.controller.observer.annotate(self, observation, fields={"hunt_transition": transition})
                     self.controller.info(f"Hunt {transition['previous']} -> {destination}: {decision['reason']}")
                 elif decision["command"] is not None:
                     if not self.action_gate(observation, state, command=decision["command"]):
                         raise AutopatchError("Hunt movement rejected by action gate")
                     self.act(observation, state, command=decision["command"])
-                self.controller.observation_helper.record_calculations(self, observation, {
+                self.controller.observer.annotate(self, observation, calculations={
                     "hunt_state": state["active_state"], "hunt_state_id": state["state_id"],
                     "hunt_decision": {key: value for key, value in decision.items() if key != "command"},
                     "hunt_transition": observation.get("hunt_transition"),
                     "hunt_sample_interval_s": state["sample_interval_s"]})
+                self.act(observation, state)
                 self.controller.sleep(0.04)
         except AutopatchError as error:
             if state is not None and isinstance(self.last_observation, dict):
@@ -114,19 +129,22 @@ class HuntCellPhase(PhaseController):
                                          evidence=dict(source_frame=(self.last_observation.get("deep_learning") or {}).get("source_frame")),
                                          command=None)
                 try:
-                    self.controller.observation_helper.record_calculations(self, self.last_observation, {
+                    self.controller.observer.annotate(self, self.last_observation, calculations={
                         "hunt_state": state["active_state"], "hunt_state_id": state["state_id"],
-                        "hunt_decision": state["decision"], "hunt_transition": None})
+                        "hunt_decision": state["decision"],
+                        "hunt_transition": self.last_observation.get("hunt_transition"),
+                        "hunt_sample_interval_s": state["sample_interval_s"]})
                 except Exception:
                     pass  # Diagnostic failure must not obscure the original stop reason.
             raise
         finally:
             pending_error, cleanup_error = sys.exc_info()[1], None
             cleanup = [lambda: self.act(state=state, stop=True)]
+            if state is not None and state.get("vision_executor") is not None:
+                executor = state.pop("vision_executor")
+                cleanup.append(lambda: executor.shutdown(wait=False, cancel_futures=True))
             if state is not None and mode == "Agent":
                 cleanup.append(self.controller.agenthelper.invalidate_inference)
-            if state is not None and state["inference_started"]:
-                cleanup.append(self.controller.observation_helper.stop_deep_learning)
             for finish in cleanup:
                 try:
                     finish()
@@ -156,19 +174,17 @@ class HuntCellPhase(PhaseController):
                 raise ValueError()
         except (ValueError, TypeError, OverflowError):
             raise AutopatchError("Hunt requires a positive finite resistance baseline and contact threshold")
-        helper = self.controller.observation_helper
-        helper.reset_history(self, None, include_images=False)
-        state = dict(cell=cell, mode=mode, cell_type=cell_type, inference_started=False,
+        self.begin_observations()
+        state = dict(cell=cell, mode=mode, cell_type=cell_type,
                      active_state="spear" if mode == "Adaptive" and cell_type == "Slice" else mode.lower(),
                      state_id=1, state_context={}, pending_transition=None, decision=None,
                      readings=collections.deque(maxlen=5), start_position=None,
-                     contact=dict(active=False, latched=False, recovery=None), pending_motion=None,
+                     contact=dict(active=False, latched=False, recovery=None),
                      applied_command=None, settled=False, stopped_at=None, settled_at=None,
                      previous_pose=None, last_sample_at=None, agent_generation=0,
                      observe=dict(fields=["resistance", "manipulator_position", "stage_positions",
-                                         "deep_learning", "camera_image", "pipette_positions", "pressure",
-                                         "commanded_pressure_mbar", "pressure_atm_state", "motion_state"],
-                                  raw_measurements=True, cell=None, target_cell=cell))
+                                         "deep_learning", "camera_image", "pipette_image_xy", "pipette_defocus_um", "pressure",
+                                         "commanded_pressure_mbar", "pressure_atm_state"]))
         self.state = state
         if mode == "Agent":
             self.controller.agenthelper.prepare_model("hunt")
@@ -184,13 +200,11 @@ class HuntCellPhase(PhaseController):
                     raise AutopatchError("Adaptive progress percentage must be between 0 and 100")
                 state.update(progress_baseline_um=gap, progress_cycles=0, pipette_z_um=None,
                              progress_cycle_limit=int(cycles), required_progress=percent)
-            try:
-                helper.start_deep_learning(cell=None)
-                helper.set_deep_learning_models(cell=True, pipette=True)
-                state["inference_started"] = True
-            except BaseException:
-                helper.stop_deep_learning()
-                raise
+        stage, unit = self.controller.calibrated_stage, self.controller.calibrated_unit
+        self.frame_context = {
+            "stage": stage.position,
+            "microscope": lambda: unit.microscope.position() / unit.config.microscope_units_per_um,
+        }
         self.controller.info(f"Hunt starting: mode={mode}, cell_type={cell_type}, baseline_R={self.controller.first_res} MOhm")
         return state
 
@@ -242,46 +256,6 @@ class HuntCellPhase(PhaseController):
                     raise AutopatchError("Shift exceeded its 50 um planar envelope")
             if time.monotonic() - context["entered_at"] > 60:
                 raise AutopatchError("Hunt action exceeded its monitoring timeout")
-        devices = (("manipulator", self.controller.calibrated_unit),
-                   ("stage", self.controller.calibrated_stage), ("microscope", self.controller.microscope))
-        active_command = state["applied_command"]
-        if active_command is not None and active_command[0] in ("velocity", "relative_velocity"):
-            name = next(name for name, device in devices if id(device) == active_command[1])
-            if observation["motion_state"][name].get("velocity_failed", False):
-                raise AutopatchError("Hunt velocity command failed")
-        pending = state["pending_motion"]
-        if pending is not None:
-            info = observation["motion_state"][pending["role"]]
-            current = (stage[2] if pending["role"] == "microscope" else
-                       stage[:2] if pending["role"] == "stage" else position)
-            pending["status"] = "running"
-            if info.get("command_failed", False) or (pending["command_id"] is not None
-                    and info.get("command_id") != pending["command_id"]):
-                pending["status"] = "failed"
-            elif info["sampled_at"] > pending["issued_at"] and not info["busy"]:
-                encoder = "encoder_sequence" in info and pending["role"] != "stage"
-                fresh = True
-                if encoder:
-                    sequence = info["encoder_sequence"]
-                    if pending["idle_sequence"] is None:
-                        pending["idle_sequence"] = sequence
-                        fresh = False
-                    else:
-                        fresh = sequence > pending["idle_sequence"]
-                if fresh:
-                    measured = np.asarray(current, dtype=float).copy()
-                    if encoder:
-                        measured.flat[-1] = float(info["encoder_z"])
-                    error = np.abs(measured - pending["target"])
-                    tolerance = 2.0 if encoder else 0.5
-                    if not np.isfinite(error).all():
-                        pending["status"] = "failed"
-                    elif np.max(error) <= tolerance:
-                        pending["status"] = "settled"
-                    elif encoder and pending["attempts"] < 5:
-                        pending["status"] = "retry"
-                    else:
-                        pending["status"] = "failed"
         return observation
 
     def decide(self, observation, state, *, mode, cell_type):
@@ -290,9 +264,7 @@ class HuntCellPhase(PhaseController):
                         evidence=dict(observed_at=observation.get("observed_at"),
                                       source_frame=(observation.get("deep_learning") or {}).get("source_frame"),
                                       resistance=observation.get("resistance"),
-                                      settled=state["settled"],
-                                      tracking_uncertainty_um=(observation.get("pipette_tracking") or {}).get("relative_uncertainty_um"),
-                                      tip_minus_cell_um=(observation.get("pipette_tracking") or {}).get("tip_minus_cell_um")))
+                                      settled=state["settled"]))
         contact = state["contact"]
         if contact["active"] or contact["latched"]:
             decision["reason"] = "contact_confirmation"
@@ -303,6 +275,10 @@ class HuntCellPhase(PhaseController):
             decision["reason"] = "operator_motion"
             return decision
         if mode == "Agent":
+            if not self.usable_tip(observation):
+                decision.update(reason="awaiting_visual_evidence",
+                    command=dict(kind="stop") if state["applied_command"] is not None else None)
+                return decision
             helper = self.controller.agenthelper
             generation = (id(state), state["agent_generation"])
             helper.request_inference(observation, generation)
@@ -331,11 +307,6 @@ class HuntCellPhase(PhaseController):
                 raise AutopatchError("Search/Scan distance settings must be finite and nonnegative")
             context.update(start=observation, entered_at=time.monotonic(), waiting=0,
                            travel_limit=min(maximum, bounds[1] - bounds[0] + bounds[3] - bounds[2] + margin))
-            if step == "spear":
-                gap = float(self.controller.config.cell_distance) if state["pipette_z_um"] is None or self.cell_z_um is None else abs(self.cell_z_um - state["pipette_z_um"])
-                if not math.isfinite(gap) or gap <= 0:
-                    raise AutopatchError("Spear requires a positive finite estimated cell separation")
-                context.update(estimated_gap_um=gap, checkpoint_um=max(0., gap - 10.))
             self.controller.info(f"Hunt mode={mode}, operation={step}, R={observation['resistance']} MOhm, travel_limit={context['travel_limit']} um")
         queued = context.get("queued_command")
         if queued is not None:
@@ -344,25 +315,28 @@ class HuntCellPhase(PhaseController):
                 return decision
             decision.update(outcome="continue", reason="stopped_move_dispatch", command=context.pop("queued_command"))
             return decision
-        pending_motion = state["pending_motion"]
-        if pending_motion is not None:
-            status = pending_motion["status"]
-            if status == "retry":
-                decision.update(reason="encoder_correction", command=dict(kind="retry", device=pending_motion["device"], value=pending_motion["target"], token=id(pending_motion)))
+        target = context.get("move_target")
+        if target is not None:
+            field = "stage_positions" if step == "center_cell" else "manipulator_position"
+            if (time.monotonic() <= context["move_issued_at"]
+                    or np.linalg.norm(np.asarray(observation[field][:2]) - target) > 1.0):
+                decision["reason"] = "alignment_move_in_progress"
                 return decision
-            if status == "failed":
-                raise AutopatchError("Hunt positional movement failed")
-            if status == "running":
-                decision["reason"] = "motion_in_progress"
-                return decision
-            if status != "settled":
-                raise AutopatchError("Unknown supervised movement status")
-            state["pending_motion"] = None
             context["after_move"] = time.monotonic()
-            decision.update(reason="movement_arrived", command=dict(kind="stop"))
+            decision.update(reason="alignment_target_reached", command=dict(kind="stop"))
+            return decision
+        if step == "scan" and context.get("returning") and not context.get("return_stopped"):
+            error = context["best_z"] - float(observation["stage_positions"][2])
+            if abs(error) <= 1.0 or error * context["return_direction"] <= 0:
+                context.update(return_stopped=True, after_move=time.monotonic())
+                decision.update(reason="focus_return_stopped", command=dict(kind="stop"))
+            else:
+                decision.update(reason="returning_to_best_focus", command=dict(kind="velocity",
+                    device=self.controller.microscope,
+                    value=context["return_direction"] * abs(float(self.controller.config.max_descent_speed))))
             return decision
         pending = state["pending_transition"]
-        fresh = self.controller.observation_helper.fresh_visual
+        fresh = self.fresh_visual
         if pending is not None:
             if pending["state_id"] != state["state_id"]:
                 raise AutopatchError("Pending transition belongs to an earlier state")
@@ -372,18 +346,18 @@ class HuntCellPhase(PhaseController):
             if not state["settled"]:
                 decision["reason"] = "awaiting_stop"
                 return decision
-            geometric = pending["reason"] in ("uncertain_tracking", "relative_motion", "reacquire_at_travel_limit", "unavailable_tracking", "travel_limit")
+            geometric = pending["reason"] == "travel_limit"
             if not geometric and not fresh(observation, pending["frame"], state["settled_at"]):
                 decision["reason"] = "awaiting_post_stop_evidence"
                 return decision
-            if pending["reason"] == "proximity_checkpoint":
-                if self.controller.observation_helper.usable_tip(observation) and (observation.get("target_cell_valid") or self.last_cell_location is not None):
-                    context["checkpoint_confirmed"] = True
-                    state["pending_transition"] = None
-                else:
-                    return decision
         if step != "spear":
-            if not fresh(observation, context.get("frame"), context.get("after_move")):
+            after_move = context.get("after_move")
+            if after_move is not None and state["stopped_at"] is not None:
+                if not state["settled"]:
+                    decision["reason"] = "awaiting_stop_after_move"
+                    return decision
+                after_move = max(after_move, state["settled_at"])
+            if not fresh(observation, context.get("frame"), after_move):
                 context["waiting"] += 1
                 if context["waiting"] >= 50:
                     raise AutopatchError(f"{step} received no fresh visual evidence")
@@ -400,26 +374,28 @@ class HuntCellPhase(PhaseController):
                 state["pending_transition"] = dict(state_id=state["state_id"], reason=reason,
                     next_state=self.transitions[step], frame=(observation.get("deep_learning") or {}).get("source_frame"), attempts=0)
                 decision.update(reason=reason, command=dict(kind="stop"))
-        elif context.pop("checkpoint_pending", False):
-            state["pending_transition"] = dict(state_id=state["state_id"], reason="proximity_checkpoint",
-                next_state=step, frame=(observation.get("deep_learning") or {}).get("source_frame"), attempts=0)
-            decision.update(reason="proximity_checkpoint", command=dict(kind="stop"))
         else:
             if pending is not None:
                 state["pending_transition"] = None
             decision.update(outcome="continue" if command else "hold", reason="state_condition_not_met", command=command)
         command = decision["command"]
-        if command is not None and command["kind"] in ("relative", "absolute_z") and not state["settled"]:
+        if command is not None and command["kind"] == "relative" and not state["settled"]:
             context["queued_command"] = command
             decision.update(outcome="hold", reason="stop_before_positional_move", command=dict(kind="stop"))
         return decision
 
     def act(self, observation=None, state=None, *, command=None, stop=False):
         """Dispatch once; never acquire observations or wait for movement completion."""
+        if (not stop and (command is None or command["kind"] != "stop")
+                and state is not None and state.get("vision_executor") is not None
+                and state["vision_future"] is None):
+            state["vision_future"] = state["vision_executor"].submit(
+                self.controller.infer_frame, state["observe"]["fields"], self.frame_context)
         if stop or (command is not None and command["kind"] == "stop"):
             first_error = None
             if state is not None:
-                state["pending_motion"] = None
+                state["state_context"].pop("move_target", None)
+                state["state_context"].pop("move_issued_at", None)
             for device in (self.controller.calibrated_stage, self.controller.calibrated_unit, self.controller.microscope):
                 try:
                     device.stop()
@@ -427,7 +403,7 @@ class HuntCellPhase(PhaseController):
                     if first_error is None:
                         first_error = error
             if state is not None:
-                state.update(pending_motion=None, applied_command=None, stopped_at=time.monotonic(), settled=False, settled_at=None)
+                state.update(applied_command=None, stopped_at=time.monotonic(), settled=False, settled_at=None)
                 state["stop_frame"] = (observation.get("deep_learning") or {}).get("source_frame") if observation else None
             if first_error is not None:
                 raise first_error
@@ -438,33 +414,26 @@ class HuntCellPhase(PhaseController):
         self.controller.success_if_requested()
         kind, device, value = command["kind"], command["device"], command["value"]
         key = (kind, id(device), tuple(np.asarray(value).reshape(-1)))
-        role = ("microscope" if device is self.controller.microscope else
-                "stage" if device is self.controller.calibrated_stage else "manipulator")
-        if kind in ("relative", "absolute_z", "retry"):
-            context = observation["motion_state"][role]
-        if kind == "retry":
-            pending = state["pending_motion"]
-            pending["command_id"] = device.start_absolute_move(pending["target"], context=context)
-            pending.update(attempts=pending["attempts"] + 1, idle_sequence=None, issued_at=time.monotonic(), status="running")
-            return
-        if kind in ("relative", "absolute_z"):
-            if context["busy"]:
-                raise AutopatchError("Observed device is still moving before positional dispatch")
-            current = (observation["stage_positions"][2] if role == "microscope" else
-                       observation["stage_positions"][:2] if role == "stage" else observation["manipulator_position"])
-            target = np.asarray(current) + np.asarray(value)[:np.size(current)] if kind == "relative" else float(value)
-            command_id = device.start_absolute_move(target, context=context)
-        elif kind == "relative_velocity" or key != state["applied_command"]:
-            device.start_velocity(value, relative=(kind == "relative_velocity"))
+        if kind == "relative":
+            context = state["state_context"]
+            field = "stage_positions" if device is self.controller.calibrated_stage else "manipulator_position"
+            target = np.asarray(observation[field][:2], dtype=float) + np.asarray(value, dtype=float)[:2]
+            device.relative_move(value)
+            context.update(move_target=target, move_issued_at=time.monotonic())
+            context["moves"] = context.get("moves", 0) + 1
+            context["commanded_distance"] = context.get("commanded_distance", 0.) + float(np.linalg.norm(value))
+            context["previous_error"] = command["alignment_error"]
+        elif kind == "relative_velocity":
+            device.relative_move_group_velocity(value)
+        elif kind == "velocity":
+            if key != state["applied_command"]:
+                if device is self.controller.microscope:
+                    device.absolute_move_velocity(value)
+                else:
+                    device.absolute_move_group_velocity(value)
+        else:
+            raise AutopatchError("Unknown Hunt movement command")
         state.update(applied_command=key, stopped_at=None, settled=False, settled_at=None)
-        if kind in ("relative", "absolute_z"):
-            state["pending_motion"] = dict(device=device, role=role, target=target, attempts=1,
-                idle_sequence=None, issued_at=time.monotonic(), command_id=command_id, status="running")
-            if kind == "relative":
-                context = state["state_context"]
-                context["moves"] = context.get("moves", 0) + 1
-                context["commanded_distance"] = context.get("commanded_distance", 0.) + float(np.linalg.norm(value))
-                context["previous_error"] = command["alignment_error"]
 
     def action_gate(self, observation=None, state=None, *, command=None):
         """Validate the command against its mode, device and retained movement budget."""
@@ -480,11 +449,6 @@ class HuntCellPhase(PhaseController):
             recovery = state["contact"].get("recovery")
             if state["contact"]["active"] and recovery is None:
                 return False
-            if kind == "retry":
-                pending = state["pending_motion"]
-                return (pending is not None and command.get("token") == id(pending)
-                        and device is pending["device"] and pending["status"] == "retry"
-                        and pending["attempts"] < 5 and np.array_equal(value, pending["target"]))
             step, context = state["active_state"], state["state_context"]
             if recovery is not None:
                 context = recovery
@@ -508,8 +472,11 @@ class HuntCellPhase(PhaseController):
                 z = float(observation["stage_positions"][2])
                 if abs(z - origin) > limit:
                     return False
-                if kind == "absolute_z":
-                    return abs(float(value) - origin) <= limit and step in ("scan", "return")
+                if context.get("returning") or step == "return":
+                    target = context["tip_z"] if recovery is not None else context["best_z"]
+                    error = float(target) - z
+                    return (kind == "velocity" and math.isfinite(float(target))
+                            and abs(float(target) - origin) <= limit and value * error > 0)
                 up = float(device.up_direction)
                 if up not in (-1., 1.):
                     return False
@@ -526,7 +493,7 @@ class HuntCellPhase(PhaseController):
                 if not math.isfinite(speed) or speed == 0 or value[2] * speed <= 0:
                     return False
                 origin = context["start"]["manipulator_position"][2]
-                limit = min(context["estimated_gap_um"], float(self.controller.config.max_distance))
+                limit = float(self.controller.config.max_distance)
             else:
                 origin, limit = state["start_position"][2], float(self.controller.config.max_distance)
             return math.isfinite(limit) and limit > 0 and abs(observation["manipulator_position"][2] - origin) < limit
@@ -534,39 +501,17 @@ class HuntCellPhase(PhaseController):
             return False
 
     def spear(self, observation, state):
+        """Descend until the selected cell is lost or the travel limit is reached."""
         context = state["state_context"]
         descent = abs(float(observation["manipulator_position"][2]) - float(context["start"]["manipulator_position"][2]))
         context["maximum_descent_um"] = max(context.get("maximum_descent_um", 0.), descent)
-        tracking, cell = observation.get("pipette_tracking") or {}, observation.get("cell_tracking") or {}
-        reason = None
-        if tracking.get("valid") and cell.get("valid"):
-            settings = self.controller.observation_helper.tracking_settings
-            uncertainty = float(tracking["relative_uncertainty_um"])
-            alignment = float(np.linalg.norm(tracking["tip_minus_cell_um"]))
-            if not math.isfinite(uncertainty) or uncertainty > settings["max_tracking_uncertainty_um"]:
-                reason = "uncertain_tracking"
-            elif not math.isfinite(alignment) or alignment > settings["max_alignment_error_um"] + uncertainty:
-                reason = "relative_motion"
-            elif descent >= min(context["estimated_gap_um"], float(self.controller.config.max_distance)):
-                reason = "reacquire_at_travel_limit"
-        elif getattr(self.controller, "home_position", None) is not None:
-            reason = "unavailable_tracking"
-        else:
-            if descent >= context["estimated_gap_um"]:
-                raise AutopatchError("Spear reached the estimated cell plane without confirmed contact")
-            if descent >= self.controller.config.max_distance:
-                reason = "travel_limit"
-            elif descent >= context["checkpoint_um"] and (not context.get("checkpoint_confirmed") or not self.controller.observation_helper.usable_tip(observation)):
-                context["checkpoint_pending"] = True
-                return False, None
-            if observation.get("target_cell_status") == "ambiguous":
-                raise AutopatchError("Spear cannot distinguish the selected cell")
-            if observation.get("target_cell_valid"):
-                context["cell_seen"] = True
-            elif observation.get("target_cell_status") == "not_detected" and context.get("cell_seen"):
-                reason = "cell_lost_confirmed"
-        if reason:
-            context["exit_reason"] = reason
+        if observation.get("target_cell_status") == "ambiguous":
+            raise AutopatchError("Spear cannot distinguish the selected cell")
+        if observation.get("target_cell_valid"):
+            context["cell_seen"] = True
+        lost = observation.get("target_cell_status") == "not_detected" and context.get("cell_seen", False)
+        if descent >= float(self.controller.config.max_distance) or lost:
+            context["exit_reason"] = "travel_limit" if descent >= float(self.controller.config.max_distance) else "cell_lost_confirmed"
             return True, None
         return False, dict(kind="velocity", device=self.controller.calibrated_unit,
                            value=[0., 0., float(self.controller.config.max_descent_speed)])
@@ -597,7 +542,7 @@ class HuntCellPhase(PhaseController):
         try:
             focus = float(evidence["pipette_focus"])
             source_z = float(evidence["source_positions"]["microscope"])
-            valid = self.controller.observation_helper.usable_tip(observation) and math.isfinite(focus) and math.isfinite(source_z) and abs(source_z - origin) <= context["travel_limit"]
+            valid = self.usable_tip(observation) and math.isfinite(focus) and math.isfinite(source_z) and abs(source_z - origin) <= context["travel_limit"]
         except (KeyError, TypeError, ValueError):
             focus, valid = float("nan"), False
         if context.get("returning") or state["pending_transition"] is not None:
@@ -612,11 +557,13 @@ class HuntCellPhase(PhaseController):
                 context.update(best_focus=abs(focus), best_z=source_z, improving=previous is not None)
             context["previous_focus"] = focus
             if abs(focus) <= 1.0 or bracketed:
-                if abs(z - context["best_z"]) <= 0.1:
+                if abs(z - context["best_z"]) <= 1.0:
                     context["exit_reason"] = "focus_verified"
                     return True, None
-                context["returning"] = True
-                return False, dict(kind="absolute_z", device=self.controller.microscope, value=context["best_z"])
+                direction = math.copysign(1., context["best_z"] - z)
+                context.update(returning=True, return_stopped=False, return_direction=direction)
+                return False, dict(kind="velocity", device=self.controller.microscope,
+                                   value=direction * abs(float(self.controller.config.max_descent_speed)))
         if abs(z - origin) >= context["travel_limit"]:
             raise AutopatchError("Scan reached its distance limit without resolving focus")
         return False, dict(kind="velocity", device=self.controller.microscope,
@@ -675,7 +622,7 @@ class HuntCellPhase(PhaseController):
             return False
         if mode != "Adaptive":
             return True
-        return bool(isinstance(observation, dict) and state["settled"] and self.controller.observation_helper.fresh_visual(
+        return bool(isinstance(observation, dict) and state["settled"] and self.fresh_visual(
             observation, state.get("stop_frame"), state["settled_at"]) and self._adaptive_contact_confirmed(observation))
 
     def _recover_contact_visuals(self, observation, state, *, mode):
@@ -699,26 +646,21 @@ class HuntCellPhase(PhaseController):
             raise AutopatchError("Contact recovery exceeded its fixed microscope envelope")
         if observation.get("target_cell_id") != recovery["start"].get("target_cell_id") or observation.get("target_cell_status") == "ambiguous":
             raise AutopatchError("Contact recovery target changed or became ambiguous")
-        if state["pending_motion"] is not None:
-            pending = state["pending_motion"]
-            status = pending["status"]
-            if status == "retry":
-                return dict(kind="retry", device=pending["device"], value=pending["target"], token=id(pending))
-            if status == "running":
-                return None
-            if status != "settled":
-                raise AutopatchError("Contact recovery return movement failed")
-            state["pending_motion"] = None
-            return dict(kind="stop")
-        helper = self.controller.observation_helper
+        if recovery["phase"] == "return" and not recovery.get("return_stopped"):
+            error = recovery["tip_z"] - z
+            if abs(error) <= 1.0 or error * recovery["return_direction"] <= 0:
+                recovery["return_stopped"] = True
+                return dict(kind="stop")
+            return dict(kind="velocity", device=self.controller.microscope,
+                        value=recovery["return_direction"] * abs(float(self.controller.config.max_descent_speed)))
         after = state["settled_at"] if state["stopped_at"] is not None else None
-        if (state["stopped_at"] is not None and not state["settled"]) or not helper.fresh_visual(observation, recovery["frame"], after):
+        if (state["stopped_at"] is not None and not state["settled"]) or not self.fresh_visual(observation, recovery["frame"], after):
             recovery["waiting"] += 1
             if recovery["waiting"] >= 50:
                 raise AutopatchError("Contact recovery received no fresh confirming evidence")
             return dict(kind="stop") if state["applied_command"] is not None else None
         recovery.update(waiting=0, frame=(observation.get("deep_learning") or {}).get("source_frame"))
-        tip, cell = helper.usable_tip(observation), observation.get("target_cell_valid", False)
+        tip, cell = self.usable_tip(observation), observation.get("target_cell_valid", False)
         if self._adaptive_contact_confirmed(observation):
             return dict(kind="stop") if state["applied_command"] is not None else None
         pending = recovery["pending"]
@@ -727,8 +669,13 @@ class HuntCellPhase(PhaseController):
         elif pending == "cell" and cell:
             if recovery["tip_z"] is None:
                 raise AutopatchError("Contact recovery has no verified pipette focus")
-            recovery.update(phase="return", pending="return")
-            return dict(kind="absolute_z", device=self.controller.microscope, value=recovery["tip_z"])
+            error = recovery["tip_z"] - z
+            recovery.update(phase="return", pending="return", return_direction=math.copysign(1., error),
+                            return_stopped=abs(error) <= 1.0)
+            if recovery["return_stopped"]:
+                return dict(kind="stop")
+            return dict(kind="velocity", device=self.controller.microscope,
+                        value=recovery["return_direction"] * abs(float(self.controller.config.max_descent_speed)))
         elif pending == "return":
             raise AutopatchError("Recovered tip is not within the selected cell contact distance")
         else:
@@ -743,34 +690,95 @@ class HuntCellPhase(PhaseController):
         direction = float(self.controller.microscope.up_direction) * (-1 if recovery["phase"] == "search" else 1)
         return dict(kind="velocity", device=self.controller.microscope, value=direction * speed)
 
-    def observe(self, include_pressure_state=False, *, target_cell=None, **kwargs):
-        """Consume shared tracking and attach this attempt's accepted search plane."""
-        helper = self.controller.observation_helper
-        observation = self.controller.observe(include_pressure_state=include_pressure_state, **kwargs)
-        if isinstance(observation, dict):
-            helper.enrich_tracking(observation, target_cell)
-            self.last_cell_location = helper.last_cell_location
-            observation["target_cell_last_known_z_um"] = self.cell_z_um if self.cell_z_um is not None else float("nan")
-            evidence = (self.cell_observation.get("deep_learning") or {}) if self.cell_observation is not None else {}
-            observation["target_cell_last_known_source_frame"] = evidence.get("source_frame")
-            observation.setdefault("field_metadata", {})["target_cell_last_known_z_um"] = dict(
-                valid=self.cell_z_um is not None and math.isfinite(float(self.cell_z_um)),
-                acquired_at=evidence.get("positions_sampled_at"), source_frame=evidence.get("source_frame"),
-                source="last_accepted_search", coordinate_system="microscope_um", last_known=True,
-                synchronized_to_frame=False)
-        helper.record_observation(self, observation)
-        for output, contract in self.observation_windows.items():
-            predicate = contract.get("predicate")
-            if predicate is None or predicate(observation):
-                observation[output] = self.observation_window(**contract)
+    def enrich_observation(self, observation):
+        """Associate raw detections with this attempt's selected cell after raw recording."""
+        evidence = observation.get("deep_learning") or {}
+        positions = evidence.get("source_positions") or {}
+        target = None if self.state is None else self.state["cell"]
+        reference = np.asarray(target[0], dtype=float) if target is not None else np.asarray([])
+        identity = tuple(float(value) for value in reference)
+        candidates, expected = [], np.asarray([np.nan, np.nan])
+        source_z, context_valid = float("nan"), False
+        try:
+            source_xy = np.asarray(positions["stage"], dtype=float).reshape(-1)[:2]
+            source_z = float(positions["microscope"])
+            available, sampled = float(evidence["frame_available_at"]), float(evidence["positions_sampled_at"])
+            context_valid = (source_xy.size == 2 and np.isfinite(source_xy).all()
+                and all(math.isfinite(value) for value in (source_z, available, sampled))
+                and sampled >= available and reference.size >= 2 and np.isfinite(reference[:2]).all()
+                and evidence.get("source_frame") is not None and not evidence.get("stale", True))
+        except (KeyError, TypeError, ValueError):
+            pass
+        detections = evidence.get("cell_detections")
+        association_available = context_valid and detections is not None
+        if association_available:
+            stage = self.controller.calibrated_stage
+            expected = np.asarray(stage.um_to_pixels_relative(source_xy))[:2] + np.asarray(stage.r0)[:2] - reference[:2]
+            known = self.last_cell_location
+            if known is not None and known["target_cell_id"] == identity:
+                expected = known["image_xy"] + np.asarray(stage.um_to_pixels_relative(source_xy - known["stage_xy"]))[:2]
+            radius = float(getattr(self.controller.config, "hunt_target_radius", 50.0)) if getattr(self.controller.config, "hunt_limit_target_radius", True) else float("inf")
+            if math.isnan(radius) or radius <= 0:
+                raise AutopatchError("Target matching radius must be positive")
+            for detection in detections:
+                try:
+                    x, y, confidence = map(float, detection[:3])
+                    height, width = evidence["source_image_shape"][:2]
+                    delta = stage.pixels_to_um_relative([x - expected[0], y - expected[1], 0.])
+                    distance = math.hypot(float(delta[0]), float(delta[1]))
+                    if all(math.isfinite(value) for value in (x, y, confidence, distance)) and confidence > 0 and 0 <= x < width and 0 <= y < height and distance <= radius:
+                        candidates.append((distance, x, y))
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+            candidates.sort()
+        ambiguous = len(candidates) > 1 and candidates[1][0] - candidates[0][0] <= 1.
+        valid = association_available and bool(candidates) and not ambiguous
+        observation.update(visual_context_valid=context_valid, target_cell_id=identity,
+            target_cell_reference_coordinates=reference.copy(), target_cell_expected_xy=expected,
+            target_cell_image_xy=np.asarray(candidates[0][1:] if valid else [np.nan, np.nan]),
+            target_cell_observed_z_um=source_z if valid else float("nan"),
+            target_cell_candidate_count=len(candidates), target_cell_valid=valid,
+            target_cell_status="observed" if valid else "ambiguous" if ambiguous else "not_detected" if association_available else "unavailable")
+        if valid:
+            self.last_cell_location = dict(target_cell_id=identity, image_xy=observation["target_cell_image_xy"].copy(),
+                stage_xy=source_xy.copy(), source_frame=evidence.get("source_frame"))
+        observation["target_cell_last_known_z_um"] = self.cell_z_um if self.cell_z_um is not None else float("nan")
+        accepted = (self.cell_observation.get("deep_learning") or {}) if self.cell_observation is not None else {}
+        observation["target_cell_last_known_source_frame"] = accepted.get("source_frame")
         return observation
+
+    @staticmethod
+    def fresh_visual(observation, previous_frame=None, after=None):
+        """Check retrieval freshness; buffered sensor-frame freshness is not established."""
+        evidence = observation.get("deep_learning") or {}
+        frame, retrieved, sampled = (evidence.get(key) for key in
+                                   ("source_frame", "frame_retrieval_started_at", "positions_sampled_at"))
+        return bool(frame is not None and frame != previous_frame and not evidence.get("stale", True)
+            and isinstance(retrieved, (int, float)) and math.isfinite(retrieved)
+            and isinstance(sampled, (int, float)) and math.isfinite(sampled)
+            and sampled >= retrieved and observation.get("visual_context_valid", False)
+            and (after is None or retrieved >= after))
+
+    @staticmethod
+    def usable_tip(observation):
+        evidence = observation.get("deep_learning") or {}
+        try:
+            tip = np.asarray(evidence["pipette_position"], dtype=float).reshape(-1)
+            shape = evidence["source_image_shape"]
+            return bool(observation.get("visual_context_valid", False)
+                and evidence.get("source_frame") is not None and not evidence.get("stale", True)
+                and (evidence.get("status") or {}).get("pipette_detector") not in ("error", "no_detection", "disabled", "no_frame")
+                and tip.size >= 2 and np.isfinite(tip[:2]).all()
+                and 0 <= tip[0] < shape[1] and 0 <= tip[1] < shape[0])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return False
 
     def _adaptive_contact_confirmed(self, observation):
         """Require a fresh tip near this attempt's observed or last-known cell."""
         if not isinstance(observation, dict) or not observation.get("visual_context_valid", False):
             return False
         evidence = observation.get("deep_learning") or {}
-        if not self.controller.observation_helper.usable_tip(observation) or observation.get("target_cell_status") == "ambiguous":
+        if not self.usable_tip(observation) or observation.get("target_cell_status") == "ambiguous":
             return False
         try:
             tip = np.asarray(evidence["pipette_position"], dtype=float).reshape(-1)[:2]
@@ -793,8 +801,9 @@ class HuntCellPhase(PhaseController):
             distance = math.hypot(float(delta[0]), float(delta[1]))
         except (KeyError, TypeError, ValueError, IndexError):
             return False
-        observation["hunt_tip_cell_distance_um"] = distance
-        observation["hunt_contact_uses_last_known_cell"] = not observation.get("target_cell_valid", False)
+        self.controller.observer.annotate(self, observation, fields={
+            "hunt_tip_cell_distance_um": distance,
+            "hunt_contact_uses_last_known_cell": not observation.get("target_cell_valid", False)})
         return math.isfinite(distance) and distance <= limit
 
     def _resistance_above_threshold(self, reading, threshold):
