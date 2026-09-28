@@ -17,7 +17,7 @@ __all__ = ['LiveFeedQt']
 
 
 class LiveFeedQt(QtWidgets.QLabel):
-    def __init__(self, camera: Camera, recording_state_manager: RecordingStateManager, image_edit=None, display_edit=None, mouse_handler=None, parent=None, log_processed_frames=False, frame_folder_name: str = "camera_frames"):
+    def __init__(self, camera: Camera, recording_state_manager: RecordingStateManager, image_edit=None, display_edit=None, mouse_handler=None, parent=None, log_processed_frames=False, frame_folder_name: str = "camera_frames", frame_overlay=None):
 
         super(LiveFeedQt, self).__init__(parent=parent)
         # The image_edit function (does nothing by default) gets the raw
@@ -32,6 +32,7 @@ class LiveFeedQt(QtWidgets.QLabel):
         if display_edit is None:
             display_edit = lambda img: img
         self.display_edit = display_edit
+        self.frame_overlay = frame_overlay
 
         self.mouse_handler = mouse_handler
         self.camera = camera
@@ -152,6 +153,12 @@ class LiveFeedQt(QtWidgets.QLabel):
                                           Qt.SmoothTransformation)
             if self.display_edit is not None:
                 self.display_edit(scaled_pixmap)
+            if self.frame_overlay is not None:
+                timing_reader = getattr(self.camera, "get_frame_timing", None)
+                timing = timing_reader(frameno, frame_time) if callable(timing_reader) else None
+                self.frame_overlay(scaled_pixmap, camera=self.camera, frame_id=frameno,
+                                   acquired_at=(timing or {}).get("acquisition_started_at"),
+                                   image_shape=frame.shape)
             self.setPixmap(scaled_pixmap)
 
         except Exception:

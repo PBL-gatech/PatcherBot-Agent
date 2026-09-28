@@ -67,7 +67,7 @@ class PatchGui(ManipulatorGui):
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
         logging.debug("Added config GUI.")
         classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task,self.interface_signals, self.recording_state_manager)
-        self.add_tab(classic_patching_tab, 'Classic Auto Patching', index = 0)
+        self.add_tab(classic_patching_tab, 'PatcherBot Agent', index = 0)
 
     def register_commands(self):
         super(PatchGui, self).register_commands()

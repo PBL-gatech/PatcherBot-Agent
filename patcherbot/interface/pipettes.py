@@ -167,12 +167,16 @@ class PipetteInterface(TaskInterface):
         if os.path.isfile(config_filename):
             with open(config_filename, 'rb') as f:
                 cal = pickle.load(f)
+                home = np.asarray(cal['home'], dtype=float).reshape(-1)
+                safe = np.asarray(cal['safe'], dtype=float).reshape(-1)
+                if home.shape != (6,) or safe.shape != (6,) or not np.isfinite(np.r_[home, safe]).all():
+                    raise ValueError('Saved home and safe anchors must each contain six finite coordinates')
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
-                self.home_position = cal['home'][:2]
-                self.home_stage_position = cal['home'][2:]
-                self.safe_position = cal['safe'][:2]
-                self.safe_stage_position = cal['safe'][2:]
+                self.home_position = home[:3].copy()
+                self.home_stage_position = home[3:].copy()
+                self.safe_position = safe[:3].copy()
+                self.safe_stage_position = safe[3:].copy()
                 self.cleaning_bath_position = cal['bath']
 
                 print('Loaded calibration from file!')

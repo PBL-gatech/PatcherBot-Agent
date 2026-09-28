@@ -29,6 +29,7 @@ from patcherbot.controller import TaskController
 from patcherbot.utils.config import NumberWithUnit
 from patcherbot.interface.base import command
 from .livefeed import LiveFeedQt
+from .tracking_overlay import build_tracking_overlay, paint_tracking_overlay
 
 
 class Logger(QtCore.QAbstractTableModel, logging.Handler):
@@ -568,6 +569,7 @@ class CameraGui(QtWidgets.QMainWindow):
             self.main_video = LiveFeedQt(self.main_camera,
                                          image_edit=self.image_edit,
                                          display_edit=self.display_edit,
+                                         frame_overlay=self.tracking_display,
                                          mouse_handler=self.video_mouse_press,
                                          recording_state_manager=self.recording_state_manager,
                                          frame_folder_name='camera_frames')
@@ -576,6 +578,7 @@ class CameraGui(QtWidgets.QMainWindow):
             self.aux_video = LiveFeedQt(self.aux_camera,
                                         image_edit=self.image_edit,
                                         display_edit=self.display_edit,
+                                         frame_overlay=self.tracking_display,
                                         mouse_handler=self.video_mouse_press,
                                         recording_state_manager=self.recording_state_manager,
                                         frame_folder_name='aux_camera_frames')
@@ -757,6 +760,35 @@ class CameraGui(QtWidgets.QMainWindow):
         painter.drawEllipse(c_x - 15, c_y - 15, 30, 30)
         painter.end()
 
+    @command(category='General', description='Show/hide raw tracking detections')
+    def toggle_raw_tracking(self):
+        self.show_raw_tracking = not getattr(self, "show_raw_tracking", False)
+
+    @command(category='General', description='Show/hide calibration-only tracking predictions')
+    def toggle_calibration_tracking(self):
+        self.show_calibration_tracking = not getattr(self, "show_calibration_tracking", False)
+
+    def tracking_display(self, pixmap, *, camera, frame_id, acquired_at, image_shape):
+        """Draw only evidence belonging to the image currently displayed."""
+        if not self.show_overlay:
+            return
+        interface = getattr(self, "patch_interface", None)
+        controller = getattr(interface, "current_autopatcher", None)
+        stage = getattr(controller, "calibrated_stage", None)
+        if getattr(stage, "camera", None) is not camera:
+            return
+        helper = getattr(controller, "observation_helper", None)
+        frame_reader = getattr(helper, "tracking_for_frame", None)
+        observation = (frame_reader(frame_id, acquired_at, image_shape, camera=camera)
+                       if callable(frame_reader) else getattr(helper, "latest_tracking_observation", None))
+        if observation is None:
+            observation = {"pipette_tracking": {"valid": False}, "cell_tracking": {"valid": False}}
+        overlay = build_tracking_overlay(
+            observation, frame_id, acquired_at, image_shape,
+            show_raw=getattr(self, "show_raw_tracking", False),
+            show_prediction=getattr(self, "show_calibration_tracking", False))
+        paint_tracking_overlay(pixmap, overlay, image_shape)
+
     def display_edit(self, pixmap):
         '''
         Applies the functions stored in `~.CameraGui.display_edit_funcs` to the
@@ -855,6 +887,8 @@ class CameraGui(QtWidgets.QMainWindow):
         '''
         self.register_key_action(Qt.Key_Question, None, self.help_keypress)
         self.register_key_action(Qt.Key_L, None, self.log_keypress)
+        self.register_key_action(Qt.Key_R, Qt.ControlModifier | Qt.AltModifier, self.toggle_raw_tracking)
+        self.register_key_action(Qt.Key_P, Qt.ControlModifier | Qt.AltModifier, self.toggle_calibration_tracking)
         self.register_camera_key_action(Qt.Key_N, None, 'normalize')
         self.register_key_action(Qt.Key_Q, Qt.ControlModifier, self.exit)
         self.register_camera_key_action(Qt.Key_Plus, None,
@@ -1171,15 +1205,21 @@ class CameraGui(QtWidgets.QMainWindow):
     def add_config_gui(self, config, gui_class=None):
         logging.debug('Adding config GUI for {}'.format(config.name))
         config_gui = ConfigGui(config) if gui_class is None else gui_class(config)
-        self.config_tab.addTab(config_gui, config.name)
+        self.add_tab(config_gui, config.name)
         logging.debug('Config GUI added')
         return config_gui
 
     def add_tab(self, tab, name, index=None):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(tab)
         if index is None:
-            self.config_tab.addTab(tab, name)
+            self.config_tab.addTab(scroll, name)
         else:
-            self.config_tab.insertTab(index, tab, name)
+            self.config_tab.insertTab(index, scroll, name)
 
     @command(category='General',
              description='Show/hide the configuration pane')

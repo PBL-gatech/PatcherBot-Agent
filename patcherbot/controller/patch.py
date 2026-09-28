@@ -803,17 +803,25 @@ class AutoPatcher(TaskController):
 
     # region Observations and measurements
     def observe(self, include_pressure_state: bool = False, *, fields=None, sampling=None,
-                raw_measurements=False, deep_learning=False, cell=None,
+                raw_measurements=False, deep_learning=False, cell=None, target_cell=None,
                 num_measurements=None, interval=None):
         """Delegate observation collection and cached model readings to the helper."""
         if num_measurements is not None or interval is not None:
             return self.observation_helper.observe(
                 include_pressure_state=include_pressure_state, fields=fields, sampling=sampling,
-                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell,
+                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell, target_cell=target_cell,
                 num_measurements=num_measurements, interval=interval)
         return self.observation_helper.observe(
             include_pressure_state=include_pressure_state, fields=fields, sampling=sampling,
-            raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell)
+            raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell, target_cell=target_cell)
+
+    def invalidate_tracking_anchor(self, reason, *, stage=False):
+        """Notify a physical pipette replacement or encoder reset.
+
+        Stage resets invalidate both tracks. Estimates remain unavailable until
+        the corresponding stored home or calibration identity changes.
+        """
+        self.observation_helper.invalidate_tracking(reason, pipette=True, cell=stage)
 
     def _observe_legacy(self, include_pressure_state: bool = False):
         """Compatibility entry point; model readings now come from the cache."""
@@ -937,6 +945,7 @@ class AutoPatcher(TaskController):
 
         self.calibrated_stage.set_max_speed(10000)
         self.calibrated_unit.set_max_speed(100000)
+        self.observe(fields=["manipulator_position", "stage_positions", "deep_learning"], target_cell=cell)
         self.info("Located Cell")
         self.success_requested = True
         self.success_if_requested()

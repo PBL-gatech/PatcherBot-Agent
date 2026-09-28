@@ -1,5 +1,7 @@
 import sys
 import time
+import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict, Any, List
 
@@ -24,6 +26,12 @@ class AgentHelper:
     def __init__(self, use_ai_features: bool = True):
         """Track the active agent instance and its configuration."""
         self._use_ai_features = bool(use_ai_features)
+        self._inference_lock = threading.Lock()
+        self._model_call_lock = threading.RLock()
+        self._inference_epoch = 0
+        self._inference_generation = None
+        self._inference_worker = None
+        self._inference_result = None
         self._agent_classes: Optional[Dict[str, Any]] = None
         self.agent = None
         self.requires_goal = False
@@ -66,6 +74,7 @@ class AgentHelper:
 
     def prepare_model(self, model_type, *, allow_goal_placeholders: Optional[bool] = None):
         """Instantiate one of the supported agent subclasses."""
+        self.invalidate_inference()
         agent_classes = self._load_agent_classes()
         demo_replay_cls = agent_classes["DemoReplayAgent"]
         self.model_type = model_type
@@ -259,6 +268,67 @@ class AgentHelper:
             "obs_keys": obs_keys,
         }
 
+    def invalidate_inference(self) -> None:
+        """Discard asynchronous actions immediately without waiting for the model."""
+        with self._inference_lock:
+            self._inference_epoch += 1
+            self._inference_generation = None
+            self._inference_result = None
+
+    def request_inference(self, observation, generation, goal=None, *, is_demo=False) -> bool:
+        """Snapshot one request; return False while a worker or result is outstanding.
+
+        The caller supplies an attempt/contact generation and must invalidate on
+        cancellation. An invalidated model call may finish, but cannot publish
+        an action. New calls wait for that worker through polling, never joining.
+        """
+        with self._inference_lock:
+            if generation != self._inference_generation:
+                self._inference_epoch += 1
+                self._inference_generation = generation
+                self._inference_result = None
+            if self._inference_worker is not None or self._inference_result is not None:
+                return False
+            if self.agent is None:
+                raise RuntimeError("Call prepare_model before request_inference")
+            snapshot = deepcopy(observation)
+            active_goal = deepcopy(goal) if self.requires_goal else None
+            agent, epoch = self.agent, self._inference_epoch
+
+            def evaluate():
+                action, error = None, None
+                try:
+                    with self._model_call_lock:
+                        action = deepcopy(agent.inference(
+                            observation=snapshot, goal=active_goal, is_demo=is_demo))
+                except BaseException as caught:
+                    error = caught
+                with self._inference_lock:
+                    if epoch == self._inference_epoch and generation == self._inference_generation:
+                        self._inference_result = (generation, action, error)
+                    self._inference_worker = None
+
+            worker = threading.Thread(target=evaluate, name="patcherbot-agent-inference", daemon=True)
+            self._inference_worker = worker
+            try:
+                worker.start()
+            except BaseException:
+                self._inference_worker = None
+                raise
+            return True
+
+    def poll_inference(self, generation):
+        """Consume a matching result once; (True, None) is a completed zero action."""
+        with self._inference_lock:
+            result = self._inference_result
+            if result is None or generation != self._inference_generation or result[0] != generation:
+                return False, None
+            self._inference_result = None
+        _, action, error = result
+        if error is not None:
+            raise error
+        return True, action
+
     def run_inference(
         self,
         observation: Union[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], Dict[str, np.ndarray]],
@@ -270,7 +340,8 @@ class AgentHelper:
         if self.agent is None:
             raise RuntimeError("Call prepare_model before run_inference")
         active_goal = goal if self.requires_goal else None
-        return self.agent.inference(observation=observation, goal=active_goal, is_demo=is_demo)
+        with self._model_call_lock:
+            return self.agent.inference(observation=observation, goal=active_goal, is_demo=is_demo)
 
 
 class AgentTester:

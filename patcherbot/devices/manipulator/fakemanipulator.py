@@ -10,6 +10,7 @@ from numpy import zeros, clip, pi
 import numpy as np
 import time
 import math
+import threading
 
 __all__ = ['FakeManipulator']
 
@@ -22,7 +23,9 @@ class FakeManipulator(Manipulator):
         if all([min is not None, max is not None]):
             if len(min) != len(max):
                 raise ValueError('min/max needs to be the same length (# of axes)')
-        self.num_axes = len(min)
+        self.num_axes = len(min) if min is not None else len(max) if max is not None else 9
+        self._supervised_lock = threading.RLock()
+        self._supervised_move = None
 
         # Continuous movement values.
         self.x = zeros(self.num_axes)  # current position (um) of each axis
@@ -124,6 +127,43 @@ class FakeManipulator(Manipulator):
         self.cmd_time[idx] = None
         return False
 
+    def start_move(self, target, axes):
+        """Start a finite simulated move without advancing or waiting for time."""
+        target = np.asarray(target, dtype=float)
+        axes = list(axes)
+        if (target.shape != (len(axes),) or not axes or not np.isfinite(target).all()
+                or any(isinstance(axis, bool) or int(axis) != axis or not 1 <= axis <= self.num_axes for axis in axes)
+                or len(set(axes)) != len(axes)):
+            raise ValueError("Invalid supervised target")
+        axes = list(map(int, axes))
+        if self.min is not None and self.max is not None:
+            if any(not self.min[axis - 1] <= value <= self.max[axis - 1] for axis, value in zip(axes, target)):
+                raise ValueError("Supervised target is outside simulator limits")
+        with self._supervised_lock:
+            if any([self.update_axis(axis) for axis in axes]):
+                raise RuntimeError("Device is busy")
+            handle = dict(axes=axes, target=target.copy(), status="running")
+            self._supervised_move = handle
+            try:
+                self.absolute_move_group(target, axes)
+            except BaseException:
+                handle["status"] = "failed"
+                raise
+            return handle
+
+    def poll_move(self, handle=None):
+        with self._supervised_lock:
+            pending = self._supervised_move
+            if pending is None or (handle is not None and handle is not pending):
+                return "failed"
+            if pending["status"] != "running":
+                return pending["status"]
+            if any([self.update_axis(axis) for axis in pending["axes"]]):
+                return "running"
+            actual = self.position_group(pending["axes"])
+            pending["status"] = "settled" if np.allclose(actual, pending["target"], rtol=0, atol=1e-6) else "failed"
+            return pending["status"]
+
     def absolute_move(self, x, axis, speed=None):
         """
         Moves the given axis to an absolute position x (in um).
@@ -222,6 +262,23 @@ class FakeManipulator(Manipulator):
             targets.append(current_pos + displacement)
         self.absolute_move_group(targets, axes, speed)
 
+    def poll_velocity(self):
+        """Direct velocity dispatch reports command errors at start_velocity."""
+        return "running"
+
+    def start_velocity(self, velocity, axes, *, relative=False):
+        """Validate and dispatch velocity without a completion wait."""
+        velocity, axes = list(map(float, velocity)), list(axes)
+        if (len(velocity) != len(axes) or not axes or len(set(axes)) != len(axes)
+                or any(isinstance(axis, bool) or not isinstance(axis, (int, np.integer))
+                       or not 1 <= axis <= self.num_axes for axis in axes)
+                or not all(map(math.isfinite, velocity))):
+            raise ValueError("Invalid supervised velocity")
+        with self._supervised_lock:
+            if self._supervised_move is not None and self._supervised_move['status'] == 'running':
+                raise RuntimeError("Positional movement is still running")
+            self.absolute_move_group_velocity(velocity, axes)
+
     def absolute_move_group_velocity(self, vel, axes):
         """
         Moves the given group of axes continuously at the specified velocity.
@@ -248,12 +305,13 @@ class FakeManipulator(Manipulator):
             vel_iterable = False
 
         for i, axis in enumerate(axes):
-            if self.update_axis(axis):
-                raise RuntimeError("Cannot move while another command is running on axis {}".format(axis))
+            self.update_axis(axis)
             v = vel[i] if vel_iterable else vel
             self.speeds[axis-1] = v / 1000 * 82  # conversion to internal speed units
             self.cmd_time[axis-1] = current_time
-            self.setpoint[axis-1] = float('inf') if v > 0 else float('-inf')
+            self.setpoint[axis-1] = (float('inf') if v > 0 else float('-inf')) if v else self.x[axis-1]
+            if not v:
+                self.cmd_time[axis-1] = None
 
     def relative_move_group_velocity(self, vel, axes):
         """
@@ -261,20 +319,17 @@ class FakeManipulator(Manipulator):
         """
         self.absolute_move_group_velocity(vel, axes)
 
-    def stop(self, axis):
-        """
-        Stops any movement on the specified axis.
-        
-        Parameters
-        ----------
-        axis : int
-            Axis number (starting at 1).
-        """
-        self.update_axis(axis)
-        idx = axis - 1
-        self.speeds[idx] = 0
-        self.cmd_time[idx] = None
-        self.setpoint[idx] = self.x[idx]
+    def stop(self, axis=None):
+        """Cancel pending supervision and stop one axis, or all axes when omitted."""
+        with self._supervised_lock:
+            self._supervised_move = None
+            axes = range(1, self.num_axes + 1) if axis is None else [axis]
+            for selected in axes:
+                self.update_axis(selected)
+                index = selected - 1
+                self.speeds[index] = 0
+                self.cmd_time[index] = None
+                self.setpoint[index] = self.x[index]
 
     def wait_until_still(self, axes=None):
         """

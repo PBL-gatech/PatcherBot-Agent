@@ -47,9 +47,14 @@ class PhaseController(ABC):
         return self.controller.observation_helper.observation_window(self, field, width, **options)
 
     def observe(self, include_pressure_state: bool = False, *, fields=None, sampling=None, raw_measurements=False,
-                deep_learning=False, cell=None, num_measurements=None, interval=None):
+                deep_learning=False, cell=None, target_cell=None, num_measurements=None, interval=None):
         """Read through controller overrides and record into helper-owned history."""
-        if num_measurements is not None or interval is not None:
+        if target_cell is not None:
+            observation = self.controller.observe(
+                include_pressure_state, fields=fields, sampling=sampling,
+                raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell,
+                target_cell=target_cell, num_measurements=num_measurements, interval=interval)
+        elif num_measurements is not None or interval is not None:
             observation = self.controller.observe(
                 include_pressure_state, fields=fields, sampling=sampling,
                 raw_measurements=raw_measurements, deep_learning=deep_learning, cell=cell,

@@ -4,6 +4,7 @@ from .manipulator import Manipulator
 import time
 import threading
 import re
+import math
 
 __all__ = ['ScientificaSerial']
 
@@ -190,6 +191,8 @@ class ScientificaSerialEncoder(Manipulator):
         self.encoderZ = 0
 
         self._lock = threading.Lock()
+        self._supervised_lock = threading.RLock()
+        self._supervised_move = None
         self._supports_stage_z_profile = None
         self.current_pos = [0, 0, 0]
         self._current_objective = 1
@@ -313,6 +316,105 @@ class ScientificaSerialEncoder(Manipulator):
         '''
         self._encoder_acq.run_loop(freq=freq)
 
+    def start_move(self, target, axes):
+        """Dispatch one command; polls perform any remaining encoder corrections."""
+        target, axes = list(map(float, target)), list(axes)
+        if (len(target) != len(axes) or not axes or
+                any(isinstance(a, bool) or a not in (1, 2, 3) for a in axes) or
+                not all(map(math.isfinite, target)) or len(set(axes)) != len(axes)):
+            raise ValueError("Invalid supervised target")
+        axes = list(map(int, axes))
+        if set(axes) not in ({1}, {2}, {3}, {1, 2}, {1, 2, 3}):
+            raise ValueError("Unsupported supervised axis combination")
+        if 3 in axes and hasattr(self, 'DEFAULT_Z_CORRECTION_MAX_RETRIES') and not hasattr(self, '_encoder_acq'):
+            raise RuntimeError("Encoder acquisition is unavailable")
+        if not self._supervised_lock.acquire(blocking=False):
+            raise RuntimeError("Device is busy")
+        try:
+            if self._supervised_busy():
+                raise RuntimeError("Device is busy")
+            move = dict(target=target, axes=axes, attempts=0, idle_sequence=None, status='running')
+            self._supervised_move = move
+            try:
+                self._dispatch_supervised_move()
+            except Exception:
+                move['status'] = 'failed'
+                raise
+            return move
+        finally:
+            self._supervised_lock.release()
+
+    def _supervised_busy(self):
+        response = self._sendCmd(SerialCommands.GET_IS_BUSY).strip()
+        if response not in ('0', '1'):
+            raise RuntimeError("Invalid device busy response: " + response)
+        return response == '1'
+
+    def _dispatch_supervised_move(self):
+        # Caller holds the motion lock, so stop cannot be followed by a late retry.
+        move = self._supervised_move
+        target, axes = move['target'], move['axes']
+        values = dict(zip(axes, target))
+        if hasattr(self, '_encoder_acq') and 3 in axes:
+            encoder, _ = self._encoder_acq.get_encoder_state()
+            stage_z = self._encoder_acq.get_stage_z()
+            if not all(map(math.isfinite, (encoder, stage_z))):
+                raise ValueError("Invalid encoder position")
+            values[3] = stage_z + values[3] - encoder
+        if axes == [3]:
+            command = SerialCommands.SET_Z_POS.format(int(values[3] * 10))
+        else:
+            x = values[1] if 1 in values else self.position(1)
+            y = values[2] if 2 in values else self.position(2)
+            if not all(map(math.isfinite, (x, y))):
+                raise ValueError("Invalid stage position")
+            if 3 in values:
+                command = SerialCommands.SET_X_Y_Z_POS_ABS.format(int(x * 10), int(y * 10), int(values[3] * 10))
+            else:
+                command = SerialCommands.SET_X_Y_POS_ABS.format(int(x * 10), int(y * 10))
+        response = self._sendCmd(command).strip()
+        if not response or response.startswith('E,'):
+            raise RuntimeError("Movement command rejected: " + response)
+        move['attempts'] += 1
+        move['idle_sequence'] = None
+
+    def poll_move(self, handle=None):
+        if not self._supervised_lock.acquire(blocking=False):
+            return 'running'
+        try:
+            move = self._supervised_move
+            if move is None or (handle is not None and handle is not move):
+                return 'failed'
+            if move['status'] != 'running':
+                return move['status']
+            try:
+                if self._supervised_busy():
+                    return 'running'
+                if hasattr(self, '_encoder_acq') and 3 in move['axes']:
+                    encoder, sequence = self._encoder_acq.get_encoder_state()
+                    if not math.isfinite(encoder):
+                        move['status'] = 'failed'
+                        return 'failed'
+                    if move['idle_sequence'] is None:
+                        move['idle_sequence'] = sequence
+                        return 'running'
+                    if sequence <= move['idle_sequence']:
+                        return 'running'
+                    target = move['target'][move['axes'].index(3)]
+                    if abs(target - encoder) > self.DEFAULT_Z_CORRECTION_TOLERANCE_UM:
+                        if move['attempts'] >= self.DEFAULT_Z_CORRECTION_MAX_RETRIES:
+                            move['status'] = 'failed'
+                            return 'failed'
+                        self._dispatch_supervised_move()
+                        return 'running'
+                move['status'] = 'settled'
+                return 'settled'
+            except Exception:
+                move['status'] = 'failed'
+                raise
+        finally:
+            self._supervised_lock.release()
+
     def absolute_move(self, pos, axis):
         print(f'[OBJDBG] {self.__class__.__name__}.absolute_move axis={axis} pos_um={pos}')
 
@@ -396,6 +498,33 @@ class ScientificaSerialEncoder(Manipulator):
         else:
             print(f'unimplemented move group {x} {axes}')
 
+    def poll_velocity(self):
+        """Direct velocity dispatch reports command errors at start_velocity."""
+        return "running"
+
+    def start_velocity(self, velocity, axes, *, relative=False):
+        """Opt-in velocity dispatch with validation and visible serial failures."""
+        velocity, axes = list(map(float, velocity)), list(axes)
+        if (len(velocity) != len(axes) or not axes or len(set(axes)) != len(axes)
+                or any(isinstance(axis, bool) or axis not in (1, 2, 3) for axis in axes)
+                or not all(map(math.isfinite, velocity))):
+            raise ValueError("Invalid supervised velocity")
+        if not self._supervised_lock.acquire(blocking=False):
+            raise RuntimeError("Device is busy")
+        try:
+            pending = self._supervised_move
+            if pending is not None and pending['status'] == 'running':
+                raise RuntimeError("Positional movement is still running")
+            values = [0., 0., 0.]
+            for value, axis in zip(velocity, axes):
+                values[int(axis) - 1] = value
+            # Firmware uses direct axis velocities for both velocity interfaces.
+            response = self._sendCmd(SerialCommands.SET_X_Y_Z_VEL.format(*values)).strip()
+            if not response or response.startswith('E,'):
+                raise RuntimeError("Velocity command rejected: " + response)
+        finally:
+            self._supervised_lock.release()
+
     def absolute_move_group_velocity(self,vel,axes):   
         try: 
          self.info(f"Setting velocity to {vel} on axes {axes}")
@@ -424,7 +553,9 @@ class ScientificaSerialEncoder(Manipulator):
                 break
 
     def stop(self):
-        self._sendCmd(SerialCommands.STOP)
+        with self._supervised_lock:
+            self._supervised_move = None
+            self._sendCmd(SerialCommands.STOP)
 
     def get_current_objective(self):
         return self._current_objective
@@ -465,6 +596,8 @@ class ScientificaSerialNoEncoder(Manipulator):
     def __init__(self, comPort: serial.Serial, objective_lift_um=None):
         self.comPort : serial.Serial = comPort
         self._lock = threading.Lock()
+        self._supervised_lock = threading.RLock()
+        self._supervised_move = None
         self._supports_stage_z_profile = None
         self.current_pos = [0, 0, 0]
         self._current_objective = 1
@@ -584,6 +717,13 @@ class ScientificaSerialNoEncoder(Manipulator):
             if sleepTime > 0:
                 time.sleep(sleepTime)
 
+    start_move = ScientificaSerialEncoder.start_move
+    _supervised_busy = ScientificaSerialEncoder._supervised_busy
+    _dispatch_supervised_move = ScientificaSerialEncoder._dispatch_supervised_move
+    poll_move = ScientificaSerialEncoder.poll_move
+    start_velocity = ScientificaSerialEncoder.start_velocity
+    poll_velocity = ScientificaSerialEncoder.poll_velocity
+
     def absolute_move(self, pos, axis, speed=None):
         print(f'[OBJDBG] {self.__class__.__name__}.absolute_move axis={axis} pos_um={pos}')
         '''Moves the device to an absolute position in um.
@@ -689,7 +829,9 @@ class ScientificaSerialNoEncoder(Manipulator):
                 break
 
     def stop(self):
-        self._sendCmd(SerialCommands.STOP)
+        with self._supervised_lock:
+            self._supervised_move = None
+            self._sendCmd(SerialCommands.STOP)
 
     def get_current_objective(self):
         return self._current_objective

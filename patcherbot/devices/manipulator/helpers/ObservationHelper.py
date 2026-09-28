@@ -4,9 +4,20 @@ import time
 from collections import deque
 from copy import deepcopy
 from numbers import Integral, Real
-from threading import Event, Lock, Thread, current_thread
+from threading import Event, Lock, RLock, Thread, current_thread
 
 import numpy as np
+
+try:
+    from .ObservationTracking import ObservationTracking
+except ImportError:  # Standalone hardware-free loading used by regression tests.
+    import importlib.util
+    from pathlib import Path
+    _tracking_spec = importlib.util.spec_from_file_location(
+        "observation_tracking", Path(__file__).with_name("ObservationTracking.py"))
+    _tracking_module = importlib.util.module_from_spec(_tracking_spec)
+    _tracking_spec.loader.exec_module(_tracking_module)
+    ObservationTracking = _tracking_module.ObservationTracking
 
 
 class ObservationHelper:
@@ -32,6 +43,82 @@ class ObservationHelper:
         self._history_options = {}
         self._recorded_observations = {}
         self._latest = {}
+        self._tracking_lock = RLock()
+        self._tracking = ObservationTracking(controller, lambda: time.monotonic())
+        self.tracking_settings = self._tracking.pipette_tracking_settings
+        self.latest_tracking_observation = None
+        self._last_tracking_input = None
+        self._selected_tracking_target = None
+
+    @property
+    def last_cell_location(self):
+        return self._tracking.last_cell_location
+
+    def enrich_tracking(self, observation, target_cell=None):
+        """Attach estimates once per observation; raw measurements stay untouched."""
+        with self._tracking_lock:
+            if target_cell is not self._selected_tracking_target:
+                self._tracking._cell_track = None
+                self._tracking.last_cell_location = None
+                self._selected_tracking_target = target_cell
+            calibrations = []
+            for name in ("cell", "pipette"):
+                try:
+                    calibrations.append(self._tracking._calibration_identity(name))
+                except (AttributeError, TypeError, ValueError):
+                    calibrations.append(None)
+            identity = (id(target_cell), None if target_cell is None else
+                        tuple(np.asarray(target_cell[0]).reshape(-1)), tuple(calibrations))
+            if (self._last_tracking_input is not None and
+                    self._last_tracking_input[0] is observation and
+                    self._last_tracking_input[1] == identity):
+                return observation
+            result = self._tracking.enrich(observation, target_cell)
+            self._last_tracking_input = (observation, identity)
+            if isinstance(result, dict):
+                self.latest_tracking_observation = deepcopy(result)
+            return result
+
+    def tracking_for_frame(self, frame_id, acquired_at, image_shape, camera=None):
+        """Project cached tracking onto a displayed frame; never acquire hardware."""
+        with self._tracking_lock:
+            result = self._tracking.for_frame(frame_id, acquired_at, image_shape, camera)
+            cached = self.latest_tracking_observation or {}
+            evidence = cached.get("deep_learning") or {}
+            try:
+                age = time.monotonic() - float(acquired_at)
+                matched = (frame_id is not None and evidence.get("source_frame") == frame_id and
+                           evidence.get("frame_acquired_at") == acquired_at and
+                           tuple(image_shape[:2]) == tuple(evidence.get("source_image_shape", ())[:2]) and
+                           0 <= age <= self.deep_learning_max_age and
+                           (camera is None or camera is self.controller.calibrated_stage.camera))
+            except (TypeError, ValueError):
+                matched = False
+            if matched:
+                if result is None:
+                    result = dict(observed_at=time.monotonic(), field_metadata={"camera_image": dict(
+                        source_frame=frame_id, acquired_at=acquired_at, valid=True, stale=False)},
+                        pipette_tracking=dict(valid=False, display_valid=False),
+                        cell_tracking=dict(valid=False, display_valid=False))
+                for field in ("deep_learning", "target_cell_id", "target_cell_image_xy",
+                              "target_cell_valid", "visual_context_valid"):
+                    if field in cached:
+                        result[field] = deepcopy(cached[field])
+                result["deep_learning"].update(age_s=age, stale=False)
+            return result
+
+    def invalidate_tracking(self, reason, *, pipette=True, cell=False):
+        """Notify replacement or encoder re-zeroing without changing calibration."""
+        with self._tracking_lock:
+            self._tracking.invalidate(reason, pipette=pipette, cell=cell)
+            self._last_tracking_input = None
+            self.latest_tracking_observation = None
+
+    def fresh_visual(self, observation, previous_frame=None, after=None):
+        return self._tracking._fresh_visual(observation, previous_frame, after)
+
+    def usable_tip(self, observation):
+        return self._tracking._usable_tip(observation)
 
     def reset_history(self, phase, maxlen, *, include_images=True):
         """Reset attempt history; None retains all rows, optionally without images."""
@@ -443,10 +530,28 @@ class ObservationHelper:
             if frame is not None:
                 unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
                 if pipette_models:
-                    result["pipette_position"] = read_model("pipette_detector", lambda:
-                        unit.pipetteCalHelper.pipetteDetector.detect_pipette(frame))
-                    result["pipette_focus"] = read_model("pipette_focuser", lambda:
-                        unit.pipetteFocusHelper.pipetteFocuser.get_pipette_focus_value(frame))
+                    detector = unit.pipetteCalHelper.pipetteDetector
+                    focuser = unit.pipetteFocusHelper.pipetteFocuser
+                    detailed = getattr(detector, "detect_pipette_details", None)
+                    if callable(detailed):
+                        details = read_model("pipette_detector", lambda: detailed(frame)) or {}
+                        result["pipette_position"] = details.get("tip_xy")
+                        result["confidence"]["pipette_detector"] = details.get("box_confidence")
+                        if result["status"]["pipette_detector"] != "error":
+                            result["status"]["pipette_detector"] = ("ok" if result["pipette_position"] is not None else "no_detection")
+                        if getattr(focuser, "detector", None) is detector:
+                            result["pipette_focus"] = details.get("z_um")
+                            result["confidence"]["pipette_focuser"] = details.get("z_confidence")
+                            if result["status"]["pipette_detector"] == "error":
+                                result["status"]["pipette_focuser"] = "error"
+                                result["errors"]["pipette_focuser"] = result["errors"]["pipette_detector"]
+                            else:
+                                result["status"]["pipette_focuser"] = ("ok" if result["pipette_focus"] is not None else "no_detection")
+                        else:
+                            result["pipette_focus"] = read_model("pipette_focuser", lambda: focuser.get_pipette_focus_value(frame))
+                    else:
+                        result["pipette_position"] = read_model("pipette_detector", lambda: detector.detect_pipette(frame))
+                        result["pipette_focus"] = read_model("pipette_focuser", lambda: focuser.get_pipette_focus_value(frame))
                 if cell_models:
                     # The model accepts a frame; the UI helper acquires its own.
                     result["cell_detections"] = read_model("cell_detector", lambda:
@@ -502,7 +607,7 @@ class ObservationHelper:
             "pressure", "commanded_pressure_mbar", "pressure_atm_state",
             "access_resistance", "capacitance", "manipulator_position",
             "deep_learning", "cell_detections", "tracked_cell_position", "pipette_focus",
-            "pipette_image_xy", "pipette_defocus_um",
+            "pipette_image_xy", "pipette_defocus_um", "pipette_tracking", "cell_tracking",
         }
         if isinstance(fields, str):
             raise TypeError("fields must be an iterable of names, not a string")
@@ -537,7 +642,7 @@ class ObservationHelper:
         return legacy, requested, sample_options
 
     def observe(self, include_pressure_state: bool = False, *, fields=None, sampling=None,
-                raw_measurements=False, deep_learning=False, cell=None,
+                raw_measurements=False, deep_learning=False, cell=None, target_cell=None,
                 num_measurements=None, interval=None):
         """Acquire selected measurements explicitly; numeric sampling applies to electrical readings.
 
@@ -568,6 +673,10 @@ class ObservationHelper:
             self._validate_sampling(capacitance_count, capacitance_interval)
         if not legacy and "pipette_positions" in requested:
             requested = tuple(dict.fromkeys((*requested, "pipette_image_xy", "pipette_defocus_um")))
+        tracking_requested = bool({"pipette_tracking", "cell_tracking"}.intersection(requested))
+        if tracking_requested:
+            requested = tuple(dict.fromkeys((*[field for field in requested if field not in ("pipette_tracking", "cell_tracking")],
+                                             "manipulator_position", "stage_positions", "deep_learning")))
         values, metadata = {}, {}
         if deep_learning:
             self.refresh_deep_learning(cell=cell, _frame=self._camera_frame())
@@ -690,4 +799,6 @@ class ObservationHelper:
             return [values[field] for field in requested]
         values["observed_at"] = observed_at
         values["field_metadata"] = metadata
+        if target_cell is not None or tracking_requested:
+            self.enrich_tracking(values, target_cell)
         return values
