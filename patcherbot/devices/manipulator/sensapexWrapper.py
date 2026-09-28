@@ -210,62 +210,35 @@ class SensapexManip(Manipulator):
         return mv
 
     # ---- Motion primitives ----
-    def start_move(self, target, axes):
-        """Dispatch without waiting for an earlier move; report busy instead."""
+    def start_move(self, target, axes, *, context=None):
+        """Send one SDK command using the position already sampled by observation."""
         target, axes = list(map(float, target)), list(axes)
-        if (len(target) != len(axes) or not axes or
-                any(isinstance(a, bool) or a not in (1, 2, 3) for a in axes) or
-                len(set(axes)) != len(axes) or not all(map(math.isfinite, target))):
-            raise ValueError("Invalid supervised target")
-        if not self._lock.acquire(blocking=False):
-            raise RuntimeError("Device is busy")
-        try:
-            event = self._get_last_move_event()
-            if any(self._vel) or (event is not None and not event.is_set()) or self.dev.is_busy():
-                raise RuntimeError("Device is busy")
-            # Preserve extra motor axes and use the SDK's cached position (timeout=0).
-            position = self._convert_coords(self.dev.get_pos(0), self.tilt_angle_deg, False)
-            if len(position) < 3 or not all(map(math.isfinite, position)):
-                raise ValueError("Invalid device position")
-            for value, axis in zip(target, axes):
-                position[int(axis) - 1] = value
-            if not math.isfinite(self._max_speed) or self._max_speed <= 0:
-                raise ValueError("Invalid movement speed")
-            move = self._issue_move(position, self._max_speed, gate=False)
-            self._supervised_move = dict(request=move, status='running')
-            return self._supervised_move
-        finally:
-            self._lock.release()
+        if (len(target) != len(axes) or not axes or len(set(axes)) != len(axes)
+                or any(isinstance(axis, bool) or axis not in (1, 2, 3) for axis in axes)
+                or not all(map(math.isfinite, target))):
+            raise ValueError("Invalid movement target")
+        position = list((context or {})['native_position'])
+        if len(position) < 3 or not all(map(math.isfinite, position)):
+            raise ValueError("Invalid observed device position")
+        for value, axis in zip(target, axes):
+            position[int(axis) - 1] = value
+        if not math.isfinite(self._max_speed) or self._max_speed <= 0:
+            raise ValueError("Invalid movement speed")
+        with self._lock:
+            return id(self._issue_move(position, self._max_speed, gate=False))
 
-    def poll_move(self, handle=None):
-        if not self._lock.acquire(blocking=False):
-            return 'running'
-        try:
-            pending = getattr(self, '_supervised_move', None)
-            if pending is None or (handle is not None and handle is not pending):
-                return 'failed'
-            if pending['status'] != 'running':
-                return pending['status']
-            move = pending['request']
+    def read_motion_state(self):
+        """Expose one SDK/cache snapshot; completion policy belongs to the controller."""
+        with self._lock:
+            move = self._last_move
             event = getattr(move, 'finished_event', None)
-            if event is None:
-                pending['status'] = 'failed'
-                raise RuntimeError("Movement handle has no completion event")
-            if not event.is_set():
-                return 'running'
-            # SDK interruption and failed position readbacks also set finished_event.
-            failed = bool(move.interrupted or move._last_pos_exception is not None)
-            actual, target = np.asarray(move.last_pos, dtype=float), np.asarray(move.target_pos, dtype=float)
-            if actual.shape != target.shape or actual.ndim != 1 or not np.isfinite(actual).all():
-                failed = True
-            else:
-                tolerances = np.asarray(move._retry_threshold, dtype=float)[:len(target)]
-                requested = np.isfinite(target)
-                failed = failed or bool(np.any(np.abs(actual[requested] - target[requested]) > tolerances[requested]))
-            pending['status'] = 'failed' if failed else 'settled'
-            return pending['status']
-        finally:
-            self._lock.release()
+            error = getattr(self, '_velocity_error', None)
+            return dict(busy=bool(self.dev.is_busy() or (event is not None and not event.is_set())),
+                        native_position=self._convert_coords(self.dev.get_pos(0), self.tilt_angle_deg, False),
+                        command_id=None if move is None else id(move),
+                        command_failed=bool(move is not None and (getattr(move, 'interrupted', False)
+                                            or getattr(move, '_last_pos_exception', None) is not None)),
+                        velocity_failed=error is not None and error[0] == self._velocity_generation)
 
     def absolute_move(self, pos, axis, speed=None):
         self.absolute_move_group([pos], [axis], speed=speed)
@@ -331,15 +304,6 @@ class SensapexManip(Manipulator):
         target = [cur[0] + delta[0], cur[1] + delta[1], cur[2] + delta[2]]
         return self.absolute_move_group(target, [1, 2, 3], speed=speed)
 
-    def poll_velocity(self):
-        """Expose worker dispatch failures only for the current velocity command."""
-        if not self._lock.acquire(blocking=False):
-            return "running"
-        try:
-            error = getattr(self, '_velocity_error', None)
-            return "failed" if error is not None and error[0] == self._velocity_generation else "running"
-        finally:
-            self._lock.release()
 
     def start_velocity(self, velocity, axes, *, relative=False):
         """Validate and queue velocity through the existing SDK worker."""
@@ -351,9 +315,6 @@ class SensapexManip(Manipulator):
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Device is busy")
         try:
-            pending = getattr(self, '_supervised_move', None)
-            if pending is not None and pending['status'] == 'running':
-                raise RuntimeError("Positional movement is still running")
             self.absolute_move_group_velocity(velocity, axes)
         finally:
             self._lock.release()
@@ -461,8 +422,7 @@ class SensapexManip(Manipulator):
         Stops current movements.
         """
         with self._lock:
-            supervised = getattr(self, '_supervised_move', None) is not None or any(self._vel)
-            self._supervised_move = None
+            supervised = self._last_move is not None or any(self._vel)
             self._velocity_generation += 1
             self._velocity_error = None
             self._vel = [0.0, 0.0, 0.0]

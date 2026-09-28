@@ -29,7 +29,6 @@ from patcherbot.controller import TaskController
 from patcherbot.utils.config import NumberWithUnit
 from patcherbot.interface.base import command
 from .livefeed import LiveFeedQt
-from .tracking_overlay import build_tracking_overlay, paint_tracking_overlay
 
 
 class Logger(QtCore.QAbstractTableModel, logging.Handler):
@@ -568,8 +567,8 @@ class CameraGui(QtWidgets.QMainWindow):
         if self.main_camera is not None:
             self.main_video = LiveFeedQt(self.main_camera,
                                          image_edit=self.image_edit,
-                                         display_edit=self.display_edit,
-                                         frame_overlay=self.tracking_display,
+                                         display_edit=functools.partial(self.display_edit, camera=self.main_camera),
+                                         frame_overlay=getattr(self, "tracking_display", None),
                                          mouse_handler=self.video_mouse_press,
                                          recording_state_manager=self.recording_state_manager,
                                          frame_folder_name='camera_frames')
@@ -577,8 +576,8 @@ class CameraGui(QtWidgets.QMainWindow):
         if self.aux_camera is not None:
             self.aux_video = LiveFeedQt(self.aux_camera,
                                         image_edit=self.image_edit,
-                                        display_edit=self.display_edit,
-                                         frame_overlay=self.tracking_display,
+                                        display_edit=functools.partial(self.display_edit, camera=self.aux_camera),
+                                         frame_overlay=getattr(self, "tracking_display", None),
                                         mouse_handler=self.video_mouse_press,
                                         recording_state_manager=self.recording_state_manager,
                                         frame_folder_name='aux_camera_frames')
@@ -760,36 +759,9 @@ class CameraGui(QtWidgets.QMainWindow):
         painter.drawEllipse(c_x - 15, c_y - 15, 30, 30)
         painter.end()
 
-    @command(category='General', description='Show/hide raw tracking detections')
-    def toggle_raw_tracking(self):
-        self.show_raw_tracking = not getattr(self, "show_raw_tracking", False)
 
-    @command(category='General', description='Show/hide calibration-only tracking predictions')
-    def toggle_calibration_tracking(self):
-        self.show_calibration_tracking = not getattr(self, "show_calibration_tracking", False)
 
-    def tracking_display(self, pixmap, *, camera, frame_id, acquired_at, image_shape):
-        """Draw only evidence belonging to the image currently displayed."""
-        if not self.show_overlay:
-            return
-        interface = getattr(self, "patch_interface", None)
-        controller = getattr(interface, "current_autopatcher", None)
-        stage = getattr(controller, "calibrated_stage", None)
-        if getattr(stage, "camera", None) is not camera:
-            return
-        helper = getattr(controller, "observation_helper", None)
-        frame_reader = getattr(helper, "tracking_for_frame", None)
-        observation = (frame_reader(frame_id, acquired_at, image_shape, camera=camera)
-                       if callable(frame_reader) else getattr(helper, "latest_tracking_observation", None))
-        if observation is None:
-            observation = {"pipette_tracking": {"valid": False}, "cell_tracking": {"valid": False}}
-        overlay = build_tracking_overlay(
-            observation, frame_id, acquired_at, image_shape,
-            show_raw=getattr(self, "show_raw_tracking", False),
-            show_prediction=getattr(self, "show_calibration_tracking", False))
-        paint_tracking_overlay(pixmap, overlay, image_shape)
-
-    def display_edit(self, pixmap):
+    def display_edit(self, pixmap, *, camera=None):
         '''
         Applies the functions stored in `~.CameraGui.display_edit_funcs` to the
         video image pixmap.
@@ -799,6 +771,8 @@ class CameraGui(QtWidgets.QMainWindow):
         pixmap : `QPixmap`
             The pixmap to draw on.
         '''
+        if camera is not None and camera is not self.active_camera:
+            return
         if self.show_overlay:
             for func in self.display_edit_funcs:
                 func(pixmap)
@@ -887,8 +861,6 @@ class CameraGui(QtWidgets.QMainWindow):
         '''
         self.register_key_action(Qt.Key_Question, None, self.help_keypress)
         self.register_key_action(Qt.Key_L, None, self.log_keypress)
-        self.register_key_action(Qt.Key_R, Qt.ControlModifier | Qt.AltModifier, self.toggle_raw_tracking)
-        self.register_key_action(Qt.Key_P, Qt.ControlModifier | Qt.AltModifier, self.toggle_calibration_tracking)
         self.register_camera_key_action(Qt.Key_N, None, 'normalize')
         self.register_key_action(Qt.Key_Q, Qt.ControlModifier, self.exit)
         self.register_camera_key_action(Qt.Key_Plus, None,

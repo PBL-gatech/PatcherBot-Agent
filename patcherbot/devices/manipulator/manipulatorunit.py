@@ -46,33 +46,23 @@ class ManipulatorUnit(Manipulator):
         else:
             return self.dev.position(self.axes[axis])
 
-    def start_absolute_move(self, target):
-        """Dispatch a move and retain its identity without waiting for completion."""
+    def start_absolute_move(self, target, *, context=None):
+        """Send one absolute command using the observation's device context."""
         target = np.asarray(target, dtype=float)
         if target.shape != (len(self.axes),) or not np.isfinite(target).all():
             raise ValueError("Move target must contain one finite value per axis")
-        if not all(callable(getattr(self.dev, name, None)) for name in ("start_move", "poll_move")):
-            raise NotImplementedError("This backend does not support supervised movement")
-        handle = self.dev.start_move(target.tolist(), self.axes)
-        if handle is None:
-            raise RuntimeError("Backend did not return a supervised movement handle")
-        self._supervised_pending = handle
+        return self.dev.start_move(target.tolist(), self.axes, context=context)
 
-    def start_relative_move(self, delta):
-        delta = np.asarray(delta, dtype=float)
-        if delta.shape != (len(self.axes),) or not np.isfinite(delta).all():
-            raise ValueError("Move delta must contain one finite value per axis")
-        self.start_absolute_move(np.asarray(self.position(), dtype=float) + delta)
+    def start_relative_move(self, delta, *, position, context=None):
+        """Use a supplied observation; this command never samples position."""
+        delta, position = np.asarray(delta, dtype=float), np.asarray(position, dtype=float)
+        if delta.shape != (len(self.axes),) or position.shape != delta.shape:
+            raise ValueError("Move delta and observed position must match device axes")
+        return self.start_absolute_move(position + delta, context=context)
 
-    def poll_move(self):
-        """Return running, settled or failed for this wrapper's own command."""
-        handle = getattr(self, "_supervised_pending", None)
-        if handle is None:
-            return "failed"
-        status = self.dev.poll_move(handle)
-        if status not in ("running", "settled", "failed"):
-            raise RuntimeError("Backend returned an invalid movement status")
-        return status
+    def read_motion_state(self):
+        """Read one passive backend snapshot for ObservationHelper."""
+        return self.dev.read_motion_state()
 
     def absolute_move(self, x, axis = None, blocking=False, speed=None):
         '''
@@ -141,21 +131,13 @@ class ManipulatorUnit(Manipulator):
         self.dev.relative_move_group(x, self.axes,speed)
 
 
-    def poll_velocity(self):
-        """Return the current backend velocity command status."""
-        if not callable(getattr(self.dev, "poll_velocity", None)):
-            raise NotImplementedError("This backend does not support supervised velocity")
-        status = self.dev.poll_velocity()
-        if status not in ("running", "failed"):
-            raise RuntimeError("Backend returned an invalid velocity status")
-        return status
 
     def start_velocity(self, velocity, *, relative=False):
         """Explicit supervised velocity dispatch; backend failures propagate."""
         velocity = np.asarray(velocity, dtype=float)
         if velocity.shape != (len(self.axes),) or not np.isfinite(velocity).all():
             raise ValueError("Velocity must contain one finite value per axis")
-        if not all(callable(getattr(self.dev, name, None)) for name in ("start_velocity", "poll_velocity")):
+        if not callable(getattr(self.dev, "start_velocity", None)):
             raise NotImplementedError("This backend does not support supervised velocity")
         self.dev.start_velocity(velocity.tolist(), self.axes, relative=relative)
 
@@ -188,7 +170,6 @@ class ManipulatorUnit(Manipulator):
         Stop current movements.
         """
         # self.abort_if_requested()
-        self._supervised_pending = None
         self.dev.stop()
 
     def wait_until_still(self, axes = None):

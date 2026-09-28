@@ -28,6 +28,9 @@ class ManipulatorGui(CameraGui):
         self.microscope_camera = camera
         self.pipette_camera = aux_camera
         self.interface = pipette_interface
+        for video in (self.main_video, self.aux_video):
+            if video is not None:
+                video.recording_config = self.interface.calibration_config
         self.control_thread = QtCore.QThread()
         self.control_thread.setObjectName('PipetteControlThread')
         self.interface.moveToThread(self.control_thread)

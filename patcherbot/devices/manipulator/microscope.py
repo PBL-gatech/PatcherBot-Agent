@@ -59,30 +59,20 @@ class Microscope(Manipulator):
         
         return true_position
 
-    def start_absolute_move(self, target):
-        """Dispatch in microns, matching absolute_move; do not wait or sleep."""
+    def start_absolute_move(self, target, *, context=None):
+        """Send one absolute command using the observation's device context."""
         target = float(target)
         if not math.isfinite(target):
             raise ValueError("Microscope target must be finite")
-        if not all(callable(getattr(self.dev, name, None)) for name in ("start_move", "poll_move")):
-            raise NotImplementedError("This backend does not support supervised movement")
-        handle = self.dev.start_move([target], [self.axis])
-        if handle is None:
-            raise RuntimeError("Backend did not return a supervised movement handle")
-        self._supervised_pending = handle
+        return self.dev.start_move([target], [self.axis], context=context)
 
-    def start_relative_move(self, delta):
-        # position() is scaled for the historical observation interface.
-        self.start_absolute_move(float(self.dev.position(self.axis)) + float(delta))
+    def start_relative_move(self, delta, *, position, context=None):
+        """Use a supplied observation; this command never samples position."""
+        return self.start_absolute_move(float(position) + float(delta), context=context)
 
-    def poll_move(self):
-        handle = getattr(self, "_supervised_pending", None)
-        if handle is None:
-            return "failed"
-        status = self.dev.poll_move(handle)
-        if status not in ("running", "settled", "failed"):
-            raise RuntimeError("Backend returned an invalid movement status")
-        return status
+    def read_motion_state(self):
+        """Read one passive backend snapshot for ObservationHelper."""
+        return self.dev.read_motion_state()
 
     def absolute_move(self, x):
         '''
@@ -96,21 +86,13 @@ class Microscope(Manipulator):
         self.dev.absolute_move(x, self.axis)
         self.sleep(.05)
 
-    def poll_velocity(self):
-        """Return the current backend velocity command status."""
-        if not callable(getattr(self.dev, "poll_velocity", None)):
-            raise NotImplementedError("This backend does not support supervised velocity")
-        status = self.dev.poll_velocity()
-        if status not in ("running", "failed"):
-            raise RuntimeError("Backend returned an invalid velocity status")
-        return status
 
     def start_velocity(self, velocity, *, relative=False):
         """Dispatch microscope velocity explicitly, preserving micron units."""
         velocity = float(velocity)
         if not math.isfinite(velocity):
             raise ValueError("Microscope velocity must be finite")
-        if not all(callable(getattr(self.dev, name, None)) for name in ("start_velocity", "poll_velocity")):
+        if not callable(getattr(self.dev, "start_velocity", None)):
             raise NotImplementedError("This backend does not support supervised velocity")
         self.dev.start_velocity([velocity], [self.axis], relative=relative)
 
@@ -180,7 +162,6 @@ class Microscope(Manipulator):
         """
         Stop current movements.
         """
-        self._supervised_pending = None
         self.dev.stop()
 
     def wait_until_still(self):

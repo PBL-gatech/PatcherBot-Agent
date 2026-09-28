@@ -12,6 +12,7 @@ class CalibrationConfig(Config):
     position_update = NumberWithUnit(1000, unit="ms",
                                      doc="dt for updating displayed pos.",
                                      bounds=(0, 10000))
+    record_overlays = Boolean(False, doc="Record overlays")
 
     autofocus_dist = NumberWithUnit(15, unit="um",
                                      doc="z dist to scan for autofocusing.",
@@ -110,7 +111,7 @@ class CalibrationConfig(Config):
             "pipette_focus_crop_feature",
             "use_ai_features",
         ]),
-        ("Display", ["position_update"]),
+        ("Display", ["position_update", "record_overlays"]),
         ("Pressure", ["native_zero", "native_per_mbar", "reader_offset", "reader_scale"]),
         ("Positions", ["home_position", "home_position_stage", "safe_position", "safe_position_stage", "bath_position", "safe_position_delta_um", "home_position_delta_um"]),
     ]

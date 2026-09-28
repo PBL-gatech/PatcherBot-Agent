@@ -281,6 +281,19 @@ class ObservationHelper:
         z = unit.microscope.position() / unit.config.microscope_units_per_um
         return self._cache_reading("stage_positions", np.append(stage, z))
 
+    def get_motion_state(self):
+        """Sample each physical device once; never wait, retry, or decide completion."""
+        snapshots, sampled = {}, {}
+        for name, device in (("manipulator", self.controller.calibrated_unit),
+                             ("stage", self.controller.calibrated_stage),
+                             ("microscope", self.controller.microscope)):
+            backend = getattr(device, 'dev', device)
+            key = id(backend)
+            if key not in sampled:
+                sampled[key] = dict(device.read_motion_state(), sampled_at=time.monotonic())
+            snapshots[name] = dict(sampled[key])
+        return self._cache_reading("motion_state", snapshots)
+
     @staticmethod
     def _validate_sampling(num_measurements, interval):
         if isinstance(num_measurements, bool) or not isinstance(num_measurements, Integral) or num_measurements < 1:
@@ -605,7 +618,7 @@ class ObservationHelper:
         supported = {
             "pipette_positions", "stage_positions", "camera_image", "resistance",
             "pressure", "commanded_pressure_mbar", "pressure_atm_state",
-            "access_resistance", "capacitance", "manipulator_position",
+            "access_resistance", "capacitance", "manipulator_position", "motion_state",
             "deep_learning", "cell_detections", "tracked_cell_position", "pipette_focus",
             "pipette_image_xy", "pipette_defocus_um", "pipette_tracking", "cell_tracking",
         }
@@ -701,6 +714,8 @@ class ObservationHelper:
                 value = self.get_manipulator_position()
             elif field == "stage_positions":
                 value = self.get_stage_positions()
+            elif field == "motion_state":
+                value = self.get_motion_state()
             elif field == "camera_image":
                 if source_image is not None and not (legacy and not deep_learning):
                     value = source_image
@@ -774,6 +789,8 @@ class ObservationHelper:
                     valid = value is not None and bool(np.isfinite(np.asarray(value, dtype=float)).all())
                 except (TypeError, ValueError):
                     valid = False
+                if field == "motion_state":
+                    valid = all(isinstance(item.get("busy"), bool) for item in value.values())
                 entry.update(read_at=now, valid=bool(valid), source_frame=entry.get("source_frame"),
                              age_s=age, stale=age is None or age < 0 or age > 1.0)
                 if field == "pressure" and not entry.get("freshness_known", False):

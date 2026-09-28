@@ -8,34 +8,34 @@ The software rebuild is implemented. Offline checks exercise the real Hunt super
 - Fresh, pose-consistent detector measurements correct those residuals once. Confidence and innovation gates reject outliers; missing confidence remains unknown. Raw detector fields remain available. Defocus prediction and cell-plane separation remain unavailable; measured focus is separate.
 - Hunt repeatedly acquires one observation, updates its quantities, evaluates contact and limits, evaluates the active mode/state, dispatches a command, and sleeps 40 ms. It records actual observation intervals.
 - Hunt alone commits S-state transitions. Each decision carries its state ID, reason, and evidence reference. A proposed transition stops movement, retains the state context, and requires applicable settled/fresh confirmation. Contact holds preserve travel budgets and best measurements.
-- Positional moves and velocity commands use explicit supervised dispatch, polling, and cancellation. Agent inference has one outstanding request and discards invalidated results.
-- Camera/livefeed render a matching cached frame estimate; they do not read hardware. Prediction-only markers, uncertainty, measurement age, raw/calibration toggles, and offscreen arrows live in presentation code.
+- ObservationHelper samples passive device status once per observation, deduplicating shared backends. Hunt owns movement completion, encoder correction attempts, and cancellation. Commands use the observed position and return after one dispatch; no new device polling loops are introduced. Existing device acquisition and legacy blocking APIs remain unchanged. Agent inference has one outstanding request and discards invalidated results.
+- Camera/livefeed render a matching cached frame estimate; they do not read hardware. Prediction-only markers, uncertainty ellipses, raw/calibration toggles, and offscreen arrows live in PatchGui. Tracking status text has been removed. Calibration Display now controls whether rig recordings include overlays.
 
 ## Hunt method audit
 
-Final Hunt size: **763 lines, 19 methods**, compared with 1,546 lines and 32 methods at the start of this rebuild.
+Final Hunt size: **824 lines, 19 methods**, compared with 1,546 lines and 32 methods at the start of this rebuild.
 
 | Method | Start-end lines |
 |---|---|
 | `__init__` | 19-25 |
 | `run` | 27-137 |
 | `prepare` | 139-195 |
-| `calculate` | 197-250 |
-| `decide` | 252-377 |
-| `act` | 379-414 |
-| `action_gate` | 416-476 |
-| `spear` | 478-514 |
-| `search` | 516-532 |
-| `scan` | 534-565 |
-| `shift` | 567-604 |
-| `failure_gate` | 606-611 |
-| `success_gate` | 613-621 |
-| `_recover_contact_visuals` | 623-683 |
-| `observe` | 685-705 |
-| `_adaptive_contact_confirmed` | 707-737 |
-| `_resistance_above_threshold` | 739-749 |
-| `_resistance_threshold_reached` | 751-755 |
-| `_isCellDetected` | 757-762 |
+| `calculate` | 197-285 |
+| `decide` | 287-415 |
+| `act` | 417-467 |
+| `action_gate` | 469-534 |
+| `spear` | 536-572 |
+| `search` | 574-590 |
+| `scan` | 592-623 |
+| `shift` | 625-662 |
+| `failure_gate` | 664-669 |
+| `success_gate` | 671-679 |
+| `_recover_contact_visuals` | 681-744 |
+| `observe` | 746-766 |
+| `_adaptive_contact_confirmed` | 768-798 |
+| `_resistance_above_threshold` | 800-810 |
+| `_resistance_threshold_reached` | 812-816 |
+| `_isCellDetected` | 818-823 |
 
 The three added Hunt-specific methods separate immediate electrical stopping, Adaptive visual confirmation, and single-observation microscope recovery. The original compatibility method `_isCellDetected` has a real caller in `controller/patch.py:350-353`; it is not a retained private forwarding name with no caller.
 
@@ -47,24 +47,30 @@ These are current line ranges for the changed areas, not a claim that every line
 
 | File | Start-end lines | Change / requirement |
 |---|---|---|
-| `patcherbot/controller/phases/hunt_cell.py` | 1-763 | One continuously supervised loop, persistent states, guarded transitions and decisions, distinct mode contracts, supervised movement, async Agent, raw contact confirmation. |
+| `patcherbot/controller/phases/hunt_cell.py` | 168-171; 245-284; 347-360; 417-467; 482-487; 702-714 | Existing supervisor now owns pending targets, completion, encoder freshness/retries and cancellation; 19 methods and one while loop. |
 | `patcherbot/devices/manipulator/helpers/ObservationTracking.py` | 1-487 | Shared home/stage prediction, residual fusion, uncertainty, association, timing checks, frame projection and invalidation. |
-| `patcherbot/devices/manipulator/helpers/ObservationHelper.py` | 7-20; 46-121; 533-554; 605-610; 644-646; 676-679; 802-804 | Persistent ownership/cache, target context, one-pass detailed heads, tracking fields and independent focuser compatibility. |
+| `patcherbot/devices/manipulator/helpers/ObservationHelper.py` | 284-295; 621-624; 717-718; 792-793 | Collect passive motion snapshots once per physical backend in each observation; no completion or retry policy. |
 | `patcherbot/controller/PhaseController.py` | 49-57 | Forward target_cell independently of learned tracker cell. |
 | `patcherbot/controller/patch.py` | 805-824; 948 | Shared observation forwarding, explicit anchor invalidation hook and settled Locate sample. |
 | `patcherbot/controller/phases/approach_cell.py` | 49 | Settled Approach sample through shared observation helper. |
 | `patcherbot/interface/pipettes.py` | 170-179 | Validate both six-coordinate records before loading; split XYZ/XYZ for home and safe. |
 | `patcherbot/devices/manipulator/helpers/AgentHelper.py` | 3-4; 29-34; 77; 271-344 | Single outstanding asynchronous request, generation invalidation, locked model calls, preserved synchronous interface. |
-| `patcherbot/devices/manipulator/manipulatorunit.py` | 49-75; 144-160; 186-192 | Positional and velocity start/poll wrappers; cancel before stopping. |
-| `patcherbot/devices/manipulator/microscope.py` | 11; 62-85; 99-115; 126-130; 179-184 | Equivalent microscope API, correct axis dispatch and cancellation. |
-| `patcherbot/devices/manipulator/scientificaSerial.py` | 194-195; 319-416; 501-526; 555-558; 599-600; 720-725; 831-834 | Pollable bounded encoder correction, explicit velocity failure propagation, cancellation serialized with dispatch; NoEncoder reuse. |
-| `patcherbot/devices/manipulator/sensapexWrapper.py` | 66-67; 213-268; 334-359; 377-379; 459-473; 492-526 | No prior-move wait on supervised start; poll SDK failures; generations prevent commands after cancellation and stale velocity errors. |
-| `patcherbot/devices/manipulator/fakemanipulator.py` | 13; 26-28; 130-165; 265-280; 299-314; 322-332 | Time-spanning supervised fake movement, finite zero/change velocities and stop-all behavior. |
-| `patcherbot/gui/livefeed.py` | 20; 35; 156-162 | Pass displayed frame ID/time/image shape to optional overlay callback. |
-| `patcherbot/gui/camera.py` | 32; 572; 581; 763-790; 890-891 | Main-camera tracking callback and Ctrl+Alt+R/P raw/calibration toggles. |
-| `patcherbot/gui/tracking_overlay.py` | 1-159 | Fused/predicted/raw markers, uncertainty ellipse, ages, defocus, offscreen arrows and stale handling. |
+| `patcherbot/devices/manipulator/manipulatorunit.py` | 49-65; 135-142; 168-173 | Commands use supplied observation context; passive status forwarding; remove pending motion and completion polling. |
+| `patcherbot/devices/manipulator/microscope.py` | 62-75; 90-97; 161-165 | Same passive command/status boundary for the microscope; no command-side position sampling. |
+| `patcherbot/devices/manipulator/scientificaSerial.py` | 317-356; 442-454; 484-485; 646; 753-754 | One-command starts and passive busy/encoder snapshots; remove newly introduced correction polling and retained targets. |
+| `patcherbot/devices/manipulator/sensapexWrapper.py` | 213-241; 308-320; 420-433 | Single SDK dispatch and passive snapshot; remove device-side completion/target state; preserve cancellation generations. |
+| `patcherbot/devices/manipulator/fakemanipulator.py` | 127-143; 244-252; 294-302 | Match passive command/status API without retaining supervision policy. |
+| `patcherbot/gui/livefeed.py` | 48; 105-118; 151-176 | Read recording toggle; record raw frames or paint existing callbacks at camera resolution; copy source/output buffers. |
+| `patcherbot/gui/camera.py` | 569-580; 764-778 | Forward optional frame renderer and emitting camera; guard inherited painters against the wrong camera; remove patch-specific rendering ownership. |
+| `patcherbot/gui/patch.py` | 3; 75-76; 93-236 | Own tracking markers and optional raw/calibration shortcuts beside the autopatcher interface. Remove tracking text; delete standalone tracking_overlay.py. |
 
-Tests changed or added:
+| `patcherbot/devices/manipulator/CalibrationConfig.py` | 15; 114 | Add Record overlays under Display, default off. |
+| `patcherbot/gui/manipulator.py` | 31-33 | Share the calibration config with both recording views. |
+| `regression_tests/test_hunt_observations.py` | 117-129; 308-312 | Update retained fixtures for passive motion snapshots; no new tests or test files. |
+
+Follow-up validation: **35 retained regression tests passed**; all changed Python modules compile. Inline checks cover controller-owned retries and cancellation, status sampling, Qt marker equivalence, live recording-toggle changes, raw-buffer preservation, camera routing and source-resolution output. No test files were created. Annotated recordings use RGB8; raw recordings preserve the available source array. Real-device response timing remains unmeasured.
+
+Historical tests changed or added (the generated test files and temporary validation artifacts below were subsequently removed at the user's request):
 
 | File under `regression_tests/` | Start-end lines | Coverage |
 |---|---|---|
@@ -82,7 +88,7 @@ Migrated existing test areas: `test_hunt_observations.py` 63-73, 102-128, 170-17
 
 Existing lifecycle, Training, electrical contact and resistance replay regressions were included in the complete suite. Migrated S-state tests execute the actual supervisor instead of reconstructing the removed nested loops; they retain the original safety and progress assertions.
 
-## Offline validation
+## Historical offline validation before test cleanup
 
 - **239 tests passed**, no failures, errors or skips, using unittest discovery from a temporary working directory. [Final test log](C:/Users/SA-FOR~1/AppData/Local/Temp/patcherbot_full_validation_rqlxd3nr/regressions.log).
 - **553 Python files parsed and compiled**. Flat temporary bytecode destinations avoid Windows path-length failures in vendored DINOv2 directories.

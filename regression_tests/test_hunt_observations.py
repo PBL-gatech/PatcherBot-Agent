@@ -114,9 +114,19 @@ class Device:
         self.relative_move(displacement)
         self.move_status = "running"
 
-    def start_absolute_move(self, value):
-        self.absolute_move(value)
+    def start_absolute_move(self, value, *, context=None):
+        if self.name == "microscope":
+            self.absolute_move(value)
+        else:
+            value = np.asarray(value)
+            delta = np.zeros_like(self.xyz)
+            delta[:len(value)] = value - self.xyz[:len(value)]
+            self.relative_move(delta)
         self.move_status = "running"
+
+    def read_motion_state(self):
+        status = self.poll_move()
+        return dict(busy=status == "running", command_failed=status == "failed", velocity_failed=False)
 
     def poll_move(self):
         if self.move_status == "failed":
@@ -296,7 +306,9 @@ class HardwareFreeTest(unittest.TestCase):
         record = self.helper.record_calculations
         first = [observation]
         def next_observation(**kwargs):
-            return first.pop() if first else observe(**kwargs)
+            result = first.pop() if first else observe(**kwargs)
+            result["motion_state"] = self.helper.get_motion_state()
+            return result
         def deciding(*args, **kwargs):
             result = decide(*args, **kwargs)
             if result["outcome"] == "transition":

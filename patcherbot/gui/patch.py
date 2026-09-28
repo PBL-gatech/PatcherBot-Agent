@@ -7,6 +7,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import PyQt5.QtGui as QtGui
 import numpy as np
 import logging
+import math
 import time
 
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
@@ -71,6 +72,8 @@ class PatchGui(ManipulatorGui):
 
     def register_commands(self):
         super(PatchGui, self).register_commands()
+        self.register_key_action(Qt.Key_R, Qt.ControlModifier | Qt.AltModifier, self.toggle_raw_tracking)
+        self.register_key_action(Qt.Key_P, Qt.ControlModifier | Qt.AltModifier, self.toggle_calibration_tracking)
         # self.register_mouse_action(Qt.LeftButton, Qt.ShiftModifier,
         #                            self.patch_interface.patch_with_move)
         self.register_mouse_action(Qt.LeftButton, Qt.NoModifier,
@@ -85,6 +88,153 @@ class PatchGui(ManipulatorGui):
                                  self.patch_interface.store_rinsing_position)
         self.register_key_action(Qt.Key_F4, None,
                                  self.patch_interface.clean_pipette)
+
+    @command(category='General', description='Show/hide raw tracking detections')
+    def toggle_raw_tracking(self):
+        self.show_raw_tracking = not getattr(self, "show_raw_tracking", False)
+
+    @command(category='General', description='Show/hide calibration-only tracking predictions')
+    def toggle_calibration_tracking(self):
+        self.show_calibration_tracking = not getattr(self, "show_calibration_tracking", False)
+
+    def tracking_display(self, pixmap, *, camera, frame_id, acquired_at, image_shape):
+        """Draw only evidence belonging to the image currently displayed."""
+        if not self.show_overlay:
+            return
+        interface = getattr(self, "patch_interface", None)
+        controller = getattr(interface, "current_autopatcher", None)
+        stage = getattr(controller, "calibrated_stage", None)
+        if getattr(stage, "camera", None) is not camera:
+            return
+        helper = getattr(controller, "observation_helper", None)
+        frame_reader = getattr(helper, "tracking_for_frame", None)
+        observation = (frame_reader(frame_id, acquired_at, image_shape, camera=camera)
+                       if callable(frame_reader) else getattr(helper, "latest_tracking_observation", None))
+        if observation is None:
+            observation = {"pipette_tracking": {"valid": False}, "cell_tracking": {"valid": False}}
+        now = time.monotonic()
+        show_raw = getattr(self, "show_raw_tracking", False)
+        show_prediction = getattr(self, "show_calibration_tracking", False)
+        max_age = 1.0
+        markers = []
+        if not isinstance(observation, dict):
+            return
+        height, width = image_shape[:2]
+        if width <= 0 or height <= 0:
+            return
+        evidence = observation.get("deep_learning") or {}
+        for name in ("pipette", "cell"):
+            track = observation.get(name + "_tracking") or {}
+            if not track.get("valid"):
+                raw = evidence.get("pipette_position") if name == "pipette" else (
+                    observation.get("target_cell_image_xy") if observation.get("target_cell_valid") else None)
+                try:
+                    raw_match = (raw is not None and not evidence.get("stale", True)
+                                 and evidence.get("source_frame") == frame_id
+                                 and acquired_at is not None and evidence.get("frame_acquired_at") == acquired_at
+                                 and 0 <= now - float(acquired_at) <= max_age
+                                 and (evidence.get("status") or {}).get(name + "_detector") not in
+                                     ("error", "no_detection", "disabled", "no_frame"))
+                except (TypeError, ValueError):
+                    raw_match = False
+                if not raw_match:
+                    continue
+                track = dict(valid=True, display_valid=True, display_acquired_at=acquired_at,
+                             source_frame=frame_id, image_shape=evidence.get("source_image_shape", ()),
+                             image_xy=raw, status="raw")
+            stamp = track.get("display_acquired_at")
+            try:
+                age = now - float(stamp)
+                matched = (track.get("display_valid") and acquired_at is not None
+                           and frame_id == track.get("source_frame")
+                           and float(acquired_at) == float(stamp)
+                           and tuple(track["image_shape"][:2]) == tuple(image_shape[:2])
+                           and 0 <= age <= max_age)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                matched, age = False, float("inf")
+            if not matched:
+                continue
+            status = str(track.get("status") or "prediction_only")
+            color = ("#ff7080" if status == "raw" else "#ffba45" if status == "prediction_only"
+                     else "#44e08a" if name == "pipette" else "#64caff")
+            candidates = [(track.get("image_xy"), status, color, track.get("covariance_pixels"))]
+            if show_prediction and track.get("source_predicted_xy") is not None:
+                candidates.append((track["source_predicted_xy"], "calibration", "#c893ff", None))
+            if (show_raw and status != "raw" and not evidence.get("stale", True)
+                    and evidence.get("source_frame") == frame_id
+                    and evidence.get("frame_acquired_at") == acquired_at
+                    and (evidence.get("status") or {}).get(name + "_detector") not in
+                        ("error", "no_detection", "disabled", "no_frame")):
+                point = evidence.get("pipette_position") if name == "pipette" else track.get("measurement_xy")
+                if name == "cell" and point is None and observation.get("target_cell_valid"):
+                    point = observation.get("target_cell_image_xy")
+                if point is not None:
+                    candidates.append((point, "raw", "#ff7080", None))
+            for point, style, color, covariance in candidates:
+                try:
+                    point = np.asarray(point, dtype=float).reshape(2)
+                    if not np.isfinite(point).all():
+                        continue
+                    outside = not (0 <= point[0] < width and 0 <= point[1] < height)
+                    if outside and style == "raw":
+                        continue
+                    visible = point.copy()
+                    arrow = None
+                    if outside:
+                        center = np.array([width / 2., height / 2.])
+                        direction = point - center
+                        distance = np.linalg.norm(direction)
+                        unit = direction / distance
+                        fraction = min(max(0., center[i] - 12.) / abs(direction[i])
+                                       for i in range(2) if direction[i] != 0)
+                        visible = center + fraction * direction
+                        side = np.array([-unit[1], unit[0]])
+                        arrow = [visible, visible - 12 * unit + 6 * side, visible - 12 * unit - 6 * side]
+                    ellipse = None
+                    if covariance is not None and not outside:
+                        try:
+                            covariance = np.asarray(covariance, dtype=float).reshape(2, 2)
+                            if np.isfinite(covariance).all():
+                                values, vectors = np.linalg.eigh(covariance)
+                                if min(values) >= 0:
+                                    ellipse = (np.sqrt(values), math.degrees(math.atan2(vectors[1, 0], vectors[0, 0])))
+                        except (TypeError, ValueError, np.linalg.LinAlgError):
+                            pass
+                    markers.append(dict(name=name, xy=point.copy(), display_xy=visible,
+                                                   style=style, color=color, arrow=arrow, ellipse=ellipse))
+                except (TypeError, ValueError, IndexError, np.linalg.LinAlgError):
+                    continue
+
+        painter = QtGui.QPainter(pixmap)
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.save()
+            painter.scale(pixmap.width() / image_shape[1], pixmap.height() / image_shape[0])
+            for marker in markers:
+                pen = QtGui.QPen(QtGui.QColor(marker["color"]), 2)
+                pen.setCosmetic(True)
+                pen.setStyle(QtCore.Qt.DashLine if marker["style"] == "prediction_only" else QtCore.Qt.SolidLine)
+                painter.setPen(pen)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                point = marker["display_xy"]
+                if marker["arrow"] is not None:
+                    painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(*p) for p in marker["arrow"]]))
+                elif marker["style"] in ("raw", "calibration"):
+                    painter.drawLine(QtCore.QPointF(point[0]-5, point[1]), QtCore.QPointF(point[0]+5, point[1]))
+                    painter.drawLine(QtCore.QPointF(point[0], point[1]-5), QtCore.QPointF(point[0], point[1]+5))
+                else:
+                    painter.drawEllipse(QtCore.QPointF(*point), 6, 6)
+                if marker["ellipse"] is not None:
+                    radii, angle = marker["ellipse"]
+                    painter.save()
+                    painter.translate(*point)
+                    painter.rotate(angle)
+                    painter.drawEllipse(QtCore.QPointF(0, 0), float(radii[0]), float(radii[1]))
+                    painter.restore()
+            painter.restore()
+        finally:
+            painter.end()
+
 
     def toggle_cell_list_window(self, checked=None):
         if checked is None:

@@ -167,7 +167,7 @@ class HuntCellPhase(PhaseController):
                      previous_pose=None, last_sample_at=None, agent_generation=0,
                      observe=dict(fields=["resistance", "manipulator_position", "stage_positions",
                                          "deep_learning", "camera_image", "pipette_positions", "pressure",
-                                         "commanded_pressure_mbar", "pressure_atm_state"],
+                                         "commanded_pressure_mbar", "pressure_atm_state", "motion_state"],
                                   raw_measurements=True, cell=None, target_cell=cell))
         self.state = state
         if mode == "Agent":
@@ -242,11 +242,46 @@ class HuntCellPhase(PhaseController):
                     raise AutopatchError("Shift exceeded its 50 um planar envelope")
             if time.monotonic() - context["entered_at"] > 60:
                 raise AutopatchError("Hunt action exceeded its monitoring timeout")
+        devices = (("manipulator", self.controller.calibrated_unit),
+                   ("stage", self.controller.calibrated_stage), ("microscope", self.controller.microscope))
         active_command = state["applied_command"]
         if active_command is not None and active_command[0] in ("velocity", "relative_velocity"):
-            for device in (self.controller.calibrated_unit, self.controller.microscope):
-                if id(device) == active_command[1] and device.poll_velocity() == "failed":
-                    raise AutopatchError("Hunt velocity command failed")
+            name = next(name for name, device in devices if id(device) == active_command[1])
+            if observation["motion_state"][name].get("velocity_failed", False):
+                raise AutopatchError("Hunt velocity command failed")
+        pending = state["pending_motion"]
+        if pending is not None:
+            info = observation["motion_state"][pending["role"]]
+            current = (stage[2] if pending["role"] == "microscope" else
+                       stage[:2] if pending["role"] == "stage" else position)
+            pending["status"] = "running"
+            if info.get("command_failed", False) or (pending["command_id"] is not None
+                    and info.get("command_id") != pending["command_id"]):
+                pending["status"] = "failed"
+            elif info["sampled_at"] > pending["issued_at"] and not info["busy"]:
+                encoder = "encoder_sequence" in info and pending["role"] != "stage"
+                fresh = True
+                if encoder:
+                    sequence = info["encoder_sequence"]
+                    if pending["idle_sequence"] is None:
+                        pending["idle_sequence"] = sequence
+                        fresh = False
+                    else:
+                        fresh = sequence > pending["idle_sequence"]
+                if fresh:
+                    measured = np.asarray(current, dtype=float).copy()
+                    if encoder:
+                        measured.flat[-1] = float(info["encoder_z"])
+                    error = np.abs(measured - pending["target"])
+                    tolerance = 2.0 if encoder else 0.5
+                    if not np.isfinite(error).all():
+                        pending["status"] = "failed"
+                    elif np.max(error) <= tolerance:
+                        pending["status"] = "settled"
+                    elif encoder and pending["attempts"] < 5:
+                        pending["status"] = "retry"
+                    else:
+                        pending["status"] = "failed"
         return observation
 
     def decide(self, observation, state, *, mode, cell_type):
@@ -311,7 +346,10 @@ class HuntCellPhase(PhaseController):
             return decision
         pending_motion = state["pending_motion"]
         if pending_motion is not None:
-            status = pending_motion["device"].poll_move()
+            status = pending_motion["status"]
+            if status == "retry":
+                decision.update(reason="encoder_correction", command=dict(kind="retry", device=pending_motion["device"], value=pending_motion["target"], token=id(pending_motion)))
+                return decision
             if status == "failed":
                 raise AutopatchError("Hunt positional movement failed")
             if status == "running":
@@ -380,6 +418,8 @@ class HuntCellPhase(PhaseController):
         """Dispatch once; never acquire observations or wait for movement completion."""
         if stop or (command is not None and command["kind"] == "stop"):
             first_error = None
+            if state is not None:
+                state["pending_motion"] = None
             for device in (self.controller.calibrated_stage, self.controller.calibrated_unit, self.controller.microscope):
                 try:
                     device.stop()
@@ -398,15 +438,28 @@ class HuntCellPhase(PhaseController):
         self.controller.success_if_requested()
         kind, device, value = command["kind"], command["device"], command["value"]
         key = (kind, id(device), tuple(np.asarray(value).reshape(-1)))
-        if kind == "relative":
-            device.start_relative_move(value)
-        elif kind == "absolute_z":
-            device.start_absolute_move(value)
+        role = ("microscope" if device is self.controller.microscope else
+                "stage" if device is self.controller.calibrated_stage else "manipulator")
+        if kind in ("relative", "absolute_z", "retry"):
+            context = observation["motion_state"][role]
+        if kind == "retry":
+            pending = state["pending_motion"]
+            pending["command_id"] = device.start_absolute_move(pending["target"], context=context)
+            pending.update(attempts=pending["attempts"] + 1, idle_sequence=None, issued_at=time.monotonic(), status="running")
+            return
+        if kind in ("relative", "absolute_z"):
+            if context["busy"]:
+                raise AutopatchError("Observed device is still moving before positional dispatch")
+            current = (observation["stage_positions"][2] if role == "microscope" else
+                       observation["stage_positions"][:2] if role == "stage" else observation["manipulator_position"])
+            target = np.asarray(current) + np.asarray(value)[:np.size(current)] if kind == "relative" else float(value)
+            command_id = device.start_absolute_move(target, context=context)
         elif kind == "relative_velocity" or key != state["applied_command"]:
             device.start_velocity(value, relative=(kind == "relative_velocity"))
         state.update(applied_command=key, stopped_at=None, settled=False, settled_at=None)
         if kind in ("relative", "absolute_z"):
-            state["pending_motion"] = command
+            state["pending_motion"] = dict(device=device, role=role, target=target, attempts=1,
+                idle_sequence=None, issued_at=time.monotonic(), command_id=command_id, status="running")
             if kind == "relative":
                 context = state["state_context"]
                 context["moves"] = context.get("moves", 0) + 1
@@ -427,6 +480,11 @@ class HuntCellPhase(PhaseController):
             recovery = state["contact"].get("recovery")
             if state["contact"]["active"] and recovery is None:
                 return False
+            if kind == "retry":
+                pending = state["pending_motion"]
+                return (pending is not None and command.get("token") == id(pending)
+                        and device is pending["device"] and pending["status"] == "retry"
+                        and pending["attempts"] < 5 and np.array_equal(value, pending["target"]))
             step, context = state["active_state"], state["state_context"]
             if recovery is not None:
                 context = recovery
@@ -642,7 +700,10 @@ class HuntCellPhase(PhaseController):
         if observation.get("target_cell_id") != recovery["start"].get("target_cell_id") or observation.get("target_cell_status") == "ambiguous":
             raise AutopatchError("Contact recovery target changed or became ambiguous")
         if state["pending_motion"] is not None:
-            status = self.controller.microscope.poll_move()
+            pending = state["pending_motion"]
+            status = pending["status"]
+            if status == "retry":
+                return dict(kind="retry", device=pending["device"], value=pending["target"], token=id(pending))
             if status == "running":
                 return None
             if status != "settled":
