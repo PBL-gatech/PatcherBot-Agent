@@ -69,6 +69,8 @@ class Device:
         self.Minv = np.eye(2)
         self.r0 = np.zeros(2)
         self.up_direction = 1
+        self.move_polls_remaining = 0
+        self.move_status = "settled"
 
     def position(self):
         return float(self.xyz[2]) if self.name == "microscope" else self.xyz.copy()
@@ -97,6 +99,34 @@ class Device:
     def absolute_move_velocity(self, velocity):
         self.controller.events.append(("focus_velocity", self.name, velocity))
 
+    def start_velocity(self, value, *, relative=False):
+        if relative:
+            self.relative_move_group_velocity(value)
+        elif self.name == "microscope":
+            self.absolute_move_velocity(value)
+        else:
+            self.absolute_move_group_velocity(value)
+
+    def poll_velocity(self):
+        return "running"
+
+    def start_relative_move(self, displacement):
+        self.relative_move(displacement)
+        self.move_status = "running"
+
+    def start_absolute_move(self, value):
+        self.absolute_move(value)
+        self.move_status = "running"
+
+    def poll_move(self):
+        if self.move_status == "failed":
+            return "failed"
+        if self.move_polls_remaining > 0:
+            self.move_polls_remaining -= 1
+            return "running"
+        self.move_status = "settled"
+        return "settled"
+
     def wait_until_still(self):
         pass
 
@@ -117,6 +147,7 @@ class Controller:
         self.rig_ready = True
         self.resistance = 5.4
         self.read_count = 0
+        self.initial_clear_samples = 0
         self.inference_calls = 0
         self.manual_after_samples = None
         self.calibrated_stage = Device(self, "stage")
@@ -138,8 +169,10 @@ class Controller:
                            get_ATM=lambda: False,
                            set_pressure=self.set_pressure)
         self.daq = NS(resistance=lambda: 5.0)
+        self._agent_result = None
         self.agenthelper = NS(prepare_model=lambda name: self.events.append(("model", name)),
-                              run_inference=self.inference)
+                              run_inference=self.inference, request_inference=self.request_inference,
+                              poll_inference=self.poll_inference, invalidate_inference=self.invalidate_inference)
         self.observation_helper = ObservationHelper(self)
 
     def set_pressure(self, value):
@@ -154,7 +187,7 @@ class Controller:
         self.read_count += 1
         if self.read_count > 1000:
             raise AssertionError("Hunt did not terminate")
-        return self.resistance
+        return 5.0 if self.read_count <= self.initial_clear_samples else self.resistance
 
     def abort_if_requested(self):
         if self.abort_requested:
@@ -191,6 +224,22 @@ class Controller:
         self.events.append(("inference", action))
         return action
 
+    def request_inference(self, observation, generation):
+        if self._agent_result is not None:
+            return False
+        self._agent_result = (generation, self.inference(observation))
+        return True
+
+    def poll_inference(self, generation):
+        if self._agent_result is None or self._agent_result[0] != generation:
+            return False, None
+        _, action = self._agent_result
+        self._agent_result = None
+        return True, action
+
+    def invalidate_inference(self):
+        self._agent_result = None
+
     def devices(self):
         return self.calibrated_stage, self.calibrated_unit, self.microscope
 
@@ -205,7 +254,7 @@ class HardwareFreeTest(unittest.TestCase):
         self.controller = Controller(self.clock)
         self.helper = self.controller.observation_helper
 
-    def publish(self, frame=11, value=1.0, acquired_at=None, target=None):
+    def publish(self, frame=11, value=1.0, acquired_at=None, target=None, image_shape=(4, 6, 3)):
         acquired_at = self.clock.now - 0.1 if acquired_at is None else acquired_at
         result = dict(source_frame=frame, frame_available_at=acquired_at,
                       frame_acquired_at=acquired_at - 0.01,
@@ -219,10 +268,54 @@ class HardwareFreeTest(unittest.TestCase):
                       source_positions={"stage": np.zeros(3), "microscope": 0.0,
                                         "manipulator": np.zeros(3)},
                       positions_sampled_at=acquired_at + 0.01,
-                      source_image_shape=(4, 6, 3),
-                      _source_image=np.full((4, 6, 3), value, dtype=np.uint8))
+                      source_image_shape=image_shape,
+                      _source_image=np.full(image_shape, value, dtype=np.uint8))
         self.helper._deep_learning_observation = (target, deepcopy(result))
         return result
+
+    def enable_fresh_hunt_visuals(self):
+        """Simulate a running detector only for lifecycle tests that require contact."""
+        original_observe = self.controller.observe
+        def observe(*args, **kwargs):
+            result = self.publish(frame=self.controller.read_count + 1, value=50.0)
+            result["source_image_shape"] = (100, 100, 3)
+            result["_source_image"] = np.zeros((100, 100, 3), dtype=np.uint8)
+            self.helper._deep_learning_observation = (None, result)
+            return original_observe(*args, **kwargs)
+        self.controller.observe = observe
+
+    def drive_operation(self, phase, monitor, *, observation, state, mode="Adaptive"):
+        """Exercise the real supervisor until this operation commits its transition."""
+        class OperationCompleted(Exception):
+            pass
+        name = monitor.__name__
+        state["active_state"] = ("center_cell" if getattr(phase, "shift_cell", True) else "center_pipette") if name == "shift" else name
+        if "z_bounds" not in state:
+            state["start_position"] = None
+        prepare, observe, decide = phase.prepare, phase.observe, phase.decide
+        record = self.helper.record_calculations
+        first = [observation]
+        def next_observation(**kwargs):
+            return first.pop() if first else observe(**kwargs)
+        def deciding(*args, **kwargs):
+            result = decide(*args, **kwargs)
+            if result["outcome"] == "transition":
+                self.operation_context = dict(state["state_context"])
+            return result
+        def recorded(owner, sample, calculations):
+            record(owner, sample, calculations)
+            if sample.get("hunt_transition") is not None:
+                raise OperationCompleted()
+        phase.prepare = lambda *args, **kwargs: state
+        phase.observe, phase.decide = next_observation, deciding
+        self.helper.record_calculations = recorded
+        try:
+            phase.run(state["cell"])
+        except OperationCompleted:
+            return True
+        finally:
+            phase.prepare, phase.observe, phase.decide = prepare, observe, decide
+            self.helper.record_calculations = record
 
     def phase(self, mode="Adaptive", cell_type="Slice"):
         self.controller.config.mode = mode
@@ -360,20 +453,47 @@ class HuntTests(HardwareFreeTest):
         phase = self.phase(mode, cell_type)
         cell = (np.array([-50., -50.]), np.zeros((100, 100, 3)), np.zeros(3))
         state = phase.prepare(cell, mode=mode, cell_type=cell_type)
-        self.publish(value=50.)
+        self.publish(value=50., image_shape=(100, 100, 3))
         observation = phase.observe(**state["observe"])
+        phase.calculate(observation, state)
         return phase, state, observation
 
     def complete_cycle(self, phase, state, observation, gap):
-        state["completed"] = False
-        self.assertEqual(phase.decide(observation, state, mode="Adaptive", cell_type="Slice")[0], phase.spear)
-        state["completed"] = True
-        for expected in (phase.search, phase.shift, phase.scan, phase.shift):
-            self.assertEqual(phase.decide(observation, state, mode="Adaptive", cell_type="Slice")[0], expected)
-        self.assertFalse(phase.shift_cell)
+        """Supply successful operation predicates; let run commit all five transitions."""
         phase.cell_z_um = 100.
         state["pipette_z_um"] = 100. + gap
-        return phase.decide(observation, state, mode="Adaptive", cell_type="Slice")
+        originals = {name: getattr(phase, name) for name in ("spear", "search", "scan", "shift")}
+        observe, record = phase.observe, self.helper.record_calculations
+        def sample():
+            self.clock.now += .05
+            result = deepcopy(observation)
+            result["resistance"] = 5.
+            result["target_cell_observed_z_um"] = 100.
+            result["visual_context_valid"] = True
+            result["deep_learning"].update(source_frame=int(self.clock.now * 1000),
+                frame_acquired_at=self.clock.now, positions_sampled_at=self.clock.now, stale=False)
+            return result
+        def completed(observation, current):
+            current["state_context"].update(exit_reason="verified_operation", best_z=100. + gap)
+            return True, None
+        try:
+            phase.observe = lambda **kwargs: sample()
+            self.helper.record_calculations = lambda *args, **kwargs: None
+            state["readings"].clear()
+            for step in ("spear", "search", "center_cell", "scan", "center_pipette"):
+                name = "shift" if step.startswith("center_") else step
+                def monitor(observation, current):
+                    return completed(observation, current)
+                monitor.__name__ = name
+                setattr(phase, name, monitor)
+                phase.shift_cell = step == "center_cell"
+                self.assertEqual(state["active_state"], step)
+                self.drive_operation(phase, monitor, observation=sample(), state=state)
+            return state["decision"]
+        finally:
+            for name, monitor in originals.items():
+                setattr(phase, name, monitor)
+            phase.observe, self.helper.record_calculations = observe, record
 
 
 
@@ -416,7 +536,7 @@ class HuntTests(HardwareFreeTest):
 
     def test_target_association_and_pressure_are_in_the_recorded_sample(self):
         phase, state, _ = self.make_attempt()
-        self.publish(frame=31, value=50.)
+        self.publish(frame=31, value=50., image_shape=(100, 100, 3))
         self.helper._deep_learning_observation[1]["source_positions"]["microscope"] = 7.
         self.controller.calibrated_stage.xyz[0] = 200.
         observation = phase.observe(**state["observe"])
@@ -440,8 +560,10 @@ class HuntTests(HardwareFreeTest):
         self.assertFalse(observation["target_cell_valid"])
         self.assertEqual(observation["target_cell_status"], "unavailable")
         self.assertTrue(np.isnan(observation["target_cell_observed_z_um"]))
-        phase.spear(observation, observation, dict(state, descent_direction=1, monitor_state={}))
-        self.assertIsNone(phase.cell_lost)
+        state["state_context"] = dict(start=observation, estimated_gap_um=20., checkpoint_um=10.)
+        completed, _ = phase.spear(observation, state)
+        self.assertFalse(completed)
+        self.assertNotIn("exit_reason", state["state_context"])
         self.helper._deep_learning_observation[1]["cell_detections"] = []
         self.assertEqual(phase.observe(**state["observe"])["target_cell_status"], "not_detected")
 
@@ -465,14 +587,14 @@ class HuntTests(HardwareFreeTest):
             pipette_focus=0., source_image_shape=(100, 100, 3))
         observation["visual_context_valid"] = True
         observation["target_cell_valid"] = True
-        for monitor in (phase.search, phase.scan, phase.shift):
-            with self.subTest(monitor=monitor.__name__):
-                state["monitor_state"] = {"after_move": 100.}
-                state["travel_limit"] = 10.
-                phase.shift_cell = False
-                completed, command, _ = monitor(observation, observation, state)
-                self.assertFalse(completed)
-                self.assertEqual(command, 0.)
+        for step in ("search", "scan", "center_pipette"):
+            with self.subTest(step=step):
+                state.update(active_state=step, state_context=dict(after_move=100., start=observation,
+                             travel_limit=10., entered_at=self.clock.now, waiting=0))
+                decision = phase.decide(observation, state, mode="Adaptive", cell_type="Slice")
+                self.assertEqual(decision["outcome"], "hold")
+                self.assertEqual(decision["reason"], "awaiting_visual_evidence")
+                self.assertIsNone(decision["command"])
 
     def test_progress_starts_at_20_counts_first_cycle_and_resets_early(self):
         phase, state, observation = self.make_attempt()
@@ -497,7 +619,7 @@ class HuntTests(HardwareFreeTest):
                     self.complete_cycle(phase, state, observation, 20.)
                 with self.assertRaises(AutopatchError):
                     self.complete_cycle(phase, state, observation, final_gap)
-                self.assertEqual(phase.operation, phase.shift)
+                self.assertEqual(state["active_state"], "center_pipette")
                 reset = phase.prepare(state["cell"], mode="Adaptive", cell_type="Slice")
                 self.assertEqual(reset["progress_cycles"], 0)
                 self.assertEqual(reset["progress_baseline_um"], 20.)
@@ -505,24 +627,23 @@ class HuntTests(HardwareFreeTest):
 
     def test_spear_requires_a_seen_cell_before_declaring_visual_loss(self):
         phase, state, observation = self.make_attempt()
-        state["monitor_state"] = {}
-        state["descent_direction"] = 1
+        state["state_context"] = dict(start=deepcopy(observation), estimated_gap_um=20., checkpoint_um=10.)
         observation.update(target_cell_valid=False, target_cell_status="not_detected")
-        completed, _, _ = phase.spear(observation, observation, state)
+        completed, _ = phase.spear(observation, state)
         self.assertFalse(completed)
-        self.assertIsNone(phase.cell_lost)
+        self.assertNotIn("cell_seen", state["state_context"])
         observation.update(target_cell_valid=True, target_cell_status="observed")
-        completed, _, _ = phase.spear(observation, observation, state)
+        completed, _ = phase.spear(observation, state)
         self.assertFalse(completed)
-        self.assertFalse(phase.cell_lost)
+        self.assertTrue(state["state_context"]["cell_seen"])
         observation.update(target_cell_valid=False, target_cell_status="unavailable")
-        completed, _, _ = phase.spear(observation, observation, state)
+        completed, _ = phase.spear(observation, state)
         self.assertFalse(completed)
-        self.assertFalse(phase.cell_lost)
+        self.assertNotIn("exit_reason", state["state_context"])
         observation.update(target_cell_status="not_detected")
-        completed, _, _ = phase.spear(observation, observation, state)
+        completed, _ = phase.spear(observation, state)
         self.assertTrue(completed)
-        self.assertTrue(phase.cell_lost)
+        self.assertEqual(state["state_context"]["exit_reason"], "cell_lost_confirmed")
 
     def test_invalid_adaptive_baseline_fails_before_movement(self):
         for distance in (0., -1., float("nan"), float("inf")):
@@ -538,8 +659,11 @@ class HuntTests(HardwareFreeTest):
             for cell_type in ("Plate", "Slice"):
                 with self.subTest(mode=mode, cell_type=cell_type):
                     self.controller = Controller(self.clock, mode, cell_type)
+                    self.controller.initial_clear_samples = 3
                     self.helper = self.controller.observation_helper
                     phase = self.phase(mode, cell_type)
+                    if mode == "Adaptive":
+                        self.enable_fresh_hunt_visuals()
                     if mode == "Training":
                         self.controller.manual_after_samples = 5
                         original_observe = self.controller.observe
@@ -554,7 +678,7 @@ class HuntTests(HardwareFreeTest):
                     moves = [e for e in self.controller.events if e[0] in ("absolute", "relative")]
                     if mode in ("Manual", "Training"):
                         self.assertFalse(moves)
-                    self.assertEqual(self.controller.read_count, 5 if mode == "Training" else 4)
+                    self.assertEqual(self.controller.read_count, 5 if mode == "Training" else 8)
                     if mode == "Agent":
                         self.assertIn(("relative", "pipette", (-10., -20., 3.)), moves)
                         self.assertIn(("relative", "pipette", (0, 0, 0)), moves)
@@ -580,7 +704,7 @@ class HuntTests(HardwareFreeTest):
                         self.controller.config.cell_distance = float("nan")
                     phase.prepare((np.array([-50., -50.]), None, None), mode=mode, cell_type=cell_type)
                     self.assertFalse(any(e[0] in ("absolute", "relative") for e in self.controller.events))
-                    if mode == "Adaptive" and cell_type == "Slice":
+                    if mode == "Adaptive":
                         self.assertEqual(calls, [("start", {"cell": None}),
                                                  ("models", {"cell": True, "pipette": True})])
                     else:
@@ -600,8 +724,11 @@ class HuntTests(HardwareFreeTest):
         for mode, cell_type, changed_mode, changed_type in changes:
             with self.subTest(mode=mode, cell_type=cell_type):
                 self.controller = Controller(self.clock, mode, cell_type)
+                self.controller.initial_clear_samples = 3
                 self.helper = self.controller.observation_helper
                 phase = self.phase(mode, cell_type)
+                if mode == "Adaptive":
+                    self.enable_fresh_hunt_visuals()
                 calls = []
                 self.helper.start_deep_learning = lambda **kw: calls.append("start")
                 self.helper.set_deep_learning_models = lambda **kw: calls.append("models")
@@ -633,10 +760,10 @@ class HuntTests(HardwareFreeTest):
                     self.assertIn(("absolute", "pipette", (0, 0, 2.)), moves)
                     self.assertTrue(all(e[0] == "absolute" for e in moves))
                 self.assertEqual(calls, ["start", "models", "stop"]
-                                 if mode == "Adaptive" and cell_type == "Slice" else [])
+                                 if mode == "Adaptive" else [])
                 model_calls = [e for e in self.controller.events if e[0] == "model"]
                 self.assertEqual(model_calls, [("model", "hunt")] if mode == "Agent" else [])
-                self.assertEqual(self.controller.read_count, 5 if mode == "Training" else 4)
+                self.assertEqual(self.controller.read_count, 5 if mode == "Training" else 8)
                 self.assertTrue(all(device.stops for device in self.controller.devices()))
 
     def test_adaptive_inference_start_and_selection_failures_are_cleaned_up(self):
@@ -685,24 +812,32 @@ class HuntTests(HardwareFreeTest):
 
     def test_public_run_stops_after_four_unproductive_cycles_before_fifth_spear(self):
         phase = self.phase()
-        self.controller.resistance = 5.0
+        self.controller.resistance = 5.
         self.helper.stop_deep_learning = lambda: self.controller.events.append(("inference_stop",))
-        actual_act = phase.act
-        operations = []
-        def completed_action(monitor=None, **kwargs):
-            if kwargs.get("stop"):
-                return actual_act(stop=True)
-            operations.append((monitor.__name__, phase.shift_cell))
-            if monitor == phase.shift and not phase.shift_cell:
-                phase.cell_z_um = 100.0
-                kwargs["state"]["pipette_z_um"] = 120.0
-            return True
-        phase.act = completed_action
-        with self.assertRaisesRegex(AutopatchError, "4 cycles"):
-            phase.run((np.array([-50.0, -50.0]), None, None))
-        self.assertEqual(sum(name == "spear" for name, _ in operations), 4)
-        self.assertEqual(sum(name == "shift" and not cell for name, cell in operations), 4)
-        self.assertEqual(phase.operation, phase.shift)
+        operations, seen_states = [], set()
+        def completed(observation, current):
+            if current["state_id"] not in seen_states:
+                operations.append(current["active_state"])
+                seen_states.add(current["state_id"])
+            current["state_context"].update(exit_reason="verified_operation", best_z=120.)
+            return True, None
+        phase.spear = phase.search = phase.scan = phase.shift = completed
+        def observe(**kwargs):
+            self.clock.now += .05
+            sample = dict(resistance=5., manipulator_position=np.zeros(3), stage_positions=np.zeros(3),
+                          target_cell_observed_z_um=100., visual_context_valid=True,
+                          deep_learning=dict(source_frame=int(self.clock.now * 1000), stale=False,
+                              frame_acquired_at=self.clock.now, positions_sampled_at=self.clock.now))
+            self.helper.record_observation(phase, sample)
+            return sample
+        phase.observe = observe
+        with self.assertRaisesRegex(AutopatchError, "cycle-progress"):
+            phase.run((np.array([-50., -50.]), None, None))
+        self.assertEqual(operations.count("spear"), 4)
+        self.assertEqual(operations.count("center_pipette"), 4)
+        self.assertEqual(phase.state["progress_cycles"], 4)
+        self.assertEqual(phase.state["state_id"], 20)
+        self.assertEqual(phase.state["active_state"], "center_pipette")
         self.assertTrue(all(device.stops for device in self.controller.devices()))
         self.assertIn(("inference_stop",), self.controller.events)
 
@@ -727,22 +862,22 @@ class HuntTests(HardwareFreeTest):
 class ActionGateTests(HardwareFreeTest):
     def setup_gate(self):
         phase = self.phase()
-        observation = {"manipulator_position": np.zeros(3),
-                       "stage_positions": np.zeros(3), "resistance": 5.0}
-        state = {"start_position": np.zeros(3), "travel_limit": 10.0,
-                 "descent_direction": 1, "observe": {},
-                 "readings": collections.deque([5.0] * 5), "latest_resistance": 5.0}
+        state = phase.prepare((np.array([-50., -50.]), None, None), mode="Adaptive", cell_type="Slice")
+        observation = dict(manipulator_position=np.zeros(3), stage_positions=np.zeros(3), resistance=5.0,
+                           visual_context_valid=True, deep_learning=dict(source_frame=1,
+                               frame_acquired_at=self.clock.now, positions_sampled_at=self.clock.now, stale=False))
+        phase.calculate(observation, state)
+        state["state_context"] = dict(start=deepcopy(observation), entered_at=self.clock.now,
+                                     travel_limit=10., estimated_gap_um=20., checkpoint_um=10., waiting=0)
+        self.controller.events.clear()
         return phase, observation, state
 
     def test_shift_rejects_unsafe_vectors_and_projected_total_travel(self):
         phase, observation, state = self.setup_gate()
-        phase.shift_cell = True
-        start = deepcopy(observation)
+        state["active_state"] = "center_cell"
         def allowed(vector, device=None):
-            return phase.action_gate(observation, state, monitor=phase.shift,
-                                     command={"relative": vector}, start=start,
-                                     mode="Adaptive", max_distance=20.0,
-                                     device=device or self.controller.calibrated_stage)
+            command = dict(kind="relative", value=vector, device=device or self.controller.calibrated_stage)
+            return phase.action_gate(observation, state, command=command)
         for vector in ([50.01, 0], [0, 0, 1], [math.nan, 0], [1], [1, 2, 3, 4]):
             with self.subTest(vector=vector):
                 self.assertFalse(allowed(vector))
@@ -755,113 +890,110 @@ class ActionGateTests(HardwareFreeTest):
 
     def test_focus_gate_bounds_target_velocity_direction_and_live_limit(self):
         phase, observation, state = self.setup_gate()
-        start = deepcopy(observation)
-        def allowed(monitor, command, maximum=20.0):
-            return phase.action_gate(observation, state, monitor=monitor,
-                                     command=command, start=start, mode="Adaptive",
-                                     max_distance=maximum, device=self.controller.microscope)
-        self.assertTrue(allowed(phase.scan, {"absolute_z": 10.0}))
-        self.assertFalse(allowed(phase.scan, {"absolute_z": 10.01}))
-        self.assertFalse(allowed(phase.scan, {"absolute_z": 7.0}, 5.0))
-        self.assertFalse(allowed(phase.search, {"absolute_z": 1.0}))
-        self.assertTrue(allowed(phase.search, -2.0))
-        self.assertFalse(allowed(phase.search, 2.0))
-        self.assertTrue(allowed(phase.scan, 2.0))
-        self.assertFalse(allowed(phase.scan, -2.0))
-        observation["stage_positions"][2] = 10.0
-        self.assertFalse(allowed(phase.scan, 2.0))
-        observation["stage_positions"][2] = -10.0
-        self.assertFalse(allowed(phase.search, -2.0))
-        observation["stage_positions"][2] = 100.0
-        self.assertTrue(allowed(phase.search, 0.0))
+        def allowed(step, value, maximum=20., kind="velocity"):
+            state["active_state"] = step
+            self.controller.config.max_distance = maximum
+            return phase.action_gate(observation, state, command=dict(
+                kind=kind, value=value, device=self.controller.microscope))
+        self.assertTrue(allowed("scan", 10., kind="absolute_z"))
+        self.assertFalse(allowed("scan", 10.01, kind="absolute_z"))
+        self.assertFalse(allowed("scan", 7., 5., kind="absolute_z"))
+        self.assertFalse(allowed("search", 1., kind="absolute_z"))
+        self.assertTrue(allowed("search", -2.))
+        self.assertFalse(allowed("search", 2.))
+        self.assertTrue(allowed("scan", 2.))
+        self.assertFalse(allowed("scan", -2.))
+        observation["stage_positions"][2] = 10.
+        self.assertFalse(allowed("scan", 2.))
+        observation["stage_positions"][2] = -10.
+        self.assertFalse(allowed("search", -2.))
+        observation["stage_positions"][2] = 100.
+        self.assertTrue(phase.action_gate(observation, state, command=dict(kind="stop")))
 
     def test_spear_and_direct_modes_reject_distance_and_passive_motion(self):
         phase, observation, state = self.setup_gate()
-        start = deepcopy(observation)
-        common = dict(mode="Adaptive", max_distance=20.0,
-                      device=self.controller.calibrated_unit)
-        self.assertTrue(phase.action_gate(observation, state, monitor=phase.spear,
-                                         command=2.0, start=start, **common))
-        self.assertFalse(phase.action_gate(observation, state, monitor=phase.spear,
-                                          command=-2.0, start=start, **common))
-        observation["manipulator_position"][2] = 20.0
-        self.assertFalse(phase.action_gate(observation, state, monitor=phase.spear,
-                                          command=2.0, start=start, **common))
+        command = dict(kind="velocity", device=self.controller.calibrated_unit, value=[0., 0., 2.])
+        self.assertTrue(phase.action_gate(observation, state, command=command))
+        self.assertFalse(phase.action_gate(observation, state, command=dict(command, value=[0., 0., -2.])))
+        observation["manipulator_position"][2] = 20.
+        self.assertFalse(phase.action_gate(observation, state, command=command))
         for mode in ("Classic", "Agent", "Adaptive", "Manual", "Training"):
             with self.subTest(mode=mode):
-                with self.assertRaises(AutopatchError):
-                    phase.act(observation=observation, state=state,
-                              velocity=[0, 0, 2], mode=mode)
-        observation["manipulator_position"][2] = 0.0
+                state["mode"] = mode
+                self.assertFalse(phase.action_gate(observation, state, command=command))
+        observation["manipulator_position"][2] = 0.
         for mode in ("Manual", "Training"):
-            with self.assertRaises(AutopatchError):
-                phase.act(observation=observation, state=state, velocity=[0, 0, 2], mode=mode)
+            state["mode"] = mode
+            self.assertFalse(phase.action_gate(observation, state, command=command))
         self.assertFalse(any(event[0] in ("absolute", "relative") for event in self.controller.events))
 
     def test_executor_rejects_second_shift_outside_total_envelope(self):
         phase, observation, state = self.setup_gate()
         phase.shift_cell = True
-        phase.success_gate = lambda *args, **kwargs: False
         calls = []
-        def monitor(observation, start, state):
+        def monitor(observation, current):
             calls.append(1)
-            return False, {"relative": [40 if len(calls) == 1 else 20, 0, 0]}, self.controller.calibrated_stage
+            return False, dict(kind="relative", value=[40 if len(calls) == 1 else 20, 0, 0],
+                               device=self.controller.calibrated_stage, alignment_error=100. / len(calls))
+        monitor.__name__ = "shift"
         phase.shift = monitor
-        phase.observe = lambda **kwargs: dict(observation, stage_positions=self.controller.calibrated_stage.xyz.copy())
+        def observe(**kwargs):
+            self.clock.now += .05
+            result = deepcopy(observation)
+            result["stage_positions"] = self.controller.calibrated_stage.xyz.copy()
+            result["deep_learning"].update(source_frame=int(self.clock.now * 1000),
+                                           frame_acquired_at=self.clock.now, positions_sampled_at=self.clock.now)
+            return result
+        phase.observe = observe
+        self.helper.record_calculations = lambda *args, **kwargs: None
         with self.assertRaisesRegex(AutopatchError, "action gate"):
-            phase.act(phase.shift, observation=observation, state=state, mode="Adaptive")
+            self.drive_operation(phase, phase.shift, observation=observation, state=state)
         moves = [event for event in self.controller.events if event[0] == "relative_move"]
-        self.assertEqual(moves, [("relative_move", "stage", (40.0, 0.0, 0.0))])
+        self.assertEqual(moves, [("relative_move", "stage", (40., 0., 0.))])
         self.assertTrue(all(device.stops for device in self.controller.devices()))
 
     def test_unchanged_spear_velocity_rechecks_reduced_live_distance(self):
         phase, observation, state = self.setup_gate()
-        phase.success_gate = lambda *args, **kwargs: False
-        def monitor(observation, start, state):
-            state["descent_direction"] = 1
-            return False, 2.0, self.controller.calibrated_unit
+        def monitor(observation, current):
+            return False, dict(kind="velocity", value=[0., 0., 2.], device=self.controller.calibrated_unit)
+        monitor.__name__ = "spear"
         def next_observation(**kwargs):
-            self.controller.config.max_distance = 5.0
-            return dict(observation, manipulator_position=np.array([0.0, 0.0, 10.0]))
+            self.controller.config.max_distance = 5.
+            return dict(observation, manipulator_position=np.array([0., 0., 10.]))
         phase.spear, phase.observe = monitor, next_observation
+        self.helper.record_calculations = lambda *args, **kwargs: None
         with self.assertRaisesRegex(AutopatchError, "action gate"):
-            phase.act(phase.spear, observation=observation, state=state, mode="Adaptive")
+            self.drive_operation(phase, phase.spear, observation=observation, state=state)
         moves = [event for event in self.controller.events if event[0] == "absolute"]
-        self.assertEqual(moves, [("absolute", "pipette", (0, 0, 2.0))])
+        self.assertEqual(moves, [("absolute", "pipette", (0, 0, 2.))])
         self.assertTrue(all(device.stops for device in self.controller.devices()))
 
     def test_classic_speed_updates_and_unchanged_velocity_still_rechecks_limit(self):
         phase, observation, state = self.setup_gate()
-        state["started"] = True
-        for speed in (2.0, 2.0, 3.0):
+        state.update(mode="Classic", active_state="classic")
+        for speed in (2., 2., 3.):
             self.controller.config.max_descent_speed = speed
-            monitor, velocity, relative = phase.decide(observation, state,
-                                                       mode="Classic", cell_type="Plate")
-            phase.act(monitor, observation=observation, state=state,
-                      velocity=velocity, relative=relative, mode="Classic")
+            decision = phase.decide(observation, state, mode="Classic", cell_type="Plate")
+            self.assertTrue(phase.action_gate(observation, state, command=decision["command"]))
+            phase.act(observation, state, command=decision["command"])
         self.assertEqual([event for event in self.controller.events if event[0] == "absolute"],
-                         [("absolute", "pipette", (0, 0, 2.0)),
-                          ("absolute", "pipette", (0, 0, 3.0))])
-        observation["manipulator_position"][2] = 10.0
-        self.controller.config.max_distance = 5.0
-        monitor, velocity, relative = phase.decide(observation, state,
-                                                   mode="Classic", cell_type="Plate")
-        with self.assertRaisesRegex(AutopatchError, "action gate"):
-            phase.act(monitor, observation=observation, state=state,
-                      velocity=velocity, relative=relative, mode="Classic")
+                         [("absolute", "pipette", (0, 0, 2.)), ("absolute", "pipette", (0, 0, 3.))])
+        observation["manipulator_position"][2] = 10.
+        self.controller.config.max_distance = 5.
+        decision = phase.decide(observation, state, mode="Classic", cell_type="Plate")
+        self.assertFalse(phase.action_gate(observation, state, command=decision["command"]))
         self.assertEqual(len([event for event in self.controller.events if event[0] == "absolute"]), 2)
 
     def test_request_exceptions_take_precedence_over_rejected_motion(self):
         phase, observation, state = self.setup_gate()
+        command = dict(kind="velocity", device=self.controller.calibrated_unit, value=[0., 0., 2.])
         for abort, success, exception in ((True, False, RequestedAbortException),
                                           (False, True, RequestedSuccessException),
                                           (True, True, RequestedAbortException)):
             with self.subTest(abort=abort, success=success):
-                self.controller.abort_requested = abort
-                self.controller.success_requested = success
+                self.controller.abort_requested, self.controller.success_requested = abort, success
                 with self.assertRaises(exception):
-                    phase.act(observation=observation, state=state,
-                              velocity=[0, 0, 2], mode="Classic")
+                    phase.act(observation, state, command=command)
                 phase.act(stop=True)
         self.assertFalse(any(event[0] in ("absolute", "relative") for event in self.controller.events))
         self.assertTrue(all(device.stops == 3 for device in self.controller.devices()))
