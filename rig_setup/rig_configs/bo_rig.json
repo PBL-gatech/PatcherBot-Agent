@@ -1,119 +1,98 @@
 {
-    "name":  "Bo Rig",
-    "schema_version":  2,
-    "calibration_file":  "bo_cal.yaml",
-    "patch_file":  "bo_patch.yaml",
-    "protocol_file":  "bo_protocol.yaml",
-    "calibration":  {
-                        "pipette_detector_model":  null,
-                        "pipette_focuser_model":  null
-                    },
-    "ai_features":  {
-                        "enabled":  true
-                    },
-    "devices":  {
-                    "stage_controller":  {
-                                             "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
-                                             "params":  {
-                                                            "serial":  {
-                                                                           "port":  "COM9",
-                                                                           "baudrate":  9600
-                                                                       },
-                                                            "max_speed":  100000,
-                                                            "max_accel":  1000,
-                                                            "polling_freq":  100
-                                                        }
-                                         },
-                    "pipette_controller":  {
-                                               "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
-                                               "params":  {
-                                                              "serial":  {
-                                                                             "port":  "COM16",
-                                                                             "baudrate":  9600
-                                                                         },
-                                                              "max_speed":  100000,
-                                                              "max_accel":  1000,
-                                                              "polling_freq":  100
-                                                          }
-                                           },
-                    "camera":  {
-                                   "class":  "patcherbot.devices.camera.pcocamera.PcoCamera",
-                                   "params":  {
-                                                  "width":  1280,
-                                                  "height":  1280
-                                              }
-                               },
-                    "pipette_camera":  {
-                                           "class":  "patcherbot.devices.camera.camera.FakeCamera",
-                                           "params":  {
-                                                          "image_z":  0,
-                                                          "paramecium":  false
-                                                      }
-                                       },
-                    "cell_sorter_controller":  {
-                                                   "class":  "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterController",
-                                                   "params":  {
-
-                                                              }
-                                               },
-                    "cell_sorter_manipulator":  {
-                                                    "class":  "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterManip",
-                                                    "params":  {
-
-                                                               }
-                                                },
-                    "daq":  {
-                                "class":  "patcherbot.devices.amplifier.DAQ.NiDAQ",
-                                "params":  {
-                                               "readDev":  "Dev1",
-                                               "readChannel":  "ai17",
-                                               "cmdDev":  "Dev1",
-                                               "cmdChannel":  "ao0",
-                                               "respDev":  "Dev1",
-                                               "respChannel":  "ai19"
-                                           }
-                            },
-                    "amplifier":  {
-                                      "class":  "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
-                                      "params":  {
-                                                     "channel":  1
-                                                 }
-                                  },
-                    "pressure":  {
-                                     "class":  "patcherbot.devices.pressurecontroller.SerialPressureController.SerialPressureController",
-                                     "params":  {
-                                                    "channel":  1,
-                                                    "controllerSerial":  {
-                                                                             "port":  "COM7",
-                                                                             "baudrate":  9600,
-                                                                             "timeout":  0
-                                                                         },
-                                                    "readerSerial":  {
-                                                                         "port":  "COM8",
-                                                                         "baudrate":  9600,
-                                                                         "timeout":  0
-                                                                     },
-                                                    "validProducts":  [
-                                                                          "USB Serial"
-                                                                      ],
-                                                    "validVIDs":  [
-                                                                      6790,
-                                                                      1027
-                                                                  ],
-                                                    "serialCmdTimeout":  1.0
-                                                }
-                                 },
-                    "lamp":  {
-                                 "class":  "patcherbot.devices.lamp.lamp.FakeLamp",
-                                 "params":  {
-
-                                            }
-                             },
-                    "laser":  {
-                                  "class":  "patcherbot.devices.laser.laser.FakeLaser",
-                                  "params":  {
-
-                                             }
-                              }
-                }
+  "name": "Bo Rig",
+  "schema_version": 2,
+  "devices": {
+    "stage_controller": {
+      "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
+      "params": {
+        "serial": {
+          "port": "COM9",
+          "baudrate": 9600
+        },
+        "max_speed": 100000,
+        "max_accel": 1000,
+        "polling_freq": 100
+      }
+    },
+    "pipette_controller": {
+      "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
+      "params": {
+        "serial": {
+          "port": "COM16",
+          "baudrate": 9600
+        },
+        "max_speed": 100000,
+        "max_accel": 1000,
+        "polling_freq": 100
+      }
+    },
+    "camera": {
+      "class": "patcherbot.devices.camera.pcocamera.PcoCamera",
+      "params": {}
+    },
+    "pipette_camera": {
+      "class": "patcherbot.devices.camera.camera.FakeCamera",
+      "params": {
+        "image_z": 0,
+        "paramecium": false
+      }
+    },
+    "cell_sorter_controller": {
+      "class": "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterController",
+      "params": {}
+    },
+    "cell_sorter_manipulator": {
+      "class": "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterManip",
+      "params": {}
+    },
+    "daq": {
+      "class": "patcherbot.devices.amplifier.DAQ.NiDAQ",
+      "params": {
+        "readDev": "Dev1",
+        "readChannel": "ai17",
+        "cmdDev": "Dev1",
+        "cmdChannel": "ao0",
+        "respDev": "Dev1",
+        "respChannel": "ai19"
+      }
+    },
+    "amplifier": {
+      "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
+      "params": {
+        "channel": 1
+      }
+    },
+    "pressure": {
+      "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
+      "params": {
+        "channel": 1,
+        "controllerSerial": {
+          "port": "COM7",
+          "baudrate": 9600,
+          "timeout": 0
+        },
+        "readerSerial": {
+          "port": "COM8",
+          "baudrate": 9600,
+          "timeout": 0
+        },
+        "validProducts": [
+          "USB Serial"
+        ],
+        "validVIDs": [
+          6790,
+          1027
+        ],
+        "serialCmdTimeout": 1.0
+      }
+    },
+    "lamp": {
+      "class": "patcherbot.devices.lamp.lamp.FakeLamp",
+      "params": {}
+    },
+    "laser": {
+      "class": "patcherbot.devices.laser.laser.FakeLaser",
+      "params": {}
+    }
+  }
 }

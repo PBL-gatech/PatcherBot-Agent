@@ -814,11 +814,6 @@ class EPhysGraph(QWidget):
             pressureX = [i * self.updateDt / 1000 for i in range(len(self.pressureData))]
             self.pressurePlot.clear()
             self.pressurePlot.plot(pressureX, list(self.pressureData))
-            pressure_target = abs(pressure)
-            if pressure_target < 1:
-                pressure_target = 1
-            max_abs_pressure = pressure_target * 2
-            self.pressurePlot.setYRange(-max_abs_pressure, max_abs_pressure, padding=0.0)
             # Update the slider only if the user is not interacting with it.
             if not self.pressureCommandSlider.isSliderDown():
                 self.pressureCommandSlider.setValue(pressure)

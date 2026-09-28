@@ -10,7 +10,7 @@ custom_cclamp_protocol: true
 cclamp_step: 30
 cclamp_start: -500
 cclamp_end: 500
-cclamp_hold: -50
+cclamp_hold: -70
 cclamp_recording_time_ms: 500
 cclamp_duty_cycle: 0.5
 hclamp_duration: 30

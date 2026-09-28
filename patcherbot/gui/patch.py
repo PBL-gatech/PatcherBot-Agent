@@ -697,7 +697,7 @@ class ClassicPatchButtons(ButtonTabWidget):
         buttonList = [['move group down','move group up'],['move group in x','move group in y'],
                       ['Move to Safe Position','Move to Home Position'],
                       ['Move to cell plane','Focus Stage'],
-                      ['Store corners', 'Start Scan'],
+                      ['Store corners', 'Start Scan', 'Constant Disturbance'],
                       ['Center Pipette','Clean pipette','Focus Pipette']]
 
         cmds = [
@@ -710,11 +710,17 @@ class ClassicPatchButtons(ButtonTabWidget):
             [
                 self.patch_interface.start_selecting_corners,
                 [[self.patch_interface.move_to_scan_start, self.start_recording, self.patch_interface.start_scan, self.stop_recording]],
+                self.toggle_constant_disturbance,
             ],
             [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
 
         ]
         self.addButtonList('movement', layout, buttonList, cmds, sequential=True)
+        self.constant_disturbance_active = False
+        self.constant_disturbance_button = self.get_section_button('movement', 'Constant Disturbance')
+        if self.constant_disturbance_button is not None:
+            self.constant_disturbance_button.setCheckable(True)
+
 
         # self.pipette_location = [self.pipette_interface.follow_stage, self.pipette_interface.move_pipette_random,self.rest,self.start_recording,self.patch_interface.find_pipette]
         # self.pipette_location = [self.pipette_interface.follow_stage, self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
@@ -784,6 +790,56 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         self.setLayout(layout)
 
+    def toggle_constant_disturbance(self):
+        if self.constant_disturbance_active:
+            self.stop_constant_disturbance()
+        else:
+            self.start_constant_disturbance()
+
+    def start_constant_disturbance(self):
+        self.constant_disturbance_active = True
+        self._update_constant_disturbance_button(True)
+        self.start_recording()
+
+        cmd = self.patch_interface.constant_disturbance
+        interface = cmd.__self__
+
+        def on_finished(exit_code, message):
+            try:
+                interface.task_finished.disconnect(on_finished)
+            except Exception:
+                pass
+            if self.constant_disturbance_active:
+                self.constant_disturbance_active = False
+                self._update_constant_disturbance_button(False)
+                QtCore.QTimer.singleShot(5000, self.stop_recording)
+
+        interface.task_finished.connect(on_finished)
+        self.start_task(cmd.task_description, interface)
+        if interface in self.interface_signals:
+            command_signal, _ = self.interface_signals[interface]
+            command_signal.emit(cmd, None)
+        else:
+            cmd(None)
+
+    def stop_constant_disturbance(self):
+        self.constant_disturbance_active = False
+        self._update_constant_disturbance_button(False)
+        self.patch_interface.stop_constant_disturbance()
+        QtCore.QTimer.singleShot(5000, self.stop_recording)
+
+    def _update_constant_disturbance_button(self, active):
+        if self.constant_disturbance_button is None:
+            return
+        self.constant_disturbance_button.blockSignals(True)
+        self.constant_disturbance_button.setChecked(active)
+        self.constant_disturbance_button.blockSignals(False)
+        if active:
+            self.constant_disturbance_button.setText("Stop Disturbance")
+            self.constant_disturbance_button.setStyleSheet("background-color: red; color: white;border-radius: 5px; padding: 5px;")
+        else:
+            self.constant_disturbance_button.setText("Constant Disturbance")
+            self.constant_disturbance_button.setStyleSheet("")
     def load_calibration(self):
         self.file_selector.fileSelected.connect(self.load_calibration_file)  # Connect the signal to the slot
         self.file_selector.open_file_dialog()  # Open the file dialog

@@ -124,6 +124,17 @@ class AutoPatchInterface(TaskInterface):
         self.execute(self.current_autopatcher.scan_area)
 
     @blocking_command(category='Stage',
+                      description='Move pipette and stage in -X at constant speed',
+                      task_description='Running Constant Disturbance')
+    def constant_disturbance(self):
+        self.recording_state_manager.increment_sample_number()
+        self.execute(self.current_autopatcher.constant_disturbance)
+
+    def stop_constant_disturbance(self):
+        if self.current_autopatcher is None:
+            return
+        self.current_autopatcher.stop_constant_disturbance()
+    @blocking_command(category='Stage',
                       description='Move stage to the stored scan start coordinate',
                       task_description='Moving to scan start')
     def move_to_scan_start(self):
