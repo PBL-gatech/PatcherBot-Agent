@@ -855,8 +855,6 @@ class EPhysGraph(QWidget):
                 x_vals = list(range(len(self.resistanceDeque)))
                 self.resistancePlot.clear()
                 self.resistancePlot.plot(x_vals, list(self.resistanceDeque), pen="k")
-                max_resistance = max(totalResistance * 2, 1)
-                self.resistancePlot.setYRange(0, max_resistance, padding=0.0)
             if accessResistance is not None:
                 self.accessResistanceLabel.setText(f"Access Resistance: {accessResistance:.2f} MΩ")
             if membraneResistance is not None:

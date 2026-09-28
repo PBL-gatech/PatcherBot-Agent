@@ -1,17 +1,41 @@
-native_zero: 2033
-native_per_mbar: 2.9263
-reader_offset: 515.975015533536
-reader_scale: 0.327021812354884
-pipette_detector_model: "BoPipetteDetectorNet.onnx"
-pipette_focuser_model: regression_model2.onnx
 position_update: 1000
 autofocus_dist: 50
 stage_diag_move: 500
 frame_lag: 4
+y_delta_scan: 1340
+pipette_diag_move: 200
+stage_x_axis_flip: false
+stage_y_axis_flip: true
+pipette_z_rotation: -20.0105
 pipette_y_rotation: 25
 pipette_k_scale: 0.79156
-stage_x_axis_flip: false
-stage_y_axis_flip: false
-pipette_z_rotation: -20.0105
 microscope_units_per_um: 1.0
+home_position_delta_um: -1000
 safe_position_delta_um: -18000
+native_zero: 2033
+native_per_mbar: 2.9263
+reader_offset: 515.975015533536
+reader_scale: 0.327021812354884
+pipette_detector_model: BoPipetteDetectorNet.onnx
+pipette_focuser_model: regression_model2.onnx
+use_ai_features: true
+home_position:
+- 31434.5
+- 15251.8
+- 21607.7
+home_position_stage:
+- -27077.4
+- 54561.3
+- 15056.3
+safe_position:
+- 15120.959833340301
+- 15251.8
+- 14000.571288667412
+safe_position_stage:
+- -27077.4
+- 54561.3
+- 15056.3
+bath_position:
+- 0
+- 0
+- 0
