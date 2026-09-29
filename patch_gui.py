@@ -18,7 +18,7 @@ set_global_exception_hook()
 from patcherbot.utils.log_utils import setup_logging
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
 from patcherbot.interface import AutoPatchInterface
-from patcherbot.interface.pipettes import PipetteInterface
+from patcherbot.interface.pipettes import CellQueueCoordinator, PipetteInterface
 from patcherbot.interface.graph import GraphInterface
 from patcherbot.gui.graph import EPhysGUI, EPhysGraph, CurrentProtocolGraph, VoltageProtocolGraph, LeakSubtractionGraph, HoldingProtocolGraph, OptogeneticStimProtocolGraph, OptogeneticWavelengthProtocolGraph
 from patcherbot.gui.patch import PatchGui
@@ -160,6 +160,7 @@ def main():
             pipette_controllers[id] = PipetteInterface(
                 stage, microscope, camera, unit[id], cellSorterManip, cellSorterController,
                 calibration_data=calibration_data,
+                pipette_id=id,
             )
 
             patch_controllers[id] = AutoPatchInterface(
@@ -190,6 +191,7 @@ def main():
         pipette_controllers = PipetteInterface(
             stage, microscope, camera, unit, cellSorterManip, cellSorterController,
             calibration_data=calibration_data,
+            pipette_id="pipette_0",
             )
         
         patch_controllers = AutoPatchInterface(
@@ -206,6 +208,24 @@ def main():
             recording_state_manager,
             pipette_ids=["pipette_0"]
         )
+
+    pipette_interface_map = (
+        pipette_controllers
+        if isinstance(pipette_controllers, dict)
+        else {"pipette_0": pipette_controllers}
+    )
+    cell_queue = CellQueueCoordinator(
+        pipette_interface_map,
+        geometry=(patch_data or {}).get("pipette_geometry", []),
+        collision_guard_enabled=(patch_data or {}).get("collision_guard_enabled", True),
+    )
+    patch_interface_map = (
+        patch_controllers
+        if isinstance(patch_controllers, dict)
+        else {"pipette_0": patch_controllers}
+    )
+    for patch_interface in patch_interface_map.values():
+        patch_interface.set_cell_queue(cell_queue)
 
     gui = PatchGui(camera, pipette_camera, pipette_controllers, patch_controllers, recording_state_manager, camera_recording_session, movement_recorder, rig_recorder, graph_recorder)
     graphs = EPhysGUI(graph_interface, recording_state_manager, graph_recorder)

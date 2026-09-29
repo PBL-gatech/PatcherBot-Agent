@@ -1,6 +1,7 @@
 # coding=utf-8
 import pickle
 import os
+from pathlib import Path
 
 import numpy as np
 from datetime import datetime
@@ -12,6 +13,8 @@ from patcherbot.devices.cellsorter import CalibratedCellSorter
 import time
 
 from patcherbot.devices.manipulator.microscope import Microscope
+from .cell_queue import CellQueueCoordinator
+
 
 class PipetteInterface(TaskInterface):
     '''
@@ -19,7 +22,7 @@ class PipetteInterface(TaskInterface):
     '''
 
     def __init__(self, stage, microscope: Microscope, camera, unit, cellsorterManip, cellsorterController,
-                 config_filename='calibration.pickle', calibration_data=None):
+                 config_filename='calibration.pickle', calibration_data=None, pipette_id=None):
         """
         Initialize the PipetteInterface with hardware components and calibration configuration.
 
@@ -34,10 +37,14 @@ class PipetteInterface(TaskInterface):
             calibration_data (dict, optional): Calibration configuration data.
         """
         super().__init__()
+        self.pipette_id = str(pipette_id) if pipette_id is not None else "pipette_0"
+        suffix = self.pipette_id.rsplit("_", 1)[-1]
+        self.pipette_index = int(suffix) if suffix.isdigit() else 0
         self.microscope = microscope
         self.camera = camera
         # Create a common calibration configuration for all stages/manipulators
         self.calibration_config = CalibrationConfig(name='Calibration')
+        self.calibration_config.pipette_id = self.pipette_id
         if calibration_data:
             cleaned = {k: v for k, v in calibration_data.items() if v is not None}
             self.calibration_config.from_dict(cleaned)
@@ -53,9 +60,16 @@ class PipetteInterface(TaskInterface):
                                                 microscope,
                                                 camera,
                                                 config=self.calibration_config)
+        self.calibrated_unit.pipette_id = self.pipette_id
+        self.calibrated_unit.pipette_index = self.pipette_index
+        self.calibrated_stage.pipette_id = self.pipette_id
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
         self.time_truth = datetime.now()
-        self.folder_path = "experiments/Data/calibration_data/" + self.time_truth.strftime("%Y_%m_%d-%H_%M") + "/"
+        self.folder_path = (
+            "experiments/Data/calibration_data/"
+            + self.time_truth.strftime("%Y_%m_%d-%H_%M")
+            + f"/{self.pipette_id}/"
+        )
         self.folder_created = False  # Flag to track folder creation
 
    
@@ -203,7 +217,7 @@ class PipetteInterface(TaskInterface):
 
     @command(category='Manipulators',
                 description='read most recent calibration from file')
-    def read_calibration(self, config_filename='calibration.pickle'):
+    def read_calibration(self, config_filename=None):
         '''
         Read calibration from file.
 
@@ -213,15 +227,29 @@ class PipetteInterface(TaskInterface):
         Raises:
             RuntimeError: If calibration file is not found.
         '''
-        if os.path.isfile(config_filename):
+        if config_filename is None:
+            calibration_root = Path("experiments/Data/calibration_data")
+            candidates = sorted(
+                calibration_root.glob(f"*/{self.pipette_id}/calibration.pickle"),
+                key=lambda path: path.stat().st_mtime,
+            )
+            if not candidates and self.pipette_index == 0:
+                candidates = sorted(
+                    calibration_root.glob("*/calibration.pickle"),
+                    key=lambda path: path.stat().st_mtime,
+                )
+            config_filename = candidates[-1] if candidates else None
+        if config_filename is not None and os.path.isfile(config_filename):
             with open(config_filename, 'rb') as f:
                 cal = pickle.load(f)
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
-                self.home_position = cal['home'][:2]
-                self.home_stage_position = cal['home'][2:]
-                self.safe_position = cal['safe'][:2]
-                self.safe_stage_position = cal['safe'][2:]
+                home = np.asarray(cal['home'], dtype=float)
+                safe = np.asarray(cal['safe'], dtype=float)
+                self.home_position = home[:3]
+                self.home_stage_position = home[3:6]
+                self.safe_position = safe[:3]
+                self.safe_stage_position = safe[3:6]
                 self.cleaning_bath_position = cal['bath']
 
                 print('Loaded calibration from file!')
@@ -304,8 +332,8 @@ class PipetteInterface(TaskInterface):
             distance (float): Movement magnitude in micrometers.
         """
         # currently utilized for automatic safe space saving
-        angle = np.deg2rad(self.calibrated_unit.config.pipette_y_rotation)
-        distance = np.array([distance*np.cos(angle),0,distance*np.sin(angle)])
+        direction = self.calibrated_unit.config.resolve_pipette_axis_direction(self.pipette_id)
+        distance = distance * direction
         self.calibrated_unit.relative_move(distance)
         
     @command(category='Microscope',

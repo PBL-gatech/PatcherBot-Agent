@@ -1,4 +1,4 @@
-﻿from patcherbot.utils.config import Config, NumberWithUnit, Number, Boolean ,Selector
+﻿from patcherbot.utils.config import Config, NumberWithUnit, Number, Boolean, Selector, List
 import logging
 
 class PatchConfig(Config):
@@ -56,11 +56,15 @@ class PatchConfig(Config):
     auto_clean_pipette = Boolean(True, doc='Automatically clean pipette after attempt')
     lamp = Selector(default= '2', objects = ['1', '2', '3','4','5','6'], doc='default fluorescence cube slot')
     auto_capture_fluo = Boolean(False, doc='Capture fluorescence image on cell selection')
+    pipette_count = Number(4, bounds=(1, 12), doc='Number of active pipettes on the rig')
+    pipette_geometry = List(default=[], doc='Per-pipette workspace geometry, e.g. [{id, x_um, y_um, angle_deg}]')
+    collision_guard_enabled = Boolean(True, doc='Require distinct per-pipette directions before assigning cells to workspaces')
     categories = [
         ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance','slice_start_distance','max_distance', 'cell_R_increase','max_locate_speed','max_descent_speed','max_clearing_speed','use_centroid','track_cell','tracking_mode','track_max_fast_jump_px']),
         ('Sealing', ['pressure_sealing', 'gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch', 'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate', 'measurement_speed', 'Vramp_amplitude', 'seal_min_time', 'seal_deadline']),
         ('Break-in', ['zap', 'pressure_ramp_increment', 'pressure_ramp_max','pulse_pressure_break_in','pulse_pressure_duration', 'max_cell_R','max_access_R','min_cell_C']),
         ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette']),
+        ('Multi-pipette', ['pipette_count', 'pipette_geometry', 'collision_guard_enabled']),
         ('Fluorescence', ['lamp', 'auto_capture_fluo'])  
     ]
 

@@ -97,7 +97,7 @@ class CalibratedUnit(ManipulatorUnit):
 
         # Matrices for passing to the camera/microscope system
         self.M = zeros((3,len(unit.axes))) # stage units (in micron) to camera
-        self.Minv = zeros((len(unit.axes),3)) # Inverse of M
+        self.M_inv = zeros((len(unit.axes),3)) # Inverse of M
         self.r0 = zeros(3) # offset for px -> um conversion
         self.r0_inv = zeros(3) # offset for um -> px conversion
         self.unit = unit
@@ -143,11 +143,11 @@ class CalibratedUnit(ManipulatorUnit):
         Returns:
             numpy.ndarray: Position in microns.
         '''
-        if self.Minv.shape[1] == 2: #2x2 stage movement
-            xy = dot(self.Minv, pos_pixels[0:2]) + self.r0_inv[0:2]
+        if self.M_inv.shape[1] == 2: #2x2 stage movement
+            xy = dot(self.M_inv, pos_pixels[0:2]) + self.r0_inv[0:2]
             return np.array([xy[0], xy[1], 0])
         else: #3x3 pipette movement
-            return dot(self.Minv, pos_pixels) + self.r0_inv
+            return dot(self.M_inv, pos_pixels) + self.r0_inv
     
     def pixels_to_um_relative(self, pos_pixels):
         '''
@@ -159,11 +159,11 @@ class CalibratedUnit(ManipulatorUnit):
         Returns:
             numpy.ndarray: Displacement in microns.
         '''
-        if self.Minv.shape[1] == 2: #2x2 stage movement
-            xy = dot(self.Minv, pos_pixels[0:2])
+        if self.M_inv.shape[1] == 2: #2x2 stage movement
+            xy = dot(self.M_inv, pos_pixels[0:2])
             return np.array([xy[0], xy[1], 0])
         else: #3x3 pipette movement
-            return dot(self.Minv, pos_pixels)
+            return dot(self.M_inv, pos_pixels)
     
     def um_to_pixels(self, pos_microns):
         '''
@@ -189,7 +189,6 @@ class CalibratedUnit(ManipulatorUnit):
         '''
         return dot(self.M, pos_microns)
     
-
     def reference_position(self, include_offset = True):
         '''
         Position of the pipette in pixels (camera coordinate frame)
@@ -241,8 +240,6 @@ class CalibratedUnit(ManipulatorUnit):
             self.wait_until_still()
             return
 
-
-
     def autofocus_pipette(self):
         '''Use the microscope image to put the pipette in focus
         '''
@@ -270,7 +267,6 @@ class CalibratedUnit(ManipulatorUnit):
         y_max = min(int(pipette_px[1] + crop_size // 2), h)
         cropped_img = img[y_min:y_max, x_min:x_max]
         self.pipetteFocusHelper.focus(cropped_img)
-
 
     def safe_move(self, r):
         '''
@@ -309,7 +305,7 @@ class CalibratedUnit(ManipulatorUnit):
             p.append(((M[0,axis]**2 + M[1,axis]**2))**.5) #TODO: is this correct? 
         return p
     
-    def rotate(self, coordinates, axis):
+    def rotate(self, coordinates, axis, pipette_index=0):
         '''
         Rotate coordinates about one or more axes using configured angles.
         Accepts a single axis (0/1/2) or an ordered list/tuple of axes.
@@ -317,6 +313,7 @@ class CalibratedUnit(ManipulatorUnit):
         Args:
             coordinates (array-like): Input coordinates.
             axis (int or sequence): Axis or axes to rotate about (0=X, 1=Y, 2=Z).
+            pipette_index (int or str): Pipette index or ID used to select its rotation matrix.
 
         Returns:
             numpy.ndarray: Rotated coordinates.
@@ -339,6 +336,14 @@ class CalibratedUnit(ManipulatorUnit):
             coords[1] = -coords[1]
 
         k_scale = float(self.config.pipette_k_scale) if hasattr(self.config, 'pipette_k_scale') else 1.0
+
+        pipette_id = pipette_index
+        default_rotation = self.config.resolve_pipette_rotation_matrix(pipette_id)
+        if default_rotation is not None:
+            coords = np.dot(default_rotation, coords)
+            rotated = k_scale * coords
+            self.debug(f"Rotated coordinates with pipette calibration: {rotated}")
+            return rotated
 
         if isinstance(axis, (list, tuple, np.ndarray)):
             axes = list(axis)
@@ -372,7 +377,6 @@ class CalibratedUnit(ManipulatorUnit):
         self.debug(f"Rotated coordinates: {rotated}")
         return rotated
         
-
     def calibrate_pipette(self):
         '''
         Calibrate the pipette using YOLO object detection and pipette encoders to create a um -> pixels transformation matrix
@@ -388,7 +392,6 @@ class CalibratedUnit(ManipulatorUnit):
         self.wait_until_still()
         self.autofocus_pipette()
         self.wait_until_still()
-
 
     def center_pipette(self):
         """
@@ -457,7 +460,6 @@ class CalibratedUnit(ManipulatorUnit):
         self.wait_until_still()
         # self.debug("DEBUG: Centering move complete.")
 
-
     def direct_pipette_3D(self, desired_px3D):
         '''
         Moves the pipette so that its detected position matches the requested 3D image coordinates.
@@ -501,7 +503,6 @@ class CalibratedUnit(ManipulatorUnit):
         self.wait_until_still()
         # self.debug("DEBUG: Centering move complete.")
 
-
     def record_cal_point(self):
         '''
         records a calibration point for the pipette
@@ -537,24 +538,23 @@ class CalibratedUnit(ManipulatorUnit):
         #just 3x3 portion of M for self.M
         self.M = mat[0:3, 0:3]
 
-        #just 3x3 portion of Minv
-        self.Minv = mat_inv[0:3, 0:3]
+        #just 3x3 portion of M_inv
+        self.M_inv = mat_inv[0:3, 0:3]
 
 
         #check for nan values (invalid cal)
-        if isnan(self.M).any() or isnan(self.Minv).any():
+        if isnan(self.M).any() or isnan(self.M_inv).any():
             raise CalibrationError('Matrix contains NaN values')
 
         self.debug('Calibration Successful!')
         self.debug(f'M: {self.M}')
         self.debug(f'r0: {self.r0}')
-        self.debug(f'Minv:  {self.Minv}')
+        self.debug(f'M_inv:  {self.M_inv}')
         self.debug(f'r0_inv: {self.r0_inv}')
 
         self.calibrated = True
         self.must_be_recalibrated = False
     
-
     def recalibrate_pipette(self):
         '''
         recalibrate pipette offset while keeping matrix
@@ -562,7 +562,7 @@ class CalibratedUnit(ManipulatorUnit):
         Raises:
             Exception: If initial calibration has not been performed.
         '''
-        if self.M is None or self.Minv is None:
+        if self.M is None or self.M_inv is None:
             raise Exception("initial calibration required for single point recalibration!")
         
         self.debug('recalculating pipette offsets...')
@@ -612,11 +612,14 @@ class CalibratedUnit(ManipulatorUnit):
         self.stage.relative_move(movement_vector)
         self.stage.wait_until_still()
         #2. rotate movement vector  y (yaw then pitch)
-        rotated_vector = self.rotate(movement_vector, [2])
+        rotated_vector = self.rotate(
+            movement_vector,
+            [2],
+            pipette_index=getattr(self, "pipette_id", 0),
+        )
         #3. move pipette by rotated movement vector
         self.relative_move(rotated_vector)
         self.wait_until_still()
-
 
     def velocity_position_control(self, position_delta, speed):
         """
@@ -648,7 +651,6 @@ class CalibratedUnit(ManipulatorUnit):
 
         unit_direction = delta / distance
         return (unit_direction * speed).tolist()
-
 
     def _velocity_move_by_displacement(self, movement_vector, speed, poll_interval=0.01):
         """
@@ -767,7 +769,6 @@ class CalibratedUnit(ManipulatorUnit):
             self.info(f"Reset pipette speed to {self.get_max_speed()} um/s after random movement.")
             self.info("Finished random pipette movement.")
 
-
     def move_pipette_random(self, movement=100):
         '''
         Moves pipette randomly in xyz. This is used for testing find_pipette.
@@ -789,7 +790,6 @@ class CalibratedUnit(ManipulatorUnit):
 
         return config
     
-
     def load_configuration(self, config):
         '''
         Loads configuration from dictionary config.
@@ -799,7 +799,7 @@ class CalibratedUnit(ManipulatorUnit):
             config (dict): Configuration dictionary.
         '''
         self.M = config.get('M', self.M)
-        self.Minv = pinv(self.M)
+        self.M_inv = pinv(self.M)
         self.r0 = np.zeros(self.M.shape[0])
         self.r0_inv = np.zeros(self.M.shape[0])
         if self.M.shape[0] == 3:
@@ -928,7 +928,7 @@ class CalibratedStage(CalibratedUnit):
             raise CalibrationError('Pipette offsets must be recalibrated')
 
         self.abort_if_requested()
-        pos_microns = dot(self.Minv, pos_pix)
+        pos_microns = dot(self.M_inv, pos_pix)
         self.relative_move(pos_microns)
 
     @property
@@ -978,9 +978,9 @@ class CalibratedStage(CalibratedUnit):
         self.r0 = mat[0:2, 2] #um -> pixels offset
         self.r0_inv = mat_inv[0:2, 2] #pixels -> um offset
 
-        #for M and Minv, we only want the upper 2x2 matrix (b/c assumption that z axis is equivilant), the rest of the matrix is just the identity
+        #for M and M_inv, we only want the upper 2x2 matrix (b/c assumption that z axis is equivilant), the rest of the matrix is just the identity
         self.M = mat[0:2, 0:2]
-        self.Minv = mat_inv[0:2, 0:2]
+        self.M_inv = mat_inv[0:2, 0:2]
         self.calibrated = True
         self.must_be_recalibrated = False
 
@@ -1080,7 +1080,7 @@ class CalibratedStage(CalibratedUnit):
         if centroid is None:
             return self.wait_until_still        # keep call chain consistent
 
-        n_axes = self.Minv.shape[1]             # 2 for XY stage, 3 for XYZ
+        n_axes = self.M_inv.shape[1]             # 2 for XY stage, 3 for XYZ
         centroid   = centroid[:n_axes]
         desired_px = np.array([self.camera.width / 2,
                             self.camera.height / 2])[:n_axes]
@@ -1154,7 +1154,7 @@ class CalibratedStage(CalibratedUnit):
         if centroid is None:
             return None, None
 
-        n_axes = self.Minv.shape[1]
+        n_axes = self.M_inv.shape[1]
         centroid = centroid[:n_axes].astype(np.float32, copy=False)
         desired_px = np.array(
             [self.camera.width / 2.0, self.camera.height / 2.0],

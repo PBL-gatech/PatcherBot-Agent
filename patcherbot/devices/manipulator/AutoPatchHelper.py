@@ -205,7 +205,7 @@ class AutoPatchHelper:
                 offset = offset[:matrix.shape[0]]
             matrix_inv = np.linalg.pinv(matrix)
             offset_inv = -matrix_inv @ offset
-            return {"M": matrix, "Minv": matrix_inv, "r0": offset, "r0_inv": offset_inv}
+            return {"M": matrix, "M_inv": matrix_inv, "r0": offset, "r0_inv": offset_inv}
 
         manip_entry = payload.get("manip") or payload.get("pipette") or payload
         stage_entry = payload.get("stage")
@@ -359,7 +359,7 @@ class AutoPatchHelper:
                 in_dim = min(matrix.shape[1], vec64.size)
                 out[:out_dim] = matrix @ vec64[:in_dim] + offset[:out_dim]
             else:
-                matrix = entry["Minv"]
+                matrix = entry["M_inv"]
                 offset = np.zeros(matrix.shape[0], dtype=np.float64) if ignore_offset else entry["r0_inv"]
                 rows = min(entry["M"].shape[0], vec64.size)
                 out_dim = matrix.shape[0]

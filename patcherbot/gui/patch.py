@@ -200,6 +200,12 @@ class PatchGui(ManipulatorGui):
         self.show_cells_button = QtWidgets.QPushButton("Show Cells")
         self.show_cells_button.setCheckable(True)
         self.show_cells_button.clicked.connect(self.toggle_cell_list_window)
+
+        self.show_pipette_danger_zone_button = QtWidgets.QPushButton("Danger Zone")
+        self.show_pipette_danger_zone_button.setCheckable(True)
+        self.show_pipette_danger_zone_button.clicked.connect(self.toggle_pipette_danger_zone)
+        self.show_pipette_danger_zone_button.setToolTip("Show the geometry-based danger zone for the active pipette on the camera feed.")
+        self.patch_toolbar.addWidget(self.show_pipette_danger_zone_button)
         # self.status_bar.insertPermanentWidget(1, self.show_cells_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
@@ -479,8 +485,82 @@ class PatchGui(ManipulatorGui):
             stage_reference = None
         signature = tuple(id(cell) for cell in cells)
         full_refresh = force or (signature != self._cell_list_signature)
-        self.cell_list_window.update_cells(cells, stage_reference, full_refresh=full_refresh)
+        assignment_map = self._assignment_map_for_active_pipette(cells)
+        self.cell_list_window.update_cells(cells, stage_reference, assignment_map=assignment_map, full_refresh=full_refresh)
         self._cell_list_signature = signature
+
+    def _assignment_map_for_active_pipette(self, cells):
+        """Return assignment and queue indices for the shared cell queue."""
+        queue = getattr(self.active_patch_interface, "_cell_queue", None)
+        if queue is None:
+            return {}
+        return {
+            index: queue.metadata(cell)
+            for index, cell in enumerate(cells)
+        }
+
+    def toggle_pipette_danger_zone(self, checked=None):
+        """Toggle overlay of the active pipette’s protected region on the microscope view."""
+        if checked is None:
+            checked = self.show_pipette_danger_zone_button.isChecked()
+        self.show_pipette_danger_zone_button.setChecked(checked)
+        self.show_pipette_danger_zone = checked
+
+    def _danger_zone_overlay(self, pixmap):
+        """Draw a translucent red region outside the allowed motion cone for the selected pipette."""
+        if not getattr(self, 'show_pipette_danger_zone', False):
+            return
+
+        if getattr(self, 'active_camera_role', 'main') != 'main':
+            return
+
+        active_pipette_id = None
+        for pipette_id, patch_interface in self.patch_interfaces.items():
+            if patch_interface is self.active_patch_interface:
+                active_pipette_id = pipette_id
+                break
+
+        if active_pipette_id is None:
+            return
+
+        if not hasattr(self, 'active_pipette'):
+            return
+
+        pipette = self.active_pipette
+        if not hasattr(pipette, 'calibrated_unit'):
+            return
+
+        try:
+            camera = self.camera
+            ref = pipette.calibrated_unit.reference_position()
+            stage = pipette.calibrated_stage.reference_position()
+        except Exception:
+            return
+
+        painter = QtGui.QPainter(pixmap)
+        painter.setOpacity(0.45)
+        painter.setBrush(QtGui.QColor(255, 0, 0, 80))
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 0, 0, 120), 1))
+
+        width = pixmap.width()
+        height = pixmap.height()
+        safe_center_x = width * 0.5
+        safe_center_y = height * 0.5
+        safe_radius = min(width, height) * 0.40
+
+        # Default: allow a broad central region and mark the rest as danger, with a soft arc
+        # around the active pipette’s known angular sector. This is just a basic template.
+        painter.drawRect(0, 0, width, height)
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
+        painter.setBrush(QtGui.QColor(0, 0, 0, 0))
+        painter.drawEllipse(int(safe_center_x - safe_radius), int(safe_center_y - safe_radius), int(2 * safe_radius), int(2 * safe_radius))
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+        painter.end()
+
+    def _install_danger_zone_overlay(self):
+        """Ensure the danger zone is part of the active display pipeline when enabled."""
+        if self._danger_zone_overlay not in self.display_edit_funcs:
+            self.display_edit_funcs.insert(0, self._danger_zone_overlay)
 
     def toggle_pipette_status_window(self, checked=None):
         """
@@ -658,6 +738,7 @@ class PatchGui(ManipulatorGui):
             self.patch_interfaces[id]
         )
 
+        self._install_danger_zone_overlay()
         self.key_actions.clear()
         self.mouse_actions.clear()
 
@@ -1119,11 +1200,14 @@ class CellListWindow(QtWidgets.QDialog):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
 
         self.thumbnail_size = thumbnail_size
-        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table = QtWidgets.QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
             "Image",
             "Fluo Image",
             "Cell",
+            "Pipette Index (0-based)",
+            "Pipette Queue (0-based)",
+            "Overall Queue (0-based)",
             "Stage (px)",
             "Stage (um)",
         ])
@@ -1149,18 +1233,21 @@ class CellListWindow(QtWidgets.QDialog):
         self.closed.emit()
         super().closeEvent(event)
 
-    def update_cells(self, cells, stage_reference=None, full_refresh=True):
+    def update_cells(self, cells, stage_reference=None, assignment_map=None, full_refresh=True):
         """
         Update the table with current cell information.
 
         Args:
             cells (list): List of cells to display.
             stage_reference (optional): Reference stage position.
+            assignment_map (dict, optional): Cell index to pipette id mapping.
             full_refresh (bool, optional): Whether to force full update. Defaults to True.
         """
         if self.table.rowCount() != len(cells):
             self.table.setRowCount(len(cells))
             full_refresh = True
+
+        assignment_map = assignment_map or {}
 
         for row, cell in enumerate(cells):
             stage_px, img, stage_um, img_fluo = self._unpack_cell(cell)
@@ -1169,8 +1256,13 @@ class CellListWindow(QtWidgets.QDialog):
                 self._set_image_cell(row, 0, img)
                 self._set_image_cell(row, 1, img_fluo, empty_text="N/A")
                 self._set_item(row, 2, str(row + 1))
-                self._set_item(row, 3, self._format_vec(stage_px))
-                self._set_item(row, 4, self._format_vec(stage_um))
+                self._set_item(row, 6, self._format_vec(stage_px))
+                self._set_item(row, 7, self._format_vec(stage_um))
+
+            assignment = assignment_map.get(row) or {}
+            self._set_item(row, 3, str(assignment.get("pipette_index", "unassigned")))
+            self._set_item(row, 4, str(assignment.get("pipette_queue_index", "")))
+            self._set_item(row, 5, str(assignment.get("overall_queue_index", "")))
 
     def _unpack_cell(self, cell):
         """
