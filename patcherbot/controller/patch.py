@@ -18,8 +18,8 @@ from datetime import datetime
 from uuid import uuid4
 import pickle
 import os
-from patcherbot.interface.patchConfig import PatchConfig
-from patcherbot.interface.protocolConfig import ProtocolConfig
+from patcherbot.configs.PatchConfig import PatchConfig
+from patcherbot.configs.ProtocolConfig import ProtocolConfig
 
 from .base import TaskController, RequestedSuccessException
 from .phases.find_pipette import FindPipettePhase

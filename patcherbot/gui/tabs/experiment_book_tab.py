@@ -10,13 +10,13 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from patcherbot.utils.experiment_book import ExperimentBookLogger
+from patcherbot.gui.ParamConfig import ParamConfig
 
 
-class ExperimentBookTab(QtWidgets.QWidget):
+class ExperimentBookTab(ParamConfig):
     """Experiment detail form with an append-only chat-style timeline."""
 
     THUMBNAIL_SIZE = QtCore.QSize(160, 120)
-    config_value_changed_signal = QtCore.pyqtSignal(str, object)
 
     def __init__(
         self,
@@ -26,8 +26,7 @@ class ExperimentBookTab(QtWidgets.QWidget):
         session_time=None,
         parent=None,
     ):
-        super().__init__(parent=parent)
-        self.config = config
+        super().__init__(config, parent=parent, build_ui=False)
         self.logger = logger if logger is not None else ExperimentBookLogger(
             folder_path=storage_root,
             session_time=session_time,
@@ -41,44 +40,27 @@ class ExperimentBookTab(QtWidgets.QWidget):
         self.state_tally_body = None
 
         self._build_ui()
-        self.config._value_changed = self._config_value_changed
-        self.config_value_changed_signal.connect(self._display_config_value)
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
 
-        details_group = QtWidgets.QGroupBox("Experiment Details")
-        details_layout = QtWidgets.QFormLayout(details_group)
-        self.experiment_name_edit = QtWidgets.QLineEdit(self.config.experiment_name)
-        self.strain_culture_edit = QtWidgets.QLineEdit(self.config.strain_culture)
-        self.gender_edit = QtWidgets.QLineEdit(self.config.gender)
-        self.age_edit = QtWidgets.QLineEdit(self.config.age)
-        self.detail_edits = {
-            "experiment_name": self.experiment_name_edit,
-            "strain_culture": self.strain_culture_edit,
-            "gender": self.gender_edit,
-            "age": self.age_edit,
-        }
-        for name, edit in self.detail_edits.items():
-            edit.setObjectName(name)
-            edit.textChanged.connect(
-                lambda value, config_name=name: self._set_config_value(
-                    config_name,
-                    value,
-                )
-            )
-        details_layout.addRow("Experiment Name:", self.experiment_name_edit)
-        details_layout.addRow("Strain/Culture:", self.strain_culture_edit)
-        details_layout.addRow("Gender:", self.gender_edit)
-        details_layout.addRow("Age:", self.age_edit)
+        category, names = next(
+            (category, names) for category, names in self.config.categories
+            if category == "Experiment Details"
+        )
+        details_group = self._create_config_group(category, names)
+        details_layout = details_group.layout()
+        self.detail_edits = {name: self.value_widgets[name] for name in names}
+        for name, widget in self.detail_edits.items():
+            setattr(self, f"{name}_edit", widget)
 
         self.save_details_button = QtWidgets.QPushButton("Save Details")
         self.save_details_button.clicked.connect(self.save_details)
-        details_layout.addRow(self.save_details_button)
+        details_layout.addWidget(self.save_details_button)
 
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
-        details_layout.addRow(self.status_label)
+        details_layout.addWidget(self.status_label)
         layout.addWidget(details_group)
 
         timeline_label = QtWidgets.QLabel("Experiment Timeline")
@@ -102,12 +84,9 @@ class ExperimentBookTab(QtWidgets.QWidget):
 
         notes_group = QtWidgets.QGroupBox("General Notes")
         notes_layout = QtWidgets.QVBoxLayout(notes_group)
-        self.notes_edit = QtWidgets.QPlainTextEdit()
+        self.notes_edit = self._create_value_widget("general_notes", multiline=True)
         self.notes_edit.setPlaceholderText("Type a note for this experiment...")
         self.notes_edit.setMaximumHeight(100)
-        self.notes_edit.setObjectName("general_notes")
-        self.notes_edit.setPlainText(self.config.general_notes)
-        self.notes_edit.textChanged.connect(self._notes_changed)
         notes_layout.addWidget(self.notes_edit)
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.setEnabled(False)
@@ -247,34 +226,6 @@ class ExperimentBookTab(QtWidgets.QWidget):
         self.config.general_notes = ""
         self._set_status("Note saved.")
         return True
-
-    def _set_config_value(self, name, value):
-        if getattr(self.config, name) != value:
-            setattr(self.config, name, value)
-
-    def _notes_changed(self):
-        self._set_config_value("general_notes", self.notes_edit.toPlainText())
-
-    def _config_value_changed(self, name, value):
-        self.config_value_changed_signal.emit(name, value)
-
-    @QtCore.pyqtSlot(str, object)
-    def _display_config_value(self, name, value):
-        if name == "general_notes":
-            widget = self.notes_edit
-            new_value = str(value)
-            if widget.toPlainText() == new_value:
-                return
-            widget.blockSignals(True)
-            widget.setPlainText(new_value)
-            widget.blockSignals(False)
-            return
-        widget = self.detail_edits.get(name)
-        if widget is None or widget.text() == str(value):
-            return
-        widget.blockSignals(True)
-        widget.setText(str(value))
-        widget.blockSignals(False)
 
     def handle_snapshot(self, payload):
         if not self.book_active:

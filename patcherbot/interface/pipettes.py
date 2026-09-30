@@ -7,7 +7,7 @@ from datetime import datetime
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
-from patcherbot.devices.manipulator.CalibrationConfig import CalibrationConfig
+from patcherbot.configs.CalibrationConfig import CalibrationConfig
 from patcherbot.devices.cellsorter import CalibratedCellSorter
 import time
 

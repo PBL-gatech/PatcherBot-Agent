@@ -12,9 +12,9 @@ from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
 from patcherbot.devices.amplifier.DAQ import NiDAQ
 from patcherbot.devices.lamp import Lamp
-from .patchConfig import PatchConfig
-from .experimentBookConfig import ExperimentBookConfig
-from .protocolConfig import ProtocolConfig
+from patcherbot.configs.PatchConfig import PatchConfig
+from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
+from patcherbot.configs.ProtocolConfig import ProtocolConfig
 from PyQt5 import QtCore
 import time
 
