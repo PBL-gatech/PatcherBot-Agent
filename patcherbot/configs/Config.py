@@ -60,7 +60,7 @@ class Config(param.Parameterized):
         super(Config, self).__setattr__(key, value)
         if not key.startswith('_') and getattr(self, '_value_changed', None) is not None:
             self._value_changed(key, value)
-            logging.debug('Config value changed: %s = %s', key, value)
+            logging.getLogger().debug('Config value changed: %s = %s', key, value)
 
     def to_dict(self):
         return {name: getattr(self, name) for name in self.param

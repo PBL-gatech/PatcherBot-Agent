@@ -24,4 +24,4 @@ class ExperimentBookConfig(Config):
         ("Notes", ["general_notes"]),
     ]
 
-    logging.info("ExperimentBookConfig initialized successfully.")
+    logging.getLogger().info("ExperimentBookConfig initialized successfully.")

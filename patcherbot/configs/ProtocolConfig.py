@@ -55,4 +55,4 @@ class ProtocolConfig(Config):
                                   'opto_wavelength_power', 'opto_power_wavelength']),
     ]
 
-    logging.info("ProtocolConfig initialized successfully.")
+    logging.getLogger().info("ProtocolConfig initialized successfully.")

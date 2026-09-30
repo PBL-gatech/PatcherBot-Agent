@@ -79,5 +79,5 @@ class PatchConfig(Config):
         ('Fluorescence', ['lamp', 'auto_capture_fluo'])  
     ]
 
-    logging.info("PatchConfig initialized successfully.")
+    logging.getLogger().info("PatchConfig initialized successfully.")
 
