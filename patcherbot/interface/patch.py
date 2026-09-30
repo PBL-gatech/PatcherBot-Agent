@@ -211,6 +211,15 @@ class AutoPatchInterface(TaskInterface):
             self.info("remove_last_cell called but there are no cells to remove")
 
 
+    def _remove_first_cell(self) -> None:
+        """Remove the first queued cell after escape or automatic cleanup."""
+        if self.cells_to_patch:
+            first_cell = self.cells_to_patch[0]
+            self.info(f"Removing first queued cell {first_cell}")
+            self.cells_to_patch = self.cells_to_patch[1:]
+        else:
+            self.info("_remove_first_cell called but there are no cells to remove")
+
     @blocking_command(category='Cell Sorter',
             description='Move the cell sorter to a cell',
             task_description='Move the cell sorter to a cell')
@@ -336,10 +345,19 @@ class AutoPatchInterface(TaskInterface):
                 for cell, image, position, _ in tuple(self.cells_to_patch)]
             if not unit.calibrated or getattr(unit, "must_be_recalibrated", False):
                 return
-            tip = np.asarray(unit.reference_position(), dtype=float)[:2]
+            home = np.asarray(controller.home_position, dtype=float)
+            stage_home = np.asarray(controller.home_stage_position, dtype=float)
+            if (home.shape != (3,) or stage_home.shape != (3,)
+                    or not np.isfinite(home).all() or not np.isfinite(stage_home).all()):
+                return
+            # HOME aligns the tip with image center; only displacement moves the arrow.
+            tip = (np.array([camera.width / 2., camera.height / 2.])
+                   + unit.um_to_pixels_relative(unit.position() - home)[:2]
+                   + stage.um_to_pixels_relative(stage.position() - stage_home[:2])[:2])
             if np.isfinite(tip).all():
                 self.pipette_controller.display_positions = dict(
                     pipette_xy=tip.copy(), at=time.monotonic(),
+                    pipette_direction_xy=np.asarray(unit.M, dtype=float)[:2, 0].copy(),
                     image_shape=(camera.height, camera.width))
         except (RuntimeError, ValueError, TypeError, OSError):
             return
@@ -391,12 +409,12 @@ class AutoPatchInterface(TaskInterface):
             self.info("Patch command completed successfully, but auto escape not enabled; leaving cell in of queue for manual follow-up.")
         elif not success and self.current_autopatcher.config.auto_clean_pipette:
             self.error("Patch command did not complete successfully; cleaning pipette and escaping cell")
-            self.remove_last_cell()
+            self._remove_first_cell()
         elif not success and not self.current_autopatcher.config.auto_clean_pipette:
              self.error("Patch command did not complete and auto escape not enabled; leaving cell in queue for manual follow-up.")
         else:
             self.info("Patch command completed successfully; escaping cell and cleaning pipette")
-            self.remove_last_cell()
+            self._remove_first_cell()
 
     @blocking_command(
         category='Patch',
@@ -432,12 +450,12 @@ class AutoPatchInterface(TaskInterface):
             self.info("Whole-cell command completed successfully, but auto escape not enabled; leaving cell in queue for manual follow-up.")
         elif not success and self.current_autopatcher.config.auto_clean_pipette:
             self.error("Whole-cell command did not complete successfully; cleaning pipette and escaping cell")
-            self.remove_last_cell()
+            self._remove_first_cell()
         elif not success and not self.current_autopatcher.config.auto_clean_pipette:
             self.error("Whole-cell command did not complete and auto escape not enabled; leaving cell in queue for manual follow-up.")
         else:
             self.info("Whole-cell command completed successfully; escaping cell and cleaning pipette")
-            self.remove_last_cell()
+            self._remove_first_cell()
 
     @blocking_command(category='Patch',
                         description='Locate the cell',
@@ -499,8 +517,7 @@ class AutoPatchInterface(TaskInterface):
         self._record_state_press("escape")
         self.execute(self.current_autopatcher.escape)
         time.sleep(2)
-        # self.cells_to_patch = self.cells_to_patch[1:]
-        self.remove_last_cell()
+        self._remove_first_cell()
 
     @blocking_command(category='Patch',
                         description='find the pipette',
@@ -516,6 +533,7 @@ class AutoPatchInterface(TaskInterface):
     def store_cleaning_position(self) -> None:
         self.current_autopatcher.cleaning_bath_position = self.pipette_controller.calibrated_unit.position()
         self.current_autopatcher.calibrated_unit.config.bath_position = tuple(self.current_autopatcher.cleaning_bath_position)
+        self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position.copy()
         # save calibration to file
         self.pipette_controller.write_calibration()
 
@@ -611,11 +629,11 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.home_stage_position = None
         self.current_autopatcher.safe_stage_position = None
         # set tuple to None in the config
-        self.current_autopatcher.calibrated_unit.config.home_position = None
-        self.current_autopatcher.calibrated_unit.config.safe_position = None
-        self.current_autopatcher.calibrated_stage.config.home_position_stage = None
-        self.current_autopatcher.calibrated_stage.config.safe_position_stage = None
-        self.current_autopatcher.calibrated_unit.config.cleaning_bath_position = None
+        self.current_autopatcher.calibrated_unit.config.home_position = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.safe_position = (0., 0., 0.)
+        self.current_autopatcher.calibrated_stage.config.home_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_stage.config.safe_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.bath_position = (0., 0., 0.)
         # self.current_autopatcher.calibrated_unit.config.rinsing_bath_position = None    
         self.info('All positions cleared')
 

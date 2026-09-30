@@ -454,6 +454,36 @@ class PipetteDetector4(PipetteDetector):
             img = np.clip(img, 0, 255).astype(np.uint8)
         return img
 
+    def detect_pipette_tracking(self, img: np.ndarray) -> dict:
+        """Return an independent native-size mask, grayscale frame and subpixel tip."""
+        prediction = dict(tip_xy=None, mask=None, frame=None)
+        if img is None:
+            return prediction
+        try:
+            gray = self._to_uint8_grayscale(img)
+            if gray.ndim != 2 or gray.size == 0:
+                raise ValueError("Expected a nonempty grayscale image")
+            result = self.adapter.predict(gray, native_mask=True)
+            prediction["frame"] = gray.copy()
+            tip = result.get("tip_xy")
+            if tip is not None:
+                tip = np.asarray(tip, dtype=float)
+                if tip.shape == (2,) and np.isfinite(tip).all():
+                    prediction["tip_xy"] = tuple(float(value) for value in tip)
+                else:
+                    logger.warning("PipetteDetector4 tracking tip has invalid shape or values")
+            mask = result.get("mask")
+            if mask is not None:
+                mask = np.asarray(mask, dtype=np.float32)
+                if mask.shape == gray.shape and np.isfinite(mask).all():
+                    prediction["mask"] = mask.copy()
+                else:
+                    logger.warning("PipetteDetector4 tracking mask has invalid shape or values")
+            return prediction
+        except Exception as exc:
+            logger.warning("PipetteDetector4 tracking inference failed: %s", exc)
+            return dict(tip_xy=None, mask=None, frame=None)
+
     def detect_pipette_details(self, img: np.ndarray) -> dict:
         """Return XY, depth in microns, box confidence and optional Z confidence.
 

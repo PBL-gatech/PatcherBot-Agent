@@ -1,6 +1,7 @@
 ﻿import os
 import glob
 import json
+import tempfile
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -1388,6 +1389,31 @@ class ScanStitcher:
             return None
         return np.concatenate(normalized, axis=concat_axis)
 
+    def _save_axis_debug_image(self, frame_paths, output_path, concat_axis):
+        # Keep the full strip on disk and load only one source frame at a time.
+        sample = self._to_bgr(frame_paths[0])
+        h, w = sample.shape[:2]
+        shape = (h * len(frame_paths), w, 3) if concat_axis == 0 else (h, w * len(frame_paths), 3)
+        with tempfile.TemporaryFile(dir=os.path.dirname(output_path) or ".") as backing_file:
+            canvas = np.memmap(backing_file, dtype=np.uint8, mode="w+", shape=shape)
+            try:
+                for i, path in enumerate(tqdm(frame_paths, desc="Writing axis debug frames", unit="frame")):
+                    frame = sample if i == 0 else self._to_bgr(path)
+                    sample = None
+                    if frame.shape[:2] != (h, w):
+                        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                    if concat_axis == 0:
+                        canvas[i * h:(i + 1) * h, :, :] = frame
+                    else:
+                        canvas[:, i * w:(i + 1) * w, :] = frame
+                    del frame
+                canvas.flush()
+                if not cv2.imwrite(output_path, canvas):
+                    raise RuntimeError(f"Failed to write axis debug image: {output_path}")
+            finally:
+                # Close the mapping before its temporary file is removed on Windows.
+                canvas._mmap.close()
+
     def save_axis_debug_images(self, horizontal_output_path=None, vertical_output_path=None):
         print("[ScanStitcher] Building axis debug images...")
         frame_timestamps, coords, frame_paths = self._align_all_frames_to_movement()
@@ -1420,20 +1446,6 @@ class ScanStitcher:
             f"horizontal={len(horizontal_indices)}, vertical={len(vertical_indices)}"
         )
 
-        h_frames = [
-            self._to_rgb(frame_paths[i])
-            for i in tqdm(horizontal_indices, desc="Loading horizontal frames", unit="frame")
-        ]
-        v_frames = [
-            self._to_rgb(frame_paths[i])
-            for i in tqdm(vertical_indices, desc="Loading vertical frames", unit="frame")
-        ]
-
-        horizontal_img = self._concat_frames(h_frames, concat_axis=0)
-        vertical_img = self._concat_frames(v_frames, concat_axis=1)
-        if horizontal_img is None or vertical_img is None:
-            raise RuntimeError("Failed to build one or both axis debug images.")
-
         if horizontal_output_path is None:
             horizontal_output_path = os.path.join(self._dataset_output_dir(), "horizontal_only_debug.tif")
         elif not os.path.isabs(horizontal_output_path):
@@ -1449,10 +1461,12 @@ class ScanStitcher:
         os.makedirs(os.path.dirname(horizontal_output_path), exist_ok=True) if os.path.dirname(horizontal_output_path) else None
         os.makedirs(os.path.dirname(vertical_output_path), exist_ok=True) if os.path.dirname(vertical_output_path) else None
 
-        if not cv2.imwrite(horizontal_output_path, cv2.cvtColor(horizontal_img, cv2.COLOR_RGB2BGR)):
-            raise RuntimeError(f"Failed to write horizontal debug image: {horizontal_output_path}")
-        if not cv2.imwrite(vertical_output_path, cv2.cvtColor(vertical_img, cv2.COLOR_RGB2BGR)):
-            raise RuntimeError(f"Failed to write vertical debug image: {vertical_output_path}")
+        self._save_axis_debug_image(
+            [frame_paths[i] for i in horizontal_indices], horizontal_output_path, concat_axis=0
+        )
+        self._save_axis_debug_image(
+            [frame_paths[i] for i in vertical_indices], vertical_output_path, concat_axis=1
+        )
 
         print(f"[ScanStitcher] Horizontal debug image saved: {horizontal_output_path}")
         print(f"[ScanStitcher] Vertical debug image saved: {vertical_output_path}")
@@ -1518,7 +1532,7 @@ def main():
     use_pixel_drift_stitch = True
     use_streaming_stitch = True
     downsample = 1
-    date_time_folder = "2026_03_13-15_28"
+    date_time_folder = "2026_09_23-18_05"
     stitcher = ScanStitcher(
         date_time_folder=date_time_folder,
         use_calibration=True,

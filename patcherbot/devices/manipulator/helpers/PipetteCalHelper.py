@@ -10,7 +10,11 @@ from patcherbot.deepLearning.pipetteDetector import PipetteDetector, PipetteDete
 from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser2
 from threading import Thread
 import logging
+from .pipette_flow import track_pipette_displacement
 
+
+CALIBRATION_FRAME_COUNT = 5
+CALIBRATION_TIMEOUT_SECONDS = 3.0
 
 def _resolve_model_path(model_name):
     if model_name is None:
@@ -46,11 +50,11 @@ class PipetteCalHelper():
     A helper class to aid with 2D pipette calibration.
 
     Overview:
-      - Calibration points are collected relative to the stage's base reference.
+      - Calibration points pair raw image coordinates with pipette encoders.
       - Only the (x, y) components are used, ignoring the z-axis.
       - Ten calibration points are gathered so that the field of view is well‐sampled.
       - A 2D affine transformation is computed from pipette encoder (x, y) positions to
-        image (x, y) positions (with stage reference subtracted), using OpenCV.
+        image (x, y) positions, using OpenCV.
       - The 2×3 matrix is then embedded in a 3×4 homogeneous transformation matrix.
     
     Summary:
@@ -91,25 +95,56 @@ class PipetteCalHelper():
         # Each calibration point will be a tuple:
         #   (image_x, image_y, encoder_x, encoder_y)
         self.cal_points = []
+        self.calibration_samples = []
+        self._flow_reference = None
 
     def collect_cal_points(self, num_points=10, xy_step=5, max_retries=5):
+        """Apply the stage-style calibration speed cap and restore the prior limit."""
+        log = logging.getLogger("patcherbot.PipetteCalibration")
+        previous_speed = self.pipette.get_max_speed()
+        if previous_speed is None or not np.isfinite(previous_speed) or previous_speed <= 0:
+            raise RuntimeError("Cannot read pipette speed; calibration was not started")
+        calibration_speed = min(float(previous_speed), self.CAL_MAX_SPEED)
+        try:
+            self.pipette.set_max_speed(calibration_speed)
+            applied_speed = self.pipette.get_max_speed()
+            if (applied_speed is None or not np.isfinite(applied_speed)
+                    or applied_speed <= 0 or applied_speed > calibration_speed):
+                raise RuntimeError("Pipette calibration speed limit was not confirmed; sampling was not started")
+            log.info("Pipette calibration speed limit: %s -> %s (controller units)",
+                     previous_speed, applied_speed)
+            return self._collect_cal_points_at_calibration_speed(num_points, xy_step, max_retries)
+        finally:
+            self.pipette.set_max_speed(previous_speed)
+            restored_speed = self.pipette.get_max_speed()
+            if restored_speed is None or restored_speed != previous_speed:
+                raise RuntimeError("Pipette speed restoration was not confirmed")
+            log.info("Pipette calibration speed limit restored to %s (controller units)", restored_speed)
+
+    def _collect_cal_points_at_calibration_speed(self, num_points=10, xy_step=5, max_retries=5):
         """
         Collects 'num_points' calibration points.
         
         For each point:
-         - The pipette’s current (x, y) image position (with the stage's reference subtracted)
+         - The pipette’s current (x, y) image position (median of five fresh detections)
            is paired with the pipette’s encoder (x, y) coordinates.
          - A small move (with added randomness) is commanded between points so that the
            calibration data covers a larger area.
         """
         self.cal_points = []
+        self.calibration_samples = []
+        self._flow_reference = None
+        step = min(2.0 * abs(float(xy_step)), 10.0)
+        logging.getLogger("patcherbot.PipetteCalibration").info(
+            "Pipette calibration sampling: X then Y, %d points, %.1f um steps, Z unchanged",
+            num_points, step)
         for i in range(num_points):
             self._record_point_with_retries(max_retries)
             if i < num_points - 1:
-                # Move pipette slightly in the plane to spread out calibration data.
-                dx = xy_step + np.random.uniform(-5, 5)
-                dy = xy_step + np.random.uniform(-5, 5)
-                self.pipette.relative_move([dx, dy, 0])
+                # Separate axis measurements; default steps stay within the old 0-10 um range.
+                delta = np.zeros(3)
+                delta[0 if i < (num_points - 1) // 2 else 1] = step
+                self.pipette.relative_move(delta.tolist())
                 self.pipette.wait_until_still()
         return len(self.cal_points) >= num_points
 
@@ -134,35 +169,121 @@ class PipetteCalHelper():
         return False
 
     def record_cal_point(self):
-        """
-        Records a calibration point as follows:
-         - Retrieves the current camera frame.
-         - Uses the pipetteDetector to detect the pipette’s (x, y) position.
-         - Subtracts the stage’s reference position so that the result is in the stage’s coordinate system.
-         - Pairs the (x, y) image position with the pipette’s encoder (x, y) coordinates.
-        """
-        # Get the latest frame from the camera.
-        _, _, _, frame = self.camera.raw_frame_queue[0]
-        pos_pix = self.pipetteDetector.detect_pipette(frame)
-        if pos_pix is not None:
-            # Optionally, display the detected pipette on the frame.
-            frame = cv2.circle(frame, pos_pix, 10, 0, 2)
-            image_x = pos_pix[0]
-            image_y = pos_pix[1]
-            # Retrieve the pipette's encoder (x, y) positions; ignore z.
-            encoder_pos = self.pipette.position()  # assumed format: [x, y, z]
-            encoder_x = encoder_pos[0]
-            encoder_y = encoder_pos[1]
-            self.cal_points.append((image_x, image_y, encoder_x, encoder_y))
-            self.camera.show_circle(pos_pix)
-            print("Recorded calibration point:", self.cal_points[-1])
+        """Record the median of five distinct newly retrieved stationary frames."""
+        log = logging.getLogger("patcherbot.PipetteCalibration")
+        started = time.monotonic()
+        encoder_pos = np.asarray(self.pipette.position(), dtype=float).copy()
+        seen, detections, observations = set(), [], []
+        sample = dict(encoder=encoder_pos.tolist(), sampling_started_at=started,
+                      frames=[], status="timeout")
+        self.calibration_samples.append(sample)
+        while time.monotonic() - started < CALIBRATION_TIMEOUT_SECONDS:
+            data = self.camera.last_raw_frame_data(include_timing=True)
+            if data is None:
+                time.sleep(0.01)
+                continue
+            frame_no, _, frame, timing = data
+            retrieved = timing.get("retrieval_started_at")
+            if frame_no in seen or retrieved is None or retrieved < started:
+                time.sleep(0.01)
+                continue
+            seen.add(frame_no)
+            if not np.allclose(self.pipette.position(), encoder_pos, atol=0.1, rtol=0):
+                sample["status"] = "encoder_moved"
+                log.warning("Pipette calibration sample rejected: encoder moved before detection")
+                return
+            if hasattr(self.pipetteDetector, "detect_pipette_tracking"):
+                tracking = self.pipetteDetector.detect_pipette_tracking(frame.copy())
+                tip = tracking.get("tip_xy")
+                flow_frame, mask = tracking.get("frame"), tracking.get("mask")
+            else:
+                tip = self.pipetteDetector.detect_pipette(frame.copy())
+                flow_frame, mask = frame.copy(), None
+            if not np.allclose(self.pipette.position(), encoder_pos, atol=0.1, rtol=0):
+                sample["status"] = "encoder_moved"
+                log.warning("Pipette calibration sample rejected: encoder moved during detection")
+                return
+            if tip is None:
+                continue
+            tip = np.asarray(tip, dtype=float)
+            if tip.shape != (2,) or not np.isfinite(tip).all():
+                continue
+            detections.append(tip)
+            observations.append((flow_frame, mask))
+            sample["frames"].append(dict(frame_no=int(frame_no),
+                                         retrieval_started_at=float(retrieved), tip_xy=tip.tolist()))
+            if len(detections) == CALIBRATION_FRAME_COUNT:
+                median = np.median(detections, axis=0)
+                representative = int(np.argmin(np.linalg.norm(np.asarray(detections) - median, axis=1)))
+                position, source = self._hybrid_position(median, *observations[representative])
+                self.cal_points.append(tuple(position) + tuple(encoder_pos[:2]))
+                spread = float(np.max(np.linalg.norm(np.asarray(detections) - median, axis=1)))
+                sample.update(status="complete", median_xy=median.tolist(), max_spread_px=spread,
+                              fitted_xy=position.tolist(), source=source)
+                log.info("Pipette calibration point %d: %d frames, median=(%.2f, %.2f) px, "
+                         "max spread=%.2f px, encoder=(%.3f, %.3f) um",
+                         len(self.cal_points), len(detections), *median, spread, *encoder_pos[:2])
+                self.camera.show_circle(tuple(int(round(v)) for v in position))
+                return
+        log.warning("Pipette calibration sample timed out: %d/%d valid new frames; point rejected",
+                    len(detections), CALIBRATION_FRAME_COUNT)
+
+    def _hybrid_position(self, detected, frame, mask):
+        """Use validated foreground motion, with detection anchoring and fallback."""
+        log = logging.getLogger("patcherbot.PipetteCalibration")
+        previous = getattr(self, "_flow_reference", None)
+        position, source = detected.copy(), "detection"
+        if previous is not None and frame is not None and mask is not None and previous["mask"] is not None:
+            try:
+                delta, quality = track_pipette_displacement(previous["frame"], frame,
+                                                           previous["mask"], mask,
+                                                           initial_displacement=detected - previous["detected"])
+                if delta is not None:
+                    disagreement = float(np.linalg.norm(delta - (detected - previous["detected"])))
+                    if disagreement <= 12.0:
+                        predicted = previous["position"] + delta
+                        position = 0.85 * predicted + 0.15 * detected
+                        source = "flow+detector"
+                    log.info("Pipette calibration flow: %s; detector disagreement=%.2f px; %s",
+                             source, disagreement, quality)
+                else:
+                    log.info("Pipette calibration flow rejected; using detection: %s", quality)
+            except (cv2.error, ValueError, TypeError):
+                log.warning("Pipette calibration flow failed; using detection", exc_info=True)
         else:
-            print("No pipette detected in current frame.")
+            log.info("Pipette calibration flow: detection anchor (no usable frame/mask pair)")
+        self._flow_reference = dict(frame=frame, mask=mask, detected=detected.copy(), position=position.copy())
+        return position, source
+
+    def _log_calibration_quality(self, matrix, inliers):
+        """Log fit residuals for the matrix selected by normal calibration."""
+        points = np.asarray(self.cal_points, dtype=float)
+        design = np.column_stack((points[:, 2:4], np.ones(len(points))))
+        errors = np.linalg.norm(design @ matrix[:2, [0, 1, 3]].T - points[:, :2], axis=1)
+        rmse = float(np.sqrt(np.mean(errors ** 2)))
+        self.last_calibration_quality = dict(
+            mode="active_calibration", status="fitted", matrix=matrix.tolist(),
+            points=points.tolist(), samples=self.calibration_samples,
+            timestamp_basis="camera_retrieval_not_sensor_exposure",
+            inliers=None if inliers is None else inliers.ravel().tolist(),
+            training_errors_px=errors.tolist(), training_rmse_px=rmse)
+        log = logging.getLogger("patcherbot.PipetteCalibration")
+        singular = np.linalg.svd(points[:, 2:4] - points[:, 2:4].mean(axis=0), compute_uv=False)
+        condition = float(singular[0] / singular[-1]) if singular[-1] > 1e-9 else float("inf")
+        flow_count = sum(sample.get("source") == "flow+detector" for sample in self.calibration_samples)
+        log.info("Pipette calibration geometry condition=%.2f; flow-assisted points=%d/%d",
+                 condition, flow_count, len(points))
+        log.info("Pipette calibration fit: %d hybrid points, %d inliers, "
+                 "fit RMSE=%.3f px, maximum fit error=%.3f px (training residuals)",
+                 len(points), 0 if inliers is None else int(np.count_nonzero(inliers)),
+                 rmse, float(errors.max()))
+        log.info("Pipette calibration selected matrix: %s", matrix.tolist())
+        log.info("Pipette calibration errors by point (px): %s", np.round(errors, 3).tolist())
 
     def calibrate(self):
         """
         Computes a 2D affine transformation that maps pipette encoder (x, y)
-        positions to image (x, y) positions (already relative to the stage's base).
+        positions to image (x, y) positions in the camera image.
         
         It then embeds the resulting 2×3 matrix into a 3×4 homogeneous transformation matrix.
         
@@ -208,6 +329,10 @@ class PipetteCalHelper():
 
         # Save the calibration matrix for later use (e.g., for centering the pipette).
         self.calibration_matrix = mat3x4
+        try:
+            self._log_calibration_quality(mat3x4, inliers)
+        except Exception:
+            logging.exception("Could not log pipette calibration fit details")
         # Clear the calibration points after computing the matrix.
         self.cal_points = []
         return mat3x4

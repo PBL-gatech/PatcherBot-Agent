@@ -244,20 +244,17 @@ class ManipulatorGui(CameraGui):
                     and positions["image_shape"] == (height, width)
                     and 0 <= time.monotonic() - positions["at"] <= 1.):
                 point = np.asarray(positions["pipette_xy"], dtype=float).copy()
+                direction = np.asarray(positions.get("pipette_direction_xy"), dtype=float).copy()
+                if direction.shape != (2,) or not np.isfinite(direction).all():
+                    direction = np.zeros(2)
                 if self.camera.flipped:
                     point[0] = width - 1 - point[0]
-                if np.isfinite(point).all():
-                    outside = not (0 <= point[0] < width and 0 <= point[1] < height)
-                    if outside:
-                        center = np.array([width / 2., height / 2.])
-                        direction = point - center
-                        unit = direction / np.linalg.norm(direction)
-                        fraction = min(max(0., center[i] - 12.) / abs(direction[i])
-                                       for i in range(2) if direction[i] != 0)
-                        point = center + fraction * direction
-                    else:
-                        unit = np.array([-1. if point[0] < 28 else 1.,
-                                         -1. if point[1] < 28 else 1.]) / np.sqrt(2.)
+                    direction[0] = -direction[0]
+                length = np.linalg.norm(direction)
+                # Match cell overlays: hide when the position leaves the image.
+                if (np.isfinite(point).all() and np.isfinite(length) and length > 0
+                        and 0 <= point[0] < width and 0 <= point[1] < height):
+                    unit = direction / length
                     side = np.array([-unit[1], unit[0]])
                     pen = QtGui.QPen(QtGui.QColor("#ffba45"), 2)
                     pen.setCosmetic(True)
