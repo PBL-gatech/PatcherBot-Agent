@@ -9,6 +9,3 @@ from .base import *
 from .camera import *
 from .pipettes import PipetteInterface
 from .patch import AutoPatchInterface
-from patcherbot.configs.PatchConfig import PatchConfig
-from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
-from patcherbot.configs.ProtocolConfig import ProtocolConfig
