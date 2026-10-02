@@ -201,11 +201,6 @@ class PatchGui(ManipulatorGui):
         self.show_cells_button.setCheckable(True)
         self.show_cells_button.clicked.connect(self.toggle_cell_list_window)
 
-        self.show_pipette_danger_zone_button = QtWidgets.QPushButton("Danger Zone")
-        self.show_pipette_danger_zone_button.setCheckable(True)
-        self.show_pipette_danger_zone_button.clicked.connect(self.toggle_pipette_danger_zone)
-        self.show_pipette_danger_zone_button.setToolTip("Show the geometry-based danger zone for the active pipette on the camera feed.")
-        self.patch_toolbar.addWidget(self.show_pipette_danger_zone_button)
         # self.status_bar.insertPermanentWidget(1, self.show_cells_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
@@ -499,69 +494,6 @@ class PatchGui(ManipulatorGui):
             for index, cell in enumerate(cells)
         }
 
-    def toggle_pipette_danger_zone(self, checked=None):
-        """Toggle overlay of the active pipette’s protected region on the microscope view."""
-        if checked is None:
-            checked = self.show_pipette_danger_zone_button.isChecked()
-        self.show_pipette_danger_zone_button.setChecked(checked)
-        self.show_pipette_danger_zone = checked
-
-    def _danger_zone_overlay(self, pixmap):
-        """Draw a translucent red region outside the allowed motion cone for the selected pipette."""
-        if not getattr(self, 'show_pipette_danger_zone', False):
-            return
-
-        if getattr(self, 'active_camera_role', 'main') != 'main':
-            return
-
-        active_pipette_id = None
-        for pipette_id, patch_interface in self.patch_interfaces.items():
-            if patch_interface is self.active_patch_interface:
-                active_pipette_id = pipette_id
-                break
-
-        if active_pipette_id is None:
-            return
-
-        if not hasattr(self, 'active_pipette'):
-            return
-
-        pipette = self.active_pipette
-        if not hasattr(pipette, 'calibrated_unit'):
-            return
-
-        try:
-            camera = self.camera
-            ref = pipette.calibrated_unit.reference_position()
-            stage = pipette.calibrated_stage.reference_position()
-        except Exception:
-            return
-
-        painter = QtGui.QPainter(pixmap)
-        painter.setOpacity(0.45)
-        painter.setBrush(QtGui.QColor(255, 0, 0, 80))
-        painter.setPen(QtGui.QPen(QtGui.QColor(255, 0, 0, 120), 1))
-
-        width = pixmap.width()
-        height = pixmap.height()
-        safe_center_x = width * 0.5
-        safe_center_y = height * 0.5
-        safe_radius = min(width, height) * 0.40
-
-        # Default: allow a broad central region and mark the rest as danger, with a soft arc
-        # around the active pipette’s known angular sector. This is just a basic template.
-        painter.drawRect(0, 0, width, height)
-        painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
-        painter.setBrush(QtGui.QColor(0, 0, 0, 0))
-        painter.drawEllipse(int(safe_center_x - safe_radius), int(safe_center_y - safe_radius), int(2 * safe_radius), int(2 * safe_radius))
-        painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
-        painter.end()
-
-    def _install_danger_zone_overlay(self):
-        """Ensure the danger zone is part of the active display pipeline when enabled."""
-        if self._danger_zone_overlay not in self.display_edit_funcs:
-            self.display_edit_funcs.insert(0, self._danger_zone_overlay)
-
     def toggle_pipette_status_window(self, checked=None):
         """
         Toggle the visibility of the PipetteStatusWindow.
@@ -738,7 +670,14 @@ class PatchGui(ManipulatorGui):
             self.patch_interfaces[id]
         )
 
-        self._install_danger_zone_overlay()
+        for tab in (
+            self.classic_tab,
+            self.calibration_tab,
+            self.patch_config_tab,
+            self.protocol_tab,
+        ):
+            tab.set_pipette(id)
+
         self.key_actions.clear()
         self.mouse_actions.clear()
 
@@ -962,10 +901,8 @@ class PipetteStackTab(QtWidgets.QWidget):
     Displays one pipette-specific widget at a time.
 
     Each pipette widget is constructed once and stored in a
-    QStackedWidget. The selector only changes visibility.
+    QStackedWidget. The active pipette toolbar selection controls visibility.
     """
-
-    pipette_changed = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -977,28 +914,6 @@ class PipetteStackTab(QtWidgets.QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
 
         # -------------------------
-        # Pipette selector
-        # -------------------------
-
-        selector_layout = QtWidgets.QHBoxLayout()
-
-        selector_layout.addWidget(
-            QtWidgets.QLabel("Pipette:")
-        )
-
-        self.selector = NoWheelComboBox()
-
-        selector_layout.addWidget(
-            self.selector
-        )
-
-        selector_layout.addStretch()
-
-        layout.addLayout(
-            selector_layout
-        )
-
-        # -------------------------
         # Pipette-specific contents
         # -------------------------
 
@@ -1007,10 +922,6 @@ class PipetteStackTab(QtWidgets.QWidget):
         layout.addWidget(
             self.stack,
             1,
-        )
-
-        self.selector.currentIndexChanged.connect(
-            self._selection_changed
         )
 
     def add_pipette_widget(
@@ -1030,54 +941,28 @@ class PipetteStackTab(QtWidgets.QWidget):
         self.widgets[pipette_id] = widget
         self.index_by_id[pipette_id] = index
 
-        self.selector.addItem(
-            pipette_id,
-            pipette_id,
-        )
-
         if len(self.widgets) == 1:
             self.stack.setCurrentIndex(index)
 
-    def _selection_changed(self, selector_index):
-        pipette_id = self.selector.itemData(
-            selector_index
-        )
-
-        if pipette_id is None:
-            return
-
-        pipette_id = str(pipette_id)
-
-        stack_index = self.index_by_id.get(
-            pipette_id
-        )
-
-        if stack_index is None:
-            return
-
-        self.stack.setCurrentIndex(
-            stack_index
-        )
-
-        self.pipette_changed.emit(
-            pipette_id
-        )
-
     def set_pipette(self, pipette_id):
         pipette_id = str(pipette_id)
-
-        index = self.selector.findData(
-            pipette_id
-        )
-
-        if index < 0:
+        index = self.index_by_id.get(pipette_id)
+        if index is None:
             return False
 
-        self.selector.setCurrentIndex(index)
+        self.stack.setCurrentIndex(index)
         return True
 
     def current_pipette_id(self):
-        return self.selector.currentData()
+        current_index = self.stack.currentIndex()
+        return next(
+            (
+                pipette_id
+                for pipette_id, index in self.index_by_id.items()
+                if index == current_index
+            ),
+            None,
+        )
 
 
 class PipetteStatusWindow(QtWidgets.QWidget):
