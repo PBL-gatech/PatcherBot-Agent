@@ -18,7 +18,8 @@ class Observer:
         self._rows.clear()
         self.attempt_id, self.attempt_token = attempt_id, object()
 
-    def observe(self, *, fields=None, num_measurements=None, interval=None, phase=None, evidence=None):
+    def observe(self, *, fields=None, num_measurements=None, interval=None, phase=None, evidence=None,
+                raw_resistance=False):
         unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
         camera = stage.camera
         requested = tuple(dict.fromkeys(self.default_fields if fields is None else fields))
@@ -37,7 +38,11 @@ class Observer:
         for name in requested:
             started = time.monotonic()
             detail = dict(source="hardware", acquired_at=None)
-            if name in electrical:
+            raw_reading = raw_resistance and name == "resistance"
+            if raw_reading:
+                value = self.controller.daq.resistance()
+                detail.update(started_at=started, num_measurements=1, interval_s=0.0)
+            elif name in electrical:
                 read, count, delay = electrical[name]
                 count = count if num_measurements is None else num_measurements
                 delay = delay if interval is None else interval
@@ -63,13 +68,20 @@ class Observer:
                 detail["read_completed_at"] = time.monotonic()
                 if name in electrical:
                     detail["acquired_at"] = detail["read_completed_at"]
-            if value is None and name not in ("camera_image", "deep_learning", "cell_detections"):
-                value = np.full(2, np.nan) if name == "pipette_image_xy" else np.nan
-            if name in electrical or name in ("pressure", "commanded_pressure_mbar", "pressure_atm_state", "pipette_defocus_um"):
-                value = float(value)
+            if not raw_reading:
+                if value is None and name not in ("camera_image", "deep_learning", "cell_detections"):
+                    value = np.full(2, np.nan) if name == "pipette_image_xy" else np.nan
+                if name in electrical or name in ("pressure", "commanded_pressure_mbar", "pressure_atm_state", "pipette_defocus_um"):
+                    value = float(value)
             detail["valid"] = bool(evidence.get("source_image_shape")) if name == "deep_learning" else value is not None
             if detail["valid"] and name not in ("camera_image", "deep_learning"):
-                detail["valid"] = bool(np.isfinite(value).all())
+                if raw_reading:
+                    try:
+                        detail["valid"] = bool(np.isfinite(value).all())
+                    except (TypeError, ValueError):
+                        detail["valid"] = False
+                else:
+                    detail["valid"] = bool(np.isfinite(value).all())
             values[name], metadata[name] = value, detail
         values.update(observed_at=time.monotonic(), field_metadata=metadata, observation_id=self._next_id,
             attempt_id=self.attempt_id, phase=None if phase is None else type(phase).__name__,

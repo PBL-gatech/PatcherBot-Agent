@@ -512,6 +512,18 @@ class ModelInferencer:
             "scale_y": float(scale_y),
         }
 
+    def prepare_coordinate_goal(self, goal, image):
+        """Transform a camera-space goal with the same crop/scale as the image."""
+        if image is None:
+            raise ValueError("Coordinate goal preprocessing requires a camera image")
+        params = self._compute_frame_params(np.asarray(image).shape[:2])
+        if params is None:
+            raise ValueError("Invalid camera image shape for coordinate goal")
+        result = self._scale_pipette_for_model(goal, params)
+        if result.shape != (3,) or not np.isfinite(result).all():
+            raise ValueError("Coordinate goal must be a finite three-vector")
+        return result
+
     def _prepare_image(
         self,
         image: np.ndarray,

@@ -855,7 +855,8 @@ class AutoPatcher(TaskController):
     # endregion
 
     # region Observations and measurements
-    def observe(self, *, fields=None, num_measurements=None, interval=None, phase=None, evidence=None):
+    def observe(self, *, fields=None, num_measurements=None, interval=None, phase=None, evidence=None,
+                raw_resistance=False):
         """Call requested models directly, then collect and record requested telemetry."""
         requested = tuple(dict.fromkeys(Observer.default_fields if fields is None else fields))
         if isinstance(fields, str) or set(requested) - Observer.available_fields:
@@ -874,8 +875,9 @@ class AutoPatcher(TaskController):
             at = evidence.get("frame_available_at")
         age = None if at is None else time.monotonic() - at
         evidence.update(age_s=age, stale=age is None or not 0 <= age <= 1.)
+        options = {"raw_resistance": True} if raw_resistance else {}
         return self.observer.observe(fields=requested, num_measurements=num_measurements,
-                                     interval=interval, phase=phase, evidence=evidence)
+                                     interval=interval, phase=phase, evidence=evidence, **options)
 
     def infer_frame(self, fields, frame_context=None):
         """Evaluate requested existing models on one frame; Hunt may schedule this call."""

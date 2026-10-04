@@ -13,6 +13,8 @@ class PhaseController(ABC):
         self.frame_context = {}
         self.observation_run = None
         self._observation_attempt = None
+        self.goal_event = False
+        self.awaiting_operator = False
 
     @abstractmethod
     def run(self, cell=None):
@@ -40,14 +42,25 @@ class PhaseController(ABC):
         """Apply this phase's actions using its observation and decide's command."""
         raise NotImplementedError
 
-    @abstractmethod
     def success_gate(self, observation=None, state=None):
-        """Evaluate this phase's completion condition."""
-        raise NotImplementedError
+        """Apply the shared completion policy to a phase's Boolean goal."""
+        self.controller.success_if_requested()
+        if observation is None or self.awaiting_operator:
+            return False
+        self.goal_event = bool(observation)
+        if not self.goal_event:
+            return False
+        if self.controller.config.mode == "Training":
+            self.awaiting_operator = True
+            self.controller.info("Training mode: goal reached. Click Success or Abort to finish.")
+            return False
+        return True
 
     def begin_observations(self):
         self.observation_run = uuid4().hex
         self._observation_attempt = self.controller.observer.attempt_token
+        self.goal_event = False
+        self.awaiting_operator = False
 
     def enrich_observation(self, observation):
         return observation
@@ -89,11 +102,13 @@ class PhaseController(ABC):
             result[-len(values):] = np.asarray(values, dtype=dtype)
         return result
 
-    def observe(self, *, fields=None, num_measurements=None, interval=None, evidence=None):
+    def observe(self, *, fields=None, num_measurements=None, interval=None, evidence=None,
+                raw_resistance=False):
         if self._observation_attempt is not self.controller.observer.attempt_token:
             self.begin_observations()
+        options = {"raw_resistance": True} if raw_resistance else {}
         observation = self.controller.observe(fields=fields, num_measurements=num_measurements,
-                                              interval=interval, phase=self, evidence=evidence)
+                                              interval=interval, phase=self, evidence=evidence, **options)
         acquired_fields = set(observation)
         self.enrich_observation(observation)
         derived = {key: value for key, value in observation.items() if key not in acquired_fields}
