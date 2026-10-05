@@ -290,6 +290,12 @@ class SensapexManip(Manipulator):
         with self._lock:
             self._vel = v3
 
+    def relative_move_group_velocity(self, vel, axes=None):
+        """
+        Relative velocity-mode API; Sensapex backend integrates commanded velocities.
+        """
+        self.absolute_move_group_velocity(vel, axes=axes)
+
     def wait_until_still(self, axes=None, axis=None):
         """
         Block until the device is no longer moving.

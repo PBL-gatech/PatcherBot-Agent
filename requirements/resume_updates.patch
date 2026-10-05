@@ -1,0 +1,1340 @@
+Resume/reload updates temporarily parked on 2026-09-29.
+Restore from repository root: git -c core.autocrlf=false apply --whitespace=nowarn resume_updates.patch
+The patch preserves original source line endings and includes two resume-only tests.
+Independent pipette overlay and calibration fixes are excluded.
+Edit audit: original line ranges removed/reverted (before temporary removal).
+patcherbot/gui/patch.py: 23-23, 97-109, 115-236, 920-937, 1059-1059, 1095-1095, 1104-1104, 1114-1114; original SHA256=7009777e198170a96f5e1d93141f50ac7c83b3c55a26c93be7f1dea0c9fd0bd6
+patcherbot/gui/tabs/experiment_book_tab.py: 20-21, 81-84, 123-156, 198-198; original SHA256=827603d36b52bf120f31d5e54f3b9fa592edb64cafc35b71279cb5a025b914f4
+patcherbot/interface/patch.py: 6-8, 32-40, 85-87, 115-258, 690-691, 705-706, 721-721, 755-756, 778-779, 797-800; original SHA256=0833e00379782bc02f8044ba44a19f0444f907ad8cde009f75ca407cde2f66fd
+patcherbot/interface/pipettes.py: 4-4, 21-22, 92-196, 219-219, 267-268, 299-300, 324-325, 334-334, 371-371, 393-394, 400-401; original SHA256=01acc77800f08ba5efface74c4a516d9a2eeb3a884d4d70f0da294c2dcdd3dff
+patcherbot/utils/experiment_book.py: 10-10, 33-156; original SHA256=20ae4328fdb44b19446e0e597cca3eae4a7f8a4efe905020d6fac91c481d7b22
+tests/test_experiment_reload.py: 1-274; original SHA256=49061c061fc4312daa48aac4de9668ec98f35d7ce93b892b1425902951361920
+tests/test_reload_ui.py: 1-168; original SHA256=f9e026b020e75d751afb0d7f0c8882bfa5de35c3cb90a847c7d0e7ea5d3b68c3
+
+diff --git a/patcherbot/gui/patch.py b/patcherbot/gui/patch.py
+--- a/patcherbot/gui/patch.py
++++ b/patcherbot/gui/patch.py
+@@ -20,6 +20,7 @@
+ from patcherbot.utils.RecordingStateManager import RecordingStateManager
+ from patcherbot.interface.base import command
+ 
++from patcherbot.utils.experiment_book import ExperimentBookLogger
+ from patcherbot.utils.FileLogger import FileLogger
+ from datetime import datetime
+ import json
+@@ -93,11 +94,146 @@
+             lambda: self.record_button.setChecked(self.recording_state_manager.is_recording_enabled())
+         )
+         self._recording_indicator_timer.start(100)
++        self._experiment_reloading = False
++        self._snapshot_pending = False
++        self._snapshot_timer = QtCore.QTimer(self)
++        self._snapshot_timer.setSingleShot(True)
++        self._snapshot_timer.setInterval(150)
++        self._snapshot_timer.timeout.connect(self._capture_experiment)
++        self.experiment_book_tab.reload_requested.connect(self._reload_experiment)
++        self.experiment_book_tab.details_saved.connect(self._queue_experiment_save)
++        self.patch_interface.experiment_state_changed.connect(self._queue_experiment_save)
++        self.patch_interface.experiment_snapshot_ready.connect(self._save_experiment_snapshot)
++        self.patch_interface.experiment_restore_finished.connect(self._experiment_restored)
++        self.patch_interface.experiment_state_error.connect(self._experiment_error)
++
+ 
+     def close(self):
+         self._display_position_timer.stop()
+         self.pipette_interface.display_positions = None
+         return super(PatchGui, self).close()
++
++    def _queue_experiment_save(self):
++        if not self._experiment_reloading and self.experiment_book_tab.book_active:
++            self._snapshot_timer.start()
++
++    def _capture_experiment(self):
++        if self._experiment_reloading:
++            return
++        if self._snapshot_pending:
++            self._snapshot_timer.start()
++            return
++        book = self.experiment_book_tab
++        if not book.book_active:
++            return
++        self._snapshot_pending = True
++        self.patch_command_signal.emit(self.patch_interface.capture_experiment_state,
++                                       {'logger': book.logger, 'experiment': dict(book.active_details)})
++
++    def _save_experiment_snapshot(self, payload):
++        self._snapshot_pending = False
++        if self._experiment_reloading:
++            return
++        try:
++            payload['logger'].write_experiment_state(payload['conditions'], payload['experiment'], payload['sources'])
++        except Exception as error:
++            self.experiment_book_tab._set_status('Experiment state was not saved: ' + str(error), error=True)
++
++    def _reload_experiment(self, folder):
++        if (self._experiment_reloading or self._snapshot_pending or self._origin_busy or
++                self.running_task is not None or self.patch_interface._current_controller is not None or
++                self.pipette_interface._current_controller is not None):
++            self.experiment_book_tab._set_status('Wait for the current task/save to finish.', error=True)
++            return
++        try:
++            logger = ExperimentBookLogger.open_existing(folder)
++            request = {'logger': logger}
++            try:
++                state = logger.read_experiment_state()
++            except FileNotFoundError:
++                details = logger.read_saved_details()
++                calibration, _ = QFileDialog.getOpenFileName(self, 'Select matching calibration file', folder, 'Calibration (*.pickle)')
++                if not calibration:
++                    return
++                tare, _ = QFileDialog.getOpenFileName(self, 'Select matching tare file', os.path.dirname(calibration), 'Tare (*.pickle)')
++                if not tare:
++                    return
++                request['legacy'] = dict(calibration=calibration, tare=tare, origins=logger.read_saved_origins())
++                state = dict(schema_version=1, saved_at='Legacy import: reference checks required',
++                             experiment=details, conditions={}, sources=dict(calibration=calibration, tare=tare))
++            details = state['experiment']
++            if (set(details) != set(self.experiment_book_tab.detail_edits) or
++                    any(not isinstance(value, str) for value in details.values()) or
++                    not details['experiment_name'].strip()):
++                raise ValueError('Invalid experiment details.')
++            if set(state['sources']) != {'calibration', 'tare'} or any(
++                    value is not None and not isinstance(value, str) for value in state['sources'].values()):
++                raise ValueError('Invalid source-file references.')
++            message = ('Reload ' + details['experiment_name'] + '?\nSaved: ' + state['saved_at'] +
++                       '\n\nConfirm that the hardware coordinate system, pipette and imaging setup are unchanged. '
++                       'Reload does not move hardware or change attempt numbering.')
++            if QMessageBox.question(self, 'Reload Experiment', message,
++                                    QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
++                return
++            request['state'] = state
++            self._experiment_reloading = True
++            self._snapshot_timer.stop()
++            self.classic_patching_tab.setEnabled(False)
++            self.experiment_book_tab.setEnabled(False)
++            self._display_position_timer.stop()
++            for timer in self.classic_patching_tab.pos_update_timers:
++                timer.stop()
++            self.start_task('Reloading experiment', self.patch_interface)
++            self.task_abort_button.setVisible(False)
++            self.task_abort_button.setEnabled(False)
++            self.task_success_button.setVisible(False)
++            self.task_success_button.setEnabled(False)
++            self.patch_command_signal.emit(self.patch_interface.restore_experiment_state, request)
++        except Exception as error:
++            self._experiment_error(str(error))
++
++    def _finish_experiment_reload(self):
++        self._experiment_reloading = False
++        self.classic_patching_tab.setEnabled(True)
++        self.experiment_book_tab.setEnabled(True)
++        self._display_position_timer.start()
++        for timer in self.classic_patching_tab.pos_update_timers:
++            timer.start()
++        self.task_progress.setVisible(False)
++        self.task_abort_button.setVisible(False)
++        self.task_abort_button.setEnabled(False)
++        self.task_success_button.setVisible(False)
++        self.task_success_button.setEnabled(False)
++        self.running_task = None
++        self.running_task_interface = None
++
++    def _experiment_restored(self, request):
++        try:
++            book = self.experiment_book_tab
++            state = request['state']
++            book.activate_existing(request['logger'], state['experiment'])
++            self.classic_patching_tab.restore_experiment_display(state['conditions']['completion'])
++            missing = [axis.upper() for axis, record in state['conditions']['origin_records'].items() if record is None]
++            status = 'Experiment conditions restored.'
++            if missing:
++                status += ' Slice setup incomplete: missing ' + ', '.join(missing) + ' origin.'
++            if 'legacy' in request:
++                status += ' Imported legacy calibration requires reference checks.'
++            try:
++                request['logger'].write_note(status)
++            except OSError as error:
++                status += ' Reload log could not be written: ' + str(error)
++            self._finish_experiment_reload()
++            book._set_status(status, error=bool(missing) or 'legacy' in request)
++            self._queue_experiment_save()
++        except Exception as error:
++            self._experiment_error('Experiment restored, but display refresh failed: ' + str(error))
++
++    def _experiment_error(self, message):
++        self._snapshot_pending = False
++        if self._experiment_reloading:
++            self._finish_experiment_reload()
++        self.experiment_book_tab._set_status('Experiment state error: ' + message, error=True)
+ 
+     def _origin_experiment_details(self):
+         book = self.experiment_book_tab
+@@ -781,6 +917,24 @@
+ 
+         self.setLayout(layout)
+ 
++    def restore_experiment_display(self, completion):
++        interface = self.pipette_interface
++        stage_tare = interface.tare_stage
++        scale = interface.calibrated_unit.config.microscope_units_per_um
++        def offset(value):
++            return 0.0 if value is None else float(value)
++        self.tare_pipette_pos = np.array([offset(v) for v in interface.tare_pipette], dtype=float)
++        self.currx_stage_pos = [offset(stage_tare[0]), 0.0, 0.0]
++        self.curry_stage_pos = [0.0, offset(stage_tare[1]), 0.0]
++        self.currz_stage_pos = [0.0, 0.0, offset(stage_tare[2]) * scale]
++        for key, name in {'stage': 'Calibrate Stage', 'pipette': 'Calibrate Pipette',
++                          'cleaning': 'Store Cleaning Position'}.items():
++            button = self.get_section_button('calibration', name)
++            if completion[key]:
++                self._set_button_completion_style(button, self.section_colors['calibration'])
++            else:
++                button.setStyleSheet('')
++
+     def set_origin_busy(self, busy):
+         for button in self.origin_buttons.values():
+             button.setEnabled(not busy)
+@@ -902,6 +1056,7 @@
+         self.tare_pipette_pos = currPos
+         self.pipette_interface.tare_pipette = np.array(self.tare_pipette_pos)
+         print("Tare pipette: ", self.tare_pipette_pos)
++        self.pipette_interface.experiment_state_changed.emit('tare')
+         self.pipette_interface.write_tare()
+ 
+     def update_pipette_pos_labels(self, indices):
+@@ -937,6 +1092,7 @@
+         # update pipette controller stage tare at x position as a numpy array
+         self.pipette_interface.tare_stage[0] = xPos
+         print("Tare stage x: ", self.currx_stage_pos)
++        self.pipette_interface.experiment_state_changed.emit('tare')
+         self.pipette_interface.write_tare()
+ 
+     def tare_stage_y(self):
+@@ -945,6 +1101,7 @@
+         # update pipette controller stage tare at y position as a numpy array
+         self.pipette_interface.tare_stage[1] = yPos
+         print("Tare stage y: ", self.curry_stage_pos)
++        self.pipette_interface.experiment_state_changed.emit('tare')
+         self.pipette_interface.write_tare()
+ 
+     def tare_stage_z(self):
+@@ -954,6 +1111,7 @@
+         z_scale = self.pipette_interface.calibrated_unit.config.microscope_units_per_um
+         self.pipette_interface.tare_stage[2] = zPos / z_scale
+         print("Tare stage z: ", self.currz_stage_pos)
++        self.pipette_interface.experiment_state_changed.emit('tare')
+         self.pipette_interface.write_tare()
+ 
+     def update_stage_pos_labels(self, indices):
+diff --git a/patcherbot/gui/tabs/experiment_book_tab.py b/patcherbot/gui/tabs/experiment_book_tab.py
+--- a/patcherbot/gui/tabs/experiment_book_tab.py
++++ b/patcherbot/gui/tabs/experiment_book_tab.py
+@@ -17,6 +17,8 @@
+ 
+     THUMBNAIL_SIZE = QtCore.QSize(160, 120)
+     config_value_changed_signal = QtCore.pyqtSignal(str, object)
++    reload_requested = QtCore.pyqtSignal(str)
++    details_saved = QtCore.pyqtSignal()
+ 
+     def __init__(
+         self,
+@@ -76,6 +78,10 @@
+         self.save_details_button.clicked.connect(self.save_details)
+         details_layout.addRow(self.save_details_button)
+ 
++        self.reload_button = QtWidgets.QPushButton("Reload Experiment")
++        self.reload_button.clicked.connect(self._request_reload)
++        details_layout.addRow(self.reload_button)
++
+         self.status_label = QtWidgets.QLabel()
+         self.status_label.setWordWrap(True)
+         details_layout.addRow(self.status_label)
+@@ -114,6 +120,40 @@
+         self.send_button.clicked.connect(self.send_note)
+         notes_layout.addWidget(self.send_button, alignment=QtCore.Qt.AlignRight)
+         layout.addWidget(notes_group)
++
++    def _request_reload(self):
++        folder = QtWidgets.QFileDialog.getExistingDirectory(
++            self, "Reload Experiment", ExperimentBookLogger.DEFAULT_FOLDER_PATH,
++        )
++        if folder:
++            self.reload_requested.emit(folder)
++
++    def activate_existing(self, logger, details):
++        """Activate a successfully restored book without touching counters."""
++        normalized = {name: str(details[name]) for name in self.detail_edits}
++        while self.timeline_layout.count():
++            item = self.timeline_layout.takeAt(0)
++            widget = item.widget()
++            if widget is not None:
++                widget.deleteLater()
++        self.timeline_cards.clear()
++        self.state_tally_card = None
++        self.state_tally_header = None
++        self.state_tally_body = None
++        self.logger = logger
++        for name, value in normalized.items():
++            setattr(self.config, name, value)
++        self.config.general_notes = ""
++        self.active_details = normalized
++        self.book_active = True
++        self.send_button.setEnabled(True)
++        self._add_text_card(
++            "Reloaded",
++            f"Restored conditions for {normalized['experiment_name']}.\n"
++            f"Saved history: {logger.log_path}",
++            datetime.now().astimezone(),
++        )
++        self._set_status("Experiment conditions restored.")
+ 
+     def attach_recording_state_manager(self, recording_state_manager):
+         """Attach the shared manager that owns the experiment's press counts."""
+@@ -155,6 +195,7 @@
+             tally_initialized = self._initialize_state_press_tally(timestamp)
+         if tally_initialized:
+             self._set_status("Experiment details saved.")
++        self.details_saved.emit()
+         return True
+ 
+     def _initialize_state_press_tally(self, timestamp):
+diff --git a/patcherbot/interface/patch.py b/patcherbot/interface/patch.py
+--- a/patcherbot/interface/patch.py
++++ b/patcherbot/interface/patch.py
+@@ -3,6 +3,9 @@
+ Control of automatic patch clamp algorithm
+ '''
+ import numpy as np
++from copy import deepcopy
++from datetime import datetime
++import pickle
+ 
+ from patcherbot.interface import TaskInterface, command, blocking_command
+ from patcherbot.controller import AutoPatcher
+@@ -26,6 +29,15 @@
+     '''
+     state_press_tally_changed = QtCore.pyqtSignal(object)
+     origin_saved = QtCore.pyqtSignal(object, object)
++    experiment_state_changed = QtCore.pyqtSignal()
++    experiment_snapshot_ready = QtCore.pyqtSignal(object)
++    experiment_restore_finished = QtCore.pyqtSignal(object)
++    experiment_state_error = QtCore.pyqtSignal(str)
++    POSITION_CONFIG_FIELDS = {
++        'home_position': 'home_position', 'home_stage_position': 'home_position_stage',
++        'safe_position': 'safe_position', 'safe_stage_position': 'safe_position_stage',
++        'cleaning_bath_position': 'bath_position',
++    }
+ 
+     def __init__(
+         self,
+@@ -70,6 +82,9 @@
+         self.is_selecting_corners = False
+         self.cells_to_patch = []
+         self.origins = {"x": None, "y": None}
++        self.origin_records = {"x": None, "y": None}
++        self.preparation_complete = dict(stage=False, pipette=False, cleaning=False)
++        self.pipette_controller.experiment_state_changed.connect(self._pipette_state_changed)
+         self.movement_file_path = ''
+ 
+ 
+@@ -97,6 +112,150 @@
+     def accept_origin(self, record):
+         """Commit a successful save after the GUI confirms its experiment."""
+         self.origins = dict(record["origins_um"])
++        self.origin_records[record['axis']] = deepcopy(record)
++        self.experiment_state_changed.emit()
++
++    def _pipette_state_changed(self, reason):
++        if reason == 'stage':
++            self.preparation_complete['stage'] = True
++        elif reason == 'loaded':
++            self.preparation_complete = dict(stage=False, pipette=False, cleaning=False)
++        self.experiment_state_changed.emit()
++
++    def export_experiment_state(self):
++        state = self.pipette_controller.export_experiment_state()
++        names = (*self.POSITION_CONFIG_FIELDS, 'rinsing_bath_position')
++        state['positions'] = {
++            name: None if getattr(self.current_autopatcher, name) is None else
++            np.asarray(getattr(self.current_autopatcher, name), dtype=float).tolist()
++            for name in names
++        }
++        state['origin_records'] = deepcopy(self.origin_records)
++        state['completion'] = dict(self.preparation_complete)
++        return state
++
++    def prepare_experiment_state(self, state):
++        prepared = self.pipette_controller.prepare_experiment_state(state)
++        prepared['positions'] = {}
++        for name in (*self.POSITION_CONFIG_FIELDS, 'rinsing_bath_position'):
++            value = state['positions'][name]
++            if value is not None:
++                value = np.asarray(value, dtype=float)
++                if value.shape != (3,) or not np.isfinite(value).all():
++                    raise ValueError('Invalid saved position: ' + name)
++                value = value.copy()
++            prepared['positions'][name] = value
++        prepared['origin_records'] = deepcopy(state['origin_records'])
++        if set(prepared['origin_records']) != {'x', 'y'}:
++            raise ValueError('Both origin fields must be present or explicitly unset.')
++        for axis, record in prepared['origin_records'].items():
++            if record is None:
++                continue
++            xyz = np.asarray(record['stage_xyz_um'], dtype=float)
++            value = record['origins_um'][axis]
++            if (record['axis'] != axis or xyz.shape != (3,) or
++                    not np.isfinite(xyz).all() or value is None or
++                    not np.isfinite(float(value)) or
++                    not np.isclose(float(value), xyz[0 if axis == 'x' else 1])):
++                raise ValueError('Invalid saved ' + axis.upper() + ' origin.')
++            datetime.fromisoformat(record['saved_at'])
++            if not isinstance(record['image_path'], str):
++                raise ValueError('Invalid origin image reference.')
++        complete = state['completion']
++        if set(complete) != {'stage', 'pipette', 'cleaning'} or any(type(v) is not bool for v in complete.values()):
++            raise ValueError('Invalid preparation completion flags.')
++        for key in ('stage', 'pipette'):
++            if complete[key] and (not state[key]['calibrated'] or state[key]['must_be_recalibrated']):
++                raise ValueError('Completed calibration is not valid: ' + key)
++        if complete['stage'] and state['microscope']['floor_Z'] is None:
++            raise ValueError('Completed stage calibration has no floor reference.')
++        if complete['pipette'] and any(prepared['positions'][name] is None for name in
++                ('home_position', 'home_stage_position', 'safe_position', 'safe_stage_position')):
++            raise ValueError('Completed pipette calibration has missing anchors.')
++        if complete['cleaning'] and prepared['positions']['cleaning_bath_position'] is None:
++            raise ValueError('Completed cleaning preparation has no saved position.')
++        prepared['completion'] = dict(complete)
++        return prepared
++
++    def _assign_experiment_state(self, prepared):
++        self.pipette_controller.apply_experiment_state(prepared)
++        for name, value in prepared['positions'].items():
++            for owner in (self.current_autopatcher, self.pipette_controller):
++                setattr(owner, name, None if value is None else value.copy())
++            config_name = self.POSITION_CONFIG_FIELDS.get(name)
++            if config_name:
++                setattr(self.pipette_controller.calibration_config, config_name,
++                        (0., 0., 0.) if value is None else tuple(value))
++        self.origin_records = deepcopy(prepared['origin_records'])
++        self.origins = {axis: None if record is None else float(record['origins_um'][axis])
++                        for axis, record in self.origin_records.items()}
++        self.preparation_complete = dict(prepared['completion'])
++
++    def apply_experiment_state(self, prepared):
++        previous = self.prepare_experiment_state(self.export_experiment_state())
++        try:
++            self._assign_experiment_state(prepared)
++        except Exception:
++            self._assign_experiment_state(previous)
++            raise
++
++    def capture_experiment_state(self, request):
++        try:
++            conditions = self.export_experiment_state()
++            self.prepare_experiment_state(conditions)
++            self.experiment_snapshot_ready.emit(dict(request, conditions=conditions, sources={
++                'calibration': self.pipette_controller.calibration_source_path,
++                'tare': self.pipette_controller.tare_source_path}))
++        except Exception as error:
++            self.experiment_state_error.emit(str(error))
++
++    def restore_experiment_state(self, request):
++        try:
++            if self._current_controller is not None or self.pipette_controller._current_controller is not None:
++                raise ValueError('Wait for the current task to finish.')
++            conditions = request['state']['conditions']
++            if 'legacy' in request:
++                conditions = self._legacy_experiment_state(request)
++                request['state']['conditions'] = conditions
++            prepared = self.prepare_experiment_state(conditions)
++            self.apply_experiment_state(prepared)
++            sources = request['state']['sources']
++            self.pipette_controller.calibration_source_path = sources.get('calibration')
++            self.pipette_controller.tare_source_path = sources.get('tare')
++            self.experiment_restore_finished.emit(request)
++        except Exception as error:
++            self.experiment_state_error.emit(str(error))
++
++    def _legacy_experiment_state(self, request):
++        # Legacy files lack floor/empirical-offset provenance: import as incomplete.
++        with open(request['legacy']['calibration'], 'rb') as handle:
++            calibration = pickle.load(handle)
++        with open(request['legacy']['tare'], 'rb') as handle:
++            tare = pickle.load(handle)
++        state = self.export_experiment_state()
++        for key, old_key in (('stage', 'stage'), ('pipette', 'manip')):
++            saved = calibration[old_key]
++            matrix = np.asarray(saved['M'], dtype=float)
++            offset = np.asarray(saved['r0'], dtype=float)
++            state[key] = dict(M=matrix.tolist(), Minv=np.linalg.pinv(matrix).tolist(),
++                              r0=offset.tolist(), r0_inv=(-np.linalg.pinv(matrix).dot(offset)).tolist(),
++                              up_direction=list(saved['up_direction']), emperical_offset=[0., 0., 0.],
++                              calibrated=True, must_be_recalibrated=True)
++        state['microscope']['floor_Z'] = None
++        state['stage_pipette_cal_position'] = [0., 0.]
++        state['tare'] = {key: np.asarray(tare[key], dtype=object).tolist() for key in ('stage', 'pipette')}
++        state['positions'] = {name: None for name in (*self.POSITION_CONFIG_FIELDS, 'rinsing_bath_position')}
++        for name in ('home', 'safe'):
++            values = np.asarray(calibration[name], dtype=float)
++            if values.shape != (6,):
++                raise ValueError('Invalid legacy ' + name + ' position.')
++            state['positions'][name + '_position'] = values[:3].tolist()
++            state['positions'][name + '_stage_position'] = values[3:].tolist()
++        bath = calibration.get('bath')
++        state['positions']['cleaning_bath_position'] = None if bath is None else np.asarray(bath).tolist()
++        state['origin_records'] = {axis: request['legacy']['origins'].get(axis) for axis in ('x', 'y')}
++        state['completion'] = dict(stage=False, pipette=False, cleaning=False)
++        return state
+ 
+     def _record_state_press(self, state):
+         counts = self.recording_state_manager.increment_state_press(state)
+@@ -528,6 +687,8 @@
+         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position.copy()
+         # save calibration to file
+         self.pipette_controller.write_calibration()
++        self.preparation_complete['cleaning'] = True
++        self.experiment_state_changed.emit()
+ 
+     @command(category='Patch',
+                 description='Store the position of the safe space',
+@@ -541,6 +702,8 @@
+         self.current_autopatcher.safe_stage_position = [x,y,z]
+         self.current_autopatcher.calibrated_stage.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
+         self.info(f'safe space position stored: {self.current_autopatcher.safe_position} and {self.current_autopatcher.safe_stage_position}')
++        self.experiment_state_changed.emit()
++
+ 
+     @command(category='Patch',
+                 description='Store the position of the home space',
+@@ -555,6 +718,7 @@
+         self.current_autopatcher.home_stage_position = [x,y,z]
+         self.current_autopatcher.calibrated_stage.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
+         self.info(f'safe home position stored: {self.current_autopatcher.home_position} and {self.current_autopatcher.home_stage_position}')
++        self.experiment_state_changed.emit()
+ 
+ 
+     @command(category='Patch',
+@@ -588,6 +752,8 @@
+         self.pipette_controller.safe_stage_position = self.current_autopatcher.safe_stage_position
+         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position
+         self.pipette_controller.write_calibration()
++        self.preparation_complete['pipette'] = True
++        self.experiment_state_changed.emit()
+     
+ 
+     @command(category='Patch',
+@@ -609,6 +775,8 @@
+              success_message='Rinsing bath position stored')
+     def store_rinsing_position(self) -> None:
+         self.current_autopatcher.rinsing_bath_position = self.pipette_controller.calibrated_unit.position()
++        self.experiment_state_changed.emit()
++
+ 
+     @command(category='Patch',
+              description='clear all stored positions',
+@@ -626,6 +794,10 @@
+         self.current_autopatcher.calibrated_stage.config.home_position_stage = (0., 0., 0.)
+         self.current_autopatcher.calibrated_stage.config.safe_position_stage = (0., 0., 0.)
+         self.current_autopatcher.calibrated_unit.config.bath_position = (0., 0., 0.)
++        for name in (*self.POSITION_CONFIG_FIELDS, 'rinsing_bath_position'):
++            setattr(self.pipette_controller, name, None)
++        self.preparation_complete = dict(stage=False, pipette=False, cleaning=False)
++        self.experiment_state_changed.emit()
+         # self.current_autopatcher.calibrated_unit.config.rinsing_bath_position = None    
+         self.info('All positions cleared')
+ 
+diff --git a/patcherbot/interface/pipettes.py b/patcherbot/interface/pipettes.py
+--- a/patcherbot/interface/pipettes.py
++++ b/patcherbot/interface/pipettes.py
+@@ -1,6 +1,7 @@
+ # coding=utf-8
+ import pickle
+ import os
++from PyQt5 import QtCore
+ 
+ import numpy as np
+ from datetime import datetime
+@@ -17,6 +18,8 @@
+     '''
+     Controller for the stage, the microscope, a pipette, and the cell sorter.
+     '''
++
++    experiment_state_changed = QtCore.pyqtSignal(str)
+ 
+     def __init__(
+         self,
+@@ -86,6 +89,111 @@
+         self.safe_stage_position = None
+         self.tare_pipette = np.array([None, None, None])
+         self.tare_stage = np.array([None, None, None])
++        self.calibration_source_path = None
++        self.tare_source_path = None
++
++    def _experiment_compatibility(self):
++        fields = ('microscope_units_per_um', 'stage_x_axis_flip',
++                  'stage_y_axis_flip', 'pipette_z_rotation',
++                  'pipette_y_rotation', 'pipette_k_scale')
++        return {
++            'stage_axes': list(self.calibrated_stage.axes),
++            'pipette_axes': list(self.calibrated_unit.axes),
++            'microscope_axis': self.microscope.axis,
++            'camera_size': [int(self.camera.width), int(self.camera.height)],
++            'camera_flipped': bool(getattr(self.camera, 'flipped', False)),
++            'coordinates': {name: getattr(self.calibration_config, name)
++                            for name in fields},
++        }
++
++    def export_experiment_state(self):
++        """Copy calibration data without querying or moving hardware."""
++        def calibration(device):
++            state = {name: np.asarray(getattr(device, name)).tolist()
++                     for name in ('M', 'Minv', 'r0', 'r0_inv',
++                                  'up_direction', 'emperical_offset')}
++            state.update(calibrated=bool(device.calibrated),
++                         must_be_recalibrated=bool(device.must_be_recalibrated))
++            return state
++        return {
++            'stage': calibration(self.calibrated_stage),
++            'pipette': calibration(self.calibrated_unit),
++            'microscope': {'floor_Z': self.microscope.floor_Z,
++                           'up_direction': self.microscope.up_direction},
++            'stage_pipette_cal_position': np.asarray(
++                self.calibrated_stage.pipette_cal_position).tolist(),
++            'tare': {'stage': self.tare_stage.tolist(),
++                     'pipette': self.tare_pipette.tolist()},
++            'compatibility': self._experiment_compatibility(),
++        }
++
++    def prepare_experiment_state(self, state):
++        """Validate the entire device checkpoint before modifying live state."""
++        if not isinstance(state, dict):
++            raise ValueError('Experiment conditions must be an object')
++        if state.get('compatibility') != self._experiment_compatibility():
++            raise ValueError('Saved hardware axes, imaging or coordinate settings differ')
++
++        def array(value, shape, name):
++            result = np.asarray(value, dtype=float)
++            if result.shape != shape or not np.isfinite(result).all():
++                raise ValueError('Invalid saved ' + name)
++            return result.copy()
++
++        prepared = {}
++        for name, axes in (('stage', 2), ('pipette', 3)):
++            saved = state[name]
++            for flag in ('calibrated', 'must_be_recalibrated'):
++                if type(saved[flag]) is not bool:
++                    raise ValueError('Invalid calibration status')
++            rows = 2 if name == 'stage' and np.shape(saved['M']) == (2, 2) else 3
++            if saved['calibrated'] and name == 'stage' and rows != 2:
++                raise ValueError('Invalid calibrated stage dimensions')
++            part = {
++                'M': array(saved['M'], (rows, axes), name + ' matrix'),
++                'Minv': array(saved['Minv'], (axes, rows), name + ' inverse'),
++                'r0': array(saved['r0'], (rows,), name + ' offset'),
++                'r0_inv': array(saved['r0_inv'], (rows,), name + ' inverse offset'),
++                'up_direction': array(saved['up_direction'], (axes,), name + ' direction').tolist(),
++                'emperical_offset': array(saved['emperical_offset'], (3,), name + ' empirical offset'),
++                'calibrated': saved['calibrated'],
++                'must_be_recalibrated': saved['must_be_recalibrated'],
++            }
++            if saved['calibrated'] and (np.linalg.matrix_rank(part['M']) != axes
++                    or not np.allclose(part['Minv'] @ part['M'], np.eye(axes), rtol=1e-5, atol=1e-7)):
++                raise ValueError('Saved calibration matrix and inverse are inconsistent')
++            prepared[name] = part
++        microscope = state['microscope']
++        floor = microscope['floor_Z']
++        if floor is not None:
++            floor = float(array(floor, (), 'microscope floor'))
++        direction = float(array(microscope['up_direction'], (), 'microscope direction'))
++        prepared['microscope'] = {'floor_Z': floor, 'up_direction': direction}
++        prepared['stage_pipette_cal_position'] = array(
++            state['stage_pipette_cal_position'], (2,), 'pipette calibration stage position')
++        prepared['tare'] = {}
++        for name in ('stage', 'pipette'):
++            values = state['tare'][name]
++            if not isinstance(values, list) or len(values) != 3:
++                raise ValueError('Invalid saved tare')
++            prepared['tare'][name] = np.array([
++                None if value is None else float(array(value, (), name + ' tare'))
++                for value in values], dtype=object)
++        return prepared
++
++    def apply_experiment_state(self, prepared):
++        """Apply only a previously validated checkpoint; never move hardware."""
++        for name, device in (('stage', self.calibrated_stage),
++                             ('pipette', self.calibrated_unit)):
++            for field in ('M', 'Minv', 'r0', 'r0_inv', 'up_direction',
++                          'emperical_offset', 'calibrated', 'must_be_recalibrated'):
++                value = prepared[name][field]
++                setattr(device, field, value.copy() if hasattr(value, 'copy') else value)
++        self.calibrated_stage.pipette_cal_position = prepared['stage_pipette_cal_position'].copy()
++        self.microscope.floor_Z = prepared['microscope']['floor_Z']
++        self.microscope.up_direction = prepared['microscope']['up_direction']
++        self.tare_stage = prepared['tare']['stage'].copy()
++        self.tare_pipette = prepared['tare']['pipette'].copy()
+ 
+     def connect(self, main_gui):
+         pass #TODO: unused?
+@@ -108,6 +216,7 @@
+              default_arg=10)
+     def finish_calibration(self, none):
+         self.calibrated_unit.finish_calibration()
++        self.experiment_state_changed.emit("pipette")
+ 
+     @command(category='Manipulators',
+              description='Move pipette in x direction by {:.0f}μm',
+@@ -155,6 +264,8 @@
+                     'bath': self.cleaning_bath_position,
+                 }, f)
+             self.info('Calibration written to file')
++            self.calibration_source_path = os.path.abspath(file_path)
++            self.experiment_state_changed.emit('calibration_written')
+         except Exception as e:
+             self.error(f'Error writing calibration to file: {e}')
+             raise
+@@ -185,6 +296,8 @@
+                 print(cal['manip'])
+                 print('Stage calibration:')
+                 print(cal['stage'])
++                self.calibration_source_path = os.path.abspath(config_filename)
++                self.experiment_state_changed.emit('loaded')
+         else:
+             raise RuntimeError('No calibration file found, need to calibrate before usage!')
+ 
+@@ -208,6 +321,8 @@
+                     'stage': self.tare_stage,
+                 }, f)
+             self.info('Tare position written to file')
++            self.tare_source_path = os.path.abspath(file_path)
++            self.experiment_state_changed.emit('tare')
+         except Exception as e:
+             self.error(f'Error writing tare position to file: {e}')
+             raise
+@@ -216,6 +331,7 @@
+                 description='recalibrate manipulator offset while preserving matrix')
+     def recalibrate_manipulator(self):
+         self.calibrated_unit.recalibrate_pipette()
++        self.experiment_state_changed.emit("pipette")
+             
+     @command(category='Manipulators',
+              description='Move pipette in y direction by {:.0f}μm',
+@@ -252,6 +368,7 @@
+         z_scale = self.calibrated_unit.config.microscope_units_per_um
+         self.microscope.floor_Z = self.microscope.position() / z_scale
+         self.info(f'Cell plane position set to {self.microscope.floor_Z}')
++        self.experiment_state_changed.emit('floor')
+ 
+     @command(category='Stage',
+              description='Move stage vertically by {:.0f}μm',
+@@ -273,13 +390,15 @@
+                       description='Calibrate stage only',
+                       task_description='Calibrating stage')
+     def calibrate_stage(self):
+-        self.execute([self.calibrated_stage.calibrate])
++        if self.execute([self.calibrated_stage.calibrate]):
++            self.experiment_state_changed.emit("stage")
+ 
+     @blocking_command(category='Manipulators',
+                       description='Calibrate manipulator',
+                       task_description='Calibrating manipulator')
+     def calibrate_manipulator(self):
+-        self.execute([self.calibrated_unit.calibrate_pipette])
++        if self.execute([self.calibrated_unit.calibrate_pipette]):
++            self.experiment_state_changed.emit("pipette")
+ 
+     @blocking_command(category='Manipulators',
+                       description='Detect the pipette',
+diff --git a/patcherbot/utils/experiment_book.py b/patcherbot/utils/experiment_book.py
+--- a/patcherbot/utils/experiment_book.py
++++ b/patcherbot/utils/experiment_book.py
+@@ -7,6 +7,7 @@
+ from numbers import Integral
+ import os
+ from pathlib import Path
++import tempfile
+ 
+ 
+ class ExperimentBookLogger:
+@@ -29,6 +30,130 @@
+             "ExperimentBookLogger initialized. Folder path set to: %s",
+             self.folder_path,
+         )
++
++    @classmethod
++    def open_existing(cls, session_dir):
++        """Attach to an existing book without creating a new session."""
++        path = Path(session_dir).resolve(strict=True)
++        log_path = path / "experiment_book.log"
++        if not path.is_dir() or not log_path.is_file():
++            raise ValueError("Select an existing experiment book folder.")
++        logger = cls.__new__(cls)
++        logger.time_truth = datetime.now().astimezone()
++        logger.folder_path = str(path)
++        logger.filename = str(log_path)
++        logger.session_dir = path
++        logger.log_path = log_path
++        logger.folder_created = True
++        return logger
++
++    def write_experiment_state(self, conditions, experiment, sources):
++        """Atomically persist validated, JSON-native experiment conditions."""
++        state = {
++            "schema_version": 1,
++            "saved_at": self._timestamp(),
++            "experiment": dict(experiment),
++            "conditions": dict(conditions),
++            "sources": dict(sources),
++        }
++        payload = json.dumps(state, indent=2, allow_nan=False) + "\n"
++        self.create_folder()
++        destination = self.session_dir / "experiment_state.json"
++        temporary = None
++        try:
++            with tempfile.NamedTemporaryFile(
++                mode="w", encoding="utf-8", newline="\n",
++                dir=self.session_dir, prefix=".experiment_state-",
++                suffix=".tmp", delete=False,
++            ) as handle:
++                temporary = Path(handle.name)
++                handle.write(payload)
++                handle.flush()
++                os.fsync(handle.fileno())
++            os.replace(temporary, destination)
++        finally:
++            if temporary is not None and temporary.exists():
++                temporary.unlink()
++        return state
++
++    @staticmethod
++    def _reject_json_constant(value):
++        raise ValueError(f"Nonfinite JSON value: {value}")
++
++    def read_experiment_state(self):
++        """Read the envelope; the interface validates physical conditions."""
++        with (self.session_dir / "experiment_state.json").open(encoding="utf-8") as handle:
++            state = json.load(handle, parse_constant=self._reject_json_constant)
++        required = {"schema_version", "saved_at", "experiment", "conditions", "sources"}
++        if not isinstance(state, dict) or set(state) != required:
++            raise ValueError("Invalid experiment-state structure.")
++        if type(state["schema_version"]) is not int or state["schema_version"] != 1:
++            raise ValueError("Unsupported experiment-state version.")
++        if not isinstance(state["saved_at"], str):
++            raise ValueError("Invalid experiment-state timestamp.")
++        datetime.fromisoformat(state["saved_at"])
++        for key in ("experiment", "conditions", "sources"):
++            if not isinstance(state[key], dict):
++                raise ValueError(f"Invalid experiment-state {key}.")
++        return state
++
++    def _saved_entries(self):
++        """Read writer-formatted entries without replaying events."""
++        entry_type = None
++        body = []
++        for line in self.log_path.read_text(encoding="utf-8").splitlines():
++            header = None
++            if line.startswith("[") and "] " in line:
++                timestamp, candidate = line[1:].split("] ", 1)
++                if candidate in {"DETAILS", "NOTE", "SNAPSHOT", "STATE TALLY", "ORIGIN X", "ORIGIN Y"}:
++                    try:
++                        datetime.fromisoformat(timestamp)
++                    except ValueError:
++                        pass
++                    else:
++                        header = candidate
++            if header is not None:
++                if entry_type is not None:
++                    yield entry_type, body
++                entry_type, body = header, []
++            elif entry_type is not None:
++                body.append(line)
++        if entry_type is not None:
++            yield entry_type, body
++
++    def read_saved_details(self):
++        """Read the latest details from an older book without a checkpoint."""
++        prefixes = {
++            "Experiment name: ": "experiment_name", "Strain/Culture: ": "strain_culture",
++            "Gender: ": "gender", "Age: ": "age",
++        }
++        details = None
++        for entry_type, body in self._saved_entries():
++            if entry_type != "DETAILS":
++                continue
++            details = {}
++            for line in body:
++                for prefix, key in prefixes.items():
++                    if line.startswith(prefix):
++                        details[key] = line[len(prefix):]
++            if set(details) != set(prefixes.values()) or not details["experiment_name"]:
++                raise ValueError("Incomplete saved experiment details.")
++        if details is None:
++            raise ValueError("The experiment book has no saved details.")
++        return details
++
++    def read_saved_origins(self):
++        """Return the latest JSON origin record for each saved axis."""
++        records = {}
++        for entry_type, body in self._saved_entries():
++            if entry_type not in ("ORIGIN X", "ORIGIN Y"):
++                continue
++            record = json.loads("\n".join(body), parse_constant=self._reject_json_constant)
++            axis = entry_type[-1].lower()
++            if not isinstance(record, dict) or record.get("axis") != axis:
++                raise ValueError("Invalid saved origin record.")
++            records[axis] = record
++        return records
+ 
+     def create_folder(self):
+         """Create the timestamped session folder on the first write."""
+diff --git a/tests/test_experiment_reload.py b/tests/test_experiment_reload.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_experiment_reload.py
+@@ -0,0 +1,274 @@
++"""Hardware-free regressions for saved experiment restoration.
++
++Compile production class methods without hardware imports/constructors. This
++keeps tests runnable on development computers without NI or microscope drivers.
++"""
++import ast
++from copy import deepcopy
++from datetime import datetime
++import importlib.util
++import json
++import os
++from pathlib import Path
++import pickle
++from types import SimpleNamespace
++import tempfile
++import unittest
++from unittest.mock import Mock, patch
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def source_class(path, name):
++    tree = ast.parse((ROOT / path).read_text(encoding="utf-8-sig"))
++    node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == name)
++    body = []
++    for item in node.body:
++        if isinstance(item, ast.FunctionDef) and item.name != "__init__":
++            item.decorator_list = [d for d in item.decorator_list
++                                   if isinstance(d, ast.Name) and d.id in ("staticmethod", "classmethod")]
++            item.returns = None
++            for argument in item.args.args + item.args.kwonlyargs:
++                argument.annotation = None
++            body.append(item)
++        elif isinstance(item, ast.Assign) and all(isinstance(t, ast.Name) and t.id.isupper() for t in item.targets):
++            body.append(item)
++    node.bases = []
++    node.keywords = []
++    node.decorator_list = []
++    node.body = body
++    namespace = dict(np=np, deepcopy=deepcopy, datetime=datetime, json=json, os=os,
++                     pickle=pickle, Path=Path)
++    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), path, "exec"), namespace)
++    return namespace[name]
++
++
++spec = importlib.util.spec_from_file_location("reload_logger", ROOT / "patcherbot/utils/experiment_book.py")
++logger_module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(logger_module)
++Logger = logger_module.ExperimentBookLogger
++
++
++def origin(axis, value):
++    return dict(axis=axis, origin_id=("a" if axis == "x" else "b") * 32,
++                saved_at="2026-09-28T12:00:00+00:00", image_path=f"images/{axis}.png",
++                origins_um={"x": value if axis == "x" else None,
++                            "y": value if axis == "y" else None},
++                stage_xyz_um=[value, value, 30.0],
++                experiment={"experiment_name": "slice A"})
++
++
++class LoggerTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.logger = Logger(self.temp.name)
++        self.logger.write_details({"experiment_name": "slice A"})
++
++    def test_roundtrip_uses_existing_folder_and_missing_sources_are_provenance(self):
++        saved = self.logger.write_experiment_state({"origin_records": {"x": origin("x", 13)}},
++                                                  {"experiment_name": "slice A"},
++                                                  {"calibration": "missing/calibration.pickle"})
++        opened = Logger.open_existing(self.logger.session_dir)
++        self.assertEqual(opened.session_dir, self.logger.session_dir.resolve())
++        self.assertEqual(opened.read_experiment_state(), saved)
++        self.assertEqual(len(list(Path(self.temp.name).iterdir())), 1)
++
++    def test_interrupted_replace_preserves_previous_snapshot(self):
++        saved = self.logger.write_experiment_state({"value": 1}, {}, {})
++        with patch.object(logger_module.os, "replace", side_effect=OSError("interrupted")):
++            with self.assertRaises(OSError):
++                self.logger.write_experiment_state({"value": 2}, {}, {})
++        self.assertEqual(self.logger.read_experiment_state(), saved)
++        self.assertEqual(list(self.logger.session_dir.glob(".experiment_state-*.tmp")), [])
++
++    def test_invalid_envelopes_are_rejected(self):
++        state = self.logger.write_experiment_state({}, {}, {})
++        invalid = []
++        for key, value in (("schema_version", 999), ("saved_at", "bad date"),
++                           ("conditions", []), ("experiment", []), ("sources", [])):
++            item = deepcopy(state)
++            item[key] = value
++            invalid.append(item)
++        invalid.append({**state, "conditions": {"bad": float("nan")}})
++        for item in invalid:
++            with self.subTest(item=item):
++                (self.logger.session_dir / "experiment_state.json").write_text(json.dumps(item), encoding="utf-8")
++                with self.assertRaises((ValueError, TypeError)):
++                    self.logger.read_experiment_state()
++
++    def test_legacy_origins_use_latest_valid_record_per_axis(self):
++        self.logger.write_origin(origin("x", 10))
++        y = self.logger.write_origin(origin("y", 20))
++        x = self.logger.write_origin(origin("x", 30))
++        before = self.logger.log_path.read_bytes()
++        self.assertEqual(self.logger.read_saved_origins(), {"x": x, "y": y})
++        self.assertEqual(self.logger.log_path.read_bytes(), before)
++
++    def test_nonfinite_write_does_not_replace_valid_snapshot(self):
++        saved = self.logger.write_experiment_state({}, {}, {})
++        with self.assertRaises(ValueError):
++            self.logger.write_experiment_state({"bad": float("inf")}, {}, {})
++        self.assertEqual(self.logger.read_experiment_state(), saved)
++
++
++class CalibrationTests(unittest.TestCase):
++    def make_interface(self):
++        cls = source_class("patcherbot/interface/pipettes.py", "PipetteInterface")
++        interface = cls()
++        config = SimpleNamespace(microscope_units_per_um=5.0, stage_x_axis_flip=False,
++                                 stage_y_axis_flip=True, pipette_z_rotation=-60.75,
++                                 pipette_y_rotation=25.0, pipette_k_scale=1.0)
++        def unit(size):
++            return SimpleNamespace(M=np.eye(size) * 2, Minv=np.eye(size) / 2,
++                                   r0=np.arange(size) + 17.0, r0_inv=np.arange(size) - 8.0,
++                                   up_direction=[-1] * size, emperical_offset=np.array([2., 3., 4.]),
++                                   calibrated=True, must_be_recalibrated=False, axes=list(range(size)),
++                                   config=config, absolute_move=Mock(side_effect=AssertionError("movement")),
++                                   relative_move=Mock(side_effect=AssertionError("movement")))
++        interface.calibrated_stage = unit(2)
++        interface.calibrated_stage.pipette_cal_position = np.array([8., 9.])
++        interface.calibrated_unit = unit(3)
++        interface.calibration_config = config
++        interface.camera = SimpleNamespace(width=640, height=480, flip=False, rotation=0,
++                                           flip_x=False, flip_y=False, rotate=0)
++        interface.microscope = SimpleNamespace(floor_Z=42.0, up_direction=-1, axes=[2], axis=2, units_per_um=5.0)
++        interface.tare_stage = np.array([11., None, 4.], dtype=object)
++        interface.tare_pipette = np.array([1., 2., 3.])
++        interface.experiment_sources = {"calibration": None, "tare": None}
++        interface.experiment_state_changed = Mock()
++        return interface
++
++    def test_roundtrip_preserves_offsets_floor_and_unset_tare(self):
++        interface = self.make_interface()
++        saved = interface.export_experiment_state()
++        prepared = interface.prepare_experiment_state(saved)
++        interface.calibrated_unit.r0[:] = 0
++        interface.calibrated_unit.r0_inv[:] = 0
++        interface.microscope.floor_Z = 999
++        interface.apply_experiment_state(prepared)
++        self.assertEqual(interface.export_experiment_state(), saved)
++        np.testing.assert_array_equal(interface.calibrated_unit.r0, [17, 18, 19])
++        np.testing.assert_array_equal(interface.calibrated_unit.r0_inv, [-8, -7, -6])
++        self.assertIsNone(interface.tare_stage[1])
++        self.assertEqual(interface.microscope.floor_Z, 42)
++        interface.calibrated_unit.absolute_move.assert_not_called()
++        interface.calibrated_stage.relative_move.assert_not_called()
++
++    def test_invalid_state_and_compatibility_leave_active_state_unchanged(self):
++        interface = self.make_interface()
++        saved = interface.export_experiment_state()
++        malformed = deepcopy(saved)
++        malformed["pipette"]["r0"] = [1, 2]
++        with self.assertRaises(ValueError):
++            interface.prepare_experiment_state(malformed)
++        self.assertEqual(interface.export_experiment_state(), saved)
++        incompatible = deepcopy(saved)
++        incompatible["compatibility"] = {}
++        with self.assertRaises(ValueError):
++            interface.prepare_experiment_state(incompatible)
++        self.assertEqual(interface.export_experiment_state(), saved)
++
++    def test_cold_stage_dimensions_and_missing_tares_are_preserved(self):
++        interface = self.make_interface()
++        stage = interface.calibrated_stage
++        stage.calibrated = False
++        stage.M = np.zeros((3, 2))
++        stage.Minv = np.zeros((2, 3))
++        stage.r0 = np.zeros(3)
++        stage.r0_inv = np.zeros(3)
++        interface.tare_stage[:] = None
++        saved = interface.export_experiment_state()
++        interface.apply_experiment_state(interface.prepare_experiment_state(saved))
++        self.assertEqual(interface.export_experiment_state(), saved)
++
++    def test_display_converts_z_and_updates_only_requested_glows(self):
++        cls = source_class("patcherbot/gui/patch.py", "ClassicPatchButtons")
++        display = cls()
++        display.pipette_interface = self.make_interface()
++        buttons = {name: Mock() for name in ("Calibrate Stage", "Calibrate Pipette", "Store Cleaning Position")}
++        display.get_section_button = lambda section, name: buttons[name]
++        display._set_button_completion_style = Mock()
++        display.section_colors = {"calibration": "blue"}
++        display.restore_experiment_display({"stage": True, "pipette": True, "cleaning": False})
++        self.assertEqual(display.currz_stage_pos, [0.0, 0.0, 20.0])
++        self.assertEqual(display.curry_stage_pos, [0.0, 0.0, 0.0])
++        np.testing.assert_array_equal(display.tare_pipette_pos, [1, 2, 3])
++        self.assertEqual(display._set_button_completion_style.call_count, 2)
++        buttons["Store Cleaning Position"].setStyleSheet.assert_called_once_with("")
++
++
++class AggregateTests(unittest.TestCase):
++    make_interface = CalibrationTests.make_interface
++    def make_aggregate(self):
++        cls = source_class("patcherbot/interface/patch.py", "AutoPatchInterface")
++        interface = cls()
++        interface.pipette_controller = self.make_interface()
++        interface.current_autopatcher = SimpleNamespace(attempt_counter=13, sample_number=7,
++            record=Mock(side_effect=AssertionError("recording")))
++        for name in (*interface.POSITION_CONFIG_FIELDS, "rinsing_bath_position"):
++            setattr(interface.current_autopatcher, name, np.array([1., 2., 3.]))
++        interface.origin_records = {"x": origin("x", 17), "y": origin("y", 29)}
++        interface.origins = {"x": 17., "y": 29.}
++        interface.preparation_complete = dict(stage=True, pipette=True, cleaning=True)
++        interface.recording_state_manager = SimpleNamespace(counts={"patch": 12})
++        return interface
++
++    def test_positions_origins_and_counters_survive_restore(self):
++        interface = self.make_aggregate()
++        saved = interface.export_experiment_state()
++        interface.origins = {"x": -1, "y": -2}
++        interface.apply_experiment_state(interface.prepare_experiment_state(saved))
++        self.assertEqual(interface.origins, {"x": 17., "y": 29.})
++        self.assertEqual(interface.origin_records, saved["origin_records"])
++        self.assertEqual(interface.current_autopatcher.attempt_counter, 13)
++        self.assertEqual(interface.current_autopatcher.sample_number, 7)
++        self.assertEqual(interface.recording_state_manager.counts, {"patch": 12})
++        for name, config_name in interface.POSITION_CONFIG_FIELDS.items():
++            np.testing.assert_array_equal(getattr(interface.pipette_controller, name), [1, 2, 3])
++            self.assertEqual(getattr(interface.pipette_controller.calibration_config, config_name), (1, 2, 3))
++        interface.current_autopatcher.record.assert_not_called()
++
++    def test_unset_positions_clear_runtime_with_real_config_descriptors(self):
++        import param
++        interface = self.make_aggregate()
++        fields = dict(vars(interface.pipette_controller.calibration_config))
++        fields.update({name: param.Tuple(default=(0, 0, 0))
++                       for name in interface.POSITION_CONFIG_FIELDS.values()})
++        config_type = type("ReloadTestConfig", (param.Parameterized,), fields)
++        interface.pipette_controller.calibration_config = config_type()
++        saved = interface.export_experiment_state()
++        saved["positions"] = {name: None for name in saved["positions"]}
++        saved["completion"] = {name: False for name in saved["completion"]}
++        interface.apply_experiment_state(interface.prepare_experiment_state(saved))
++        for name, config_name in interface.POSITION_CONFIG_FIELDS.items():
++            self.assertIsNone(getattr(interface.current_autopatcher, name))
++            self.assertIsNone(getattr(interface.pipette_controller, name))
++            self.assertEqual(getattr(interface.pipette_controller.calibration_config, config_name), (0, 0, 0))
++
++    def test_missing_origins_clear_active_origin_and_assignment_failure_rolls_back(self):
++        interface = self.make_aggregate()
++        saved = interface.export_experiment_state()
++        candidate = deepcopy(saved)
++        candidate["origin_records"] = {"x": None, "y": None}
++        candidate["pipette"]["r0"] = [50, 51, 52]
++        original = interface._assign_experiment_state
++        calls = []
++        def fail_once(prepared):
++            original(prepared)
++            calls.append(None)
++            if len(calls) == 1:
++                raise RuntimeError("injected assignment failure")
++        interface._assign_experiment_state = fail_once
++        with self.assertRaises(RuntimeError):
++            interface.apply_experiment_state(interface.prepare_experiment_state(candidate))
++        self.assertEqual(interface.export_experiment_state(), saved)
++        interface._assign_experiment_state = original
++        interface.apply_experiment_state(interface.prepare_experiment_state(candidate))
++        self.assertEqual(interface.origins, {"x": None, "y": None})
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_reload_ui.py b/tests/test_reload_ui.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_reload_ui.py
+@@ -0,0 +1,168 @@
++"""Exercise production reload handlers with Qt widgets and no hardware imports."""
++import ast
++import os
++from pathlib import Path
++from types import SimpleNamespace
++import unittest
++from unittest.mock import Mock
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++from PyQt5 import QtCore, QtWidgets
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def production_method(path, method_name, namespace):
++    tree = ast.parse((ROOT / path).read_text(encoding="utf-8-sig"))
++    method = next(method for cls in tree.body if isinstance(cls, ast.ClassDef)
++                  for method in cls.body
++                  if isinstance(method, ast.FunctionDef) and method.name == method_name)
++    method.decorator_list = []
++    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
++    exec(compile(module, path, "exec"), namespace)
++    return namespace[method_name]
++
++
++class ReloadUiTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
++
++    def setUp(self):
++        self.state = {
++            "experiment": {"experiment_name": "slice A", "strain_culture": "test",
++                           "gender": "", "age": ""},
++            "saved_at": "2026-09-28T20:42:11+00:00",
++            "sources": {"calibration": None, "tare": None},
++            "conditions": {"completion": dict(stage=True, pipette=True, cleaning=False),
++                           "origin_records": {"x": {"saved": True}, "y": {"saved": True}}},
++        }
++        self.logger = SimpleNamespace(read_experiment_state=Mock(return_value=self.state),
++                                      write_note=Mock())
++        self.logger_factory = SimpleNamespace(open_existing=Mock(return_value=self.logger))
++        namespace = dict(os=os, ExperimentBookLogger=self.logger_factory,
++                         QMessageBox=SimpleNamespace(Yes=1, Cancel=2, question=Mock(return_value=1)))
++        methods = {name: production_method("patcherbot/gui/patch.py", name, namespace)
++                   for name in ("_reload_experiment", "_finish_experiment_reload",
++                                "_experiment_restored", "_experiment_error")}
++        methods["start_task"] = production_method("patcherbot/gui/camera.py", "start_task", namespace)
++        self.gui = type("ReloadHarness", (QtWidgets.QWidget,), methods)()
++        gui = self.gui
++        gui.status_bar = QtWidgets.QStatusBar(gui)
++        gui.task_progress_text = QtWidgets.QLabel(gui)
++        gui.task_progress = QtWidgets.QProgressBar(gui)
++        gui.task_abort_button = QtWidgets.QPushButton(gui)
++        gui.task_success_button = QtWidgets.QPushButton(gui)
++        gui.classic_patching_tab = QtWidgets.QWidget(gui)
++        gui.classic_patching_tab.restore_experiment_display = Mock()
++        gui.experiment_book_tab = QtWidgets.QWidget(gui)
++        gui.experiment_book_tab.detail_edits = dict(self.state["experiment"])
++        gui.experiment_book_tab.activate_existing = Mock()
++        gui.experiment_book_tab._set_status = Mock()
++        gui.patch_interface = SimpleNamespace(
++            _current_controller=None,
++            restore_experiment_state=Mock(side_effect=AssertionError("Worker executed in UI")))
++        gui.pipette_interface = SimpleNamespace(_current_controller=None)
++        gui.patch_command_signal = SimpleNamespace(emit=Mock())
++        gui._queue_experiment_save = Mock()
++        gui._experiment_reloading = False
++        gui._snapshot_pending = False
++        gui._origin_busy = False
++        gui.running_task = None
++        gui.running_task_interface = None
++        gui._snapshot_timer = QtCore.QTimer(gui)
++        gui._display_position_timer = QtCore.QTimer(gui)
++        gui.classic_patching_tab.pos_update_timers = [QtCore.QTimer(gui), QtCore.QTimer(gui)]
++        self.timers = [gui._snapshot_timer, gui._display_position_timer,
++                       *gui.classic_patching_tab.pos_update_timers]
++        for timer in self.timers:
++            timer.start(60000)
++        self.request = dict(logger=self.logger, state=self.state)
++
++    def tearDown(self):
++        for timer in self.timers:
++            timer.stop()
++        self.gui.close()
++        self.gui.deleteLater()
++        self.app.processEvents()
++
++    def begin_reload(self):
++        self.gui._reload_experiment("saved-experiment")
++        self.assertTrue(self.gui._experiment_reloading)
++        self.assertEqual(self.gui.running_task, "Reloading experiment")
++
++    def assert_finished(self):
++        gui = self.gui
++        self.assertFalse(gui._experiment_reloading)
++        self.assertIsNone(gui.running_task)
++        self.assertIsNone(gui.running_task_interface)
++        self.assertTrue(gui.task_progress.isHidden())
++        for button in (gui.task_abort_button, gui.task_success_button):
++            self.assertTrue(button.isHidden())
++            self.assertFalse(button.isEnabled())
++        self.assertTrue(gui.classic_patching_tab.isEnabled())
++        self.assertTrue(gui.experiment_book_tab.isEnabled())
++        self.assertTrue(gui._display_position_timer.isActive())
++        for timer in gui.classic_patching_tab.pos_update_timers:
++            self.assertTrue(timer.isActive())
++        gui.patch_interface.restore_experiment_state.assert_not_called()
++
++    def test_reload_shows_progress_without_invalid_abort_or_success_actions(self):
++        self.begin_reload()
++        gui = self.gui
++        self.assertFalse(gui.task_progress.isHidden())
++        for button in (gui.task_abort_button, gui.task_success_button):
++            self.assertTrue(button.isHidden())
++            self.assertFalse(button.isEnabled())
++        self.assertFalse(gui.classic_patching_tab.isEnabled())
++        self.assertFalse(gui.experiment_book_tab.isEnabled())
++        self.assertTrue(all(not timer.isActive() for timer in self.timers))
++        gui.patch_command_signal.emit.assert_called_once_with(
++            gui.patch_interface.restore_experiment_state, self.request)
++        gui.patch_interface.restore_experiment_state.assert_not_called()
++
++    def test_success_removes_indicator_and_restores_gui_activity(self):
++        self.begin_reload()
++        self.gui._experiment_restored(self.request)
++        self.assert_finished()
++        self.gui.experiment_book_tab.activate_existing.assert_called_once_with(
++            self.logger, self.state["experiment"])
++        self.gui.classic_patching_tab.restore_experiment_display.assert_called_once_with(
++            self.state["conditions"]["completion"])
++        self.logger.write_note.assert_called_once()
++        self.gui._queue_experiment_save.assert_called_once()
++
++    def test_worker_error_removes_indicator_and_restores_gui_activity(self):
++        self.begin_reload()
++        self.gui._experiment_error("Saved state invalid")
++        self.assert_finished()
++        args, kwargs = self.gui.experiment_book_tab._set_status.call_args
++        self.assertIn("Saved state invalid", args[0])
++        self.assertTrue(kwargs["error"])
++
++    def assert_refresh_failure_recovers(self, operation):
++        self.begin_reload()
++        operation.side_effect = RuntimeError("Display refresh failed")
++        self.gui._experiment_restored(self.request)
++        self.assert_finished()
++        args, kwargs = self.gui.experiment_book_tab._set_status.call_args
++        self.assertIn("Display refresh failed", args[0])
++        self.assertTrue(kwargs["error"])
++
++    def test_book_activation_error_still_finishes_reload(self):
++        self.assert_refresh_failure_recovers(self.gui.experiment_book_tab.activate_existing)
++
++    def test_calibration_display_error_still_finishes_reload(self):
++        self.assert_refresh_failure_recovers(self.gui.classic_patching_tab.restore_experiment_display)
++
++    def test_note_write_failure_does_not_leave_reload_running(self):
++        self.begin_reload()
++        self.logger.write_note.side_effect = OSError("Log unavailable")
++        self.gui._experiment_restored(self.request)
++        self.assert_finished()
++        self.assertIn("Log unavailable", self.gui.experiment_book_tab._set_status.call_args.args[0])
++
++
++if __name__ == "__main__":
++    unittest.main()

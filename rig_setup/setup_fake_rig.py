@@ -1,5 +1,5 @@
 '''
-"Fake setup" for GUI development on a computer without access to a rig
+"Fake setup" for GUI development on a computer without access to a rig LEGACY CODE NOW
 '''
 import numpy as np
 from patcherbot.devices.amplifier.amplifier import FakeAmplifier

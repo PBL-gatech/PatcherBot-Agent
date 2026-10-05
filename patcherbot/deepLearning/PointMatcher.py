@@ -1,8 +1,9 @@
-import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -11,34 +12,15 @@ try:
 except ImportError:  # matplotlib is optional
     plt = None
 
-# Ensure the vendored LightGlue package is importable even when not installed globally.
-_LIGHTGLUE_PARENT = Path(__file__).parent / "cellModel" / "LightGlue"
-if str(_LIGHTGLUE_PARENT) not in sys.path:
-    sys.path.insert(0, str(_LIGHTGLUE_PARENT))
-
 try:
-    from lightglue import ALIKED, DISK, DoGHardNet, LightGlue, SIFT, SuperPoint
-    from lightglue.utils import load_image, match_pair
-    _LIGHTGLUE_AVAILABLE = True
-    _LIGHTGLUE_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - optional dependency
-    _LIGHTGLUE_AVAILABLE = False
-    _LIGHTGLUE_IMPORT_ERROR = exc
-    ALIKED = DISK = DoGHardNet = LightGlue = SIFT = SuperPoint = None
-    load_image = None
-    match_pair = None
+    from .cellModel.lightglue_backend_transformers import TransformersLightGlueBackend
+except ImportError:  # pragma: no cover - allow running as a script
+    from cellModel.lightglue_backend_transformers import TransformersLightGlueBackend
 
-_EXTRACTOR_MAP = (
-    {
-        "superpoint": SuperPoint,
-        "disk": DISK,
-        "aliked": ALIKED,
-        "sift": SIFT,
-        "doghardnet": DoGHardNet,
-    }
-    if _LIGHTGLUE_AVAILABLE
-    else {}
-)
+_FEATURE_MODEL_MAP = {
+    "superpoint": "ETH-CVG/lightglue_superpoint",
+    "disk": "ETH-CVG/lightglue_disk",
+}
 
 PathLike = Union[str, Path]
 
@@ -58,9 +40,11 @@ class PointMatcher:
             detail = f" (import error: {_LIGHTGLUE_IMPORT_ERROR})" if _LIGHTGLUE_IMPORT_ERROR else ""
             raise NotImplementedError(f"LightGlue is not available{detail}.")
         self.features = features.lower()
-        if self.features not in _EXTRACTOR_MAP:
-            supported = ", ".join(sorted(_EXTRACTOR_MAP))
-            raise ValueError(f"Unsupported features '{features}'. Choose from: {supported}.")
+        if self.features not in _FEATURE_MODEL_MAP:
+            supported = ", ".join(sorted(_FEATURE_MODEL_MAP))
+            raise ValueError(
+                f"Unsupported features '{features}'. Transformers LightGlue supports: {supported}."
+            )
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -70,11 +54,14 @@ class PointMatcher:
         if "max_num_keypoints" not in extractor_kwargs and self.features == "superpoint":
             extractor_kwargs["max_num_keypoints"] = 2048
 
-        extractor_cls = _EXTRACTOR_MAP[self.features]
-        self.extractor = extractor_cls(**extractor_kwargs).eval().to(self.device)
-
         matcher_kwargs = dict(matcher_conf or {})
-        self.matcher = LightGlue(features=self.features, **matcher_kwargs).eval().to(self.device)
+        model_id = _FEATURE_MODEL_MAP[self.features]
+        self.backend = TransformersLightGlueBackend(
+            model_id=model_id,
+            device=self.device,
+            extractor_conf=extractor_kwargs,
+            matcher_conf=matcher_kwargs,
+        )
 
     def match(
         self,
@@ -82,14 +69,16 @@ class PointMatcher:
         image1: Union[PathLike, torch.Tensor],
         *,
         load_conf: Optional[Dict] = None,
+        include_overlay: bool = True,
         **preprocess,
     ) -> Dict[str, object]:
         """Match two images and report latency.
 
         Args:
             image0/image1: Either file paths or pre-loaded ``torch.Tensor`` images.
-            load_conf: Extra kwargs forwarded to ``lightglue.utils.load_image`` when the
+            load_conf: Extra kwargs forwarded to the internal image loader when the
                 inputs are file paths. Example: ``{\"resize\": 1024}``.
+            include_overlay: Render the aligned image overlay; otherwise return None.
             **preprocess: Additional preprocessing configuration for the extractor.
 
         Returns:
@@ -99,14 +88,16 @@ class PointMatcher:
         image1_tensor = self._prepare_image(image1, load_conf)
 
         start = time.perf_counter()
-        feats0, feats1, matches = match_pair(
-            self.extractor, self.matcher, image0_tensor, image1_tensor, device=self.device, **preprocess
-        )
+        feats0, feats1, matches = self.backend.match_pair(image0_tensor, image1_tensor)
         latency = time.perf_counter() - start
 
         keypoints_pair = self._get_matched_keypoints(feats0, feats1, matches)
         center_shift = self._calculate_shift(keypoints_pair, feats0, feats1)
-        overlay = self._match_patch(image0_tensor, image1_tensor, keypoints_pair)
+        overlay = None
+        if include_overlay:
+            overlay = self._match_patch(
+                image0_tensor.to(self.device), image1_tensor.to(self.device), keypoints_pair
+            )
 
         return {
             "feats0": feats0,
@@ -124,8 +115,61 @@ class PointMatcher:
             tensor = image
         else:
             load_kwargs = dict(load_conf or {})
-            tensor = load_image(str(image), **load_kwargs)
-        return tensor.to(self.device)
+            tensor = self._load_image(str(image), **load_kwargs)
+
+        if tensor.dtype == torch.uint8:
+            tensor = tensor.to(dtype=torch.float32) / 255.0
+        return tensor
+
+    @staticmethod
+    def _load_image(path: str, resize: Optional[Union[int, Tuple[int, int]]] = None, **kwargs: object) -> torch.Tensor:
+        """Load an image from disk as a (C,H,W) float tensor in [0,1].
+
+        This mirrors the previous LightGlue loader behavior (RGB + optional resize).
+        """
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"Could not read image at {path}.")
+        img = img[..., ::-1]  # BGR -> RGB
+
+        if resize is not None:
+            fn = str(kwargs.get("fn", "max"))
+            interp = str(kwargs.get("interp", "area"))
+            img = PointMatcher._resize_image(img, resize, fn=fn, interp=interp)
+
+        img = img.transpose((2, 0, 1))  # HWC -> CHW
+        return torch.tensor(img / 255.0, dtype=torch.float32)
+
+    @staticmethod
+    def _resize_image(
+        image: np.ndarray,
+        size: Union[int, Tuple[int, int]],
+        *,
+        fn: str = "max",
+        interp: str = "area",
+    ) -> np.ndarray:
+        h, w = image.shape[:2]
+        fn_op = {"max": max, "min": min}.get(fn)
+        if fn_op is None:
+            raise ValueError(f"Unsupported resize fn '{fn}'.")
+
+        if isinstance(size, int):
+            scale = float(size) / float(fn_op(h, w))
+            h_new = int(round(h * scale))
+            w_new = int(round(w * scale))
+        else:
+            h_new, w_new = int(size[0]), int(size[1])
+
+        mode = {
+            "linear": cv2.INTER_LINEAR,
+            "cubic": cv2.INTER_CUBIC,
+            "nearest": cv2.INTER_NEAREST,
+            "area": cv2.INTER_AREA,
+        }.get(interp)
+        if mode is None:
+            raise ValueError(f"Unsupported resize interp '{interp}'.")
+
+        return cv2.resize(image, (w_new, h_new), interpolation=mode)
 
     def _get_matched_keypoints(
         self,
@@ -140,9 +184,6 @@ class PointMatcher:
             return None
 
         valid = (match_indices >= 0).all(dim=1)
-        if not valid.any().item():
-            return None
-
         match_indices = match_indices[valid].to(device=feats0["keypoints"].device, dtype=torch.long)
         if match_indices.numel() == 0:
             return None

@@ -2,10 +2,14 @@ import sys
 import os
 import csv
 import bisect
+import json
+import logging
+from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton,
-    QFileDialog, QShortcut, QHBoxLayout, QFrame, QSlider, QMessageBox, QSizePolicy, QStackedWidget
+    QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QComboBox,
+    QFileDialog, QShortcut, QHBoxLayout, QFrame, QSlider, QMessageBox, QSizePolicy, QStackedWidget,
+    QLineEdit, QGraphicsDropShadowEffect, QDialog, QProgressBar
 )
 from PyQt5.QtGui import QPixmap, QColor, QKeySequence
 from PyQt5.QtCore import Qt, QTimer
@@ -14,6 +18,62 @@ import pyqtgraph.opengl as gl
 import numpy as np
 from collections import deque
 import re
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - dependency may be unavailable in some environments
+    cv2 = None
+
+logger = logging.getLogger(__name__)
+
+
+def _bootstrap_repo_import_path():
+    """Ensure the repository root is importable when running this file directly."""
+    try:
+        repo_root = Path(__file__).resolve().parents[4]
+    except Exception:
+        return
+    candidate_paths = [
+        repo_root,
+        repo_root / "patcherbot" / "deepLearning",
+    ]
+    for candidate in candidate_paths:
+        try:
+            if not candidate.exists():
+                continue
+        except Exception:
+            continue
+        candidate_str = str(candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+
+
+_bootstrap_repo_import_path()
+
+CELL_DETECTOR_PIDNET = "pidnet"
+CELL_DETECTOR_YOLO = "yolo"
+
+
+def _create_cell_detector(model_name):
+    """Create the selected cell detector without changing the PIDNet path."""
+    normalized_name = str(model_name).strip().lower()
+    if normalized_name == CELL_DETECTOR_PIDNET:
+        from patcherbot.deepLearning.CellDetector import CellDetector2
+        return CellDetector2(model_type="pidnet")
+    if normalized_name == CELL_DETECTOR_YOLO:
+        from patcherbot.deepLearning.CellDetector import CellDetectorYOLO1
+        return CellDetectorYOLO1()
+    raise ValueError(f"Unsupported cell detector model: {model_name!r}")
+
+
+def _cell_detector_display_name(model_name):
+    normalized_name = str(model_name).strip().lower()
+    if normalized_name == CELL_DETECTOR_PIDNET:
+        return "CellDetector2 PIDNet"
+    if normalized_name == CELL_DETECTOR_YOLO:
+        return "CellDetectorYOLO1"
+    return str(model_name)
+
 
 # ------------------- 3D Mesh Creation Functions -------------------
 
@@ -303,6 +363,8 @@ class DataManager:
         self.directory = None
         self.scaling_factor = scaling_factor  # micrometers to millimeters
         self.init_image_time = 0.0
+        self.state_windows = []
+        self._state_window_starts = []
 
     def load_directory(self, directory):
         self.directory = directory
@@ -326,6 +388,125 @@ class DataManager:
             self.load_graph_data(graph_file_path)
         else:
             raise FileNotFoundError("graph_recording.csv not found in the selected directory.")
+
+        valid_start, valid_end = self._get_valid_recording_window()
+        folder_name = os.path.basename(os.path.normpath(directory))
+        self.load_state_attempts(folder_name, valid_start, valid_end)
+
+    def _get_valid_recording_window(self):
+        if self.graph_data:
+            return self.graph_data[0]['time'], self.graph_data[-1]['time']
+        if self.timestamps:
+            return self.timestamps[0], self.timestamps[-1]
+        return 0.0, 0.0
+
+    @staticmethod
+    def _slugify_state_name(name):
+        cleaned = name.strip().lower().replace(" ", "_")
+        slug = ''.join(ch if (ch.isalnum() or ch == '_') else '_' for ch in cleaned)
+        slug = slug.strip('_')
+        return slug or 'state'
+
+    def load_state_attempts(self, rig_recorder_data_folder, valid_start, valid_end):
+        self.state_windows = []
+        self._state_window_starts = []
+
+        day_token = rig_recorder_data_folder.split('-', 1)[0]
+        tolerance = 0.5
+
+        state_roots = self._candidate_state_roots()
+        if not state_roots:
+            return
+
+        seen_json_paths = set()
+        for state_root in state_roots:
+            for day_dir in sorted(state_root.glob(f"{day_token}*")):
+                if not day_dir.is_dir():
+                    continue
+                for attempt_dir in sorted(day_dir.glob("attempt_*")):
+                    if not attempt_dir.is_dir():
+                        continue
+                    for json_path in sorted(attempt_dir.glob("*.json")):
+                        try:
+                            json_key = str(json_path.resolve())
+                        except OSError:
+                            json_key = str(json_path)
+                        if json_key in seen_json_paths:
+                            continue
+                        seen_json_paths.add(json_key)
+                        try:
+                            with open(json_path, "r", encoding="utf-8") as fh:
+                                payload = json.load(fh)
+                        except (OSError, json.JSONDecodeError):
+                            continue
+
+                        started = payload.get("started")
+                        finished = payload.get("finished")
+                        if started is None or finished is None:
+                            continue
+                        try:
+                            started = float(started)
+                            finished = float(finished)
+                        except (TypeError, ValueError):
+                            continue
+                        if finished <= started:
+                            continue
+                        if finished < (valid_start - tolerance) or started > (valid_end + tolerance):
+                            continue
+
+                        stem = json_path.stem
+                        parts = stem.split("_")
+                        if len(parts) >= 3:
+                            state_name = "_".join(parts[1:-1])
+                        else:
+                            state_name = stem
+                        state_name = self._slugify_state_name(state_name)
+                        outcome = payload.get("outcome")
+                        try:
+                            outcome_code = int(outcome) if outcome is not None else None
+                        except (TypeError, ValueError):
+                            outcome_code = None
+
+                        self.state_windows.append((started, finished, state_name, outcome_code))
+
+        self.state_windows.sort(key=lambda window: window[0])
+        self._state_window_starts = [window[0] for window in self.state_windows]
+
+    def _candidate_state_roots(self):
+        """Return candidate state_recorder_data roots, preferring paths near the selected recording."""
+        roots = []
+        seen = set()
+
+        def add_root(path):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            key = str(resolved)
+            if key in seen:
+                return
+            if path.exists() and path.is_dir():
+                roots.append(path)
+                seen.add(key)
+
+        if self.directory:
+            recording_path = Path(self.directory)
+            for ancestor in recording_path.parents:
+                add_root(ancestor / "state_recorder_data")
+
+        add_root(Path("experiments/Data/state_recorder_data"))
+        return roots
+
+    def get_active_state_for_timestamp(self, timestamp):
+        if not self.state_windows:
+            return None, None
+
+        idx = bisect.bisect_right(self._state_window_starts, timestamp)
+        for j in range(idx - 1, -1, -1):
+            started, finished, state_name, outcome_code = self.state_windows[j]
+            if started <= timestamp <= finished:
+                return state_name, outcome_code
+        return None, None
 
     def _parse_image_directory(self, directory, allow_empty=False, empty_message=None):
         if not os.path.exists(directory):
@@ -638,6 +819,100 @@ class DataManager:
             index_str, timestamp_str = 0, 0.0  # Default values in case of error
         return index_str, timestamp_str
 
+
+class DirectoryLoadWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str, str)
+    progress = QtCore.pyqtSignal(str)
+
+    def __init__(self, directory, scaling_factor):
+        super().__init__()
+        self.directory = directory
+        self.scaling_factor = scaling_factor
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            self.progress.emit("Loading camera, movement, and graph recordings...")
+            manager = DataManager(scaling_factor=self.scaling_factor)
+            manager.load_directory(self.directory)
+            self.finished.emit(manager)
+        except FileNotFoundError as exc:
+            self.error.emit("File Not Found", str(exc))
+        except IOError as exc:
+            self.error.emit("IO Error", str(exc))
+        except Exception as exc:
+            self.error.emit("Error", f"An unexpected error occurred: {exc}")
+
+
+class InferenceEnableWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        enable_pipette_detector,
+        enable_cell_detector,
+        enable_pipette_focuser,
+        cell_detector_model=CELL_DETECTOR_PIDNET,
+    ):
+        super().__init__()
+        self.enable_pipette_detector = bool(enable_pipette_detector)
+        self.enable_cell_detector = bool(enable_cell_detector)
+        self.enable_pipette_focuser = bool(enable_pipette_focuser)
+        self.cell_detector_model = str(cell_detector_model).strip().lower()
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        result = {
+            "pipette_detector": None,
+            "cell_detector": None,
+            "pipette_focuser": None,
+            "pipette_detector_init_failed": False,
+            "cell_detector_init_failed": False,
+            "pipette_focuser_init_failed": False,
+            "warnings": [],
+        }
+        try:
+            if self.enable_pipette_detector:
+                self.progress.emit("Initializing pipette detector...")
+                try:
+                    from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
+                    result["pipette_detector"] = PipetteDetectorYOLO1()
+                except Exception as exc:
+                    result["pipette_detector_init_failed"] = True
+                    result["warnings"].append(
+                        f"PipetteDetectorYOLO1 init failed; disabling pipette overlay: {exc}"
+                    )
+
+            if self.enable_cell_detector:
+                detector_name = _cell_detector_display_name(self.cell_detector_model)
+                self.progress.emit(f"Initializing {detector_name}...")
+                try:
+                    result["cell_detector"] = _create_cell_detector(self.cell_detector_model)
+                except Exception as exc:
+                    result["cell_detector_init_failed"] = True
+                    result["warnings"].append(
+                        f"{detector_name} init failed; disabling cell overlay: {exc}"
+                    )
+
+            if self.enable_pipette_focuser:
+                self.progress.emit("Initializing pipette focuser...")
+                try:
+                    from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser
+                    result["pipette_focuser"] = PipetteFocuser()
+                except Exception as exc:
+                    result["pipette_focuser_init_failed"] = True
+                    result["warnings"].append(
+                        f"PipetteFocuser init failed; disabling focus readout: {exc}"
+                    )
+
+            self.finished.emit(result)
+        except Exception as exc:
+            self.error.emit(f"Inference initialization failed: {exc}")
+
 # ------------------- Main Integrated Window -------------------
 
 class IntegratedTimeline(QMainWindow):
@@ -787,6 +1062,27 @@ class IntegratedTimeline(QMainWindow):
 
         info_frame_layout.addWidget(self.info, stretch=1)
 
+        self.chapter_label = QLabel("Chapter:")
+        info_frame_layout.addWidget(self.chapter_label)
+
+        self.chapter_selector = QComboBox()
+        self.chapter_selector.setMinimumWidth(240)
+        self.chapter_selector.setMaximumWidth(360)
+        self.chapter_selector.addItem("Entire Replay", (0, -1))
+        self.chapter_selector.currentIndexChanged.connect(self._on_chapter_changed)
+        info_frame_layout.addWidget(self.chapter_selector)
+
+        self.state_indicator = QLineEdit("No state")
+        self.state_indicator.setReadOnly(True)
+        self.state_indicator.setFocusPolicy(Qt.NoFocus)
+        self.state_indicator.setAlignment(Qt.AlignCenter)
+        self.state_indicator.setMinimumWidth(180)
+        self.state_indicator.setMaximumWidth(260)
+        self.state_glow_effect = None
+        self._last_state_indicator_key = ("__unset__", "__unset__")
+        self._set_state_indicator(None)
+        info_frame_layout.addWidget(self.state_indicator)
+
         # Buttons Layout
         self.buttons_layout = QHBoxLayout()
         self.buttons_layout.setSpacing(10)
@@ -822,6 +1118,29 @@ class IntegratedTimeline(QMainWindow):
         self.buttons_layout.addWidget(self.toggle_view_button)
         self.update_toggle_button_text()
 
+        # Toggle Inference Button
+        self.toggle_inference_button = QPushButton("")
+        self.toggle_inference_button.setCheckable(True)
+        self.toggle_inference_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.toggle_inference_button.clicked.connect(self.toggle_replay_inference)
+        self.buttons_layout.addWidget(self.toggle_inference_button)
+
+        self.cell_detector_model_label = QLabel("Cell model:")
+        self.cell_detector_model_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.buttons_layout.addWidget(self.cell_detector_model_label)
+
+        self.cell_detector_model_selector = QComboBox()
+        self.cell_detector_model_selector.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.cell_detector_model_selector.addItem("PIDNet", CELL_DETECTOR_PIDNET)
+        self.cell_detector_model_selector.addItem("YOLO", CELL_DETECTOR_YOLO)
+        self.cell_detector_model_selector.setToolTip(
+            "Choose the cell detector used when replay inference is enabled."
+        )
+        self.cell_detector_model_selector.currentIndexChanged.connect(
+            self._on_cell_detector_model_changed
+        )
+        self.buttons_layout.addWidget(self.cell_detector_model_selector)
+
         # Add a spacer to push buttons to the left
         self.buttons_layout.addStretch()
 
@@ -837,8 +1156,41 @@ class IntegratedTimeline(QMainWindow):
         # Initialize Data Manager
         self.data_manager = DataManager()
 
+        # Inference/overlay settings (configure in-file as needed)
+        self.enable_replay_inference = False
+        self.enable_pipette_detector = True
+        self.enable_cell_detector = True
+        self.enable_pipette_focuser = True
+        self.cell_detector_model = self.cell_detector_model_selector.currentData()
+        self.overlay_point_radius = 6
+        self.overlay_text_margin = 10
+
+        # Lazy-loaded model holders and runtime state
+        self._pipette_detector = None
+        self._cell_detector = None
+        self._pipette_focuser = None
+
+        self._pipette_detector_init_failed = False
+        self._cell_detector_init_failed = False
+        self._pipette_focuser_init_failed = False
+        self._frame_overlay_results = None
+        self._cv2_unavailable_warned = False
+        self._inference_disabled_notice_printed = False
+        self._loading_dialog = None
+        self._loading_elapsed_timer = None
+        self._load_thread = None
+        self._load_worker = None
+        self._pending_directory = None
+        self._inference_enable_thread = None
+        self._inference_enable_worker = None
+
+        self.toggle_inference_button.setChecked(self.enable_replay_inference)
+        self.update_inference_toggle_button_text()
+
         # Initialize variables
         self.current_index = 0
+        self._chapter_start_index = 0
+        self._chapter_end_index = -1
         self.directory = None
 
         # Deques for real-time graphing
@@ -892,6 +1244,59 @@ class IntegratedTimeline(QMainWindow):
             }
         """)
 
+    def _ensure_state_glow_effect(self):
+        effect = self.state_indicator.graphicsEffect()
+        if effect is None or not isinstance(effect, QGraphicsDropShadowEffect):
+            effect = QGraphicsDropShadowEffect(self.state_indicator)
+            effect.setOffset(0, 0)
+            effect.setBlurRadius(18)
+            self.state_indicator.setGraphicsEffect(effect)
+        self.state_glow_effect = effect
+        return effect
+
+    def _set_state_indicator(self, state_name, outcome_code=None):
+        glow_effect = self._ensure_state_glow_effect()
+        if state_name:
+            # Outcome code colors:
+            # 0 -> green (success), 1 -> red (failure), 2 -> yellow (abort), 3+ -> orange
+            if outcome_code == 0:
+                bg_color = "#0f3a1d"
+                text_color = "#9dffb6"
+                border_color = "#2ee66f"
+                glow_color = QColor(46, 230, 111)
+            elif outcome_code == 1:
+                bg_color = "#3b1414"
+                text_color = "#ffb0b0"
+                border_color = "#ff5c5c"
+                glow_color = QColor(255, 92, 92)
+            elif outcome_code == 2:
+                bg_color = "#3b320f"
+                text_color = "#ffe88f"
+                border_color = "#ffd84d"
+                glow_color = QColor(255, 216, 77)
+            else:
+                bg_color = "#3a240f"
+                text_color = "#ffc991"
+                border_color = "#ff9e42"
+                glow_color = QColor(255, 158, 66)
+
+            self.state_indicator.setText(state_name)
+            self.state_indicator.setStyleSheet(
+                "QLineEdit { "
+                f"background-color: {bg_color}; color: {text_color}; "
+                f"border: 2px solid {border_color}; border-radius: 4px; padding: 4px 8px; font-weight: 600; }}"
+            )
+            glow_effect.setColor(glow_color)
+            glow_effect.setEnabled(True)
+        else:
+            self.state_indicator.setText("No state")
+            self.state_indicator.setStyleSheet(
+                "QLineEdit { background-color: #3a3a3a; color: #d8d8d8; "
+                "border: 1px solid #5a5a5a; border-radius: 4px; padding: 4px 8px; }"
+            )
+            glow_effect.setEnabled(False)
+        self.state_indicator.update()
+
     def toggle_view(self):
         """Cycle through available right-side views."""
         next_view = self._get_next_view_key()
@@ -924,6 +1329,262 @@ class IntegratedTimeline(QMainWindow):
             return
         self.toggle_view_button.setText(f"Switch to {self.view_labels[next_view]}")
 
+    def update_inference_toggle_button_text(self):
+        if self.enable_replay_inference:
+            self.toggle_inference_button.setText("Disable Inference")
+        else:
+            self.toggle_inference_button.setText("Enable Inference")
+
+    def _show_loading_popup(self, message):
+        self._close_loading_popup()
+        dialog = QDialog(self)
+        dialog.setModal(True)
+        dialog.setWindowTitle("Loading Replay")
+        dialog.setWindowFlags(dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dialog.setMinimumWidth(420)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title_label = QLabel("Loading data into view...")
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        title_label.setStyleSheet("color: #7dff9b; font-weight: 700; font-size: 14px;")
+        layout.addWidget(title_label)
+
+        self._loading_message_label = QLabel(message)
+        self._loading_message_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._loading_message_label.setStyleSheet("color: #d9ffe3;")
+        layout.addWidget(self._loading_message_label)
+
+        self._loading_elapsed_label = QLabel("Elapsed: 0.0 s")
+        self._loading_elapsed_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._loading_elapsed_label.setStyleSheet("color: #9dffb6;")
+        layout.addWidget(self._loading_elapsed_label)
+
+        bar = QProgressBar(dialog)
+        bar.setRange(0, 0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(14)
+        bar.setStyleSheet(
+            "QProgressBar {"
+            "border: 1px solid #2e7d44; border-radius: 6px; background-color: #132318;"
+            "}"
+            "QProgressBar::chunk {"
+            "background-color: #2ee66f;"
+            "}"
+        )
+        layout.addWidget(bar)
+
+        self._loading_dialog = dialog
+        self._loading_elapsed_timer = QtCore.QElapsedTimer()
+        self._loading_elapsed_timer.start()
+
+        self._loading_tick_timer = QTimer(self)
+        self._loading_tick_timer.setInterval(100)
+        self._loading_tick_timer.timeout.connect(self._update_loading_popup_elapsed)
+        self._loading_tick_timer.start()
+
+        dialog.show()
+        QApplication.processEvents()
+
+    def _update_loading_popup_elapsed(self):
+        if self._loading_dialog is None or self._loading_elapsed_timer is None:
+            return
+        try:
+            elapsed_s = self._loading_elapsed_timer.elapsed() / 1000.0
+        except Exception:
+            elapsed_s = 0.0
+        if hasattr(self, "_loading_elapsed_label") and self._loading_elapsed_label is not None:
+            self._loading_elapsed_label.setText(f"Elapsed: {elapsed_s:.1f} s")
+        QApplication.processEvents()
+
+    def _set_loading_popup_message(self, message):
+        if self._loading_dialog is None:
+            return
+        if hasattr(self, "_loading_message_label") and self._loading_message_label is not None:
+            self._loading_message_label.setText(message)
+        QApplication.processEvents()
+
+    def _close_loading_popup(self):
+        tick_timer = getattr(self, "_loading_tick_timer", None)
+        if tick_timer is not None:
+            try:
+                tick_timer.stop()
+            except Exception:
+                pass
+            self._loading_tick_timer = None
+        dialog = self._loading_dialog
+        self._loading_dialog = None
+        self._loading_elapsed_timer = None
+        self._loading_message_label = None
+        self._loading_elapsed_label = None
+        if dialog is not None:
+            try:
+                dialog.close()
+            except Exception:
+                pass
+
+    def _start_directory_load_worker(self, directory):
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._close_loading_popup()
+            QMessageBox.warning(self, "Loading In Progress", "A directory load is already running.")
+            return
+
+        self._pending_directory = directory
+        self._load_thread = QtCore.QThread(self)
+        self._load_worker = DirectoryLoadWorker(
+            directory=directory,
+            scaling_factor=self.data_manager.scaling_factor,
+        )
+        self._load_worker.moveToThread(self._load_thread)
+
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.progress.connect(self._set_loading_popup_message)
+        self._load_worker.finished.connect(self._on_directory_load_finished)
+        self._load_worker.error.connect(self._on_directory_load_error)
+
+        self._load_worker.finished.connect(self._load_thread.quit)
+        self._load_worker.error.connect(self._load_thread.quit)
+        self._load_worker.finished.connect(self._load_worker.deleteLater)
+        self._load_worker.error.connect(self._load_worker.deleteLater)
+        self._load_thread.finished.connect(self._load_thread.deleteLater)
+        self._load_thread.finished.connect(self._on_directory_load_thread_finished)
+
+        self._load_thread.start()
+
+    def _on_directory_load_thread_finished(self):
+        self._load_thread = None
+        self._load_worker = None
+        self._pending_directory = None
+
+    def _on_directory_load_finished(self, loaded_manager):
+        try:
+            self.data_manager = loaded_manager
+            self.directory = loaded_manager.directory or self._pending_directory
+            self.info.setText(f"Loaded data from {self.directory}")
+            self._last_state_indicator_key = ("__unset__", "__unset__")
+            self.current_view_key = 'graphs'
+            self.graph_stack.setCurrentWidget(self.view_widgets[self.current_view_key])
+            self._reset_inference_state()
+            self.refresh_view_order()
+
+            self._set_loading_popup_message("Preparing timeline chapters...")
+            self._populate_chapters()
+
+            self._set_loading_popup_message("Rendering first frame...")
+            self.update_view()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {exc}")
+        finally:
+            self._close_loading_popup()
+
+    def _on_directory_load_error(self, title, message):
+        self._close_loading_popup()
+        QMessageBox.critical(self, title, message)
+
+    def _start_inference_enable_worker(self):
+        if self._inference_enable_thread is not None and self._inference_enable_thread.isRunning():
+            return
+
+        self._inference_enable_thread = QtCore.QThread(self)
+        self._inference_enable_worker = InferenceEnableWorker(
+            enable_pipette_detector=self.enable_pipette_detector,
+            enable_cell_detector=self.enable_cell_detector,
+            enable_pipette_focuser=self.enable_pipette_focuser,
+            cell_detector_model=self.cell_detector_model,
+        )
+        self._inference_enable_worker.moveToThread(self._inference_enable_thread)
+
+        self._inference_enable_thread.started.connect(self._inference_enable_worker.run)
+        self._inference_enable_worker.progress.connect(self._set_loading_popup_message)
+        self._inference_enable_worker.finished.connect(self._on_inference_enable_worker_finished)
+        self._inference_enable_worker.error.connect(self._on_inference_enable_worker_error)
+
+        self._inference_enable_worker.finished.connect(self._inference_enable_thread.quit)
+        self._inference_enable_worker.error.connect(self._inference_enable_thread.quit)
+        self._inference_enable_worker.finished.connect(self._inference_enable_worker.deleteLater)
+        self._inference_enable_worker.error.connect(self._inference_enable_worker.deleteLater)
+        self._inference_enable_thread.finished.connect(self._inference_enable_thread.deleteLater)
+        self._inference_enable_thread.finished.connect(self._on_inference_enable_thread_finished)
+
+        self._inference_enable_thread.start()
+
+    def _on_inference_enable_thread_finished(self):
+        self._inference_enable_thread = None
+        self._inference_enable_worker = None
+
+    def _on_inference_enable_worker_finished(self, result):
+        try:
+            self._pipette_detector = result.get("pipette_detector")
+            self._cell_detector = result.get("cell_detector")
+            self._pipette_focuser = result.get("pipette_focuser")
+            self._pipette_detector_init_failed = bool(result.get("pipette_detector_init_failed", False))
+            self._cell_detector_init_failed = bool(result.get("cell_detector_init_failed", False))
+            self._pipette_focuser_init_failed = bool(result.get("pipette_focuser_init_failed", False))
+            for warning_text in result.get("warnings", []):
+                logger.warning(warning_text)
+        except Exception as exc:
+            logger.error("Failed to apply inference initialization results: %s", exc)
+            self._on_inference_enable_worker_error(f"Inference initialization failed: {exc}")
+            return
+
+        self._complete_enable_inference()
+
+    def _on_inference_enable_worker_error(self, message):
+        logger.error("%s", message)
+        self.enable_replay_inference = False
+        self.toggle_inference_button.setChecked(False)
+        self.update_inference_toggle_button_text()
+        self.toggle_inference_button.setEnabled(True)
+        self.cell_detector_model_selector.setEnabled(True)
+        self._close_loading_popup()
+        QMessageBox.critical(self, "Inference Error", message)
+
+    def _complete_enable_inference(self):
+        try:
+            logger.info("Replay deep-learning inference enabled.")
+            if self.data_manager.image_paths and 0 <= self.current_index < len(self.data_manager.image_paths):
+                self._set_loading_popup_message("Rendering first inferred frame...")
+                self.update_view()
+        except Exception as exc:
+            logger.error("Failed while enabling replay inference: %s", exc)
+            self.enable_replay_inference = False
+            self.toggle_inference_button.setChecked(False)
+            self.update_inference_toggle_button_text()
+            self.cell_detector_model_selector.setEnabled(True)
+            QMessageBox.critical(self, "Inference Error", f"Failed to enable inference: {exc}")
+        finally:
+            self.toggle_inference_button.setEnabled(True)
+            self._close_loading_popup()
+
+    def toggle_replay_inference(self, checked):
+        self.enable_replay_inference = bool(checked)
+        self.update_inference_toggle_button_text()
+        self.cell_detector_model_selector.setEnabled(not self.enable_replay_inference)
+
+        if self.enable_replay_inference:
+            self._inference_disabled_notice_printed = False
+            self._show_loading_popup("Enabling deep-learning inference...")
+            self._set_loading_popup_message("Initializing inference and loading models...")
+            self.toggle_inference_button.setEnabled(False)
+            self._start_inference_enable_worker()
+            return
+
+        logger.error("Replay deep-learning inference disabled by toggle; continuing without inference overlays.")
+        self._frame_overlay_results = None
+        if self.data_manager.image_paths and 0 <= self.current_index < len(self.data_manager.image_paths):
+            self.display_image(self.data_manager.image_paths[self.current_index])
+
+    def _on_cell_detector_model_changed(self):
+        selected_model = self.cell_detector_model_selector.currentData()
+        if selected_model is None:
+            return
+        self.cell_detector_model = str(selected_model).strip().lower()
+        self._cell_detector = None
+        self._cell_detector_init_failed = False
+        self._reset_inference_state()
+
     def refresh_view_order(self):
         self.view_order = ['graphs', 'three_d']
         if self.data_manager.has_aux_images():
@@ -941,39 +1602,253 @@ class IntegratedTimeline(QMainWindow):
 
         self.update_toggle_button_text()
 
+    def _reset_inference_state(self):
+        self._frame_overlay_results = None
+
+    def _ensure_pipette_detector(self):
+        if self._pipette_detector is not None:
+            return self._pipette_detector
+        if self._pipette_detector_init_failed:
+            return None
+        try:
+            from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
+            self._pipette_detector = PipetteDetectorYOLO1()
+        except Exception as exc:
+            self._pipette_detector_init_failed = True
+            logger.warning("PipetteDetectorYOLO1 init failed; disabling pipette overlay: %s", exc)
+            self._pipette_detector = None
+        return self._pipette_detector
+
+    def _ensure_cell_detector(self):
+        if self._cell_detector is not None:
+            return self._cell_detector
+        if self._cell_detector_init_failed:
+            return None
+        detector_name = _cell_detector_display_name(self.cell_detector_model)
+        try:
+            self._cell_detector = _create_cell_detector(self.cell_detector_model)
+        except Exception as exc:
+            self._cell_detector_init_failed = True
+            logger.warning("%s init failed; disabling cell overlay: %s", detector_name, exc)
+            self._cell_detector = None
+        return self._cell_detector
+
+    def _ensure_pipette_focuser(self):
+        if self._pipette_focuser is not None:
+            return self._pipette_focuser
+        if self._pipette_focuser_init_failed:
+            return None
+        try:
+            from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser
+            self._pipette_focuser = PipetteFocuser()
+        except Exception as exc:
+            self._pipette_focuser_init_failed = True
+            logger.warning("PipetteFocuser init failed; disabling focus readout: %s", exc)
+            self._pipette_focuser = None
+        return self._pipette_focuser
+
+    @staticmethod
+    def _normalize_point(point, width, height):
+        if point is None:
+            return None
+        try:
+            x = float(point[0])
+            y = float(point[1])
+        except Exception:
+            return None
+        if not np.isfinite([x, y]).all():
+            return None
+        x_i = int(round(x))
+        y_i = int(round(y))
+        if x_i < 0 or y_i < 0 or x_i >= int(width) or y_i >= int(height):
+            return None
+        return x_i, y_i
+
+    def _run_frame_inference(self, image_path, active_state):
+        self._frame_overlay_results = {
+            "image_path": image_path,
+            "pipette_point": None,
+            "cell_points": [],
+            "focus_value": None,
+        }
+
+        if not self.enable_replay_inference:
+            if not self._inference_disabled_notice_printed:
+                logger.error("Replay deep-learning inference is disabled; continuing without inference overlays.")
+                self._inference_disabled_notice_printed = True
+            return
+        self._inference_disabled_notice_printed = False
+        if cv2 is None:
+            if not self._cv2_unavailable_warned:
+                logger.warning("OpenCV (cv2) is unavailable; replay inference overlays are disabled.")
+                self._cv2_unavailable_warned = True
+            return
+
+        try:
+            frame_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        except Exception as exc:
+            logger.warning("Failed to read replay frame for inference %s: %s", image_path, exc)
+            return
+
+        if frame_bgr is None:
+            logger.warning("Failed to read replay frame for inference: %s", image_path)
+            return
+
+        h, w = frame_bgr.shape[:2]
+
+        if self.enable_pipette_detector:
+            detector = self._ensure_pipette_detector()
+            if detector is not None:
+                try:
+                    point = detector.detect_pipette(frame_bgr)
+                    self._frame_overlay_results["pipette_point"] = self._normalize_point(point, w, h)
+                except Exception as exc:
+                    logger.warning("Pipette detector inference failed on replay frame: %s", exc)
+
+        if self.enable_cell_detector:
+            detector = self._ensure_cell_detector()
+            if detector is not None:
+                try:
+                    detections = detector.detect_cells(frame_bgr, max_outputs=20)
+                    self._frame_overlay_results["cell_points"] = [
+                        point
+                        for detection in detections
+                        if (point := self._normalize_point(detection, w, h)) is not None
+                    ]
+                except Exception as exc:
+                    logger.warning("Cell detector inference failed on replay frame: %s", exc)
+
+        if self.enable_pipette_focuser:
+            focuser = self._ensure_pipette_focuser()
+            if focuser is not None:
+                try:
+                    focus_value = float(focuser.get_pipette_focus_value(frame_bgr))
+                    if np.isfinite(focus_value):
+                        self._frame_overlay_results["focus_value"] = focus_value
+                except Exception as exc:
+                    logger.warning("Pipette focus inference failed on replay frame: %s", exc)
+
+    def _draw_overlay_point(self, painter, point, color):
+        if point is None:
+            return
+        try:
+            x, y = int(point[0]), int(point[1])
+        except Exception:
+            return
+        painter.setPen(QtGui.QPen(color, 2))
+        painter.setBrush(QtGui.QBrush(color))
+        painter.drawEllipse(QtCore.QPointF(float(x), float(y)), float(self.overlay_point_radius), float(self.overlay_point_radius))
+
+    def _apply_frame_overlays(self, pixmap, image_path):
+        if pixmap is None or pixmap.isNull():
+            return pixmap
+        if not self._frame_overlay_results:
+            return pixmap
+        if self._frame_overlay_results.get("image_path") != image_path:
+            return pixmap
+
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        self._draw_overlay_point(
+            painter,
+            self._frame_overlay_results.get("pipette_point"),
+            QtGui.QColor(255, 0, 0),
+        )
+        for cell_point in self._frame_overlay_results.get("cell_points", []):
+            self._draw_overlay_point(painter, cell_point, QtGui.QColor(0, 255, 0))
+        focus_value = self._frame_overlay_results.get("focus_value")
+        if focus_value is not None:
+            text_rect = pixmap.rect().adjusted(
+                self.overlay_text_margin,
+                self.overlay_text_margin,
+                -self.overlay_text_margin,
+                -self.overlay_text_margin,
+            )
+            font = painter.font()
+            font.setPointSize(12)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 255, 0)))
+            painter.drawText(
+                text_rect,
+                Qt.AlignTop | Qt.AlignRight,
+                f"Focus: {focus_value:.2f}",
+            )
+
+        painter.end()
+        return pixmap
+
+    def _populate_chapters(self):
+        """Build selectable replay ranges from recorded state windows."""
+        frame_count = len(self.data_manager.timestamps)
+        full_end = frame_count - 1
+        self._chapter_start_index = 0
+        self._chapter_end_index = full_end
+        self.current_index = 0
+
+        self.chapter_selector.blockSignals(True)
+        self.slider.blockSignals(True)
+        try:
+            self.chapter_selector.clear()
+            self.chapter_selector.addItem("Entire Replay", (0, full_end))
+
+            occurrences = {}
+            for started, finished, state_name, outcome_code in self.data_manager.state_windows:
+                start_index = bisect.bisect_left(self.data_manager.timestamps, started)
+                end_index = bisect.bisect_right(self.data_manager.timestamps, finished) - 1
+                if start_index >= frame_count or end_index < start_index:
+                    continue
+
+                occurrences[state_name] = occurrences.get(state_name, 0) + 1
+                display_name = state_name.replace("_", " ").title()
+                label = f"{display_name} #{occurrences[state_name]}"
+                if outcome_code is not None:
+                    label += f" — outcome {outcome_code}"
+                self.chapter_selector.addItem(label, (start_index, min(end_index, full_end)))
+
+            self.chapter_selector.setCurrentIndex(0)
+            self.slider.setMinimum(0)
+            self.slider.setMaximum(max(0, full_end))
+            self.slider.setValue(0)
+        finally:
+            self.slider.blockSignals(False)
+            self.chapter_selector.blockSignals(False)
+
+    def _on_chapter_changed(self, chapter_index):
+        """Activate a chapter and constrain all replay navigation to its frames."""
+        if not self.data_manager.image_paths:
+            return
+        chapter_range = self.chapter_selector.itemData(chapter_index)
+        if not chapter_range or len(chapter_range) != 2:
+            return
+
+        start_index, end_index = (int(chapter_range[0]), int(chapter_range[1]))
+        if end_index < start_index:
+            return
+
+        self.timer.stop()
+        self.toggle_video_button.setText("Play")
+        self._chapter_start_index = start_index
+        self._chapter_end_index = end_index
+        self.current_index = start_index
+
+        self.slider.blockSignals(True)
+        try:
+            self.slider.setMinimum(start_index)
+            self.slider.setMaximum(end_index)
+            self.slider.setValue(start_index)
+        finally:
+            self.slider.blockSignals(False)
+        self.update_view()
+
     def open_directory(self):
         """Open a directory dialog to select data directory."""
         directory = QFileDialog.getExistingDirectory(self, "Open Directory", "")
         if directory:
-            try:
-                self.data_manager.load_directory(directory)
-                self.directory = directory
-                self.info.setText(f"Loaded data from {directory}")
-                self.current_view_key = 'graphs'
-                self.graph_stack.setCurrentWidget(self.view_widgets[self.current_view_key])
-                self.refresh_view_order()
-
-                # Initialize timeline
-                self.current_index = 0
-
-                # Prevent valueChanged feedback while reconfiguring the slider
-                self.slider.blockSignals(True)
-                try:
-                    self.slider.setMinimum(0)
-                    self.slider.setMaximum(len(self.data_manager.image_paths) - 1)
-                    self.slider.setValue(self.current_index)
-                finally:
-                    self.slider.blockSignals(False)
-
-                # Display first timepoint
-                self.update_view()
-
-            except FileNotFoundError as e:
-                QMessageBox.critical(self, "File Not Found", str(e))
-            except IOError as e:
-                QMessageBox.critical(self, "IO Error", str(e))
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+            self._show_loading_popup("Scanning files...")
+            self._set_loading_popup_message("Loading camera, movement, and graph recordings...")
+            self._start_directory_load_worker(directory)
 
     def check_data_loaded(self):
         """Check if data is loaded before allowing navigation."""
@@ -987,20 +1862,18 @@ class IntegratedTimeline(QMainWindow):
         if not self.check_data_loaded():
             return
 
-        if self.current_index > 0:
+        if self.current_index > self._chapter_start_index:
             self.current_index -= 1
             self.slider.setValue(self.current_index)
-            self.update_view()
 
     def show_next_timepoint(self):
         """Show the next timepoint."""
         if not self.check_data_loaded():
             return
 
-        if self.current_index < len(self.data_manager.image_paths) - 1:
+        if self.current_index < self._chapter_end_index:
             self.current_index += 1
             self.slider.setValue(self.current_index)
-            self.update_view()
 
     def toggle_video(self):
         """Toggle play/pause functionality."""
@@ -1019,10 +1892,9 @@ class IntegratedTimeline(QMainWindow):
         if not self.check_data_loaded():
             return
 
-        if self.current_index < len(self.data_manager.image_paths) - 1:
+        if self.current_index < self._chapter_end_index:
             self.current_index += 1
             self.slider.setValue(self.current_index)
-            self.update_view()
         else:
             self.toggle_video_button.setText("Play")
             self.timer.stop()
@@ -1037,7 +1909,15 @@ class IntegratedTimeline(QMainWindow):
 
     def update_view(self):
         """Update image, 2D graphs, and 3D plot based on current index."""
-        self.display_image(self.data_manager.image_paths[self.current_index])
+        image_path = self.data_manager.image_paths[self.current_index]
+        current_timestamp = self.data_manager.timestamps[self.current_index]
+        active_state, outcome_code = self.data_manager.get_active_state_for_timestamp(current_timestamp)
+        self._run_frame_inference(image_path, active_state)
+        self.display_image(image_path)
+        indicator_key = (active_state, outcome_code)
+        if indicator_key != self._last_state_indicator_key:
+            self._set_state_indicator(active_state, outcome_code)
+            self._last_state_indicator_key = indicator_key
         if self.data_manager.has_aux_images():
             self.update_aux_image()
         self.update_graphs()
@@ -1053,6 +1933,7 @@ class IntegratedTimeline(QMainWindow):
         if pixmap.isNull():
             QMessageBox.warning(self, "Error", "Unable to load image.")
         else:
+            pixmap = self._apply_frame_overlays(pixmap, image_path)
             # Scale the pixmap to fit the label while maintaining aspect ratio
             scaled_pixmap = pixmap.scaled(
                 self.image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation

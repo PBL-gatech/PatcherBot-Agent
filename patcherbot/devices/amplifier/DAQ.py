@@ -1346,6 +1346,63 @@ class NiDAQ(DAQ):
         )
         self.ao_task.write(wave, auto_start=False)
 
+    def _build_optogenetic_timeline(self, protocol_steps: list[dict]):
+        stim_timeline: list[dict] = []
+        cursor = 0.0
+        for step in protocol_steps:
+            duration = float(step.get("duration_s", 0.0))
+            if duration <= 0:
+                continue
+            entry = dict(step)
+            entry["start_s"] = cursor
+            cursor += duration
+            entry["end_s"] = cursor
+            stim_timeline.append(entry)
+
+        if not stim_timeline:
+            raise ValueError("protocol_steps must contain positive durations")
+
+        protocol_type = stim_timeline[0].get("protocol_type")
+        return stim_timeline, cursor, protocol_type
+
+    def _wait_until(self, deadline_s: float, *, tight_timing: bool = True) -> None:
+        """
+        Sleep until deadline_s; optionally spin for the last few ms to reduce jitter.
+        """
+        while True:
+            remaining = deadline_s - time.perf_counter()
+            if remaining <= 0:
+                return
+            if not tight_timing or remaining > 0.005:
+                time.sleep(min(0.001, max(0.0, remaining - 0.002)))
+                continue
+            while time.perf_counter() < deadline_s:
+                pass
+
+    def _setup_optogenetic_ai_task(self, rate_hz: int, num_samples: int):
+        ai = nidaqmx.Task()
+        ai.ai_channels.add_ai_voltage_chan(
+            f"{self.readDev}/{self.readChannel}",
+            terminal_config=nidaqmx.constants.TerminalConfiguration.DIFF,
+            min_val=-10.0, max_val=10.0)
+        ai.ai_channels.add_ai_voltage_chan(
+            f"{self.respDev}/{self.respChannel}",
+            terminal_config=nidaqmx.constants.TerminalConfiguration.DIFF,
+            min_val=-10.0, max_val=10.0)
+        ai.timing.cfg_samp_clk_timing(
+            rate=rate_hz,
+            sample_mode=nidaqmx.constants.AcquisitionType.FINITE,
+            samps_per_chan=num_samples)
+        return ai
+
+    def _read_optogenetic_ai(self, ai_task, num_samples: int, duration_s: float):
+        raw = ai_task.read(
+            number_of_samples_per_channel=num_samples,
+            timeout=duration_s + 2.0)
+        ai_task.stop()
+        ai_task.close()
+        return np.asarray(raw, dtype=float)
+
     def getLeakSubtraction(
             self,
             *,
@@ -1700,9 +1757,9 @@ class NiDAQ(DAQ):
         # ───────── constants ─────────
         samplesPerSec  = 100_000
         dutyCycle      = float(dutyCycle)
-        recordingTime  = recordingTimeMs * 1e-3
-        wave_freq      = 1.0 / recordingTime
-        fullRecTime    = 4 * recordingTime
+        recordingTime  = recordingTimeMs * 1e-3   # 0.25 s / segment
+        wave_freq      = 1.0 / recordingTime      # 4 Hz
+        fullRecTime    = 4 * recordingTime        # 1.0 s / train
         exp_samples    = int(samplesPerSec * fullRecTime)
 
         # ─ 1. build pulse list ───────
@@ -1808,7 +1865,7 @@ class NiDAQ(DAQ):
         Returns
         -------
         np.ndarray
-            [time_s, resp_V, read_V]  – identical to the legacy layout.
+            [time_s, resp_A, read_V]
         """
         import nidaqmx
         import nidaqmx.constants as c
@@ -1842,8 +1899,9 @@ class NiDAQ(DAQ):
             ai.stop(); ai.close()
 
             raw = np.array(raw, dtype=float)
-            resp = raw[1]      # still in DAQ volts
-            read = raw[0]
+            # Keep unit conversions consistent with other V-clamp protocol paths.
+            resp = raw[1] * self.V_CLAMP_VOLT_PER_AMP
+            read = raw[0] * self.V_CLAMP_VOLT_PER_VOLT
             t = np.linspace(0, duration_s, num_samples, dtype=float)
 
             self.holding_protocol_data = np.array([t, resp, read])

@@ -16,15 +16,21 @@ class FocusHelper():
         self.microscope = microscope
         self.camera = camera
 
+    def _distance_scale(self):
+        if getattr(self.microscope, "config", None) is not None:
+            return float(self.microscope.config.microscope_units_per_um)
+        return float(getattr(self.microscope, "units_per_um", 5.0))
+
     def autofocusContinuous(self, distance, timeout=1):
 
 
         focusThread = FocusUpdater(self.microscope, self.camera)
         focusThread.start()
-        commandedPos = self.microscope.position() + distance
+        scale = self._distance_scale()
+        commandedPos = self.microscope.position() / scale + distance
         self.microscope.relative_move(distance)
         start_time = time.time()
-        while abs(self.microscope.position() - commandedPos) > 0.3:
+        while abs(self.microscope.position() / scale - commandedPos) > 0.3:
             if time.time() - start_time > timeout:
                 print("Timeout reached waiting for microscope movement")
                 break
@@ -44,10 +50,11 @@ class FocusHelper():
 
     def autofocus(self, dist=100):
         self.microscope.set_max_speed(self.FOCUSING_MAX_SPEED)
-        initPos = self.microscope.position()
+        scale = self._distance_scale()
+        initPos = self.microscope.position() / scale
         # print("Moving downward to collect forward scores..")
         bestForwardPos, bestForwardScore = self.autofocusContinuous(-dist)
-        # print(f"Focus values:{bestForwardPos} um, {bestForwardScore} units")
+        # print(f"Focus values:{bestForwardPos/scale} um, {bestForwardScore} units")
 
         self.microscope.set_max_speed(self.NORMAL_MAX_SPEED)
         # self.microscope.absolute_move(initPos)
@@ -58,12 +65,12 @@ class FocusHelper():
         self.microscope.set_max_speed(self.FOCUSING_MAX_SPEED)
         # print("Moving upward to collect backwards scores..")
         bestBackwardPos, bestBackwardScore = self.autofocusContinuous(dist)
-        # print(f"Focus values:{bestBackwardPos} um, {bestBackwardScore} units")
+        # print(f"Focus values:{bestBackwardPos/scale} um, {bestBackwardScore} units")
 
         self.microscope.set_max_speed(self.NORMAL_MAX_SPEED)
 
         finalPos = bestForwardPos if bestForwardScore >= bestBackwardScore else bestBackwardPos
-        finalPos = finalPos
+        finalPos = finalPos / scale
         # print(f"FinalPosition: {finalPos}")
         self.microscope.absolute_move(finalPos)
         self.microscope.wait_until_still()

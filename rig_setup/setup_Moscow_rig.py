@@ -1,5 +1,5 @@
 '''
-This script sets up the Moscow rig. It is used to set up the devices and their connections. The devices are then used in the main script.
+This script sets up the Moscow rig. It is used to set up the devices and their connections. The devices are then used in the main script. LEGACY CODE NOW
 '''
 import serial
 from patcherbot.devices.amplifier.multiclamp import MultiClampChannel

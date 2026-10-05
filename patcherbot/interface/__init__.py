@@ -9,5 +9,3 @@ from .base import *
 from .camera import *
 from .pipettes import PipetteInterface
 from .patch import AutoPatchInterface
-from .patchConfig import PatchConfig
-from .protocolConfig import ProtocolConfig

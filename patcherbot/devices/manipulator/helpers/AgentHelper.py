@@ -1,28 +1,38 @@
 import sys
 import time
+import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict, Any, List
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
-from patcherbot.deepLearning.PatcherBotAgent import (
-    Burglar,
-    CellHunter,
-    DemoReplayAgent,
-    GigaSealer,
-    PipetteFinder,
+import h5py
+
+_AI_FEATURE_DISABLED_MESSAGE = (
+    "AI features need to be enabled in calibration config before use. "
+    "Set calibration.use_ai_features to true."
 )
 
-import h5py
+_DEFAULT_REPLAY_OBS_KEYS = ("camera_image", "pipette_positions", "stage_positions", "resistance")
+_REPLAY_MODEL_TYPES = {"find_pipette_replay", "hunt_replay"}
 
 
 class AgentHelper:
 
-    def __init__(self):
+    def __init__(self, use_ai_features: bool = True):
         """Track the active agent instance and its configuration."""
+        self._use_ai_features = bool(use_ai_features)
+        self._inference_lock = threading.Lock()
+        self._model_call_lock = threading.RLock()
+        self._inference_epoch = 0
+        self._inference_generation = None
+        self._inference_worker = None
+        self._inference_result = None
+        self._agent_classes: Optional[Dict[str, Any]] = None
         self.agent = None
         self.requires_goal = False
         self._demo_actions: Optional[np.ndarray] = None
@@ -36,19 +46,48 @@ class AgentHelper:
             },
         }
 
-    def prepare_model(self, model_type):
+    def _load_agent_classes(self) -> Dict[str, Any]:
+        if self._agent_classes is not None:
+            return self._agent_classes
+
+        if not self._use_ai_features:
+            raise NotImplementedError(_AI_FEATURE_DISABLED_MESSAGE)
+        try:
+            from patcherbot.deepLearning.PatcherBotAgentR import (
+                Burglar,
+                CellHunter,
+                DemoReplayAgent,
+                GigaSealer,
+                PipetteFinder,
+            )
+        except Exception as exc:
+            raise NotImplementedError(f"Agent models are not available: {exc}") from exc
+
+        self._agent_classes = {
+            "Burglar": Burglar,
+            "CellHunter": CellHunter,
+            "DemoReplayAgent": DemoReplayAgent,
+            "GigaSealer": GigaSealer,
+            "PipetteFinder": PipetteFinder,
+        }
+        return self._agent_classes
+
+    def prepare_model(self, model_type, *, allow_goal_placeholders: Optional[bool] = None):
         """Instantiate one of the supported agent subclasses."""
+        self.invalidate_inference()
+        agent_classes = self._load_agent_classes()
+        demo_replay_cls = agent_classes["DemoReplayAgent"]
         self.model_type = model_type
         if model_type == "find_pipette":
-            self.agent = PipetteFinder()
+            self.agent = agent_classes["PipetteFinder"]()
         elif model_type == "hunt":
-            self.agent = CellHunter()
+            self.agent = agent_classes["CellHunter"]()
         elif model_type == "gigaseal":
-            self.agent = GigaSealer()
+            self.agent = agent_classes["GigaSealer"]()
         elif model_type == "break_in":
-            self.agent = Burglar()
+            self.agent = agent_classes["Burglar"]()
         elif model_type in {"find_pipette_replay", "hunt_replay"}:
-            self.agent = DemoReplayAgent()
+            self.agent = demo_replay_cls()
             if self._demo_actions is None:
                 source = self._default_demo_sources.get(model_type)
                 if source and source.get("path"):
@@ -65,11 +104,41 @@ class AgentHelper:
                 self.agent.load_actions(self._demo_actions)
         else:
             raise ValueError(f"Model type '{model_type}' not supported")
-        if isinstance(self.agent, DemoReplayAgent):
+        if isinstance(self.agent, demo_replay_cls):
             image_size = self._infer_image_size(self._last_demo_dataset)
             if image_size is not None:
                 self.agent.set_image_size(image_size)
+        if allow_goal_placeholders is not None and hasattr(self.agent, "allow_goal_placeholders"):
+            self.agent.allow_goal_placeholders = bool(allow_goal_placeholders)
         self.requires_goal = bool(getattr(self.agent, "goal_required", False))
+
+    def observation_input_width(self, input_name: str, default_width: int = 15) -> int:
+        """Return an active policy input's final dimension, or zero if unused."""
+        if self.agent is None:
+            return 0
+        required_keys = ()
+        getter = getattr(self.agent, "get_required_obs_keys", None)
+        if callable(getter):
+            try:
+                required_keys = tuple(str(key) for key in getter())
+            except Exception:
+                required_keys = ()
+        if not required_keys:
+            required_keys = tuple(str(key) for key in getattr(self.agent, "obs_keys", ()) or ())
+
+        importer = getattr(self.agent, "importer", None)
+        obs_shapes = getattr(importer, "obs_shapes", {}) or {}
+        if input_name not in required_keys and input_name not in obs_shapes:
+            return 0
+        shape = obs_shapes.get(input_name)
+        if shape is not None:
+            try:
+                shape_tuple = tuple(int(dim) for dim in shape)
+            except Exception:
+                shape_tuple = ()
+            if shape_tuple:
+                return max(1, shape_tuple[-1])
+        return max(1, int(default_width))
 
     def load_demo(self, actions: np.ndarray) -> None:
         """Store demo actions for later replay and pass them to an active replay agent."""
@@ -79,19 +148,33 @@ class AgentHelper:
         if replay.size == 0:
             raise ValueError("Demo action array must contain at least one action")
         self._demo_actions = replay.astype(np.float32, copy=False)
-        if isinstance(self.agent, DemoReplayAgent):
+        if self.agent is not None and type(self.agent).__name__ == "DemoReplayAgent":
             self.agent.load_actions(self._demo_actions)
 
     def has_demo_actions(self) -> bool:
         """Return True when a demo action sequence has been cached."""
         return self._demo_actions is not None and self._demo_actions.size > 0
 
-    def load_demo_from_hdf5(self, data_path: Union[str, Path], *, demo_id: Optional[str] = None) -> Dict[str, Any]:
+    def load_demo_from_hdf5(self, data_path: Union[str, Path], *, demo_id: Optional[str] = None, model_type: Optional[str] = None) -> Dict[str, Any]:
         """Load demo data from disk and cache its action sequence for replay use."""
-        dataset = self._load_hdf5_sequence(Path(data_path), demo_id=demo_id)
+        dataset = self._load_hdf5_sequence(Path(data_path), demo_id=demo_id, model_type=model_type or getattr(self, "model_type", None))
         self._last_demo_dataset = dataset
         self.load_demo(dataset["actions"])
         return dataset
+
+    def _get_active_obs_keys(self, model_type: Optional[str] = None) -> Tuple[str, ...]:
+        """Return observation keys from the active model instead of hardcoded model presets."""
+        if self.agent is not None and type(self.agent).__name__ != "DemoReplayAgent":
+            getter = getattr(self.agent, "get_required_obs_keys", None)
+            keys = getter() if callable(getter) else getattr(self.agent, "obs_keys", None)
+            if keys:
+                return tuple(str(key) for key in keys)
+
+        model_key = str(model_type or getattr(self, "model_type", "")).lower()
+        if model_key in _REPLAY_MODEL_TYPES:
+            return _DEFAULT_REPLAY_OBS_KEYS
+
+        raise RuntimeError("Prepare the target model before loading HDF5 so its config can define observation keys.")
 
     def set_demo_source(
         self,
@@ -127,6 +210,7 @@ class AgentHelper:
         data_path: Path,
         *,
         demo_id: Optional[str] = None,
+        model_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Load a single demonstration sequence from an HDF5 file."""
         data_path = Path(data_path)
@@ -147,46 +231,107 @@ class AgentHelper:
             act_root = f"data/{demo_key}"
 
             obs_group = h5[f"{obs_root}"]
-            images = obs_group["camera_image"][:]
-            num_frames = images.shape[0]
-
-            if "resistance" in obs_group:
-                resistance = obs_group["resistance"][:]
-            else:
-                resistance = np.zeros((num_frames, 1), dtype=np.float32)
-
-            if "pipette_positions" in obs_group:
-                pipette_positions = obs_group["pipette_positions"][:]
-            else:
-                pipette_positions = np.zeros((num_frames, 3), dtype=np.float32)
-
-            if "stage_positions" in obs_group:
-                stage_positions = obs_group["stage_positions"][:]
-            else:
-                stage_positions = np.zeros((num_frames, 3), dtype=np.float32)
             actions = h5[f"{act_root}/actions"][:]
+            obs_keys = self._get_active_obs_keys(model_type)
+            missing_obs = [key for key in obs_keys if key not in obs_group]
+            if missing_obs:
+                raise ValueError(
+                    f"Demo '{demo_key}' in {data_path} is missing required observation keys: {missing_obs}"
+                )
 
-        stage_positions = np.asarray(stage_positions, dtype=np.float32)
-        if stage_positions.ndim != 2:
-            stage_positions = stage_positions.reshape(stage_positions.shape[0], -1)
-        if stage_positions.shape[1] == 2:
-            zeros = np.zeros((stage_positions.shape[0], 1), dtype=np.float32)
-            stage_positions = np.concatenate([stage_positions, zeros], axis=1)
-        elif stage_positions.shape[1] > 3:
-            stage_positions = stage_positions[:, :3]
+            def _read_obs_value(key: str) -> np.ndarray:
+                value = obs_group[key][:]
+                if "image" in key.lower():
+                    return np.asarray(value)
+                return np.asarray(value, dtype=np.float32)
+
+            obs_values = {key: _read_obs_value(key) for key in obs_keys}
+            num_frames = int(actions.shape[0])
+            image_key = next((key for key in obs_keys if "image" in key.lower()), None)
+            pipette_key = next((key for key in obs_keys if "pipette" in key.lower()), None)
+            stage_key = next((key for key in obs_keys if "stage" in key.lower()), None)
+            resistance_key = next((key for key in obs_keys if "resist" in key.lower()), None)
+
+            images = obs_values.get(image_key)
+            resistance = obs_values.get(resistance_key)
+            pipette_positions = obs_values.get(pipette_key)
+            stage_positions = obs_values.get(stage_key)
 
         return {
             "demo_id": demo_key,
-            "images": np.asarray(images),
-            "resistance": np.asarray(resistance, dtype=np.float32),
-            "pipette_positions": np.asarray(pipette_positions, dtype=np.float32),
-            "stage_positions": np.asarray(stage_positions, dtype=np.float32),
+            "images": None if images is None else np.asarray(images),
+            "resistance": None if resistance is None else np.asarray(resistance, dtype=np.float32),
+            "pipette_positions": None if pipette_positions is None else np.asarray(pipette_positions, dtype=np.float32),
+            "stage_positions": None if stage_positions is None else np.asarray(stage_positions, dtype=np.float32),
             "actions": np.asarray(actions, dtype=np.float32),
+            "obs": obs_values,
+            "obs_keys": obs_keys,
         }
+
+    def invalidate_inference(self) -> None:
+        """Discard asynchronous actions immediately without waiting for the model."""
+        with self._inference_lock:
+            self._inference_epoch += 1
+            self._inference_generation = None
+            self._inference_result = None
+
+    def request_inference(self, observation, generation, goal=None, *, is_demo=False) -> bool:
+        """Snapshot one request; return False while a worker or result is outstanding.
+
+        The caller supplies an attempt/contact generation and must invalidate on
+        cancellation. An invalidated model call may finish, but cannot publish
+        an action. New calls wait for that worker through polling, never joining.
+        """
+        with self._inference_lock:
+            if generation != self._inference_generation:
+                self._inference_epoch += 1
+                self._inference_generation = generation
+                self._inference_result = None
+            if self._inference_worker is not None or self._inference_result is not None:
+                return False
+            if self.agent is None:
+                raise RuntimeError("Call prepare_model before request_inference")
+            snapshot = deepcopy(observation)
+            active_goal = deepcopy(goal) if self.requires_goal else None
+            agent, epoch = self.agent, self._inference_epoch
+
+            def evaluate():
+                action, error = None, None
+                try:
+                    with self._model_call_lock:
+                        action = deepcopy(agent.inference(
+                            observation=snapshot, goal=active_goal, is_demo=is_demo))
+                except BaseException as caught:
+                    error = caught
+                with self._inference_lock:
+                    if epoch == self._inference_epoch and generation == self._inference_generation:
+                        self._inference_result = (generation, action, error)
+                    self._inference_worker = None
+
+            worker = threading.Thread(target=evaluate, name="patcherbot-agent-inference", daemon=True)
+            self._inference_worker = worker
+            try:
+                worker.start()
+            except BaseException:
+                self._inference_worker = None
+                raise
+            return True
+
+    def poll_inference(self, generation):
+        """Consume a matching result once; (True, None) is a completed zero action."""
+        with self._inference_lock:
+            result = self._inference_result
+            if result is None or generation != self._inference_generation or result[0] != generation:
+                return False, None
+            self._inference_result = None
+        _, action, error = result
+        if error is not None:
+            raise error
+        return True, action
 
     def run_inference(
         self,
-        observation: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        observation: Union[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], Dict[str, np.ndarray]],
         goal: Optional[np.ndarray] = None,
         *,
         is_demo: bool = False,
@@ -195,7 +340,8 @@ class AgentHelper:
         if self.agent is None:
             raise RuntimeError("Call prepare_model before run_inference")
         active_goal = goal if self.requires_goal else None
-        return self.agent.inference(observation=observation, goal=active_goal, is_demo=is_demo)
+        with self._model_call_lock:
+            return self.agent.inference(observation=observation, goal=active_goal, is_demo=is_demo)
 
 
 class AgentTester:
@@ -230,7 +376,7 @@ class AgentTester:
 
         diff = pred_flat[:, :min_dim] - gt_flat[:, :min_dim]
         return np.linalg.norm(diff, axis=1).astype(float).tolist()
-    
+
     def visualize(
         self,
         pred: Optional[np.ndarray] = None,
@@ -509,26 +655,27 @@ class AgentTester:
         demo_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run inference over a dataset and collect error/latency metrics."""
-        dataset = self.agent_helper.load_demo_from_hdf5(data_path, demo_id=demo_id)
+        self.agent_helper.prepare_model(model_type, allow_goal_placeholders=True)
+        dataset = self.agent_helper.load_demo_from_hdf5(data_path, demo_id=demo_id, model_type=model_type)
         self.last_dataset = dataset
-        self.agent_helper.prepare_model(model_type)
 
         goal = None
         if self.agent_helper.requires_goal:
+            if dataset.get("pipette_positions") is None:
+                raise RuntimeError("Goal-required model dataset is missing pipette position observations.")
             goal = np.asarray(dataset["pipette_positions"][-1], dtype=np.float32)
 
         self.predictions.clear()
         self.latencies_ms.clear()
         self.errors.clear()
 
-        num_frames = dataset["images"].shape[0]
+        num_frames = dataset["actions"].shape[0]
+        obs_keys = tuple(dataset.get("obs_keys", dataset["obs"].keys()))
         for idx in range(num_frames):
-            observation = (
-                np.asarray(dataset["pipette_positions"][idx], dtype=np.float32),
-                np.asarray(dataset["stage_positions"][idx], dtype=np.float32),
-                np.asarray(dataset["images"][idx]),
-                np.asarray(dataset["resistance"][idx], dtype=np.float32),
-            )
+            observation = {
+                key: np.asarray(dataset["obs"][key][idx])
+                for key in obs_keys
+            }
 
             start = time.perf_counter()
             predicted_action = self.agent_helper.run_inference(

@@ -62,25 +62,38 @@ def main():
     daq = rig_devices["daq"]
     pressure = rig_devices["pressure"]
     lamp = rig_devices["lamp"]
-    laser = rig_devices["laser"]
+    laser = rig_devices.get("laser")
 
     recording_state_manager = RecordingStateManager()
-
-    calibration_data = config_data.get("calibration") if isinstance(config_data, dict) else None
-    print(calibration_data)
-    patch_data = config_data.get("patch") if isinstance(config_data, dict) else None
-    protocol_data = config_data.get("protocol") if isinstance(config_data, dict) else None
+    calibration_data = None
+    patch_data = None
+    protocol_data = None
+    if isinstance(config_data, dict):
+        calibration_data = config_data.get("_resolved_calibration", config_data.get("calibration"))
+        patch_data = config_data.get("_resolved_patch", config_data.get("patch"))
+        protocol_data = config_data.get("_resolved_protocol", config_data.get("protocol"))
 
     pipette_controller = PipetteInterface(
-        stage, microscope, camera, unit, cellSorterManip, cellSorterController,
+        stage,
+        microscope,
+        camera,
+        unit,
+        cellSorterManip,
+        cellSorterController,
         calibration_data=calibration_data,
     )
     patch_controller = AutoPatchInterface(
-        amplifier, daq, pressure, pipette_controller, recording_state_manager, lamp, laser,
+        amplifier,
+        daq,
+        pressure,
+        pipette_controller,
+        recording_state_manager,
+        lamp,
+        laser=laser,
         config_data=patch_data,
         protocol_data=protocol_data,
     )
-    graph_interface = GraphInterface(amplifier, daq, pressure, recording_state_manager, laser)
+    graph_interface = GraphInterface(amplifier, daq, pressure, recording_state_manager, laser=laser)
     gui = PatchGui(camera, pipette_camera, pipette_controller, patch_controller, recording_state_manager)
     graphs = EPhysGraph(graph_interface, recording_state_manager)
     # graphs.location_on_the_screen()

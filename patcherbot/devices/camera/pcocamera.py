@@ -38,7 +38,7 @@ class PcoCamera(Camera):
         print(f"CAMERA {self.cam}")
 
         # self.ca .sdk.set_timestamp_mode('binary & ascii')
-        config = {'exposure time': 5e-3,
+        config = {'exposure time': 20e-3,
                     'roi': (385, 385, 1664, 1664),
                     'timestamp': 'off',
                     'trigger': 'auto sequence',
@@ -60,6 +60,7 @@ class PcoCamera(Camera):
 
         self.last_frame_time = None
         self.fps = 0
+        self.lastFrame = None
 
 
 
@@ -109,6 +110,8 @@ class PcoCamera(Camera):
             img = self.get_16bit_image()
             # print(f"IMAGE after get_16bit_image: {img}")
             # print(type(img))
+        if img is None:
+            return
         # print(f"AFTER IMAGE: {img}")
         #is there a better way to do this?
         #maybe 2 stdevs instead?
@@ -149,7 +152,7 @@ class PcoCamera(Camera):
             # print(meta)
         except Exception as e:
             print(f"ERROR in get_16bit_image: {e}")
-            return self.last_frame # there was an error grabbing the most recent frame
+            return self.lastFrame # there was an error grabbing the most recent frame
 
         return img
 

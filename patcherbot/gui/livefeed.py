@@ -44,6 +44,7 @@ class LiveFeedQt(QtWidgets.QLabel):
         self.recorder = FileLogger(recording_state_manager, folder_path="experiments/Data/rig_recorder_data/", isVideo=True, filetype="csv", recorder_filename="camera_frames", frame_folder_name=frame_folder_name)
         self._uses_aux_folder = frame_folder_name == self.recorder.aux_frame_folder_name
         self.log_processed_frames = bool(log_processed_frames)
+        self.recording_config = None
 
         # Remember the last frame that we displayed, to not unnecessarily
         # process/show the same frame for slow input sources
@@ -100,24 +101,20 @@ class LiveFeedQt(QtWidgets.QLabel):
             if processed_frame is None:
                 return
 
+            record_overlays = bool(getattr(self.recording_config, "record_overlays", self.log_processed_frames))
+            source_frame = raw_frame if raw_frame is not None else processed_frame
+            frame_to_log = source_frame.copy()
             if self._last_frameno is None or self._last_frameno != frameno:
-                frame = self.image_edit(processed_frame)
+                frame = self.image_edit(processed_frame.copy())
                 self._last_edited_frame = frame
                 self._last_frameno = frameno
             else:
                 frame = self._last_edited_frame
 
-            frame_to_log = frame
-            if not self.log_processed_frames and raw_frame is not None:
-                frame_to_log = raw_frame.copy() if hasattr(raw_frame, "copy") else raw_frame
-            # * Where you place this function is important, relative to repeated frames and such. Either you check in this file
-            # * or in the FileLogger file
-            if self._uses_aux_folder:
-                self.recorder.write_aux_camera_frames(frame_time.timestamp(), frame_to_log, frameno)
-            else:
-                self.recorder.write_camera_frames(frame_time.timestamp(), frame_to_log, frameno)
-            # self.log_frame_rate()
-            # print(f"FRAME SHAPE: {frame.shape}")
+            annotate_recording = record_overlays and self.recording_state_manager.is_recording_enabled()
+            write_frame = self.recorder.write_aux_camera_frames if self._uses_aux_folder else self.recorder.write_camera_frames
+            if not annotate_recording:
+                write_frame(frame_time.timestamp(), frame_to_log, frameno)
 
             if len(frame.shape) == 2:
                 # Grayscale image via MicroManager
@@ -152,6 +149,19 @@ class LiveFeedQt(QtWidgets.QLabel):
                                           Qt.SmoothTransformation)
             if self.display_edit is not None:
                 self.display_edit(scaled_pixmap)
+            if annotate_recording:
+                # Paint at camera resolution so recording does not depend on window size.
+                recorded_pixmap = pixmap.copy()
+                if self.display_edit is not None:
+                    self.display_edit(recorded_pixmap)
+                recorded_image = recorded_pixmap.toImage().convertToFormat(QtGui.QImage.Format_RGB888)
+                pixels = recorded_image.bits()
+                pixels.setsize(recorded_image.byteCount())
+                frame_to_log = np.frombuffer(pixels, dtype=np.uint8).reshape(
+                    recorded_image.height(), recorded_image.bytesPerLine())[:, :recorded_image.width() * 3]
+                frame_to_log = frame_to_log.reshape(recorded_image.height(), recorded_image.width(), 3).copy()
+            if annotate_recording:
+                write_frame(frame_time.timestamp(), frame_to_log, frameno)
             self.setPixmap(scaled_pixmap)
 
         except Exception:

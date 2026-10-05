@@ -1050,10 +1050,8 @@ class EPhysGraph(QWidget):
         power_value = int(round(power))
         self.laserPowerBox.setPlaceholderText(f"Set to: {power_value} %")
         self.laserPowerLabel.setText(f"Power: {power_value} %")
-
-        laser_available = power_state is not None or wavelength is not None
         for widget in (self.laserPowerBox, self.laserLeftButton, self.laserToggleButton, self.laserRightButton):
-            widget.setEnabled(laser_available)
+            widget.setEnabled(True)
 
         if power_state != "on":
             self.laserToggleButton.setText("Off")

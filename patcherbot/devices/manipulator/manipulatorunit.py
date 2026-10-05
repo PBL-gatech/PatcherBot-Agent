@@ -117,9 +117,25 @@ class ManipulatorUnit(Manipulator):
         '''
         Moves the device in um/s.
         '''
-
-        self.dev.absolute_move_group_velocity(vel)
+        try:
+            self.dev.absolute_move_group_velocity(vel)
+        except TypeError:
+            # Some backends require explicit device axes for velocity commands.
+            self.dev.absolute_move_group_velocity(vel, self.axes)
         # self.sleep(.005)
+
+    def relative_move_group_velocity(self, vel):
+        '''
+        Moves the device in um/s using the relative-velocity API when available.
+        '''
+        if hasattr(self.dev, "relative_move_group_velocity"):
+            try:
+                self.dev.relative_move_group_velocity(vel)
+                return
+            except TypeError:
+                self.dev.relative_move_group_velocity(vel, self.axes)
+                return
+        self.absolute_move_group_velocity(vel)
 
     def stop(self):
         """

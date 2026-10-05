@@ -2,6 +2,7 @@
 from __future__ import absolute_import
 
 import collections
+import ast
 # Support older versions of Python
 try:
     from collections.abc import Sequence
@@ -25,7 +26,7 @@ import qtawesome as qta
 
 from patcherbot.interface.camera import CameraInterface
 from patcherbot.controller import TaskController
-from patcherbot.utils.config import NumberWithUnit
+from patcherbot.configs.Config import NumberWithUnit
 from patcherbot.interface.base import command
 from .livefeed import LiveFeedQt
 
@@ -413,6 +414,7 @@ class CameraGui(QtWidgets.QMainWindow):
     camera_reset_signal = QtCore.pyqtSignal(TaskController)
     aux_camera_signal = QtCore.pyqtSignal(MethodType, object)
     aux_camera_reset_signal = QtCore.pyqtSignal(TaskController)
+    snapshot_captured = QtCore.pyqtSignal(object)
 
 
     def __init__(self, camera, aux_camera=None, recording_state_manager=None,
@@ -480,6 +482,12 @@ class CameraGui(QtWidgets.QMainWindow):
         self.log_button.setCheckable(True)
         self.log_button.setToolTip('Toggle log window display')
 
+        self.overlay_button = QtWidgets.QToolButton(clicked=self.toggle_overlay)
+        self.overlay_button.setIcon(qta.icon('fa.bullseye'))
+        self.overlay_button.setCheckable(True)
+        self.overlay_button.setChecked(self.show_overlay)
+        self.overlay_button.setToolTip('Show/hide overlays (does not enable overlay recording)')
+
         self.record_button = QtWidgets.QToolButton(clicked=self.toggle_recording)
         self.record_button.setIcon(qta.icon('fa.video-camera'))
         self.record_button.setCheckable(True)
@@ -521,8 +529,9 @@ class CameraGui(QtWidgets.QMainWindow):
         self.setexposure_edit.setPlaceholderText('Exposure time (ms)')
         self.status_bar.addPermanentWidget(self.setexposure_edit)
         self.status_bar.addPermanentWidget(self.help_button)
-        # self.status_bar.addPermanentWidget(self.log_button)
-        # self.status_bar.addPermanentWidget(self.record_button)
+        self.status_bar.addPermanentWidget(self.log_button)
+        self.status_bar.addPermanentWidget(self.overlay_button)
+        self.status_bar.addPermanentWidget(self.record_button)
         self.status_bar.addPermanentWidget(self.snap_image_button)
         self.status_bar.addPermanentWidget(self.autoexposure_button)
         self.status_bar.addPermanentWidget(self.unnormalize_button)
@@ -567,7 +576,7 @@ class CameraGui(QtWidgets.QMainWindow):
         if self.main_camera is not None:
             self.main_video = LiveFeedQt(self.main_camera,
                                          image_edit=self.image_edit,
-                                         display_edit=self.display_edit,
+                                         display_edit=functools.partial(self.display_edit, camera=self.main_camera),
                                          mouse_handler=self.video_mouse_press,
                                          recording_state_manager=self.recording_state_manager,
                                          frame_folder_name='camera_frames')
@@ -575,7 +584,7 @@ class CameraGui(QtWidgets.QMainWindow):
         if self.aux_camera is not None:
             self.aux_video = LiveFeedQt(self.aux_camera,
                                         image_edit=self.image_edit,
-                                        display_edit=self.display_edit,
+                                        display_edit=functools.partial(self.display_edit, camera=self.aux_camera),
                                         mouse_handler=self.video_mouse_press,
                                         recording_state_manager=self.recording_state_manager,
                                         frame_folder_name='aux_camera_frames')
@@ -637,7 +646,13 @@ class CameraGui(QtWidgets.QMainWindow):
     def snap_active_camera_image(self):
         if self.active_interface is None:
             return
-        self.active_interface.snap_image()
+        snapshot = self.active_interface.snap_image()
+        if snapshot is None:
+            return
+        snapshot = dict(snapshot)
+        snapshot["camera_role"] = self.active_camera_role
+        self.snapshot_captured.emit(snapshot)
+        return snapshot
 
     def handle_autonormalize_change(self, state):
         if self.active_interface is None:
@@ -751,7 +766,9 @@ class CameraGui(QtWidgets.QMainWindow):
         painter.drawEllipse(c_x - 15, c_y - 15, 30, 30)
         painter.end()
 
-    def display_edit(self, pixmap):
+
+
+    def display_edit(self, pixmap, *, camera=None):
         '''
         Applies the functions stored in `~.CameraGui.display_edit_funcs` to the
         video image pixmap.
@@ -761,6 +778,8 @@ class CameraGui(QtWidgets.QMainWindow):
         pixmap : `QPixmap`
             The pixmap to draw on.
         '''
+        if camera is not None and camera is not self.active_camera:
+            return
         if self.show_overlay:
             for func in self.display_edit_funcs:
                 func(pixmap)
@@ -1162,17 +1181,24 @@ class CameraGui(QtWidgets.QMainWindow):
         else:
             self.config_button.setChecked(True)
 
-    def add_config_gui(self, config):
+    def add_config_gui(self, config, gui_class=None):
         logging.debug('Adding config GUI for {}'.format(config.name))
-        config_gui = ConfigGui(config)
-        self.config_tab.addTab(config_gui, config.name)
+        config_gui = ParamConfig(config) if gui_class is None else gui_class(config)
+        self.add_tab(config_gui, config.name)
         logging.debug('Config GUI added')
+        return config_gui
 
     def add_tab(self, tab, name, index=None):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(tab)
         if index is None:
-            self.config_tab.addTab(tab, name)
+            self.config_tab.addTab(scroll, name)
         else:
-            self.config_tab.insertTab(index, tab, name)
+            self.config_tab.insertTab(index, scroll, name)
 
     @command(category='General',
              description='Show/hide the configuration pane')
@@ -1181,8 +1207,9 @@ class CameraGui(QtWidgets.QMainWindow):
 
     @command(category='General',
              description='Show/hide the overlay information on the image')
-    def toggle_overlay(self):
+    def toggle_overlay(self, checked=None):
         self.show_overlay = not self.show_overlay
+        self.overlay_button.setChecked(self.show_overlay)
 
     def toggle_configuration_display(self):
         current_sizes = self.splitter.sizes()
@@ -1197,191 +1224,7 @@ class CameraGui(QtWidgets.QMainWindow):
         self.splitter.setSizes(new_sizes)
 
 
-class ElidedLabel(QtWidgets.QLabel):
-    def __init__(self, text, minimum_width=200, *args, **kwds):
-        self.minimum_width = minimum_width
-        self.text = text
-        super(ElidedLabel, self).__init__(*args, **kwds)
+# Compatibility exports for existing camera-module imports.
+from .ParamConfig import ParamConfig, ElidedLabel
 
-    def minimumSizeHint(self):
-        return QtCore.QSize(self.minimum_width,
-                            super(ElidedLabel, self).minimumSizeHint().height())
-
-    def resizeEvent(self, event):
-        metric = QtGui.QFontMetrics(self.font())
-        elidedText = metric.elidedText(self.text, QtCore.Qt.ElideRight,
-                                       self.width())
-        self.setText(elidedText)
-
-
-class ConfigGui(QtWidgets.QWidget):
-    value_changed_signal = QtCore.pyqtSignal('QString', object)
-
-    def __init__(self, config, show_name=False):
-        super(ConfigGui, self).__init__()
-        self.config = config
-        self.config._value_changed = self.value_changed
-        self.value_changed_signal.connect(self.display_changed_value)
-        layout = QtWidgets.QVBoxLayout()
-        layout.setAlignment(Qt.AlignTop)
-        top_row = QtWidgets.QHBoxLayout()
-        if show_name:
-            self.title = QtWidgets.QLabel(config.name)
-            self.title.setStyleSheet('font-weight: bold;')
-            top_row.addWidget(self.title)
-        else:
-            top_row.setAlignment(Qt.AlignRight)
-        self.load_button = QtWidgets.QToolButton(clicked=self.load_config)
-        self.load_button.setIcon(qta.icon('fa.upload'))
-        top_row.addWidget(self.load_button)
-        self.save_button = QtWidgets.QToolButton(clicked=self.save_config)
-        self.save_button.setIcon(qta.icon('fa.download'))
-        top_row.addWidget(self.save_button)
-        layout.addLayout(top_row)
-        all_params = config.param
-        self.value_widgets = {}
-        for category, params in config.categories:
-            box = QtWidgets.QGroupBox(category)
-            rows = QtWidgets.QVBoxLayout()
-            for param_name in params:
-                param_obj = all_params[param_name]
-                row = QtWidgets.QHBoxLayout()
-                label = ElidedLabel(param_obj.doc)
-                label.setToolTip(param_obj.doc)
-                if isinstance(param_obj, param.Number):
-                    value_widget = QtWidgets.QDoubleSpinBox()
-                    value_widget.setMinimum(param_obj.bounds[0])
-                    value_widget.setMaximum(param_obj.bounds[1])
-                    value_widget.setValue(getattr(config, param_name))
-                    value_widget.valueChanged.connect(
-                        functools.partial(self.set_numerical_value, param_name))
-                if isinstance(param_obj, NumberWithUnit):
-                    value_widget = QtWidgets.QDoubleSpinBox()
-                    magnitude = param_obj.magnitude
-                    value_widget.setMinimum(param_obj.bounds[0] / magnitude)
-                    value_widget.setMaximum(param_obj.bounds[1] / magnitude)
-                    value_widget.setValue(getattr(config, param_name) / magnitude)
-                    value_widget.valueChanged.connect(
-                        functools.partial(self.set_numerical_value_with_unit, param_name, magnitude))
-                elif isinstance(param_obj, param.Boolean):
-                    value_widget = QtWidgets.QCheckBox()
-                    value_widget.setChecked(getattr(config, param_name))
-                    value_widget.stateChanged.connect(
-                        functools.partial(self.set_boolean_value, param_name, value_widget))
-                elif isinstance(param_obj, (param.Selector)):
-                    value_widget = QtWidgets.QComboBox()
-                    value_widget.addItems([str(o) for o in param_obj.objects])
-                    current = getattr(config, param_name)
-                    if current in param_obj.objects:
-                        value_widget.setCurrentIndex(param_obj.objects.index(current))
-                    value_widget.currentIndexChanged.connect(
-                        functools.partial(self.set_selector_value, param_name, param_obj.objects))
-                elif isinstance(param_obj, param.String):
-                    value_widget = QtWidgets.QLineEdit()
-                    value_widget.setText(str(getattr(config, param_name)))
-                    value_widget.textChanged.connect(
-                        functools.partial(self.set_string_value, param_name))
-                elif isinstance(param_obj, param.Tuple):         
-                    value_widget = QtWidgets.QLineEdit()          
-                    value_widget.setReadOnly(True)                
-                    value_widget.setEnabled(False)               
-                    value_widget.setText(str(getattr(config, param_name))) 
-                value_widget.setToolTip(param_obj.doc)
-                value_widget.setObjectName(param_name)
-                self.value_widgets[param_name] = value_widget
-                row.addWidget(label, stretch=1)
-                row.addWidget(value_widget)
-                if isinstance(param_obj, NumberWithUnit):
-                    unit_label = QtWidgets.QLabel(param_obj.unit)
-                    row.addWidget(unit_label)
-                rows.addLayout(row)
-            box.setLayout(rows)
-            layout.addWidget(box)
-        self.setLayout(layout)
-
-    def value_changed(self, key, value):
-        """Relay parameter updates coming from the Config object.
-        Numeric parameters are scaled by their unit magnitude; non‑numeric
-        (e.g. Selector / Boolean) are forwarded unchanged."""
-        if key not in self.value_widgets:
-            return
-
-        param_obj  = self.config.param[key]
-        magnitude  = getattr(param_obj, 'magnitude', 1)
-
-        # Only scale numeric values; leave strings / bools intact
-        if isinstance(value, (int, float)):
-            self.value_changed_signal.emit(key, value / magnitude)
-        else:
-            self.value_changed_signal.emit(key, value)
-
-    @QtCore.pyqtSlot('QString', object)
-    def display_changed_value(self, key, value):
-        box = self.findChild(QtWidgets.QCheckBox, key)
-        if box is not None:
-            box.blockSignals(True)
-            box.setChecked(bool(value))
-            box.blockSignals(False)
-            return
-        combo = self.findChild(QtWidgets.QComboBox, key)
-        if combo is not None:
-            index = combo.findText(str(value))
-            if index >= 0:
-                combo.blockSignals(True)
-                combo.setCurrentIndex(index)
-                combo.blockSignals(False)
-            return
-        spin = self.findChild((QtWidgets.QDoubleSpinBox, QtWidgets.QSpinBox), key)
-        if spin is not None:
-            spin.blockSignals(True)
-            spin.setValue(value) 
-            spin.blockSignals(False)
-            return                                             # (unchanged)
-
-        line = self.findChild(QtWidgets.QLineEdit, key)        
-        if line is not None:             
-            line.blockSignals(True)                            
-            line.setText(str(value))                           
-            line.blockSignals(False)                           
-
-
-    def set_numerical_value(self, name, value):
-        setattr(self.config, name, value)
-
-    def set_numerical_value_with_unit(self, name, magnitude, value):
-        setattr(self.config, name, value * magnitude)
-
-    def set_boolean_value(self, name, widget):
-        setattr(self.config, name, widget.isChecked())
-
-    def set_selector_value(self, name, options, index):
-        if 0 <= index < len(options):
-            setattr(self.config, name, options[index])
-
-    def set_string_value(self, name, value):
-        setattr(self.config, name, value)
-
-
-    def save_config(self):
-        filename, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save configuration",
-                                                            filter='Configuration files (*.yaml)',
-                                                            options=QtWidgets.QFileDialog.DontUseNativeDialog)
-        if filename:
-            try:
-                self.config.to_file(filename)
-            except Exception as ex:
-                err = f'Could not save configuration to file "{filename}"'
-                logging.getLogger(__name__).exception(err)
-                QtWidgets.QMessageBox.warning(self, 'Saving failed', err + '\n' + str(ex), QtWidgets.QMessageBox.Ok)
-
-    def load_config(self):
-        filename, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load configuration",
-                                                            filter='Configuration files (*.yaml)',
-                                                            options=QtWidgets.QFileDialog.DontUseNativeDialog)
-        if filename:
-            try:
-                self.config.from_file(filename)
-            except Exception as ex:
-                err = f'Could not load configuration from file "{filename}"'
-                logging.getLogger(__name__).exception(err)
-                QtWidgets.QMessageBox.warning(self, 'Loading failed', err + '\n' + str(ex), QtWidgets.QMessageBox.Ok)
+ConfigGui = ParamConfig  # Compatibility for pre-extraction imports.

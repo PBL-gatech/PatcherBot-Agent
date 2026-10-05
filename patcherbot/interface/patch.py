@@ -12,9 +12,9 @@ from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
 from patcherbot.devices.amplifier.DAQ import DAQ
 from patcherbot.devices.lamp import Lamp
-from patcherbot.devices.laser import Laser
-from .patchConfig import PatchConfig
-from .protocolConfig import ProtocolConfig
+from patcherbot.configs.PatchConfig import PatchConfig
+from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
+from patcherbot.configs.ProtocolConfig import ProtocolConfig
 from PyQt5 import QtCore
 import time
 
@@ -24,8 +24,21 @@ class AutoPatchInterface(TaskInterface):
     '''
     A class to run automatic patch-clamp
     '''
-    def __init__(self, amplifier: Amplifier, daq: DAQ, pressure: PressureController, pipette_interface: PipetteInterface,
-                 recording_state_manager: RecordingStateManager, lamp: Lamp, laser: Laser, config_data=None, protocol_data=None):
+    state_press_tally_changed = QtCore.pyqtSignal(object)
+    origin_saved = QtCore.pyqtSignal(object, object)
+
+    def __init__(
+        self,
+        amplifier: Amplifier,
+        daq: DAQ, #check daq import
+        pressure: PressureController,
+        pipette_interface: PipetteInterface,
+        recording_state_manager: RecordingStateManager,
+        lamp: Lamp,
+        laser=None,
+        config_data=None,
+        protocol_data=None,
+    ):
         super().__init__()
         self.config = PatchConfig(name='Patch')
         if config_data:
@@ -35,6 +48,7 @@ class AutoPatchInterface(TaskInterface):
         if protocol_data:
             cleaned = {k: v for k, v in protocol_data.items() if v is not None}
             self.protocol_config.from_dict(cleaned)
+        self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
         self.amplifier = amplifier
         self.daq = daq
         self.pressure = pressure
@@ -55,18 +69,44 @@ class AutoPatchInterface(TaskInterface):
         self.is_selecting_cells = False
         self.is_selecting_corners = False
         self.cells_to_patch = []
+        self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
 
-        #call update_camera_cell_list every 0.05 seconds using a QTimer
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_camera_cell_list)
-        self.timer.start(50)
+
+    @blocking_command(category='Calibration', description='Save X origin',
+                      task_description='Saving X origin and microscope image')
+    def save_x_origin(self, request):
+        self._save_origin("x", request)
+
+    @blocking_command(category='Calibration', description='Save Y origin',
+                      task_description='Saving Y origin and microscope image')
+    def save_y_origin(self, request):
+        self._save_origin("y", request)
+
+    def _save_origin(self, axis, request):
+        if (self._current_controller is not None
+                or self.pipette_controller._current_controller is not None):
+            raise ValueError("Wait for the current movement/task to finish.")
+        capture = dict(request)
+        capture.update(
+            axis=axis, origins_um=dict(self.origins),
+            movement_busy=lambda: self.pipette_controller._current_controller is not None,
+            completed=self.origin_saved.emit)
+        self.execute(self.current_autopatcher.save_origin, argument=capture)
+
+    def accept_origin(self, record):
+        """Commit a successful save after the GUI confirms its experiment."""
+        self.origins = dict(record["origins_um"])
+
+    def _record_state_press(self, state):
+        counts = self.recording_state_manager.increment_state_press(state)
+        self.state_press_tally_changed.emit(counts)
+        return counts
 
     def _microscope_z_um(self) -> float:
         return float(self.pipette_controller.calibrated_unit.microscope.position())
 
     def _protocol_holding_parameters(self):
-        config = self.current_autopatcher.config
         protocol_config = self.current_autopatcher.protocol_config
         voltage_hold = float("nan")
         current_hold = float("nan")
@@ -96,22 +136,39 @@ class AutoPatchInterface(TaskInterface):
             time.sleep(poll_interval_s)
         self.warning(f"Timed out waiting for lamp filter to reach slot {target_slot}")
 
+    def _unpack_cell_entry(self, cell_entry):
+        if cell_entry is None:
+            return None, None, None, None
+        if len(cell_entry) >= 4:
+            return cell_entry[0], cell_entry[1], cell_entry[2], cell_entry[3]
+        if len(cell_entry) == 3:
+            return cell_entry[0], cell_entry[1], cell_entry[2], None
+        return None, None, None, None
+
     
     @blocking_command(category='Patch', description='Break into the cell',
                       task_description='Breaking into the cell')
     
     def break_in(self):
+        self._record_state_press("break_in")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.break_in)
 
     @blocking_command(category='Patch', description='GigaSeal the cell',
                       task_description='GigaSealing the cell')
     def gigaseal(self):
+        self._record_state_press("gigaseal")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.gigaseal)
 
     def start_selecting_cells(self):
         self.is_selecting_cells = True
+
+    @blocking_command(category='Patch',
+                      description='Detect cells',
+                      task_description='Detecting cells')
+    def detect_cells(self):
+        self.execute(self.pipette_controller.calibrated_stage.detect_cells)
 
     def start_selecting_corners(self):
         self.is_selecting_corners = True
@@ -140,6 +197,13 @@ class AutoPatchInterface(TaskInterface):
     def move_to_scan_start(self):
         self.execute(self.pipette_controller.calibrated_stage.move_to_scan_start)
 
+
+    @blocking_command(category='Microscope',
+                      description='Switch objective',
+                      task_description='Switching objective')
+    def toggle_objective(self):
+        self.execute(self.pipette_controller.microscope.toggle_objective)
+
     @command(category='Patch',
              description='Select a corner on right-click while Store Corners is active')
     def handle_corner_right_click(self, position):
@@ -161,6 +225,15 @@ class AutoPatchInterface(TaskInterface):
             self.info("remove_last_cell called but there are no cells to remove")
 
 
+    def _remove_first_cell(self) -> None:
+        """Remove the first queued cell after escape or automatic cleanup."""
+        if self.cells_to_patch:
+            first_cell = self.cells_to_patch[0]
+            self.info(f"Removing first queued cell {first_cell}")
+            self.cells_to_patch = self.cells_to_patch[1:]
+        else:
+            self.info("_remove_first_cell called but there are no cells to remove")
+
     @blocking_command(category='Cell Sorter',
             description='Move the cell sorter to a cell',
             task_description='Move the cell sorter to a cell')
@@ -176,12 +249,12 @@ class AutoPatchInterface(TaskInterface):
     @command(category='Cell Sorter',
             description='Turn cell sorter LED on')
     def cell_sorter_led_on(self):
-        self.pipette_controller.set_cell_sorter_led(True, ring=1)
+        self.pipette_controller.calibrated_cellsorter.set_led_status(True, ring=1)
 
     @command(category='Cell Sorter',
             description='Turn cell sorter LED off')
     def cell_sorter_led_off(self):
-        self.pipette_controller.set_cell_sorter_led(False, ring=1)
+        self.pipette_controller.calibrated_cellsorter.set_led_status(False, ring=1)
 
     @blocking_command(category='DAQ',
             description='Run Protocols on the Cell',
@@ -218,7 +291,8 @@ class AutoPatchInterface(TaskInterface):
         position[0] += self.current_autopatcher.calibrated_unit.camera.width / 2
         position[1] += self.current_autopatcher.calibrated_unit.camera.height / 2
         # add the z position of the microscope
-        z_pos = self._microscope_z_um()
+        z_scale = self.current_autopatcher.calibrated_unit.config.microscope_units_per_um
+        z_pos = self.current_autopatcher.calibrated_unit.microscope.position() / z_scale
         self.info(f'z position of the microscope: {z_pos}')
         print(f'adding cell... {self.is_selecting_cells}')
         if self.is_selecting_cells:
@@ -264,19 +338,45 @@ class AutoPatchInterface(TaskInterface):
                         if current_slot is not None:
                             self._wait_for_filter_slot(current_slot)
 
-            #save the image
-            # img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            # cv2.imwrite(f'cell_{len(self.cells_to_patch)}.png', img)
             self.cells_to_patch.append((np.array(stage_pos_pixels), img, stage_pos_um, img_fluo))
             self.is_selecting_cells = False
 
-    # Update the cell list to store both cell coordinates and image.
     def update_camera_cell_list(self) -> None:
-        self.current_autopatcher.calibrated_unit.camera.cell_list = []
-        for cell, img, pos, _img_fluo in self.cells_to_patch:
-            camera_pos = -cell + self.current_autopatcher.calibrated_stage.reference_position()
-            self.current_autopatcher.calibrated_unit.camera.cell_list.append((camera_pos[0:2].astype(int), img, pos))
             
+        """Publish calibrated display coordinates from the devices' cached positions."""
+        controller = self.current_autopatcher
+        unit, stage = controller.calibrated_unit, controller.calibrated_stage
+        camera = unit.camera
+        self.pipette_controller.display_positions = None
+        camera.cell_list = []
+        if not stage.calibrated or getattr(stage, "must_be_recalibrated", False):
+            return
+        try:
+            stage_pixels = np.asarray(stage.reference_position(), dtype=float)
+            if not np.isfinite(stage_pixels).all():
+                return
+            camera.cell_list = [
+                ((stage_pixels - cell)[:2].astype(int), image, position)
+                for cell, image, position, _ in tuple(self.cells_to_patch)]
+            if not unit.calibrated or getattr(unit, "must_be_recalibrated", False):
+                return
+            home = np.asarray(controller.home_position, dtype=float)
+            stage_home = np.asarray(controller.home_stage_position, dtype=float)
+            if (home.shape != (3,) or stage_home.shape != (3,)
+                    or not np.isfinite(home).all() or not np.isfinite(stage_home).all()):
+                return
+            # HOME aligns the tip with image center; only displacement moves the arrow.
+            tip = (np.array([camera.width / 2., camera.height / 2.])
+                   + unit.um_to_pixels_relative(unit.position() - home)[:2]
+                   + stage.um_to_pixels_relative(stage.position() - stage_home[:2])[:2])
+            if np.isfinite(tip).all():
+                self.pipette_controller.display_positions = dict(
+                    pipette_xy=tip.copy(), at=time.monotonic(),
+                    pipette_direction_xy=np.asarray(unit.M, dtype=float)[:2, 0].copy(),
+                    image_shape=(camera.height, camera.width))
+        except (RuntimeError, ValueError, TypeError, OSError):
+            return
+
     @command(category='Test', 
              description='Send movement file to the autopatcher', 
              success_message='Path sent')
@@ -294,6 +394,7 @@ class AutoPatchInterface(TaskInterface):
     @blocking_command(category='Patch', description='Move to cell and patch it',
                       task_description='Moving to cell and patching it')
     def patch(self) -> None:
+        self._record_state_press("patch")
         if not self.cells_to_patch:
             self.warning("No cells queued for patching; skipping patch command")
             return
@@ -323,12 +424,53 @@ class AutoPatchInterface(TaskInterface):
             self.info("Patch command completed successfully, but auto escape not enabled; leaving cell in of queue for manual follow-up.")
         elif not success and self.current_autopatcher.config.auto_clean_pipette:
             self.error("Patch command did not complete successfully; cleaning pipette and escaping cell")
-            self.remove_last_cell()
+            self._remove_first_cell()
         elif not success and not self.current_autopatcher.config.auto_clean_pipette:
              self.error("Patch command did not complete and auto escape not enabled; leaving cell in queue for manual follow-up.")
         else:
             self.info("Patch command completed successfully; escaping cell and cleaning pipette")
-            self.remove_last_cell()
+            self._remove_first_cell()
+
+    @blocking_command(
+        category='Patch',
+        description='Attempt gigaseal, break in, and run protocols (optional escape)',
+        task_description='Attempting gigaseal, breaking in, running protocols, and optional escape'
+    )
+    def whole_cell(self) -> None:
+        if not self.cells_to_patch:
+            self.warning("No cells queued for patching; skipping whole-cell command")
+            return
+
+        stage_coords, img, stage_coords_um, img_fluo = self.cells_to_patch[0]
+
+        # Allocate a fresh sample index and persist metadata before protocols run
+        self.recording_state_manager.increment_sample_number()
+        index = self.recording_state_manager.sample_number
+        voltage_hold, current_hold = self._protocol_holding_parameters()
+        self.ephys_logger.save_cell_metadata(
+            index,
+            stage_coords_um,
+            img,
+            image_fluo=img_fluo,
+            voltage_hold=voltage_hold,
+            current_hold=current_hold,
+        )
+
+        success = self.execute(
+            self.current_autopatcher.whole_cell,
+            argument=(stage_coords, img, stage_coords_um)
+        )
+        time.sleep(2)
+        if success and not self.current_autopatcher.config.auto_clean_pipette:
+            self.info("Whole-cell command completed successfully, but auto escape not enabled; leaving cell in queue for manual follow-up.")
+        elif not success and self.current_autopatcher.config.auto_clean_pipette:
+            self.error("Whole-cell command did not complete successfully; cleaning pipette and escaping cell")
+            self._remove_first_cell()
+        elif not success and not self.current_autopatcher.config.auto_clean_pipette:
+            self.error("Whole-cell command did not complete and auto escape not enabled; leaving cell in queue for manual follow-up.")
+        else:
+            self.info("Whole-cell command completed successfully; escaping cell and cleaning pipette")
+            self._remove_first_cell()
 
     @blocking_command(
         category='Patch',
@@ -375,12 +517,24 @@ class AutoPatchInterface(TaskInterface):
                         description='Locate the cell',
                         task_description='Moving to the cell')
     def locate_cell(self):
+        self._record_state_press("locate_cell")
         cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.locate_cell,
                       argument = (cell, img, pos))
         time.sleep(2)
  
+    @blocking_command(category='Patch',
+                      description='Approach the cell',
+                      task_description='Approaching the cell')
+    def approach_cell(self):
+        self._record_state_press("approach_cell")
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
+        self.recording_state_manager.increment_sample_number()
+        self.execute(self.current_autopatcher.approach_cell,
+                     argument=(cell, img, pos))
+        time.sleep(2)
+
     @blocking_command(category='Stage',
                      description = 'Center the stage on cell',
                       task_description='Centering the stage on cell')
@@ -401,10 +555,21 @@ class AutoPatchInterface(TaskInterface):
         self.execute(self.current_autopatcher.move_stage_to_cell,
                       argument=(cell, img, pos))
 
+    @blocking_command(category='Stage',
+                     description='Move stage to cell',
+                      task_description='Moving stage to cell')
+    def move_stage_to_cell(self):
+        if not self.cells_to_patch:
+            self.warning("No cells queued for stage move; skipping command")
+            return
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
+        self.execute(self.current_autopatcher.move_stage_to_cell, argument=cell)
+
     @blocking_command(category='Patch',
                         description='Hunt the cell',
                         task_description='Moving to the cell and detecting it ')
     def hunt_cell(self):
+        self._record_state_press("hunt_cell")
         cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.current_autopatcher.hunt_cell,
@@ -416,10 +581,10 @@ class AutoPatchInterface(TaskInterface):
                         description='escape the cell',
                         task_description='Moving away from the cell, cleaning pipette and moving to home space')
     def escape_cell(self):
+        self._record_state_press("escape")
         self.execute(self.current_autopatcher.escape)
         time.sleep(2)
-        # self.cells_to_patch = self.cells_to_patch[1:]
-        self.remove_last_cell()
+        self._remove_first_cell()
 
     @blocking_command(category='Patch',
                         description='find the pipette',
@@ -435,6 +600,7 @@ class AutoPatchInterface(TaskInterface):
     def store_cleaning_position(self) -> None:
         self.current_autopatcher.cleaning_bath_position = self.pipette_controller.calibrated_unit.position()
         self.current_autopatcher.calibrated_unit.config.bath_position = tuple(self.current_autopatcher.cleaning_bath_position)
+        self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position.copy()
         # save calibration to file
         self.pipette_controller.write_calibration()
 
@@ -445,7 +611,8 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.safe_position = self.pipette_controller.calibrated_unit.position()
         self.current_autopatcher.calibrated_unit.config.safe_position = tuple(self.current_autopatcher.safe_position)
         x,y = self.pipette_controller.calibrated_stage.position()
-        z = self._microscope_z_um()
+        z_scale = self.pipette_controller.calibrated_unit.config.microscope_units_per_um
+        z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.safe_stage_position = [x,y,z]
         self.current_autopatcher.calibrated_stage.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
         self.info(f'safe space position stored: {self.current_autopatcher.safe_position} and {self.current_autopatcher.safe_stage_position}')
@@ -458,7 +625,8 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.home_position = self.pipette_controller.calibrated_unit.position()
         self.current_autopatcher.calibrated_unit.config.home_position = tuple(self.current_autopatcher.home_position)
         x,y = self.pipette_controller.calibrated_stage.position()
-        z = self._microscope_z_um()
+        z_scale = self.pipette_controller.calibrated_unit.config.microscope_units_per_um
+        z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.home_stage_position = [x,y,z]
         self.current_autopatcher.calibrated_stage.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
         self.info(f'safe home position stored: {self.current_autopatcher.home_position} and {self.current_autopatcher.home_stage_position}')
@@ -477,7 +645,8 @@ class AutoPatchInterface(TaskInterface):
             [x_pip + delta * np.cos(angle), y_pip, z_pip + delta * np.sin(angle)]
         )
         x,y = self.pipette_controller.calibrated_stage.position()
-        z = self._microscope_z_um()
+        z_scale = self.pipette_controller.calibrated_unit.config.microscope_units_per_um
+        z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.home_stage_position = [x,y,z]
         self.current_autopatcher.safe_stage_position = self.current_autopatcher.home_stage_position
         # save all positions to the config
@@ -527,11 +696,11 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.home_stage_position = None
         self.current_autopatcher.safe_stage_position = None
         # set tuple to None in the config
-        self.current_autopatcher.calibrated_unit.config.home_position = None
-        self.current_autopatcher.calibrated_unit.config.safe_position = None
-        self.current_autopatcher.calibrated_stage.config.home_position_stage = None
-        self.current_autopatcher.calibrated_stage.config.safe_position_stage = None
-        self.current_autopatcher.calibrated_unit.config.cleaning_bath_position = None
+        self.current_autopatcher.calibrated_unit.config.home_position = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.safe_position = (0., 0., 0.)
+        self.current_autopatcher.calibrated_stage.config.home_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_stage.config.safe_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.bath_position = (0., 0., 0.)
         # self.current_autopatcher.calibrated_unit.config.rinsing_bath_position = None    
         self.info('All positions cleared')
 
@@ -566,13 +735,11 @@ class AutoPatchInterface(TaskInterface):
     def move_group_up(self):
         self.execute(self.current_autopatcher.move_group_up)
 
-
     @blocking_command(category='Patch',
                       description='Move the group in x direction',
                       task_description='Moving the group in x direction')
     def move_group_in_x(self):
         self.execute(self.current_autopatcher.move_group_in_x)
-
 
     @blocking_command(category='Patch',
                       description='Move the group in y direction',

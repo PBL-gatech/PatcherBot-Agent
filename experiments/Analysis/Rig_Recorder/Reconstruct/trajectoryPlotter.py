@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Extended analysis & visualisation script for pipette, stage and resistance data
 ==============================================================================
@@ -9,7 +9,7 @@ Changes (May 29 2025)
   * Viridis colour-bar added.
   * Time-progressive colouring now works (thanks to cmap/vmin/vmax).
   * Still no legend or per-demo labels.
-* Animation defaults: ~6 × real-time (60 fps * multiplier 6).
+* Animation defaults: ~6 Ã— real-time (60 fps * multiplier 6).
 
 Toggle plots and GIF export with the flags below. Pillow is required only when
 `save_animation=True`.
@@ -27,17 +27,18 @@ from pathlib import Path
 plot_pipette_3d = True   # Static 3-D scatter (Plot 1)
 plot_resistance = False          # Plot 2
 plot_stage_3d = False            # Plot 3
-plot_time_courses = False        # Plot 4
+plot_time_courses = True        # Plot 4
+plot_time_velocity_courses = True    # Plot 4b (pipette/stage velocities)
 plot_pipette_animation = False    # Animated scatter (Plot 5)
 
 # Animation tuning -----------------------------------------------------------
-animation_speed_multiplier = 1   # ~6 × faster than real-time
+animation_speed_multiplier = 1   # ~6 Ã— faster than real-time
 base_animation_fps = 60          # logical FPS before speed-up
 save_animation = False           # Export GIF (requires Pillow)
 animation_path = Path(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\pipette_paths.gif")
 # ===========================================================================
 
-file_path = Path(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_dataset_v0_300\PatcherBot_dataset_v0_300_find_pipette.hdf5")
+file_path = Path(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_dataset_v0_740\PatcherBot_dataset_v0_740_find_pipette.hdf5")
 
 pipette_positions_data: dict[str, np.ndarray] = {}
 resistance_data: dict[str, np.ndarray] = {}
@@ -57,7 +58,7 @@ with h5py.File(file_path, "r") as hdf:
             stage_positions_data[demo_key] = demo_group["stage_positions"][:]
 
 # ---------------------------------------------------------------------------
-# 2. STATIC PLOTS (1-4) – original style ------------------------------------
+# 2. STATIC PLOTS (1-4) â€“ original style ------------------------------------
 # ---------------------------------------------------------------------------
 if plot_pipette_3d:
     fig = plt.figure(figsize=(12, 8))
@@ -68,7 +69,7 @@ if plot_pipette_3d:
         t = np.arange(positions.shape[0])
         ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
                    c=cmap(t / positions.shape[0]), marker="o", s=15)
-    ax.set(xlim=[-20, 20], ylim=[-20, 20], zlim=[30, 0],
+        ax.set(xlim=[-100, 100], ylim=[-100, 100], zlim=[-50, 50],
            title="3-D Pipette Motion with Time-Colour Encoding",
            xlabel="X position", ylabel="Y position", zlabel="Z position (top-down)")
     mappable = cm.ScalarMappable(cmap=cmap); mappable.set_array([])
@@ -79,7 +80,7 @@ if plot_resistance:
     fig, ax = plt.subplots(figsize=(12, 4))
     for resistance in resistance_data.values():
         ax.plot(resistance)
-    ax.set(title="Resistance Change over Time", xlabel="Time steps", ylabel="Resistance (Ω)")
+    ax.set(title="Resistance Change over Time", xlabel="Time steps", ylabel="Resistance (Î©)")
 
 if plot_stage_3d:
     fig = plt.figure(figsize=(12, 8))
@@ -90,7 +91,7 @@ if plot_stage_3d:
         t = np.arange(positions.shape[0])
         ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
                    c=cmap(t / positions.shape[0]), marker="o", s=15)
-    ax.set(xlim=[-20, 20], ylim=[-20, 20], zlim=[-50, 50],
+    ax.set(xlim=[-40, 40], ylim=[-40, 40], zlim=[-50, 50],
            title="3-D Stage Motion with Time-Colour Encoding",
            xlabel="X position", ylabel="Y position", zlabel="Z position (top-down)")
     cb = plt.colorbar(cm.ScalarMappable(cmap=cmap), ax=ax, pad=0.1, shrink=0.6)
@@ -108,6 +109,23 @@ if plot_time_courses:
     axs[0].set_ylabel("X Position"); axs[1].set_ylabel("Y Position"); axs[2].set_ylabel("Z Position")
     axs[2].set_xlabel("Time steps"); plt.tight_layout()
 
+if plot_time_velocity_courses:
+    fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    for pos in pipette_positions_data.values():
+        vel = np.diff(pos, axis=0)  # simple finite difference for velocity
+        if vel.size == 0:
+            continue
+        t = np.arange(vel.shape[0])
+        axs[0].plot(t, vel[:, 0]); axs[1].plot(t, vel[:, 1]); axs[2].plot(t, vel[:, 2])
+    for pos in stage_positions_data.values():
+        vel = np.diff(pos, axis=0)
+        if vel.size == 0:
+            continue
+        t = np.arange(vel.shape[0])
+        axs[0].plot(t, vel[:, 0]); axs[1].plot(t, vel[:, 1]); axs[2].plot(t, vel[:, 2])
+    axs[0].set_title('Pipette and Stage Velocity Time Courses (X, Y, Z)')
+    axs[0].set_ylabel('X Velocity'); axs[1].set_ylabel('Y Velocity'); axs[2].set_ylabel('Z Velocity')
+    axs[2].set_xlabel('Time steps'); plt.tight_layout()
 # ---------------------------------------------------------------------------
 # 3. ANIMATED 3-D PIPETTE MOTION (Plot 5) -----------------------------------
 # ---------------------------------------------------------------------------
@@ -116,7 +134,7 @@ if plot_pipette_animation and pipette_positions_data:
     fig_anim = plt.figure(figsize=(12, 8))
     ax_anim = fig_anim.add_subplot(111, projection="3d")
     ax_anim.grid(False)
-    ax_anim.set(xlim=[-20, 20], ylim=[-20, 20], zlim=[30, 0],
+    ax.set(xlim=[-100, 100], ylim=[-100, 100], zlim=[-50, 50],
                 title="Animated 3-D Pipette Motion",
                 xlabel="X position", ylabel="Y position", zlabel="Z position (top-down)")
 
@@ -157,11 +175,12 @@ if plot_pipette_animation and pipette_positions_data:
         try:
             anim.save(animation_path, writer=animation.PillowWriter(
                 fps=base_animation_fps * animation_speed_multiplier))
-            print(f"[INFO] Animation saved → {animation_path.resolve()}")
+            print(f"[INFO] Animation saved â†’ {animation_path.resolve()}")
         except Exception as exc:
-            print("[WARNING] GIF not saved –", exc)
+            print("[WARNING] GIF not saved â€“", exc)
 
 # ---------------------------------------------------------------------------
 # 4. SHOW ALL FIGURES --------------------------------------------------------
 # ---------------------------------------------------------------------------
 plt.show()
+

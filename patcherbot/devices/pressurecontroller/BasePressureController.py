@@ -31,8 +31,8 @@ class PressureAcquisitionThread(threading.Thread):
                 pressure = self.controller.measure()
                 # Ensure the measurement is an integer (as used in the GUI).
                 pressure = int(pressure)
-                # Instead of creating a dictionary, just store the numeric measurement.
-                self._last_data_queue.append(pressure)
+                # Publish the value and its acquisition time as one sample.
+                self._last_data_queue.append((pressure, time.monotonic()))
                 if self.callback:
                     self.callback(pressure)
             except Exception as e:
@@ -40,7 +40,7 @@ class PressureAcquisitionThread(threading.Thread):
             time.sleep(self.interval)
 
     def get_last_data(self):
-        return self._last_data_queue[-1] if self._last_data_queue else None
+        return self._last_data_queue[-1][0] if self._last_data_queue else None
 
     def stop(self):
         self.running = False
@@ -115,12 +115,19 @@ class PressureController(TaskController):
 
     def get_last_acquisition(self):
         """
-        Returns the most recent pressure measurement as a dictionary.
+        Returns the most recent numeric pressure measurement.
         Returns None if no data is available.
         """
         if self._pressure_acq_thread:
             return self._pressure_acq_thread.get_last_data()
         return None
+
+    def get_last_acquisition_sample(self):
+        """Return an atomic (measured pressure, acquisition time) pair."""
+        thread = self._pressure_acq_thread
+        if thread is not None and thread._last_data_queue:
+            return thread._last_data_queue[-1]
+        return None, None
 
     def stop_acquisition(self):
         """

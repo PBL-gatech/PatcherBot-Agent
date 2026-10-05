@@ -68,12 +68,19 @@ class FileLogger(threading.Thread):
 
 
     def open(self):
-        self.file = open(self.filename, 'a+')
-        if len(self.file.readlines()) == 0:
-            if self.filename == self.folder_path + "movement_recording.csv":
-                self.file.write("timestamp;st_x;st_y;st_z;pi_x;pi_y;pi_z\n")
-            if self.filename == self.folder_path + "graph_recording.csv":
-                self.file.write("timestamp;pressure;resistance;current;voltage\n")
+        self.file = open(self.filename, "a+")
+        self.file.seek(0, os.SEEK_END)
+        is_empty = self.file.tell() == 0
+
+        if is_empty:
+            headers = {
+                "movement_recording.csv": "timestamp;st_x;st_y;st_z;pi_x;pi_y;pi_z",
+                "graph_recording.csv": "timestamp;pressure;resistance;current;voltage",
+            }
+            header = headers.get(os.path.basename(self.filename))
+            if header:
+                self.file.write(f"{header}\n")
+                self.file.flush()
 
 
         print(f"Opened file at: {self.filename}")
@@ -134,7 +141,10 @@ class FileLogger(threading.Thread):
             self.write_event.clear()
             threading.Thread(target=self._write_to_file_batch, args=(contents,)).start()
 
-    def _save_image(self, frame, path):
+    def _save_image(self, frame, path, wait=False):
+        if wait:
+            self._write_image(frame, path)
+            return
         self.batch_frames.append((frame, path))
         if len(self.batch_frames) >= self.frame_batch_limit:
             # logging.info(f"Batch size reached for FRAMES. Writing to disk at {datetime.now() - self.time_truth} seconds after start")
@@ -146,11 +156,14 @@ class FileLogger(threading.Thread):
             self.write_frame.clear()
             threading.Thread(target=self._write_batch_to_disk).start()
 
+    def _write_image(self, frame, path):
+        imageio.imwrite(path, frame, format=self.image_type)
+
     def _write_batch_to_disk(self):
         while self.batch_frames:
             frame, path = self.batch_frames.popleft()
             # imwrite(path, frame)
-            imageio.imwrite(path, frame, format=self.image_type)
+            self._write_image(frame, path)
             # qoi.write(path, frame)
         self.write_frame.set()  # Signal that image saving is done
 

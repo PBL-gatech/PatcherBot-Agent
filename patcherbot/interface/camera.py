@@ -111,26 +111,45 @@ class CameraInterface(TaskInterface):
     def snap_image(self, param=None):
         try:
             frameno, frame_time, _, raw_frame = self.camera.raw_frame_queue[0]
-        except (AttributeError, IndexError, TypeError):
+        except (AttributeError, IndexError, TypeError, ValueError):
             return
         if frameno is None or raw_frame is None or frame_time is None:
             return
-        frame_to_save = raw_frame.copy() if hasattr(raw_frame, "copy") else raw_frame
+        try:
+            return self.save_snapshot(frameno, frame_time, raw_frame)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return
+        except OSError as exc:
+            logging.error("Error creating snap image folder: %s", exc)
+            return
+
+    def save_snapshot(self, frame_number, captured_at, frame, wait=False):
+        """Save a supplied frame using the normal snapshot path and image format.
+
+        With ``wait=True``, writing completes here and failures reach the caller.
+        """
+        if frame_number is None or captured_at is None or frame is None:
+            raise ValueError("Snapshot requires a frame number, timestamp, and frame.")
+        time_value = captured_at.timestamp()
+        frame_to_save = frame.copy() if hasattr(frame, "copy") else frame
+        if frame_to_save is None:
+            raise ValueError("Snapshot frame cannot be empty.")
         recorder = self.snap_image_recorder
         if not recorder.folder_created:
-            try:
-                os.makedirs(recorder.camera_folder_path, exist_ok=True)
-                os.makedirs(recorder.aux_camera_folder_path, exist_ok=True)
-                recorder.folder_created = True
-            except OSError as exc:
-                logging.error("Error creating snap image folder: %s", exc)
-                return
-        time_value = frame_time.timestamp()
+            os.makedirs(recorder.camera_folder_path, exist_ok=True)
+            os.makedirs(recorder.aux_camera_folder_path, exist_ok=True)
+            recorder.folder_created = True
         image_path = os.path.join(
             recorder.camera_folder_path,
-            f"{frameno}_{time_value}.{recorder.image_type}",
+            f"{frame_number}_{time_value}.{recorder.image_type}",
         )
-        recorder._save_image(frame_to_save, image_path)
+        recorder._save_image(frame_to_save, image_path, wait=wait)
+        return {
+            "frame_number": frame_number,
+            "captured_at": captured_at,
+            "image_path": image_path,
+            "frame": frame_to_save,
+        }
 
     @command(category='Camera',
              description='AutoNormalize the image',

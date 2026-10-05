@@ -255,6 +255,12 @@ class FakeManipulator(Manipulator):
             self.cmd_time[axis-1] = current_time
             self.setpoint[axis-1] = float('inf') if v > 0 else float('-inf')
 
+    def relative_move_group_velocity(self, vel, axes):
+        """
+        Relative velocity-mode API; fake backend uses direct velocity setpoints.
+        """
+        self.absolute_move_group_velocity(vel, axes)
+
     def stop(self, axis):
         """
         Stops any movement on the specified axis.

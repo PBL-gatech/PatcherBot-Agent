@@ -7,7 +7,7 @@ from datetime import datetime
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
-from patcherbot.devices.manipulator.CalibrationConfig import CalibrationConfig
+from patcherbot.configs.CalibrationConfig import CalibrationConfig
 from patcherbot.devices.cellsorter import CalibratedCellSorter
 import time
 
@@ -18,20 +18,31 @@ class PipetteInterface(TaskInterface):
     Controller for the stage, the microscope, a pipette, and the cell sorter.
     '''
 
-    def __init__(self, stage, microscope: Microscope, camera, unit, cellsorterManip, cellsorterController,
-                 config_filename='calibration.pickle', calibration_data=None):
+    def __init__(
+        self,
+        stage,
+        microscope: Microscope,
+        camera,
+        unit,
+        cellsorterManip,
+        cellsorterController,
+        config_filename='calibration.pickle',
+        calibration_data=None,
+    ):
         super().__init__()
         self.microscope = microscope
         self.camera = camera
+        self.display_positions = None
         # Create a common calibration configuration for all stages/manipulators
         self.calibration_config = CalibrationConfig(name='Calibration')
         if calibration_data:
             cleaned = {k: v for k, v in calibration_data.items() if v is not None}
             self.calibration_config.from_dict(cleaned)
-        if self.microscope is not None:
-            self.microscope.set_units_per_um(self.calibration_config.microscope_units_per_um)
-        if self.camera is not None:
-            self.camera.use_ai_features = bool(getattr(self.calibration_config, "use_ai_features", True))
+        self.microscope.config = self.calibration_config
+        self.microscope.units_per_um = float(self.calibration_config.microscope_units_per_um)
+        self.microscope.objective_lift_um = float(self.calibration_config.objective_lift_um)
+        if hasattr(self.microscope, 'dev'):
+            self.microscope.dev.objective_lift_um = float(self.calibration_config.objective_lift_um)
         self.calibrated_stage = CalibratedStage(stage, None, microscope, camera,
                                                 config=self.calibration_config)
         self.calibrated_unit = CalibratedUnit(unit,
@@ -157,12 +168,16 @@ class PipetteInterface(TaskInterface):
         if os.path.isfile(config_filename):
             with open(config_filename, 'rb') as f:
                 cal = pickle.load(f)
+                home = np.asarray(cal['home'], dtype=float).reshape(-1)
+                safe = np.asarray(cal['safe'], dtype=float).reshape(-1)
+                if home.shape != (6,) or safe.shape != (6,) or not np.isfinite(np.r_[home, safe]).all():
+                    raise ValueError('Saved home and safe anchors must each contain six finite coordinates')
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
-                self.home_position = cal['home'][:2]
-                self.home_stage_position = cal['home'][2:]
-                self.safe_position = cal['safe'][:2]
-                self.safe_stage_position = cal['safe'][2:]
+                self.home_position = home[:3].copy()
+                self.home_stage_position = home[3:].copy()
+                self.safe_position = safe[:3].copy()
+                self.safe_stage_position = safe[3:].copy()
                 self.cleaning_bath_position = cal['bath']
 
                 print('Loaded calibration from file!')
@@ -234,7 +249,8 @@ class PipetteInterface(TaskInterface):
              description='Set the position of the floor (cover slip)',
              success_message='Cover slip position stored')
     def set_floor(self):
-        self.microscope.floor_Z = float(self.microscope.position())
+        z_scale = self.calibrated_unit.config.microscope_units_per_um
+        self.microscope.floor_Z = self.microscope.position() / z_scale
         self.info(f'Cell plane position set to {self.microscope.floor_Z}')
 
     @command(category='Stage',
@@ -264,6 +280,12 @@ class PipetteInterface(TaskInterface):
                       task_description='Calibrating manipulator')
     def calibrate_manipulator(self):
         self.execute([self.calibrated_unit.calibrate_pipette])
+
+    @blocking_command(category='Manipulators',
+                      description='Detect the pipette',
+                      task_description='Detecting the pipette')
+    def detect_pipette(self):
+        self.execute(self.calibrated_unit.detect_pipette)
     @blocking_command(category='Manipulators',
                         description='Home the manipulator',
                         task_description='Homing the manipulator')
@@ -286,6 +308,12 @@ class PipetteInterface(TaskInterface):
     def follow_stage(self):
         self.execute([self.calibrated_unit.follow_stage])
 
+
+    @blocking_command(category='Manipulators and Stage',
+                      description='Move pipette randomly in xyz',
+                        task_description='displacing pipette randomly in xyz...')
+    def move_pipette_random_velocity(self):
+        self.execute([self.calibrated_unit.move_pipette_random_velocity])
 
     @blocking_command(category='Manipulators and Stage',
                       description='Move pipette randomly in xyz',

@@ -12,8 +12,6 @@ import time
 import threading
 import imageio
 import logging
-from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
-from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -63,6 +61,7 @@ class AcquisitionThread(threading.Thread):
         last_frame = 0
         while self.running:
             snap_time = time.time()
+            retrieval_started_at = time.monotonic()
             try:
                 raw, processed = self.camera.snap()
                 time.sleep(0.02)  # Simulate processing time
@@ -78,7 +77,8 @@ class AcquisitionThread(threading.Thread):
             raw_image = raw.copy() if hasattr(raw, "copy") else raw
             processed_entry = (last_frame, frame_time, elapsed, processed_image)
             raw_entry = (last_frame, frame_time, elapsed, raw_image)
-            self.camera._update_frame_pair(processed_entry, raw_entry)
+            self.camera._update_frame_pair(
+                processed_entry, raw_entry, retrieval_started_at=retrieval_started_at)
             # Put image into queues for disk storage and display
             for queue in self.queues:
                 queue.append(processed_entry)
@@ -104,7 +104,7 @@ class Camera(object):
     """
     Base class for all camera devices. At the end of the initialization, derived classes need to
     call self.start_acquisition() to start the thread that continously acquires images from the
-    camera.
+    camera. Frames and their retrieval timing are made available to consumers.
     """
     def __init__(self):
         super(Camera, self).__init__()
@@ -121,6 +121,7 @@ class Camera(object):
 
         self.stop_show_time = 0
         self.point_to_show = None
+        self._transient_circles = ((), 0.0)
         self.cell_list = []
         self._frame_pair_lock = threading.Lock()
         self._last_frame_pair = None
@@ -128,15 +129,23 @@ class Camera(object):
         self.last_frame_time = None
         self.fps = 0
 
+        # Default off; RigConfigManager applies calibration.use_ai_features after instantiation.
+        self.use_ai_features = False
+
         self.Cellseg = None
         self._cellseg_error = None
-        self.pipdetector = PipetteDetectorYOLO1()
         # testing flag
         
 
     def show_circle(self, point, color=(255, 255, 255), radius=10, duration=1.5, show_center=False):
-        self.point_to_show = [point, radius, color, show_center]
-        self.stop_show_time = time.time() + duration
+        self.show_circles([point], color, radius, duration, show_center)
+
+    def show_circles(self, points, color=(255, 255, 255), radius=10, duration=1.5, show_center=False):
+        circles = tuple((tuple(map(int, p)), int(radius), color, bool(show_center)) for p in points)
+        stop_show_time = time.time() + duration if circles else 0.0
+        self._transient_circles = (circles, stop_show_time)
+        self.point_to_show = list(circles[0]) if len(circles) == 1 else None
+        self.stop_show_time = stop_show_time
 
     def start_acquisition(self):
         self._acquisition_thread = AcquisitionThread(camera=self,
@@ -145,7 +154,8 @@ class Camera(object):
         self._acquisition_thread.start()
 
     def stop_acquisition(self):
-        self._acquisition_thread.running = False
+        if self._acquisition_thread is not None:
+            self._acquisition_thread.running = False
 
 
     def flip(self):
@@ -157,16 +167,18 @@ class Camera(object):
         mask = segmentor.segment(image = img, input_point = cell, input_label = label)
         return mask
 
-    def _ai_features_enabled(self) -> bool:
-        return bool(getattr(self, "use_ai_features", True))
-
     def _ensure_cellseg(self):
-        if not self._ai_features_enabled():
-            raise NotImplementedError("AI features disabled; SAM2 segmentation unavailable.")
+        if not self.use_ai_features:
+            raise NotImplementedError(
+                "SAM2 segmentation unavailable. AI features need to be enabled in "
+                "calibration config before use. Set calibration.use_ai_features to true."
+            )
         if self._cellseg_error is not None:
             raise NotImplementedError(f"SAM2 is not available: {self._cellseg_error}") from self._cellseg_error
         if self.Cellseg is None:
             try:
+                from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
+
                 self.Cellseg = CellSegmentor2()
             except Exception as exc:
                 self._cellseg_error = exc
@@ -193,11 +205,16 @@ class Camera(object):
     def preprocess(self, input_img):
         img = input_img.copy()
 
-        # Draw pipette location if needed.
-        if self.point_to_show and time.time() - self.stop_show_time < 0:
-            img = cv2.circle(img, self.point_to_show[0], self.point_to_show[1], self.point_to_show[2], -1)
-            if self.point_to_show[3]:
-                img = cv2.circle(img, self.point_to_show[0], 2, self.point_to_show[2], 3)
+        circles, stop_show_time = self._transient_circles
+        if circles and time.time() < stop_show_time:
+            for point, radius, color, show_center in circles:
+                img = cv2.circle(img, point, radius, color, -1)
+                if show_center:
+                    img = cv2.circle(img, point, 2, color, 3)
+        elif circles:
+            self._transient_circles = ((), 0.0)
+            self.point_to_show = None
+            self.stop_show_time = 0.0
 
         # Process each cell's segmentation.
         for cell_coords, _, cell_img in self.cell_list:
@@ -255,9 +272,12 @@ class Camera(object):
         raw = self.raw_snap()
         return raw, self.preprocess(raw)
 
-    def _update_frame_pair(self, processed_entry, raw_entry) -> None:
+    def _update_frame_pair(self, processed_entry, raw_entry, *, retrieval_started_at=None) -> None:
         with self._frame_pair_lock:
-            self._last_frame_pair = (processed_entry, raw_entry)
+            # snap() may return a buffered image; sensor capture time is unknown.
+            timing = dict(acquired_at=None, retrieval_started_at=retrieval_started_at,
+                          available_at=time.monotonic(), timestamp_basis="camera_retrieval")
+            self._last_frame_pair = (processed_entry, raw_entry, timing)
 
     def raw_snap(self):
         return None
@@ -300,19 +320,21 @@ class Camera(object):
         except IndexError:  # no frame (yet)
             return None
 
-    def last_raw_frame_data(self) -> None | tuple[int, datetime.datetime, np.ndarray]:
+    def last_raw_frame_data(self, *, include_timing=False):
         '''
         Get the last raw frame and its number
 
         Returns
         -------
-        (frame_number, date, raw_frame)
+        (frame_number, date, raw_frame), plus matching timing when requested.
+        Timing describes retrieval/publication, not sensor exposure.
         '''
         with self._frame_pair_lock:
             if self._last_frame_pair is None:
                 return None
-            _, raw_entry = self._last_frame_pair
-        return raw_entry[0], raw_entry[1], raw_entry[-1]
+            _, raw_entry, timing = self._last_frame_pair
+        result = (raw_entry[0], raw_entry[1], raw_entry[-1])
+        return result + (dict(timing),) if include_timing else result
 
     def last_frame_pair(self) -> None | tuple[int, datetime.datetime, np.ndarray, np.ndarray]:
         '''
@@ -321,7 +343,7 @@ class Camera(object):
         with self._frame_pair_lock:
             if self._last_frame_pair is None:
                 return None
-            processed_entry, raw_entry = self._last_frame_pair
+            processed_entry, raw_entry, _ = self._last_frame_pair
         return processed_entry[0], processed_entry[1], processed_entry[-1], raw_entry[-1]
 
     def close(self):

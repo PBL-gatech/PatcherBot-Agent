@@ -1,5 +1,45 @@
+position_update: 1000
+autofocus_dist: 15
+stage_diag_move: 500
+frame_lag: 4
+pipette_diag_move: 200
+stage_x_axis_flip: false
+stage_y_axis_flip: true
+pipette_z_rotation: -60.75
+pipette_y_rotation: 25
+clean_move_order:
+- y
+- x
+- z
+pipette_k_scale: 1
+microscope_units_per_um: 5.0
+home_position_delta_um: -1000
+safe_position_delta_um: -18000
 native_zero: 1962
 native_per_mbar: 2.7836
 reader_offset: 516.72
 reader_scale: 0.3923
-pipette_y_rotation: 0
+pipette_detector_model: 'PipetteDetectorNetX.pt'
+pipette_focuser_model: 'PipetteFocuserNet.pt'
+pipette_focus_crop_feature: false
+use_ai_features: true
+home_position:
+- 0
+- 0
+- 0
+home_position_stage:
+- 0
+- 0
+- 0
+safe_position:
+- 0
+- 0
+- 0
+safe_position_stage:
+- 0
+- 0
+- 0
+bath_position:
+- 0
+- 0
+- 0

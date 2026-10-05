@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import datetime
 import re
 import sys
 from collections import Counter
@@ -14,12 +15,13 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 # --- USER CONFIGURATION DEFAULTS ---
-DEFAULT_INPUT_DIR = Path(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\agent_movement_data\2025_11_07-18_31")
+DEFAULT_INPUT_DIR = Path(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\agent_movement_data\2026_02_18-21_38")
 DEFAULT_FPS = 30.0
 DEFAULT_RED_THRESHOLDS = (150, 100, 100)  # (r_min, g_max, b_max)
 DEFAULT_AXIS_LIMIT = 85
 LOCK_WHITE_MODE = True  # Set to True to lock white-dot coordinates to the modal position.
-CSV_FIELDNAMES = ["filename", "red_x", "red_y", "white_x", "white_y"]
+USE_IMAGE_TIME = True  # Set to True to derive timing from filenames instead of constant FPS.
+CSV_FIELDNAMES = ["filename", "red_x", "red_y", "white_x", "white_y", "duration"]
 
 
 def natural_sort_key(path: Path) -> List[object]:
@@ -97,12 +99,14 @@ class AgentVisualizer:
         red_thresholds: Sequence[int] = DEFAULT_RED_THRESHOLDS,
         axis_limit: int = DEFAULT_AXIS_LIMIT,
         lock_white_to_mode: bool = False,
+        use_image_time: bool = False,
     ) -> None:
         self.input_dir = Path(input_dir).expanduser().resolve()
         self.fps = fps
         self.r_min, self.g_max, self.b_max = red_thresholds
         self.axis_limit = axis_limit
         self.lock_white_to_mode = lock_white_to_mode
+        self._use_image_time = use_image_time
 
         self.base_name = self.input_dir.name
         self.output_dir = self.input_dir
@@ -115,6 +119,23 @@ class AgentVisualizer:
             (p for p in self.input_dir.iterdir() if p.is_file() and p.suffix.lower() in self.IMAGE_EXTS),
             key=natural_sort_key,
         )
+
+    @staticmethod
+    def _extract_timestamp_from_filename(path: Path) -> Optional[float]:
+        """Parse a POSIX timestamp from camera_image_YYYYMMDD_HHMMSS_micro.png style names."""
+
+        match = re.search(r"(\d{8})_(\d{6})_(\d{1,6})", path.stem)
+        if not match:
+            return None
+
+        date_part, time_part, micro_part = match.groups()
+        try:
+            dt_obj = datetime.datetime.strptime(f"{date_part}{time_part}", "%Y%m%d%H%M%S")
+            micro = int(micro_part.ljust(6, "0")[:6])
+            dt_obj = dt_obj.replace(microsecond=micro)
+            return dt_obj.timestamp()
+        except ValueError:
+            return None
 
     def find_red_centroid(self, arr: np.ndarray) -> Optional[Tuple[int, int]]:
         red_mask = (arr[:, :, 0] >= self.r_min) & (arr[:, :, 1] <= self.g_max) & (arr[:, :, 2] <= self.b_max)
@@ -162,6 +183,47 @@ class AgentVisualizer:
                 sanitized[key] = value
         return sanitized
 
+    def _compute_frame_durations_ms(
+        self, frame_times: Optional[Sequence[Optional[float]]], n_frames: int
+    ) -> Tuple[List[int], str, int]:
+        """Compute per-frame durations in ms plus a human-readable timing label."""
+
+        default_duration_ms = max(1, int(round(1000.0 / self.fps))) if self.fps > 0 else 1000
+        durations_ms: List[int] = [default_duration_ms] * max(n_frames, 0)
+
+        if n_frames <= 0:
+            return durations_ms, "no frames", default_duration_ms
+
+        if not self._use_image_time:
+            return durations_ms, "constant FPS", default_duration_ms
+
+        if frame_times is None or len(frame_times) != n_frames:
+            return durations_ms, "constant FPS (timestamp length mismatch)", default_duration_ms
+
+        fallback_count = 0
+        for idx in range(1, n_frames):
+            prev = frame_times[idx - 1]
+            curr = frame_times[idx]
+            if prev is None or curr is None:
+                fallback_count += 1
+                continue
+            dt = curr - prev
+            if np.isfinite(dt) and dt > 0:
+                durations_ms[idx] = max(1, int(round(dt * 1000.0)))
+            else:
+                fallback_count += 1
+
+        if durations_ms:
+            timing_label = (
+                f"image timestamps (mean {np.mean(durations_ms):.1f} ms, "
+                f"range {min(durations_ms)}-{max(durations_ms)} ms, "
+                f"fallback frames {fallback_count})"
+            )
+        else:
+            timing_label = "image timestamps"
+
+        return durations_ms, timing_label, default_duration_ms
+
     def save_csv(self, rows: Sequence[Dict[str, object]], fieldnames: Sequence[str]) -> None:
         sanitized_rows = [self._sanitize_row(row, fieldnames) for row in rows]
         with open(self.output_csv, "w", newline="") as fh:
@@ -174,6 +236,7 @@ class AgentVisualizer:
         self,
         trajectory: Sequence[Tuple[int, int]],
         frame_rows: Sequence[Dict[str, object]],
+        frame_times: Optional[Sequence[float]] = None,
     ) -> None:
         if not trajectory:
             print("No red dot detections found; red-specific plots will show 'Not enough data'.")
@@ -196,6 +259,27 @@ class AgentVisualizer:
 
         fig, axes_grid = plt.subplots(4, 2, figsize=(14, 18), dpi=100)
         axes = axes_grid.ravel()
+
+        def column_to_array(key: str) -> np.ndarray:
+            if not frame_rows:
+                return np.asarray([], dtype=float)
+            values = []
+            for row in frame_rows:
+                value = row.get(key)
+                if value is None:
+                    values.append(np.nan)
+                else:
+                    values.append(float(value))
+            return np.asarray(values, dtype=float)
+
+        frames = np.arange(len(frame_rows), dtype=int)
+        red_x_series = column_to_array("red_x")
+        red_y_series = column_to_array("red_y")
+        white_x_series = column_to_array("white_x")
+        white_y_series = column_to_array("white_y")
+        time_series: Optional[np.ndarray] = None
+        if frame_times is not None and len(frame_times) == len(frame_rows):
+            time_series = np.asarray(frame_times, dtype=float)
 
         # XY trajectory
         ax_traj = axes[0]
@@ -254,9 +338,34 @@ class AgentVisualizer:
         ax_hist_dtheta.set_xlabel("delta theta (radians)")
         ax_hist_dtheta.set_ylabel("Count")
 
+        # Speed over frames (distance / delta t)
+        ax_speed = axes[5]
+        step_dist = np.sqrt(np.diff(red_x_series) ** 2 + np.diff(red_y_series) ** 2)
+        if time_series is not None:
+            delta_t = np.diff(time_series)
+        else:
+            delta_t = np.full_like(step_dist, fill_value=1.0 / self.fps if self.fps > 0 else 1.0, dtype=float)
+        delta_t[delta_t <= 0] = np.nan
+        speed = step_dist / delta_t if step_dist.size > 0 else np.asarray([], dtype=float)
+        speed_frames = frames[1:] if frames.size > 1 else np.asarray([], dtype=int)
+        speed_mask = np.isfinite(speed)
+        if speed_mask.any():
+            ax_speed.plot(speed_frames[speed_mask], speed[speed_mask], color="tab:olive")
+            ax_speed.set_ylabel("Speed (px/sec)")
+        else:
+            ax_speed.text(0.5, 0.5, "Not enough data", ha="center", va="center", transform=ax_speed.transAxes)
+        ax_speed.set_title("6) Speed over frames")
+        ax_speed.set_xlabel("Frame")
+        ax_speed.grid(True, alpha=0.3)
+
         # FFT magnitude of delta X and delta Y
-        ax_fft = axes[5]
-        sample_spacing = 1.0 / self.fps if self.fps > 0 else 1.0
+        ax_fft = axes[6]
+        if time_series is not None and len(time_series) > 1:
+            sample_spacing = float(np.nanmean(np.diff(time_series)))
+            if not np.isfinite(sample_spacing) or sample_spacing <= 0:
+                sample_spacing = 1.0 / self.fps if self.fps > 0 else 1.0
+        else:
+            sample_spacing = 1.0 / self.fps if self.fps > 0 else 1.0
         if dx.size > 0:
             freq_dx = np.fft.rfftfreq(dx.size, d=sample_spacing)
             fft_dx = np.abs(np.fft.rfft(dx - np.mean(dx))) / max(dx.size, 1)
@@ -267,7 +376,7 @@ class AgentVisualizer:
             ax_fft.plot(freq_dy, fft_dy, label="delta Y", color="tab:orange", linestyle="--")
         if dx.size == 0 and dy.size == 0:
             ax_fft.text(0.5, 0.5, "Not enough data", ha="center", va="center", transform=ax_fft.transAxes)
-        ax_fft.set_title("FFT of delta X/Y")
+        ax_fft.set_title("7) FFT of delta X/Y")
         ax_fft.set_xlabel("Frequency (Hz)")
         ax_fft.set_ylabel("Magnitude")
         if (dx.size > 0) or (dy.size > 0):
@@ -275,25 +384,7 @@ class AgentVisualizer:
             ax_fft.legend()
 
         # Error subplot
-        ax_err = axes[6]
-
-        def column_to_array(key: str) -> np.ndarray:
-            if not frame_rows:
-                return np.asarray([], dtype=float)
-            values = []
-            for row in frame_rows:
-                value = row.get(key)
-                if value is None:
-                    values.append(np.nan)
-                else:
-                    values.append(float(value))
-            return np.asarray(values, dtype=float)
-
-        frames = np.arange(len(frame_rows), dtype=int)
-        red_x_series = column_to_array("red_x")
-        red_y_series = column_to_array("red_y")
-        white_x_series = column_to_array("white_x")
-        white_y_series = column_to_array("white_y")
+        ax_err = axes[7]
         err = euclidean_err(white_x_series, red_x_series, white_y_series, red_y_series)
         err_label = "Distance white ↔ red (px)"
 
@@ -313,14 +404,12 @@ class AgentVisualizer:
                     label="white detection missing",
                 )
 
-        ax_err.set_title("7) Error")
+        ax_err.set_title("8) Error")
         ax_err.set_xlabel("Frame")
         ax_err.set_ylabel(err_label)
         ax_err.grid(True, alpha=0.3)
         if ax_err.lines or ax_err.collections:
             ax_err.legend()
-
-        axes[7].axis("off")
 
         fig.tight_layout()
         fig.savefig(self.output_plot, dpi=100)
@@ -328,7 +417,13 @@ class AgentVisualizer:
 
         print(f"Saved trajectory plot to: {self.output_plot}")
 
-    def save_gif(self, frames: Sequence[Image.Image]) -> None:
+    def save_gif(
+        self,
+        frames: Sequence[Image.Image],
+        durations_ms: Sequence[int],
+        timing_label: str,
+        default_duration_ms: int,
+    ) -> None:
         if not frames:
             print("No frames available for GIF; skipping GIF creation.", file=sys.stderr)
             return
@@ -336,21 +431,20 @@ class AgentVisualizer:
         if self.fps <= 0:
             raise ValueError("FPS must be a positive number.")
 
-        duration_ms = max(1, int(round(1000.0 / self.fps)))
         first_frame, *other_frames = frames
         first_frame.save(
             self.output_gif,
             format="GIF",
             save_all=True,
             append_images=other_frames,
-            duration=duration_ms,
+            duration=durations_ms,
             loop=0,
             disposal=2,
         )
 
         print(
-            f"Saved GIF to {self.output_gif} with {len(frames)} frames at {self.fps:.2f} fps "
-            f"(frame duration {duration_ms} ms)."
+            f"Saved GIF to {self.output_gif} with {len(frames)} frames; timing {timing_label} "
+            f"(default frame duration {default_duration_ms} ms)."
         )
 
     def run(self) -> None:
@@ -364,6 +458,7 @@ class AgentVisualizer:
         rows: List[Dict[str, object]] = []
         trajectory: List[Tuple[int, int]] = []
         frames: List[Image.Image] = []
+        frame_times: List[Optional[float]] = []
 
         for path in image_paths:
             try:
@@ -386,6 +481,8 @@ class AgentVisualizer:
                         wx, wy = white_detection
                         white_x, white_y = int(round(wx)), int(round(wy))
 
+                    timestamp = self._extract_timestamp_from_filename(path) if self._use_image_time else None
+
                     rows.append(
                         {
                             "filename": path.name,
@@ -397,6 +494,10 @@ class AgentVisualizer:
                     )
 
                     frames.append(rgb_img.convert("RGBA"))
+                    if timestamp is not None:
+                        frame_times.append(float(timestamp))
+                    elif self._use_image_time:
+                        frame_times.append(None)
             except UnidentifiedImageError:
                 print(f"Skipping unsupported image file: {path}", file=sys.stderr)
             except OSError as exc:
@@ -420,13 +521,28 @@ class AgentVisualizer:
                     file=sys.stderr,
                 )
 
+        time_series: Optional[List[float]] = None
+        if self._use_image_time:
+            if frame_times and all(t is not None for t in frame_times):
+                time_series = [float(t) for t in frame_times]  # type: ignore[arg-type]
+            else:
+                print(
+                    "Image-time spacing requested, but one or more timestamps were missing; falling back to constant FPS.",
+                    file=sys.stderr,
+                )
+
+        durations_ms, timing_label, default_duration_ms = self._compute_frame_durations_ms(frame_times, len(frames))
+
+        for idx, row in enumerate(rows):
+            row["duration"] = durations_ms[idx] if idx < len(durations_ms) else ""
+
         if rows:
             self.save_csv(rows, CSV_FIELDNAMES)
         else:
             print("No coordinate data to write; CSV skipped.")
 
-        self.save_plot(trajectory, rows)
-        self.save_gif(frames)
+        self.save_plot(trajectory, rows, frame_times=time_series)
+        self.save_gif(frames, durations_ms=durations_ms, timing_label=timing_label, default_duration_ms=default_duration_ms)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -470,6 +586,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         red_thresholds=(args.r_min, args.g_max, args.b_max),
         axis_limit=args.axis_limit,
         lock_white_to_mode=LOCK_WHITE_MODE,
+        use_image_time=USE_IMAGE_TIME,
     )
     visualizer.run()
 
