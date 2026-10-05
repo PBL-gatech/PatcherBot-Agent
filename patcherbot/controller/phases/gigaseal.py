@@ -11,306 +11,365 @@ from ..errors import AutopatchError
 from ..PhaseController import PhaseController
 
 
-OBSERVATION_HISTORY_SIZE = 30
 
 
 @dataclass
 class GigasealState:
-    """Working values scoped to one phase run."""
-    autoPressure: bool = False
-    adaptivePressure: bool = False
-    agentPressure: bool = False
+    stage: str = "main"
     num_slope_samples: int = 5
-    sample_interval: float = 0.0
     avg_resistance: float = 0.0
-    rate_mohm_per_sec: float = 0.0
-    increase_thresh: float = 0.0
-    constant_thresh: float = 0.0
-    decrease_thresh: float = 0.0
+    sample_interval: float = 0.0
+    main_window: object = None
+    cycle_mode: object = None  # acquisition provenance, never the live routing owner
     consecutive_success: int = 0
     currPressure: float = 0.0
     prevpressure: float = 0.0
     speed: float = 1.0
     bad_cell_count: int = 0
-    max_pressure: float = 0.0
     last_agent_action: object = None
     observations_since_last_action: int = 0
     holding_switched: bool = False
     last_progress_time: float = 0.0
+    ramp_initialized: bool = False
+
 
 class GigasealPhase(PhaseController):
     def run(self, cell=None):
-        """Coordinate the original sampling, pressure, holding, and success order."""
-        state = GigasealState()
-        self.prepare(state)
-        while not self.controller.abort_requested:
-            self.failure_gate(state)
-            state.sample_interval = float(self.controller.config.measurement_speed)
-            observation = self.observe(
-                fields=["resistance"], num_measurements=state.num_slope_samples,
-                interval=state.sample_interval, raw_measurements=True,
-            )
-            self.calculate(observation, state)
-            agent_observation = self.observe(include_pressure_state=True) if state.agentPressure else observation
-            if state.agentPressure:
-                agent_observation = self.calculate(agent_observation, state)
-            command = self.decide(agent_observation, state)
-            if command is not None:
+        state = None
+        try:
+            state = self.prepare(cell)
+            while state.stage != "finished":
+                observation = self.observe(state=state)
+                calculated = self.calculate(observation, state)
+                command = self.decide(calculated, state)
                 self.act(command, state)
-                if command.get("check_pressure_release"):
-                    self.act({"atm": True, "wait_after": 5})
-                    state.sample_interval = float(self.controller.config.measurement_speed)
-                    self.failure_gate(state, self.observe(
-                        fields=["resistance"], num_measurements=state.num_slope_samples,
-                        interval=state.sample_interval, raw_measurements=True,
-                    ))
-                    state.currPressure = -5
-                    self.act({"pressure": state.currPressure, "atm": False})
-            self.success_gate(observation["resistance"], state)
-        raise AutopatchError("Seal attempt failed: gigaseal criteria not met.")
+        finally:
+            self.finish(state)
 
-    def prepare(self, state):
-        """Initialize the rig, baseline, mode, and per-attempt state in order."""
-        state.autoPressure = (self.controller.config.mode == 'Classic')
-        state.adaptivePressure = (self.controller.config.mode == 'Adaptive')
-        state.agentPressure = (self.controller.config.mode == 'Agent')
+    def prepare(self, cell=None):
+        controller = self.controller
+        self.begin_observations()
         self.observation_windows = {}
-        width = 0
-        if state.agentPressure:
-            self.controller.info("Agent gigaseal mode detected; preparing gigaseal policy.")
-            self.controller.agenthelper.prepare_model("gigaseal")
-            width = self.controller.agenthelper.observation_input_width("resistance_input")
-            if width:
-                self.observation_windows["resistance_input"] = {
-                    "field": "resistance", "width": width,
-                    "predicate": lambda sample: np.isfinite(
-                        np.asarray(sample.get("pressure_atm_state", np.nan), dtype=float)
-                    ).all(),
-                    "finite_only": True, "fill_value": 0.0,
-                }
-        # Each Agent input follows a separate averaged loop observation.
-        # Retain N prior inputs plus the current one, including interleaving.
-        self.controller.observation_helper.reset_history(self, max(
-            OBSERVATION_HISTORY_SIZE, 2 * width + 1,
-        ))
-        self.controller.info(f"{self.controller.config.mode}: Attempting to form gigaseal...")
-        self.controller.amplifier.auto_fast_compensation()
-        self.controller.sleep(1)
-        self.controller.daq.setCellMode(True)
-        self.controller.sleep(0.1)
-        self.controller.info("Collecting baseline resistance...")
-
-        state.num_slope_samples = 5
-        state.sample_interval = float(self.controller.config.measurement_speed)
-
-        baseline_observation = self.observe(
-            fields=["resistance"], num_measurements=state.num_slope_samples,
-            interval=state.sample_interval, raw_measurements=True,
-        )
-        state.avg_resistance = baseline_observation["resistance"]
-        self.controller.observation_helper.record_calculations(self, baseline_observation, {
+        state = GigasealState()
+        self._agent_model_prepared = False
+        if controller.config.mode == "Agent":
+            self._prepare_agent_window(reset=True)
+        controller.info(f"{controller.config.mode}: Attempting to form gigaseal...")
+        controller.amplifier.auto_fast_compensation()
+        controller.sleep(1)
+        controller.daq.setCellMode(True)
+        controller.sleep(0.1)
+        controller.info("Collecting baseline resistance...")
+        state.sample_interval = float(controller.config.measurement_speed)
+        baseline = self.observe(fields=["resistance"],
+            num_measurements=state.num_slope_samples, interval=state.sample_interval)
+        state.avg_resistance = baseline["resistance"]
+        controller.observer.annotate(self, baseline, calculations={
             "num_measurements": state.num_slope_samples,
             "sample_interval_s": state.sample_interval,
-            "baseline_resistance_mohm": state.avg_resistance,
-        })
-        state.consecutive_success = 0
-
-        self.controller.pressure.set_ATM(atm=True)
-
-        self.controller.sleep(3)
-
-        if state.autoPressure:
-            state.currPressure = -5
-            self.controller.pressure.set_pressure(state.currPressure)
-            self.controller.pressure.set_ATM(atm=False)
-            state.prevpressure = state.currPressure
-            state.speed = 1
-            state.bad_cell_count = 0
-            # this is already negative, e.g. -30 mbar
-            state.max_pressure = self.controller.config.pressure_ramp_max
-        elif state.adaptivePressure:
-            state.currPressure = -5
-            self.controller.pressure.set_pressure(state.currPressure)
-            self.controller.pressure.set_ATM(atm=False)
-            state.prevpressure = state.currPressure
-            state.speed = 1
-            state.bad_cell_count = 0
-            # this is already negative, e.g. -30 mbar
-            state.max_pressure = self.controller.config.pressure_ramp_max
-
-        state.holding_switched = False
+            "baseline_resistance_mohm": state.avg_resistance})
+        controller.pressure.set_ATM(atm=True)
+        controller.sleep(3)
+        if controller.config.mode in ("Classic", "Adaptive"):
+            self.act({"kind": "initialize", "mode": controller.config.mode}, state)
         state.last_progress_time = time.time()
+        return state
+
+    def _prepare_agent_window(self, *, reset=False):
+        helper = self.controller.agenthelper
+        if (reset or not getattr(self, "_agent_model_prepared", False)
+                or getattr(helper, "model_type", None) != "gigaseal" or helper.agent is None):
+            helper.prepare_model("gigaseal")
+            self._agent_model_prepared = True
+        width = helper.observation_input_width("resistance_input")
+        self.observation_windows = {}
+        if width:
+            self.observation_windows["resistance_input"] = {
+                "field": "resistance", "width": width,
+                "predicate": lambda sample: np.isfinite(np.asarray(
+                    sample.get("pressure_atm_state", np.nan), dtype=float)).all(),
+                "finite_only": True, "fill_value": 0.0}
+
+    def observe(self, *, fields=None, num_measurements=None, interval=None,
+                evidence=None, state=None):
+        self.failure_gate(state if state is not None and state.stage == "main" else None)
+        self.success_gate()
+        if state is not None:
+            if state.stage == "main":
+                state.cycle_mode = self.controller.config.mode
+            elif state.cycle_mode != self.controller.config.mode:
+                return {"stage": "invalid", "mode": state.cycle_mode}
+        if state is None:
+            result = super().observe(fields=fields, num_measurements=num_measurements,
+                                     interval=interval, evidence=evidence)
+        elif state.stage == "agent":
+            if self.controller.config.mode != "Agent":
+                return {"stage": "route", "window": state.main_window, "mode": state.cycle_mode}
+            self._prepare_agent_window()
+            sample = super().observe(fields=["manipulator_position", "pipette_image_xy",
+                "pipette_defocus_um", "stage_positions", "camera_image", "resistance",
+                "pressure", "commanded_pressure_mbar", "pressure_atm_state"])
+            result = {"stage": "agent", "sample": sample, "mode": state.cycle_mode}
+        else:
+            state.sample_interval = float(self.controller.config.measurement_speed)
+            sample = super().observe(fields=["resistance"],
+                num_measurements=state.num_slope_samples, interval=state.sample_interval)
+            result = {"stage": state.stage, "sample": sample,
+                      "interval": state.sample_interval, "mode": state.cycle_mode}
+        self.failure_gate()
+        self.success_gate()
+        return result
+
+    def calculate(self, observation=None, state=None):
+        self.failure_gate()
+        self.success_gate()
+        stage = observation["stage"]
+        if stage == "invalid" or observation.get("mode") != self.controller.config.mode:
+            return {"stage": "invalid", "mode": observation.get("mode")}
+        if stage == "agent":
+            sample = observation["sample"]
+            count = state.observations_since_last_action
+            self.controller.observer.annotate(self, sample, calculations={
+                "observations_since_last_action": count})
+            return {"stage": stage, "mode": observation["mode"], "sample": {
+                **{key: value for key, value in sample.items() if key != "calculations"},
+                "observations_since_last_action": count}}
+        if stage == "release":
+            sample = observation["sample"]
+            difference = sample["resistance"] - state.avg_resistance
+            self.controller.observer.annotate(self, sample, calculations={
+                "num_measurements": state.num_slope_samples,
+                "sample_interval_s": observation["interval"],
+                "reference_resistance_mohm": state.avg_resistance,
+                "resistance_difference_mohm": difference})
+            return {"stage": stage, "mode": observation["mode"],
+                    "resistance": sample["resistance"], "difference": difference}
+        if stage == "main":
+            sample = observation["sample"]
+            previous = state.avg_resistance
+            delta = sample["resistance"] - previous
+            state.avg_resistance = sample["resistance"]
+            minimum = self.controller.config.gigaseal_min_delta_R
+            if delta >= minimum:
+                state.last_progress_time = time.time()
+            state.main_window = {"resistance": sample["resistance"],
+                "previous_resistance": previous, "interval": observation["interval"],
+                "mode": observation["mode"]}
+            rate = delta / (state.num_slope_samples * observation["interval"])
+            calculations = {
+                "num_measurements": state.num_slope_samples,
+                "sample_interval_s": observation["interval"],
+                "previous_resistance_mohm": previous, "delta_resistance_mohm": delta,
+                "rate_mohm_per_sec": rate, "gigaseal_min_delta_R": minimum}
+            if self.controller.config.mode in ("Classic", "Adaptive"):
+                config = self.controller.config
+                target = config.gigaseal_R
+                calculations.update(gigaseal_R=target,
+                    increase_slope_gate=config.increase_slope_gate,
+                    constant_slope_gate=config.constant_slope_gate,
+                    decrease_slope_gate=config.decrease_slope_gate,
+                    increase_threshold_mohm_per_sec=target / config.increase_slope_gate,
+                    constant_threshold_mohm_per_sec=target / config.constant_slope_gate,
+                    decrease_threshold_mohm_per_sec=target / config.decrease_slope_gate)
+            self.controller.observer.annotate(self, sample, calculations=calculations)
+        window = state.main_window
+        return {"stage": stage, "mode": observation["mode"],
+                "rate": (window["resistance"] -
+            window["previous_resistance"]) / (state.num_slope_samples * window["interval"])}
+
+    def decide(self, observation=None, state=None):
+        self.failure_gate()
+        self.success_gate()
+        mode = self.controller.config.mode
+        if mode not in ("Manual", "Training", "Classic", "Adaptive", "Agent"):
+            raise AutopatchError(f"Unsupported gigaseal mode: {mode}")
+        if self.awaiting_operator:
+            return None
+        stage = observation["stage"]
+        if stage == "invalid" or observation.get("mode") != mode:
+            return {"kind": "invalidate", "mode": mode}
+        if stage == "release":
+            self.failure_gate(state, observation)
+            return {"kind": "reset" if mode in ("Classic", "Adaptive") else "done",
+                    "mode": mode}
+        if mode in ("Manual", "Training"):
+            return {"kind": "done", "mode": mode}
+        if mode == "Agent":
+            if stage != "agent":
+                return {"kind": "agent_snapshot", "mode": mode}
+            sample = observation["sample"]
+            self.controller.info("Gigaseal agent observation collected: "
+                f"resistance={float(sample['resistance']):.3f} MΩ, "
+                f"actual_pressure={float(sample['pressure']):.3f} mbar, "
+                f"setpoint={float(sample['commanded_pressure_mbar']):.3f} mbar, "
+                f"atm={bool(sample['pressure_atm_state'])}, "
+                f"observations_since_last_action={int(sample['observations_since_last_action'])}")
+            action = self.controller.agenthelper.run_inference(observation=sample, is_demo=False)
+            self.controller.info(f"Gigaseal agent raw action: {action}")
+            if action is None:
+                self.controller.warning("Gigaseal agent returned no action; skipping pressure update.")
+                return {"kind": "done", "mode": mode}
+            values = np.asarray(action).reshape(-1)
+            if values.size < 1:
+                self.controller.warning("Gigaseal agent action has no values; skipping pressure update.")
+                return {"kind": "done", "mode": mode}
+            value = float(values[0])
+            atm = bool(value >= 0.0) if values.size == 1 else bool(float(values[1]) >= 0.5)
+            pressure = (float(self.controller.pressure.get_pressure())
+                if values.size == 1 and atm else float(np.clip(value,
+                    float(self.controller.config.pressure_ramp_max), -5.0)))
+            self.controller.info("Gigaseal agent decoded action: "
+                f"commanded_pressure={pressure:.3f} mbar, atm={atm}")
+            return {"kind": "agent", "mode": mode, "pressure": pressure,
+                    "atm": atm, "retain_setpoint": values.size == 1 and atm}
+        if stage == "agent":
+            return {"kind": "route", "mode": mode}
+        if not state.ramp_initialized:
+            return {"kind": "initialize", "mode": mode, "continue_window": True}
+        target = self.controller.config.gigaseal_R
+        rate = observation["rate"]
+        pressure, speed = state.currPressure, state.speed
+        if rate < target / self.controller.config.increase_slope_gate:
+            pressure -= 5
+            speed = 3
+        elif rate <= target / self.controller.config.constant_slope_gate:
+            speed = 1
+        elif rate <= target / self.controller.config.decrease_slope_gate:
+            pressure += 5
+            speed = 3
+        return {"kind": "ramp", "mode": mode, "pressure": pressure, "speed": speed}
+
+    def act(self, observation=None, state=None):
+        self.failure_gate()
+        self.success_gate()
+        command = observation
+        if command is None:
+            return
+        if (command["kind"] == "invalidate"
+                or command["mode"] != self.controller.config.mode
+                or (state.cycle_mode is not None and command["mode"] != state.cycle_mode)):
+            self._invalidate_cycle(state)
+            return
+        kind = command["kind"]
+        if command["mode"] != "Agent":
+            state.last_agent_action = None
+            state.observations_since_last_action = 0
+        if command["mode"] not in ("Classic", "Adaptive"):
+            state.ramp_initialized = False
+        if kind in ("agent_snapshot", "route"):
+            state.stage = "agent"
+            return
+        pressure = self.controller.pressure
+        if kind == "initialize":
+            pressure.set_pressure(-5)
+            pressure.set_ATM(atm=False)
+            state.currPressure = state.prevpressure = -5
+            state.speed = 1
+            state.ramp_initialized = True
+            if command.get("continue_window"):
+                state.stage = "agent"  # route back using the same main window
+            return
+        if kind == "ramp":
+            limit = self.controller.config.pressure_ramp_max
+            target = max(min(command["pressure"], -5.0), limit)
+            if not self.action_gate(target):
+                raise AutopatchError("Invalid gigaseal pressure command")
+            state.currPressure, state.speed = target, command["speed"]
+            if target != state.prevpressure:
+                pressure.set_pressure(target)
+                state.prevpressure = target
+                self.controller.sleep(5 / state.speed)
+            if command["mode"] != self.controller.config.mode:
+                self._invalidate_cycle(state)
+                return
+            if target <= self.controller.config.pressure_ramp_max:
+                pressure.set_ATM(atm=True)
+                self.controller.sleep(5)
+                if command["mode"] != self.controller.config.mode:
+                    self._invalidate_cycle(state)
+                    return
+                state.stage = "release"
+                return
+        elif kind == "reset":
+            pressure.set_pressure(-5)
+            pressure.set_ATM(atm=False)
+            state.currPressure = -5  # preserve legacy prevpressure after reset
+        elif kind == "agent":
+            target = (float(pressure.get_pressure()) if command["retain_setpoint"]
+                      else command["pressure"])
+            if not command["retain_setpoint"]:
+                target = float(np.clip(target,
+                    float(self.controller.config.pressure_ramp_max), -5.0))
+            if not self.action_gate(target):
+                raise AutopatchError("Invalid gigaseal Agent pressure command")
+            applied = (target, command["atm"])
+            if applied != state.last_agent_action:
+                pressure.set_pressure(target)
+                pressure.set_ATM(atm=command["atm"])
+                state.last_agent_action = applied
+                state.observations_since_last_action = 0
+            else:
+                state.observations_since_last_action += 1
+        if command["mode"] != self.controller.config.mode:
+            self._invalidate_cycle(state)
+            return
+        result = self.success_gate(state.main_window["resistance"], state)
+        if result["holding"] is not None:
+            self.controller.amplifier.set_holding(result["holding"])
+            self.controller.amplifier.switch_holding(True)
+            state.holding_switched = True
+        if command["mode"] != self.controller.config.mode:
+            self._invalidate_cycle(state)
+            return
+        state.stage = "finished" if result["complete"] else "main"
+        if self.awaiting_operator and self.goal_event:
+            self.finish(state)
+
+    def _invalidate_cycle(self, state):
+        state.stage = "main"
+        state.cycle_mode = None
+        state.main_window = None
+        state.consecutive_success = 0
+        state.ramp_initialized = False
         state.last_agent_action = None
         state.observations_since_last_action = 0
 
-    def failure_gate(self, state, observation=None):
-        """Check the deadline before a loop, or evaluate a supplied pressure-release test."""
+    def action_gate(self, observation=None, state=None):
+        return np.isfinite(observation)
+
+    def failure_gate(self, state=None, observation=None):
+        self.controller.abort_if_requested()
+        if self.awaiting_operator:
+            return
         if observation is not None:
-            testresistance = observation["resistance"]
-            difference = testresistance - state.avg_resistance
-            self.controller.observation_helper.record_calculations(self, observation, {
-                "num_measurements": state.num_slope_samples,
-                "sample_interval_s": state.sample_interval,
-                "reference_resistance_mohm": state.avg_resistance,
-                "resistance_difference_mohm": difference,
-            })
-            self.controller.info(f"Test resistance: {testresistance} MΩ; difference: {difference} MΩ")
-            if difference < 0:
+            self.controller.info(f"Test resistance: {observation['resistance']} MΩ; "
+                f"difference: {observation['difference']} MΩ")
+            if observation["difference"] < 0:
                 state.bad_cell_count += 1
                 if state.bad_cell_count > 5:
                     raise AutopatchError("Bad cell detected")
+        elif state is not None and time.time() - state.last_progress_time >= self.controller.config.seal_deadline:
+            raise AutopatchError("Seal attempt failed: resistance did not improve by at least "
+                f"{self.controller.config.gigaseal_min_delta_R} MegaOhms by the "
+                f"{self.controller.config.seal_deadline} second deadline.")
+
+    def success_gate(self, observation=None, state=None):
+        super().success_gate()
+        if observation is None:
+            return None
+        target = self.controller.config.gigaseal_R
+        holding = None
+        if observation >= target / self.controller.config.hold_switch and not state.holding_switched:
+            holding = self.controller.protocol_config.vclamp_hold
+        state.consecutive_success = state.consecutive_success + 1 if observation >= target else 0
+        complete = super().success_gate(state.consecutive_success >= 3, state)
+        return {"holding": holding, "complete": complete}
+
+    def finish(self, state=None):
+        if state is None or (state.stage != "finished" and not self.goal_event):
             return
-        if time.time() - state.last_progress_time >= self.controller.config.seal_deadline:
-            raise AutopatchError(f"Seal attempt failed: resistance did not improve by at least {self.controller.config.gigaseal_min_delta_R} MegaOhms by the {self.controller.config.seal_deadline} second deadline.")
-
-    def calculate(self, observation, state):
-        """Calculate and record progress, slope thresholds, or Agent context."""
-        if state.agentPressure and "pressure_atm_state" in observation:
-            observation["observations_since_last_action"] = np.asarray(
-                [state.observations_since_last_action], dtype=np.float32,
-            )
-            self.controller.observation_helper.record_calculations(self, observation, {
-                "observations_since_last_action": state.observations_since_last_action,
-            })
-            return {key: value for key, value in observation.items() if key != "calculations"}
-        previous_resistance = state.avg_resistance
-        delta_resistance = observation["resistance"] - previous_resistance
-        state.avg_resistance = observation["resistance"]
-        state.rate_mohm_per_sec = delta_resistance / (state.num_slope_samples * state.sample_interval)
-        minimum_delta = self.controller.config.gigaseal_min_delta_R
-        if delta_resistance >= minimum_delta:
-            state.last_progress_time = time.time()
-        calculations = {
-            "num_measurements": state.num_slope_samples,
-            "sample_interval_s": state.sample_interval,
-            "previous_resistance_mohm": previous_resistance,
-            "delta_resistance_mohm": delta_resistance,
-            "rate_mohm_per_sec": state.rate_mohm_per_sec,
-            "gigaseal_min_delta_R": minimum_delta,
-        }
-        if state.autoPressure or state.adaptivePressure:
-            target_resistance = self.controller.config.gigaseal_R
-            increase_slope_gate = self.controller.config.increase_slope_gate
-            constant_slope_gate = self.controller.config.constant_slope_gate
-            decrease_slope_gate = self.controller.config.decrease_slope_gate
-            state.increase_thresh = target_resistance / increase_slope_gate
-            state.constant_thresh = target_resistance / constant_slope_gate
-            state.decrease_thresh = target_resistance / decrease_slope_gate
-            calculations.update(
-                gigaseal_R=target_resistance,
-                increase_slope_gate=increase_slope_gate,
-                constant_slope_gate=constant_slope_gate,
-                decrease_slope_gate=decrease_slope_gate,
-                increase_threshold_mohm_per_sec=state.increase_thresh,
-                constant_threshold_mohm_per_sec=state.constant_thresh,
-                decrease_threshold_mohm_per_sec=state.decrease_thresh,
-            )
-        self.controller.observation_helper.record_calculations(self, observation, calculations)
-        return observation
-
-    def decide(self, observation, state):
-        """Choose an Agent or Classic/Adaptive command from calculated inputs."""
-
-        # region Agent mode
-        if state.agentPressure:
-            self.controller.info(
-                "Gigaseal agent observation collected: "
-                f"resistance={float(observation['resistance'][0]):.3f} MΩ, "
-                f"actual_pressure={float(observation['pressure'][0]):.3f} mbar, "
-                f"setpoint={float(observation['commanded_pressure_mbar'][0]):.3f} mbar, "
-                f"atm={bool(observation['pressure_atm_state'][0])}, "
-                f"observations_since_last_action={int(observation['observations_since_last_action'][0])}"
-            )
-            action = self.controller.agenthelper.run_inference(observation=observation, is_demo=False)
-            self.controller.info(f"Gigaseal agent raw action: {action}")
-            if action is None:
-                self.controller.warning("Gigaseal agent did not return an action; skipping pressure update for this iteration.")
-            else:
-                action_array = np.asarray(action).reshape(-1)
-                if action_array.size < 1:
-                    self.controller.warning(
-                        f"Gigaseal agent action must have at least 1 value; received shape {action_array.shape}."
-                    )
-                else:
-                    first_action_value = float(action_array[0])
-                    if action_array.size == 1:
-                        target_atm = bool(first_action_value >= 0.0)
-                        if target_atm:
-                            commanded_pressure = float(self.controller.pressure.get_pressure())
-                        else:
-                            commanded_pressure = float(
-                                np.clip(first_action_value, float(self.controller.config.pressure_ramp_max), -5.0)
-                            )
-                    else:
-                        commanded_pressure = float(
-                            np.clip(first_action_value, float(self.controller.config.pressure_ramp_max), -5.0)
-                        )
-                        target_atm = bool(float(action_array[1]) >= 0.5)
-                    self.controller.info(
-                        "Gigaseal agent decoded action: "
-                        f"commanded_pressure={commanded_pressure:.3f} mbar, atm={target_atm}"
-                    )
-                    current_agent_action = (commanded_pressure, target_atm)
-                    if current_agent_action != state.last_agent_action:
-                        return {"pressure": commanded_pressure, "atm": target_atm,
-                                "agent_action": current_agent_action}
-                    state.observations_since_last_action += 1
-            return None
-        # endregion
-
-        # region Manual / Training / inactive modes
-        if not (state.autoPressure or state.adaptivePressure):
-            return None
-        # endregion
-
-        # region Classic / Adaptive modes
-        if state.rate_mohm_per_sec < state.increase_thresh:
-            state.currPressure -= 5; state.speed = 3; state.max_pressure = self.controller.config.pressure_ramp_max
-        elif state.rate_mohm_per_sec <= state.constant_thresh:
-            state.speed = 1  # maintain
-        elif state.rate_mohm_per_sec <= state.decrease_thresh:
-            state.max_pressure = self.controller.config.pressure_ramp_max; state.currPressure += 5; state.speed = 3
-
-        state.currPressure = min(state.currPressure, -5.0)
-        state.currPressure = max(state.currPressure, self.controller.config.pressure_ramp_max)
-        command = {"check_pressure_release": state.currPressure <= state.max_pressure}
-        if state.currPressure != state.prevpressure:
-            command.update(pressure=state.currPressure, wait_after=5 / state.speed, remember_pressure=True)
-        return command
-        # endregion
-
-    def act(self, command, state=None):
-        """Execute device writes and waits, recording applied commands without acquiring signals."""
-        if "pressure" in command:
-            self.controller.pressure.set_pressure(command["pressure"])
-            if command.get("remember_pressure"):
-                state.prevpressure = command["pressure"]
-        if "atm" in command:
-            self.controller.pressure.set_ATM(atm=command["atm"])
-        if "agent_action" in command:
-            state.observations_since_last_action = 0
-            state.last_agent_action = command["agent_action"]
-        if "holding" in command:
-            self.controller.amplifier.set_holding(command["holding"])
-            self.controller.amplifier.switch_holding(True)
-            state.holding_switched = True
-        if "wait_after" in command:
-            self.controller.sleep(command["wait_after"])
-
-    def success_gate(self, observation, state):
-        """Apply the holding threshold, count qualifying windows, and complete success."""
-        if observation >= self.controller.config.gigaseal_R / self.controller.config.hold_switch and not state.holding_switched:
-            self.act({"holding": self.controller.protocol_config.vclamp_hold}, state)
-        if observation >= self.controller.config.gigaseal_R:
-            state.consecutive_success += 1
-        else:
-            state.consecutive_success = 0
-        if state.consecutive_success < 3:
-            return False
-        self.act({"atm": True})
+        self.controller.pressure.set_ATM(atm=True)
         self.controller.info("Seal successful!")
-        if self.controller.config.mode == "Training":
-            self.controller.info("Training mode: goal condition reached. Click Success or Abort to finish.")
-            self.wait_for_manual_completion()
-        self.complete_success()
-        return True
+        self.goal_event = False
+        if not self.awaiting_operator:
+            self.complete_success()

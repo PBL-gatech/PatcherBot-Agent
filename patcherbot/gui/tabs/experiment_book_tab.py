@@ -10,13 +10,15 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from patcherbot.utils.experiment_book import ExperimentBookLogger
+from patcherbot.gui.ParamConfig import ParamConfig
 
 class ExperimentBookSession(QtCore.QObject):
     """Shared state and behavior for one Experiment Book session."""
 
-    event_added = QtCore.pyqtSignal(object)
-    status_changed = QtCore.pyqtSignal(str, bool)
-    active_changed = QtCore.pyqtSignal(bool)
+class ExperimentBookTab(ParamConfig):
+    """Experiment detail form with an append-only chat-style timeline."""
+
+    THUMBNAIL_SIZE = QtCore.QSize(160, 120)
 
     def __init__(
         self,
@@ -26,9 +28,7 @@ class ExperimentBookSession(QtCore.QObject):
         session_time=None,
         parent=None,
     ):
-        super().__init__(parent)
-
-        self.config = config
+        super().__init__(config, parent=parent, build_ui=False)
         self.logger = logger if logger is not None else ExperimentBookLogger(
             folder_path=storage_root,
             session_time=session_time,
@@ -245,75 +245,26 @@ class ExperimentBookTab(QtWidgets.QWidget):
 
         self._build_ui()
 
-        self.config_value_changed_signal.connect(
-            self._display_config_value
-        )
-
-        for param_name in (
-            "experiment_name",
-            "strain_culture",
-            "gender",
-            "age",
-            "general_notes",
-        ):
-            self.config.param.watch(
-                self._config_param_changed,
-                param_name,
-            )
-
-        self.session.event_added.connect(
-            self._display_event
-        )
-        self.session.status_changed.connect(
-            self._set_status
-        )
-        self.session.active_changed.connect(
-            self.send_button.setEnabled
-        )
-
-        self.send_button.setEnabled(
-            self.session.book_active
-        )
-
-        # Allows a newly-created view to catch up to the current book.
-        for event in self.session.timeline_events:
-            self._display_event(event)
-
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
 
-        details_group = QtWidgets.QGroupBox("Experiment Details")
-        details_layout = QtWidgets.QFormLayout(details_group)
-        self.experiment_name_edit = QtWidgets.QLineEdit(self.config.experiment_name)
-        self.strain_culture_edit = QtWidgets.QLineEdit(self.config.strain_culture)
-        self.gender_edit = QtWidgets.QLineEdit(self.config.gender)
-        self.age_edit = QtWidgets.QLineEdit(self.config.age)
-        self.detail_edits = {
-            "experiment_name": self.experiment_name_edit,
-            "strain_culture": self.strain_culture_edit,
-            "gender": self.gender_edit,
-            "age": self.age_edit,
-        }
-        for name, edit in self.detail_edits.items():
-            edit.setObjectName(name)
-            edit.textChanged.connect(
-                lambda value, config_name=name: self._set_config_value(
-                    config_name,
-                    value,
-                )
-            )
-        details_layout.addRow("Experiment Name:", self.experiment_name_edit)
-        details_layout.addRow("Strain/Culture:", self.strain_culture_edit)
-        details_layout.addRow("Gender:", self.gender_edit)
-        details_layout.addRow("Age:", self.age_edit)
+        category, names = next(
+            (category, names) for category, names in self.config.categories
+            if category == "Experiment Details"
+        )
+        details_group = self._create_config_group(category, names)
+        details_layout = details_group.layout()
+        self.detail_edits = {name: self.value_widgets[name] for name in names}
+        for name, widget in self.detail_edits.items():
+            setattr(self, f"{name}_edit", widget)
 
         self.save_details_button = QtWidgets.QPushButton("Save Details")
         self.save_details_button.clicked.connect(self.save_details)
-        details_layout.addRow(self.save_details_button)
+        details_layout.addWidget(self.save_details_button)
 
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
-        details_layout.addRow(self.status_label)
+        details_layout.addWidget(self.status_label)
         layout.addWidget(details_group)
 
         timeline_label = QtWidgets.QLabel("Experiment Timeline")
@@ -337,12 +288,9 @@ class ExperimentBookTab(QtWidgets.QWidget):
 
         notes_group = QtWidgets.QGroupBox("General Notes")
         notes_layout = QtWidgets.QVBoxLayout(notes_group)
-        self.notes_edit = QtWidgets.QPlainTextEdit()
+        self.notes_edit = self._create_value_widget("general_notes", multiline=True)
         self.notes_edit.setPlaceholderText("Type a note for this experiment...")
         self.notes_edit.setMaximumHeight(100)
-        self.notes_edit.setObjectName("general_notes")
-        self.notes_edit.setPlainText(self.config.general_notes)
-        self.notes_edit.textChanged.connect(self._notes_changed)
         notes_layout.addWidget(self.notes_edit)
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.setEnabled(False)
@@ -464,37 +412,6 @@ class ExperimentBookTab(QtWidgets.QWidget):
     def send_note(self):
         return self.session.send_note()
 
-    def _set_config_value(self, name, value):
-        if getattr(self.config, name) != value:
-            setattr(self.config, name, value)
-
-    def _notes_changed(self):
-        self._set_config_value("general_notes", self.notes_edit.toPlainText())
-
-    def _config_param_changed(self, event):
-        self.config_value_changed_signal.emit(
-            event.name,
-            event.new,
-        )
-
-    @QtCore.pyqtSlot(str, object)
-    def _display_config_value(self, name, value):
-        if name == "general_notes":
-            widget = self.notes_edit
-            new_value = str(value)
-            if widget.toPlainText() == new_value:
-                return
-            widget.blockSignals(True)
-            widget.setPlainText(new_value)
-            widget.blockSignals(False)
-            return
-        widget = self.detail_edits.get(name)
-        if widget is None or widget.text() == str(value):
-            return
-        widget.blockSignals(True)
-        widget.setText(str(value))
-        widget.blockSignals(False)
-
     def handle_snapshot(self, payload):
         if not self.book_active:
             return False
@@ -525,6 +442,45 @@ class ExperimentBookTab(QtWidgets.QWidget):
         self._add_snapshot_card(frame, camera_role, captured_at)
         self._set_status("Snapshot added to the experiment timeline.")
         return True
+
+    def add_origin_entry(self, record, frame):
+        """Append one already-persisted origin card without further disk writes."""
+        timestamp = datetime.fromisoformat(record["saved_at"])
+        axis = record["axis"].upper()
+        card, card_layout = self._new_card(f"Origin {axis}", timestamp)
+        xyz = record["stage_xyz_um"]
+        origins = record["origins_um"]
+        origin_text = ", ".join(
+            f"{name.upper()}: {origins[name]:.2f} um"
+            if origins.get(name) is not None else f"{name.upper()}: not saved"
+            for name in ("x", "y")
+        )
+        body = QtWidgets.QLabel(
+            f"Saved {axis} origin\n"
+            f"Stage X: {xyz[0]:.2f}, Y: {xyz[1]:.2f}, Z: {xyz[2]:.2f} um\n"
+            f"Origins: {origin_text}\n"
+            f"Image: {record['image_path']}"
+        )
+        body.setTextFormat(QtCore.Qt.PlainText)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        card_layout.addWidget(body)
+        preview = QtWidgets.QLabel()
+        preview.setObjectName("origin_thumbnail")
+        preview.setAlignment(QtCore.Qt.AlignCenter)
+        try:
+            preview.setPixmap(self._frame_to_pixmap(frame).scaled(
+                self.THUMBNAIL_SIZE,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            ))
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Origin snapshot saved but preview unavailable", exc_info=True
+            )
+            preview.setText("Preview unavailable")
+        card_layout.addWidget(preview)
+        self._append_card(card)
 
     def _add_text_card(self, entry_type, text, timestamp):
         card, card_layout = self._new_card(entry_type, timestamp)

@@ -512,6 +512,18 @@ class ModelInferencer:
             "scale_y": float(scale_y),
         }
 
+    def prepare_coordinate_goal(self, goal, image):
+        """Transform a camera-space goal with the same crop/scale as the image."""
+        if image is None:
+            raise ValueError("Coordinate goal preprocessing requires a camera image")
+        params = self._compute_frame_params(np.asarray(image).shape[:2])
+        if params is None:
+            raise ValueError("Invalid camera image shape for coordinate goal")
+        result = self._scale_pipette_for_model(goal, params)
+        if result.shape != (3,) or not np.isfinite(result).all():
+            raise ValueError("Coordinate goal must be a finite three-vector")
+        return result
+
     def _prepare_image(
         self,
         image: np.ndarray,
@@ -663,9 +675,20 @@ class ModelInferencer:
         is_demo: bool = False,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[Dict[str, Any]]]:
         extras: Dict[str, Any] = {}
+        required_keys = set(self._get_required_obs_keys())
+        shapes = getattr(self.importer, "obs_shapes", {}) or {}
         if isinstance(observation, Mapping):
             obs_map = dict(observation)
+            for key in required_keys.intersection(obs_map):
+                value = obs_map[key]
+                if isinstance(value, (bool, int, float, np.number)):
+                    shape = tuple(shapes.get(key, (1,)))
+                    arr = np.asarray(value, dtype=np.float32)
+                    obs_map[key] = arr.reshape(shape) if np.prod(shape) == 1 else arr.reshape(1)
             pipette = obs_map.get(self.pipette_key, obs_map.get("pipette_positions"))
+            if pipette is None and self.pipette_key in required_keys and "pipette_image_xy" in obs_map:
+                pipette = np.r_[np.asarray(obs_map["pipette_image_xy"], dtype=np.float32).reshape(2),
+                                float(obs_map.get("pipette_defocus_um", np.nan))].astype(np.float32)
             stage = obs_map.get(self.stage_key, obs_map.get("stage_positions"))
             image = obs_map.get(self.image_key, obs_map.get("camera_image"))
             resistance = obs_map.get(self.resistance_key, obs_map.get("resistance"))
@@ -684,7 +707,6 @@ class ModelInferencer:
             pipette, stage, image, resistance = observation
         frame_params: Optional[Dict[str, float]] = None
         self._last_frame_params = None
-        required_keys = set(self._get_required_obs_keys())
         uses_image = self.image_key in required_keys
 
         image_payload: Optional[np.ndarray] = None
@@ -732,7 +754,9 @@ class ModelInferencer:
 
         resistance_payload: Optional[np.ndarray] = None
         if resistance is not None:
-            res_arr = np.asarray(resistance, dtype=np.float32)
+            res_arr = np.atleast_1d(np.asarray(resistance, dtype=np.float32))
+            if tuple(shapes.get(self.resistance_key, (1,))) == () and res_arr.size == 1:
+                res_arr = res_arr.reshape(())
             if self.resistance_key == "resistance":
                 resistance_payload = res_arr
             elif self.resistance_key in self.obs_keys:

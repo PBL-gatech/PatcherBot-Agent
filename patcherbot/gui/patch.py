@@ -7,14 +7,14 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import PyQt5.QtGui as QtGui
 import numpy as np
 import logging
-import time
 
 from PyQt5.QtWidgets import QFileDialog, QTabWidget, QWidget,QMessageBox
 import qtawesome as qta
 
 from patcherbot.controller import TaskController
-from patcherbot.gui.camera import ConfigGui
-from patcherbot.gui.experiment_book_tab import ExperimentBookSession, ExperimentBookTab
+from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
+from patcherbot.gui.tabs.atlas_widget import AtlasWindow
+from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.experimentBookConfig import ExperimentBookConfig
 from patcherbot.interface.patch import AutoPatchInterface
@@ -200,40 +200,30 @@ class PatchGui(ManipulatorGui):
         self.show_cells_button = QtWidgets.QPushButton("Show Cells")
         self.show_cells_button.setCheckable(True)
         self.show_cells_button.clicked.connect(self.toggle_cell_list_window)
-        # self.status_bar.insertPermanentWidget(1, self.show_cells_button)
+        self.status_bar.insertPermanentWidget(0, self.show_cells_button)
+        self.atlas_window = AtlasWindow(self)
+        self.atlas_window.finished.connect(self._atlas_window_closed)
+        self.show_atlas_button = QtWidgets.QPushButton("Show Atlas")
+        self.show_atlas_button.setCheckable(True)
+        self.show_atlas_button.clicked.connect(self.toggle_atlas_window)
+        self.status_bar.insertPermanentWidget(1, self.show_atlas_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
         self._cell_list_timer.timeout.connect(self._refresh_cell_list_window)
 
-        self.patch_toolbar = QtWidgets.QToolBar("Patch Controls")
-        self.addToolBar(Qt.TopToolBarArea, self.patch_toolbar)
-        self.patch_toolbar.addWidget(self.show_cells_button)
-
-        self.pipette_status_window = PipetteStatusWindow(self.patch_interfaces, self)
-        self.pipette_status_window.setWindowFlag(Qt.Tool)
-        self.show_pipette_status_button = QtWidgets.QPushButton("Pipette Status")
-        self.pipette_status_window.closed.connect(self._pipette_status_window_closed)
-        self.show_pipette_status_button.setCheckable(True)
-        self.show_pipette_status_button.clicked.connect(self.toggle_pipette_status_window)
-        # self.status_bar.insertPermanentWidget(1, self.show_pipette_status_button)
-        self.pipette_status_timer = QtCore.QTimer(self)
-        self.pipette_status_timer.setInterval(100)
-        self.pipette_status_timer.timeout.connect(self.pipette_status_window.update_status)
-        self.patch_toolbar.addWidget(self.show_pipette_status_button)
-
-        self.switch_manipulator_box = QtWidgets.QComboBox()
-        self.patch_toolbar.addSeparator()
-        self.patch_toolbar.addWidget(QtWidgets.QLabel("Active Pipette: "))
-        self.patch_toolbar.addWidget(self.switch_manipulator_box)
-        # self.status_bar.insertPermanentWidget(1, self.switch_manipulator_box)
-
-        self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
-        self.experiment_book_session = ExperimentBookSession(self.experiment_book_config)
-        self.snapshot_captured.connect(self.experiment_book_session.handle_snapshot)
-
-        self.config_tabs = QtWidgets.QTabWidget()
-        self.config_tabs.setTabBar(
-            NoWheelTabBar(self.config_tabs)
+        self.patch_interface.moveToThread(pipette_interface.thread())
+        self._display_position_timer = QtCore.QTimer(self)
+        self._display_position_timer.setInterval(50)
+        self._display_position_timer.timeout.connect(
+            lambda: self.patch_interface.update_camera_cell_list())
+        self._display_position_timer.start()
+        self.interface_signals[self.patch_interface] = (self.patch_command_signal,
+                                                        self.patch_reset_signal)
+        self.add_config_gui(self.patch_interface.config)
+        self.add_config_gui(self.patch_interface.protocol_config)
+        self.experiment_book_tab = self.add_config_gui(
+            self.patch_interface.experiment_book_config,
+            gui_class=ExperimentBookTab,
         )
 
         self.classic_tab = PipetteStackTab()
@@ -416,9 +406,78 @@ class PatchGui(ManipulatorGui):
             self.experiment_book_tab.handle_state_press_tally
         )
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
+        self._origin_busy = False
+        self.patch_interface.origin_saved.connect(self._origin_saved)
+        self.patch_interface.task_finished.connect(self._origin_task_finished)
         logging.debug("Added config GUI.")
-        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task,self.interface_signals, self.recording_state_manager)
-        self.add_tab(classic_patching_tab, 'Classic Auto Patching', index = 0)
+        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
+        self.classic_patching_tab = classic_patching_tab
+        classic_patching_tab.origin_requested.connect(self._request_origin)
+        self.add_tab(classic_patching_tab, 'PatcherBot Agent', index = 0)
+        self.record_button.clicked.disconnect(self.toggle_recording)
+        self.record_button.clicked.connect(classic_patching_tab.toggle_recording)
+        self.record_button.setToolTip('Start/stop recording')
+        self._recording_indicator_timer = QtCore.QTimer(self)
+        self._recording_indicator_timer.timeout.connect(
+            lambda: self.record_button.setChecked(self.recording_state_manager.is_recording_enabled())
+        )
+        self._recording_indicator_timer.start(100)
+
+    def close(self):
+        self._display_position_timer.stop()
+        self.pipette_interface.display_positions = None
+        return super(PatchGui, self).close()
+
+    def _origin_experiment_details(self):
+        book = self.experiment_book_tab
+        if book.active_details is not None:
+            return dict(book.active_details)
+        return {key: str(getattr(book.config, key, "")) for key in
+                ("experiment_name", "strain_culture", "gender", "age")}
+
+    @QtCore.pyqtSlot(str)
+    def _request_origin(self, axis):
+        if self._origin_busy:
+            return
+        if (getattr(self, "running_task", None) is not None
+                or self.patch_interface._current_controller is not None
+                or self.pipette_interface._current_controller is not None):
+            self.classic_patching_tab.set_origin_status(
+                "Wait for the current movement/task to finish.", error=True)
+            return
+        request = {
+            "experiment": self._origin_experiment_details(),
+            "logger": self.experiment_book_tab.logger,
+            "camera_interface": self.main_interface,
+        }
+        command = (self.patch_interface.save_x_origin if axis == "x"
+                   else self.patch_interface.save_y_origin)
+        self._origin_busy = True
+        self.classic_patching_tab.set_origin_busy(True)
+        self.classic_patching_tab.set_origin_status("Saving origin and microscope image...")
+        self.start_task(command.task_description, self.patch_interface)
+        self.patch_command_signal.emit(command, request)
+
+    @QtCore.pyqtSlot(object, object)
+    def _origin_saved(self, record, frame):
+        if self._origin_experiment_details() != record["experiment"]:
+            self.classic_patching_tab.set_origin_status(
+                "Origin recorded for the previous experiment; current origin unchanged.", error=True)
+            return
+        self.patch_command_signal.emit(self.patch_interface.accept_origin, record)
+        self.experiment_book_tab.add_origin_entry(record, frame)
+        self.classic_patching_tab.set_origin_status(
+            record["axis"].upper() + " origin saved to Experiment Book.")
+
+    @QtCore.pyqtSlot(int, object)
+    def _origin_task_finished(self, exit_code, result):
+        if not self._origin_busy:
+            return
+        self._origin_busy = False
+        self.classic_patching_tab.set_origin_busy(False)
+        if exit_code:
+            self.classic_patching_tab.set_origin_status(
+                "Origin not saved; see the task error for details.", error=True)
 
     def register_commands(self):
         """
@@ -687,6 +746,21 @@ class PatchGui(ManipulatorGui):
         self.task_abort_button.setEnabled(False)
         self.task_success_button.setEnabled(False)
         self.active_patch_interface.abort_task()
+
+    def toggle_atlas_window(self, checked=None):
+        if checked is None:
+            checked = self.show_atlas_button.isChecked()
+        if checked:
+            self.show_atlas_button.setText("Hide Atlas")
+            self.atlas_window.show()
+            self.atlas_window.raise_()
+            self.atlas_window.activateWindow()
+        else:
+            self.atlas_window.close()
+
+    def _atlas_window_closed(self, _result=None):
+        self.show_atlas_button.setChecked(False)
+        self.show_atlas_button.setText("Show Atlas")
 
     def toggle_cell_list_window(self, checked=None):
         if checked is None:
@@ -1631,6 +1705,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
         Returns:
             list: List of button tuples for the section.
         """
+                    completion_color="rgba(0, 0, 255, 0.3)", change_color_during=None,
+                    extra_widget=None):
         # Use CollapsibleGroupBox instead of QGroupBox
         box = CollapsibleGroupBox(box_name)
         rows = QtWidgets.QVBoxLayout()
@@ -1688,6 +1764,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 active_names = set(change_color_during)
             self.active_buttons_by_section[box_name] = active_names
 
+        if extra_widget is not None:
+            rows.addWidget(extra_widget)
         box.setContentLayout(rows)
         layout.addWidget(box)
         return section_buttons
@@ -1742,6 +1820,9 @@ class ClassicPatchButtons(ButtonTabWidget):
             interface_signals (dict): Signals for interfacing with controllers.
             recording_state_manager (RecordingStateManager): Recording state manager.
         """
+    origin_requested = QtCore.pyqtSignal(str)
+
+    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager):
         super().__init__()
         self.patch_interface = patch_interface
         self.pipette_interface = pipette_interface
@@ -1777,6 +1858,37 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.pipette_cleaning_calibration = [self.patch_interface.store_cleaning_position,self.patch_interface.move_pipette_up,self.patch_interface.move_to_safe_space]
 
 
+        origin_controls = QtWidgets.QWidget()
+        origin_layout = QtWidgets.QVBoxLayout(origin_controls)
+        origin_layout.setContentsMargins(0, 0, 0, 0)
+        origin_row = QtWidgets.QHBoxLayout()
+        self.origin_buttons = {}
+        for axis in ("x", "y"):
+            button = QtWidgets.QPushButton(axis.upper() + " Origin")
+            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            button.setMinimumSize(50, 50)
+            button.clicked.connect(lambda checked, a=axis: self.origin_requested.emit(a))
+            self.origin_buttons[axis] = button
+            origin_row.addWidget(button)
+        origin_layout.addLayout(origin_row)
+        self.origin_status = QtWidgets.QLabel()
+        self.origin_status.setWordWrap(True)
+        self.origin_status.hide()
+        origin_layout.addWidget(self.origin_status)
+
+        # Add a box for calibration setup
+        # buttonList = [['Calibrate Stage','Calibrate Pipette'],['set home space','set safe space'],['Store Cleaning Position'],['Clear Calibration']]
+        buttonList = [['Calibrate Stage','Calibrate Pipette'],['Store Cleaning Position'],['Load Calibration','Clear Calibration']]
+        cmds = [[self.stage_calibration, self.pipette_calibration],
+                # [self.patch_interface.store_home_position, self.patch_interface.store_safe_position],
+                [self.pipette_cleaning_calibration],
+                [self.load_calibration, self.patch_interface.clear_positions]
+        ]
+        self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
+                        change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)",
+                        extra_widget=origin_controls)
+
+        # Add a box for movement commands 
         buttonList = [
             ["Calibrate Pipette"],
             [
@@ -1942,6 +2054,16 @@ class ClassicPatchButtons(ButtonTabWidget):
         })
 
         self.setLayout(layout)
+
+    def set_origin_busy(self, busy):
+        for button in self.origin_buttons.values():
+            button.setEnabled(not busy)
+
+    def set_origin_status(self, message, error=False):
+        self.origin_status.setText(message)
+        self.origin_status.setVisible(error)
+        for button in self.origin_buttons.values():
+            button.setToolTip(message)
 
     def load_calibration(self):
         """Opens a file dialog and connects selection to calibration loading."""

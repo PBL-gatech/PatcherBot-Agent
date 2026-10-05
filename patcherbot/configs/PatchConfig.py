@@ -1,4 +1,4 @@
-﻿from patcherbot.utils.config import Config, NumberWithUnit, Number, Boolean ,Selector
+from .Config import Config, NumberWithUnit, Number, Boolean ,Selector
 import logging
 
 class PatchConfig(Config):
@@ -14,9 +14,18 @@ class PatchConfig(Config):
     cell_distance = NumberWithUnit(20, bounds=(0, 100), doc='Initial distance above target cell', unit='μm') # 50 for Neurons, 20 for HEK cells
     max_locate_speed = NumberWithUnit(1000, bounds=(0, 10000), doc='Maximum speed for cell locating', unit='μm/s')
     slice_start_distance = NumberWithUnit(75, bounds=(0, 100), doc='Initial distance above target cell in slice', unit='μm') # 20 um default
-    max_distance = NumberWithUnit(30, bounds=(0, 100), doc='Maximum movement during approach', unit='μm')
+    max_distance = NumberWithUnit(30, bounds=(0, 100), doc='Maximum movement during hunt', unit='μm')
+    hunt_limit_target_radius = Boolean(True, doc='Limit detection matching to the selected target radius')
+    hunt_target_radius = NumberWithUnit(50, bounds=(1, 1000), unit='μm',
+                                       doc='Maximum detection distance from the expected target when radius limiting is enabled')
+    hunt_contact_distance = NumberWithUnit(5, bounds=(0.1, 100), unit='μm',
+                                          doc='Maximum image-plane tip-to-cell distance for Adaptive contact success')
     hunt_search_margin = NumberWithUnit(5, bounds=(0, 100),
                                        doc='Extra microscope Search travel after preceding Spear descent', unit='\u03bcm')
+    hunt_progress_cycles = Number(4, bounds=(1, 100),
+                                  doc='Complete adaptive cycles between Z progress checks (whole number)')
+    hunt_min_progress_percent = NumberWithUnit(25, bounds=(0, 100), unit='%',
+                                               doc='Minimum pipette-to-cell Z gap reduction per cycle window')
     max_descent_speed = Number(-10,bounds=(-50,50),doc='Maximum descent speed for Neuron Hunting')
     max_clearing_speed = Number(-100,bounds=(-200,200),doc='Maximum speed for clearing Tissue during Neuron Hunting')
     use_centroid = Boolean(True, doc='Use centroid for pipette alignment during approach')
@@ -59,11 +68,17 @@ class PatchConfig(Config):
     lamp = Selector(default= '2', objects = ['1', '2', '3','4','5','6'], doc='default fluorescence cube slot')
     auto_capture_fluo = Boolean(False, doc='Capture fluorescence image on cell selection')
     categories = [
-        ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance','slice_start_distance','max_distance', 'hunt_search_margin', 'cell_R_increase','max_locate_speed','max_descent_speed','max_clearing_speed','use_centroid','track_cell','tracking_mode','track_max_fast_jump_px']),
+        ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
+                      'max_locate_speed', 'max_clearing_speed', 'use_centroid', 'track_cell',
+                      'tracking_mode', 'track_max_fast_jump_px']),
+        ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin',
+                  'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
+                  'hunt_target_radius', 'hunt_contact_distance']),
         ('Sealing', ['pressure_sealing', 'gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch', 'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate', 'measurement_speed', 'Vramp_amplitude', 'seal_min_time', 'seal_deadline']),
         ('Break-in', ['zap', 'pressure_ramp_increment', 'pressure_ramp_max','pulse_pressure_break_in','pulse_pressure_duration', 'max_cell_R','max_access_R','min_cell_C']),
         ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette']),
         ('Fluorescence', ['lamp', 'auto_capture_fluo'])  
     ]
 
-    logging.info("PatchConfig initialized successfully.")
+    logging.getLogger().info("PatchConfig initialized successfully.")
+

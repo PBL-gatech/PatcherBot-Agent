@@ -4,7 +4,7 @@ import logging
 
 import param
 
-from patcherbot.utils.config import Config
+from .Config import Config
 
 
 class ExperimentBookConfig(Config):
@@ -24,4 +24,4 @@ class ExperimentBookConfig(Config):
         ("Notes", ["general_notes"]),
     ]
 
-    logging.info("ExperimentBookConfig initialized successfully.")
+    logging.getLogger().info("ExperimentBookConfig initialized successfully.")

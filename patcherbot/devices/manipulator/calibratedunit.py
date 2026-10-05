@@ -111,14 +111,11 @@ class CalibratedUnit(ManipulatorUnit):
         )
 
     def detect_pipette(self):
-        try:
-            frame = self.camera.raw_frame_queue[0][3]
-        except (AttributeError, IndexError, TypeError):
-            frame = None
-        if frame is None:
+        frame = self.camera.last_raw_frame_data()
+        if frame is None or frame[2] is None:
             self.camera.show_circles([])
             return None
-        point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame.copy())
+        point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame[2])
         if point is None:
             self.camera.show_circles([])
             return None
@@ -211,6 +208,8 @@ class CalibratedUnit(ManipulatorUnit):
         '''
         return dot(self.M, pos_microns)
     
+
+
 
     def reference_position(self, include_offset = True):
         '''
@@ -488,7 +487,7 @@ class CalibratedUnit(ManipulatorUnit):
         #(1) get image from raw frame queue
         _, _, _, img = self.camera.raw_frame_queue[0]
         #(2) get detected pipette position from deep learning detector
-        detected_px = np.array(self.pipetteCalHelper.pipetteDetector.detect_pipette(img))
+        detected_px = self.pipetteCalHelper.pipetteDetector.detect_pipette(img)
         #(3) extract planar values from desired_px3D
         if detected_px is None:
             self.error("No pipette detected in the current frame.")

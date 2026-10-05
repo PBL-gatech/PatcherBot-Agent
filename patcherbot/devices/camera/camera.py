@@ -85,6 +85,7 @@ class AcquisitionThread(threading.Thread):
         last_frame = 0
         while self.running:
             snap_time = time.time()
+            retrieval_started_at = time.monotonic()
             try:
                 raw, processed = self.camera.snap()
                 time.sleep(0.02)  # Simulate processing time
@@ -100,7 +101,8 @@ class AcquisitionThread(threading.Thread):
             raw_image = raw.copy() if hasattr(raw, "copy") else raw
             processed_entry = (last_frame, frame_time, elapsed, processed_image)
             raw_entry = (last_frame, frame_time, elapsed, raw_image)
-            self.camera._update_frame_pair(processed_entry, raw_entry)
+            self.camera._update_frame_pair(
+                processed_entry, raw_entry, retrieval_started_at=retrieval_started_at)
             # Put image into queues for disk storage and display
             for queue in self.queues:
                 queue.append(processed_entry)
@@ -126,7 +128,7 @@ class Camera(object):
     """
     Base class for all camera devices. At the end of the initialization, derived classes need to
     call self.start_acquisition() to start the thread that continously acquires images from the
-    camera.
+    camera. Frames and their retrieval timing are made available to consumers.
     """
     def __init__(self):
         """Initialize the base Camera object and internal state."""
@@ -198,6 +200,8 @@ class Camera(object):
     def stop_acquisition(self):
         """Stop the background acquisition thread."""
         self._acquisition_thread.running = False
+        if self._acquisition_thread is not None:
+            self._acquisition_thread.running = False
 
 
     def flip(self):
@@ -360,8 +364,12 @@ class Camera(object):
             processed_entry (tuple): Processed frame data.
             raw_entry (tuple): Raw frame data.
         """
+    def _update_frame_pair(self, processed_entry, raw_entry, *, retrieval_started_at=None) -> None:
         with self._frame_pair_lock:
-            self._last_frame_pair = (processed_entry, raw_entry)
+            # snap() may return a buffered image; sensor capture time is unknown.
+            timing = dict(acquired_at=None, retrieval_started_at=retrieval_started_at,
+                          available_at=time.monotonic(), timestamp_basis="camera_retrieval")
+            self._last_frame_pair = (processed_entry, raw_entry, timing)
 
     def raw_snap(self):
         """
@@ -421,11 +429,21 @@ class Camera(object):
         returns:
             tuple or None: (frame_number, timestamp, raw_frame)
         """
+    def last_raw_frame_data(self, *, include_timing=False):
+        '''
+        Get the last raw frame and its number
+
+        Returns
+        -------
+        (frame_number, date, raw_frame), plus matching timing when requested.
+        Timing describes retrieval/publication, not sensor exposure.
+        '''
         with self._frame_pair_lock:
             if self._last_frame_pair is None:
                 return None
-            _, raw_entry = self._last_frame_pair
-        return raw_entry[0], raw_entry[1], raw_entry[-1]
+            _, raw_entry, timing = self._last_frame_pair
+        result = (raw_entry[0], raw_entry[1], raw_entry[-1])
+        return result + (dict(timing),) if include_timing else result
 
     def last_frame_pair(self) -> None | tuple[int, datetime.datetime, np.ndarray, np.ndarray]:
         """
@@ -437,7 +455,7 @@ class Camera(object):
         with self._frame_pair_lock:
             if self._last_frame_pair is None:
                 return None
-            processed_entry, raw_entry = self._last_frame_pair
+            processed_entry, raw_entry, _ = self._last_frame_pair
         return processed_entry[0], processed_entry[1], processed_entry[-1], raw_entry[-1]
 
     def close(self):

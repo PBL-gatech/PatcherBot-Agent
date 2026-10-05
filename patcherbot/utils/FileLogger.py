@@ -147,6 +147,156 @@ class FileLogger:
     def create_folder(self):
         """Create the session directory if needed."""
         if self.folder_created:
+        # Check if the recording is enabled before creating the folder
+        if self.recording_state_manager.is_recording_enabled() and not self.folder_created:
+            try:
+                os.makedirs(self.camera_folder_path, exist_ok=True)
+                os.makedirs(self.aux_camera_folder_path, exist_ok=True)
+                self.folder_created = True  # Set the flag to True once folder is created
+                print(f"Created folder at: {self.folder_path}")
+            except OSError as exc:
+                logging.error("Error creating folder for recording: %s", exc)
+
+
+    def open(self):
+        self.file = open(self.filename, "a+")
+        self.file.seek(0, os.SEEK_END)
+        is_empty = self.file.tell() == 0
+
+        if is_empty:
+            headers = {
+                "movement_recording.csv": "timestamp;st_x;st_y;st_z;pi_x;pi_y;pi_z",
+                "graph_recording.csv": "timestamp;pressure;resistance;current;voltage",
+            }
+            header = headers.get(os.path.basename(self.filename))
+            if header:
+                self.file.write(f"{header}\n")
+                self.file.flush()
+
+
+        print(f"Opened file at: {self.filename}")
+
+    def _write_to_file(self, contents):
+        if self.file is None:
+            self.open()
+        self.file.write(contents)
+        self.file.flush()
+        self.write_event.set()  # Signal that writing is done
+        # print("Wrote file contents at path: ", self.filename)
+
+    def _write_to_file_batch(self, contents):
+        if self.file is None:
+            self.open()
+        self.file.writelines(contents)
+        self.file.flush()
+        self.write_event.set()  # Signal that writing is done
+        # print("Wrote file contents at path: ", self.filename)
+
+    def write_graph_data(self, time_value, pressure: float, resistance: float, current, voltage):
+    # ? time_current is probably not necessary, will remove in a future commit when confirmed.
+    # def write_graph_data(self, time_value, pressure: float, resistance: float, time_current, current):
+        if not self.recording_state_manager.is_recording_enabled():
+            return
+        if time_value == self.last_graph_time:
+            return
+        self.last_graph_time = time_value
+        self.create_folder()  # Create the folder if recording is enabled and it's the first time
+        # content = f"timestamp:{time_value}  pressure:{pressure}  resistance:{resistance}  / current:{current}\n"
+        content = f"{time_value};{pressure};{resistance};{current};{voltage}\n"
+        self.write_event.clear()
+        threading.Thread(target=self._write_to_file, args=(content,)).start()
+
+    def write_movement_data_batch(self, time_value, stage_x, stage_y, stage_z, pipette_x, pipette_y, pipette_z):
+        # start_time = time.perf_counter_ns()
+        if not self.recording_state_manager.is_recording_enabled():
+            return
+        if time_value == self.last_movement_time:
+            return
+        self.last_movement_time = time_value
+        self.create_folder()  # Create the folder if recording is enabled and it's the first time
+        content = f"{time_value};{stage_x};{stage_y};{stage_z};{pipette_x};{pipette_y};{pipette_z}\n"
+
+        #print('New Pos: ' + content)
+
+        self.movement_contents.append(content)
+        if len(self.movement_contents) >= self.frame_batch_limit:
+            # logging.info(f"Batch size reached for MOVEMENT. Writing to disk at {datetime.now() - self.time_truth} seconds after start")
+            self._flush_contents(self.movement_contents)
+        # end_time = time.perf_counter_ns()
+        # print(f"Time taken to write movement data: {(end_time - start_time)/1e6} ms")
+
+    def _flush_contents(self, data):
+        if data:
+            contents = data.copy()
+            data.clear()
+            self.write_event.clear()
+            threading.Thread(target=self._write_to_file_batch, args=(contents,)).start()
+
+    def _save_image(self, frame, path, wait=False):
+        if wait:
+            self._write_image(frame, path)
+            return
+        self.batch_frames.append((frame, path))
+        if len(self.batch_frames) >= self.frame_batch_limit:
+            # logging.info(f"Batch size reached for FRAMES. Writing to disk at {datetime.now() - self.time_truth} seconds after start")
+            self.write_frame.clear()
+            threading.Thread(target=self._write_batch_to_disk).start()
+    
+    def _save_image_sleep(self):
+        if self.batch_frames:
+            self.write_frame.clear()
+            threading.Thread(target=self._write_batch_to_disk).start()
+
+    def _write_image(self, frame, path):
+        imageio.imwrite(path, frame, format=self.image_type)
+
+    def _write_batch_to_disk(self):
+        while self.batch_frames:
+            frame, path = self.batch_frames.popleft()
+            # imwrite(path, frame)
+            self._write_image(frame, path)
+            # qoi.write(path, frame)
+        self.write_frame.set()  # Signal that image saving is done
+
+    def write_camera_frames(self, time_value, frame, frameno):
+        if not self.recording_state_manager.is_recording_enabled():
+            self._save_image_sleep()
+            return
+
+        # * Add this back in if you change where this function is called within the update_image function in the LiveFeedQT class. 
+        # if frameno is None:
+        #     logging.info("No frame number detected. Closing the camera recorder")
+        #     self.close()
+        #     return
+
+        if frameno <= self.last_frameno:
+            return
+        self.create_folder()  # Create the folder if recording is enabled and it's the first time
+        image_path = os.path.join(self.camera_folder_path, f"{frameno}_{time_value}.{self.image_type}")
+        self._save_image(frame, image_path)
+        self.last_frameno = frameno
+
+    def write_aux_camera_frames(self, time_value, frame, frameno):
+        if not self.recording_state_manager.is_recording_enabled():
+            self._save_image_sleep()
+            return
+
+        if frameno is None or frameno <= self.last_aux_frameno:
+            return
+        self.create_folder()
+        image_path = os.path.join(self.aux_camera_folder_path, f"{frameno}_{time_value}.{self.image_type}")
+        self._save_image(frame, image_path)
+        self.last_aux_frameno = frameno
+
+    def setBatchGraph(self, value=True):
+        self.batch_mode_graph = value
+    def setBatchMoves(self, value=True):
+        self.batch_mode_movements = value
+
+    def flush_movement_data(self):
+        if not self.write_event.is_set():
+            self.write_event.wait()
+        if not self.movement_contents:
             return
 
         try:

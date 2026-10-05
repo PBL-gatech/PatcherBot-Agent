@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from datetime import datetime
+import json
 import logging
 from numbers import Integral
 import os
@@ -113,6 +114,29 @@ class ExperimentBookLogger:
         ])
         self._write_to_file(entry)
         return normalized
+
+    def write_origin(self, record):
+        """Log an origin whose snapshot was saved by the shared camera recorder."""
+        saved = dict(record)
+        axis = saved.get("axis")
+        origin_id = str(saved.get("origin_id", ""))
+        if axis not in ("x", "y"):
+            raise ValueError("Origin axis must be x or y.")
+        if len(origin_id) != 32 or any(c not in "0123456789abcdef" for c in origin_id):
+            raise ValueError("Origin ID must be a UUID hex string.")
+        timestamp = datetime.fromisoformat(saved["saved_at"])
+        image_path = saved.get("image_path")
+        if image_path is None or not str(image_path).strip():
+            raise ValueError("Origin snapshot path cannot be empty.")
+        saved["image_path"] = Path(str(image_path).strip()).as_posix()
+        try:
+            metadata = json.dumps(saved, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Origin metadata must be JSON serializable.") from error
+        self._write_to_file(
+            f"{self._entry_header('ORIGIN ' + axis.upper(), timestamp)}\n{metadata}"
+        )
+        return saved
 
     def _write_to_file(self, entry):
         self.create_folder()

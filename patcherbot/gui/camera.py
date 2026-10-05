@@ -28,7 +28,7 @@ import qtawesome as qta
 
 from patcherbot.interface.camera import CameraInterface
 from patcherbot.controller import TaskController
-from patcherbot.utils.config import NumberWithUnit
+from patcherbot.configs.Config import NumberWithUnit
 from patcherbot.interface.base import command
 from .livefeed import LiveFeedQt
 
@@ -760,6 +760,12 @@ class CameraGui(QtWidgets.QMainWindow):
         self.log_button.setCheckable(True)
         self.log_button.setToolTip('Toggle log window display')
 
+        self.overlay_button = QtWidgets.QToolButton(clicked=self.toggle_overlay)
+        self.overlay_button.setIcon(qta.icon('fa.bullseye'))
+        self.overlay_button.setCheckable(True)
+        self.overlay_button.setChecked(self.show_overlay)
+        self.overlay_button.setToolTip('Show/hide overlays (does not enable overlay recording)')
+
         self.record_button = QtWidgets.QToolButton(clicked=self.toggle_recording)
         self.record_button.setIcon(qta.icon('fa.video-camera'))
         self.record_button.setCheckable(True)
@@ -808,6 +814,9 @@ class CameraGui(QtWidgets.QMainWindow):
         self.status_bar.addPermanentWidget(self.help_button)
         # self.status_bar.addPermanentWidget(self.log_button)
         # self.status_bar.addPermanentWidget(self.record_button)
+        self.status_bar.addPermanentWidget(self.log_button)
+        self.status_bar.addPermanentWidget(self.overlay_button)
+        self.status_bar.addPermanentWidget(self.record_button)
         self.status_bar.addPermanentWidget(self.snap_image_button)
         self.status_bar.addPermanentWidget(self.autoexposure_button)
         self.status_bar.addPermanentWidget(self.unnormalize_button)
@@ -867,14 +876,14 @@ class CameraGui(QtWidgets.QMainWindow):
         if self.main_camera is not None:
             self.main_video = LiveFeedQt(self.main_camera,
                                          image_edit=self.image_edit,
-                                         display_edit=self.display_edit,
+                                         display_edit=functools.partial(self.display_edit, camera=self.main_camera),
                                          mouse_handler=self.video_mouse_press,
                                          )
         self.pipette_video = None
         if self.selected_pipette_camera is not None:
             self.pipette_video = LiveFeedQt(self.selected_pipette_camera,
                                         image_edit=self.image_edit,
-                                        display_edit=self.display_edit,
+                                        display_edit=functools.partial(self.display_edit, camera=self.aux_camera),
                                         mouse_handler=self.video_mouse_press,
                                         )
 
@@ -1156,7 +1165,9 @@ class CameraGui(QtWidgets.QMainWindow):
         painter.drawEllipse(c_x - 15, c_y - 15, 30, 30)
         painter.end()
 
-    def display_edit(self, pixmap):
+
+
+    def display_edit(self, pixmap, *, camera=None):
         '''
         Applies the functions stored in `~.CameraGui.display_edit_funcs` to the
         video image pixmap.
@@ -1164,6 +1175,8 @@ class CameraGui(QtWidgets.QMainWindow):
         Args:
             pixmap (QPixmap): The pixmap to draw on.
         '''
+        if camera is not None and camera is not self.active_camera:
+            return
         if self.show_overlay:
             for func in self.display_edit_funcs:
                 func(pixmap)
@@ -1729,6 +1742,22 @@ class CameraGui(QtWidgets.QMainWindow):
             config_tab.addTab(tab, name)
         else:
             config_tab.insertTab(index, tab, name)
+        config_gui = ParamConfig(config) if gui_class is None else gui_class(config)
+        self.add_tab(config_gui, config.name)
+        logging.debug('Config GUI added')
+        return config_gui
+
+    def add_tab(self, tab, name, index=None):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(tab)
+        if index is None:
+            self.config_tab.addTab(scroll, name)
+        else:
+            self.config_tab.insertTab(index, scroll, name)
 
     @command(category='General',
              description='Show/hide the configuration pane')
@@ -1740,7 +1769,9 @@ class CameraGui(QtWidgets.QMainWindow):
              description='Show/hide the overlay information on the image')
     def toggle_overlay(self):
         """Toggles overlay display on the camera image."""
+    def toggle_overlay(self, checked=None):
         self.show_overlay = not self.show_overlay
+        self.overlay_button.setChecked(self.show_overlay)
 
     def toggle_configuration_display(self):
         """Shows or hides the configuration panel by adjusting splitter sizes."""
@@ -2116,3 +2147,7 @@ class ConfigGui(QtWidgets.QWidget):
                 err = f'Could not load configuration from file "{filename}"'
                 logging.getLogger(__name__).exception(err)
                 QtWidgets.QMessageBox.warning(self, 'Loading failed', err + '\n' + str(ex), QtWidgets.QMessageBox.Ok)
+# Compatibility exports for existing camera-module imports.
+from .ParamConfig import ParamConfig, ElidedLabel
+
+ConfigGui = ParamConfig  # Compatibility for pre-extraction imports.
