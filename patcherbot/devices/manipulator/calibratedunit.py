@@ -986,6 +986,24 @@ class CalibratedStage(CalibratedUnit):
 
         self.info('Stage calibration done')
 
+    def copy_calibration_from(self, calibrated_stage):
+        """Copy a completed shared-stage calibration into this wrapper."""
+        if not calibrated_stage.calibrated:
+            raise CalibrationError("Source stage has not been calibrated")
+
+        for attribute in ("M", "M_inv", "r0", "r0_inv"):
+            setattr(self, attribute, np.array(getattr(calibrated_stage, attribute), copy=True))
+        self.up_direction = list(calibrated_stage.up_direction)
+        self.calibrated = calibrated_stage.calibrated
+        self.must_be_recalibrated = calibrated_stage.must_be_recalibrated
+
+    def calibrate_rig_wide(self, calibrated_stages):
+        """Calibrate the shared hardware and update every pipette stage wrapper."""
+        self.calibrate()
+        for calibrated_stage in calibrated_stages:
+            if calibrated_stage is not self:
+                calibrated_stage.copy_calibration_from(self)
+
     def mosaic(self, width = None, height = None):
         '''
         Takes a photo mosaic. Current position corresponds to

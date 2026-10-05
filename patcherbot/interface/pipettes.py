@@ -55,6 +55,7 @@ class PipetteInterface(TaskInterface):
             self.microscope.dev.objective_lift_um = float(self.calibration_config.objective_lift_um)
         self.calibrated_stage = CalibratedStage(stage, None, microscope, camera,
                                                 config=self.calibration_config)
+        self.shared_calibrated_stages = [self.calibrated_stage]
         self.calibrated_unit = CalibratedUnit(unit,
                                                 self.calibrated_stage,
                                                 microscope,
@@ -390,8 +391,11 @@ class PipetteInterface(TaskInterface):
                       description='Calibrate stage only',
                       task_description='Calibrating stage')
     def calibrate_stage(self):
-        """Perform calibration of the stage."""
-        self.execute([self.calibrated_stage.calibrate])
+        """Calibrate the shared stage and update each pipette's stage wrapper."""
+        self.execute(
+            self.calibrated_stage.calibrate_rig_wide,
+            self.shared_calibrated_stages,
+        )
 
     @blocking_command(category='Manipulators',
                       description='Calibrate manipulator',

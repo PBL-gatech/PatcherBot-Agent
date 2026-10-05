@@ -688,10 +688,7 @@ class RigConfigManager:
             if hasattr(camera, "stageManip"):
                 camera.stageManip = stage_controller
             if hasattr(camera, "pipetteManip"):
-                if isinstance(pipette_controllers, dict):
-                    camera.pipetteManip = list(pipette_controllers.values())[0]
-                else:
-                    camera.pipetteManip = pipette_controllers
+                camera.pipetteManip = pipette_controllers
             if hasattr(camera, "cellSorterManip") and "cell_sorter_manipulator" in base_instances:
                 camera.cellSorterManip = base_instances["cell_sorter_manipulator"]
             calibration_cfg = config.get("_resolved_calibration")

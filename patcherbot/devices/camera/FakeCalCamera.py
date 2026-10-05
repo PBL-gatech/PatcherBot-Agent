@@ -14,6 +14,8 @@ import time
 
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
+FAKE_STAGE_REFERENCE_POSITION = np.array([-235000.0, 55000.0, 285000.0])
+
 class FakeCalCamera(Camera):
     """
     Simulated calibration camera that generates synthetic microscope images
@@ -172,7 +174,7 @@ class FakeCalCamera(Camera):
         # Use the part of the image under the microscope
         stage_x, stage_y, stage_z = self.stageManip.position_group([1, 2, 3])
 
-        startPos = [-235000, 55000, 285000]
+        startPos = FAKE_STAGE_REFERENCE_POSITION
         # startPos = [0,0,0]
         stage_x = stage_x - startPos[0]
         stage_y = stage_y - startPos[1]
@@ -300,7 +302,6 @@ class FakePipetteManipulator(FakeManipulator):
             [ 0,                     1,  0],
             [-np.sin(self.armAngle), 0,  np.cos(self.armAngle)]
         ], dtype=np.float32)
-
         self.real_to_raw_mat = np.linalg.inv(self.raw_to_real_mat)
 
 
@@ -408,7 +409,6 @@ class FakePipetteManipulator(FakeManipulator):
         curr_pos_real = self.position()
         x = np.array(x)
         axes = np.array(axes)
-
         if 1 in axes:
             #we're dealing with the 'virtual' d-axis
             indx = np.where(axes == 1)[0][0]
@@ -483,6 +483,8 @@ class FakePipette():
         #create an alpha mask for the pipette (to make pipette see through)
         filter = ImageEnhance.Brightness(self.pipetteImg)
         self.alphaMask = filter.enhance(1.2)
+        frame_center_um = np.array([512.0, 512.0]) / self.pixels_per_micron
+        self.geometry_direction = np.asarray(manipulator.position(), dtype=float)[:2] - frame_center_um
         
     def add_pipette_to_img(self, frame:Image, stagePos:list):
         """
@@ -519,8 +521,34 @@ class FakePipette():
         pipette_pos_img_coords = pipette_pos_stage_coords * self.pixels_per_micron
 
         #get x,y - convert to int, make relative to frame
-        pipette_img_x = int(pipette_pos_img_coords[0] - stage_img_x) - self.pipetteImg.size[0] #pipette_pos should correspond to tip of pipette (upper right) 
-        pipette_img_y = int(pipette_pos_img_coords[1] - stage_img_y)
+        tip = np.array([self.pipetteImg.width - 1.0, 0.0])
+        base = np.array([0.0, (self.pipetteImg.height - 1.0) / 2.0])
+        source_angle = np.arctan2(tip[1] - base[1], tip[0] - base[0])
+        geometry_angle = np.arctan2(self.geometry_direction[1], self.geometry_direction[0])
+        rotation_angle = np.degrees(source_angle - geometry_angle)
+        transform = cv2.getRotationMatrix2D(tuple(tip), rotation_angle, 1.0)
+        corners = np.array([
+            [0, 0],
+            [self.pipetteImg.width - 1, 0],
+            [0, self.pipetteImg.height - 1],
+            [self.pipetteImg.width - 1, self.pipetteImg.height - 1],
+        ], dtype=np.float32)
+        rotated_corners = cv2.transform(corners[None, :, :], transform)[0]
+        minimum = np.floor(rotated_corners.min(axis=0))
+        maximum = np.ceil(rotated_corners.max(axis=0))
+        transform[:, 2] -= minimum
+        output_size = (int(maximum[0] - minimum[0] + 1), int(maximum[1] - minimum[1] + 1))
+        tip_offset = transform @ np.array([tip[0], tip[1], 1.0])
+        pipette_image = cv2.warpAffine(
+            np.asarray(self.pipetteImg), transform, output_size,
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        alpha_mask = cv2.warpAffine(
+            np.asarray(self.alphaMask), transform, output_size,
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        pipette_img_x = int(round(pipette_pos_img_coords[0] - stage_img_x - tip_offset[0]))
+        pipette_img_y = int(round(pipette_pos_img_coords[1] - stage_img_y - tip_offset[1]))
 
         #blur pipette proportionally to distance between stage_z and pipette_z
         focusFactor = abs(stage_z - pipette_pos_stage_coords[2]) / 10
@@ -528,11 +556,11 @@ class FakePipette():
             focusFactor = 0.1 #resolve divide by 0 error
 
         #blur img
-        pipetteImg = cv2.GaussianBlur(np.array(self.pipetteImg), (63,63), focusFactor)
+        pipetteImg = cv2.GaussianBlur(pipette_image, (63,63), focusFactor)
         pipetteImg = Image.fromarray(pipetteImg)
 
         #blur alpha channel
-        alphaMask = cv2.GaussianBlur(np.array(self.alphaMask), (63,63), focusFactor / 2)
+        alphaMask = cv2.GaussianBlur(alpha_mask, (63,63), focusFactor / 2)
         alphaMask = alphaMask / 1.3
         alphaMask = Image.fromarray(alphaMask.astype(np.uint8))
 

@@ -2099,6 +2099,12 @@ class SharedRigControls(ButtonTabWidget):
         self.patch_interfaces = patch_interfaces
 
         # All PipetteInterfaces reference the same physical stage/microscope.
+        shared_calibrated_stages = [
+            interface.calibrated_stage
+            for interface in self.pipette_interfaces.values()
+        ]
+        for interface in self.pipette_interfaces.values():
+            interface.shared_calibrated_stages = shared_calibrated_stages
         self.stage_interface = next(
             iter(self.pipette_interfaces.values())
         )
