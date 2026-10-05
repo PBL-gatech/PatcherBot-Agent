@@ -79,7 +79,18 @@ class FakeCalCamera(Camera):
             self.noiseArrs.append((np.random.random((self.width, self.height)) * 30).astype(np.uint16))
 
         #start image recording thread
-        self.start_acquisition()
+        if self.stageManip is not None and self.pipetteManip is not None:
+            self.start_acquisition()
+
+    @property
+    def pipetteManip(self):
+        return self._pipetteManip
+
+    @pipetteManip.setter
+    def pipetteManip(self, manipulator):
+        self._pipetteManip = manipulator
+        if hasattr(self, 'pipette'):
+            self.pipette.manipulator = manipulator
 
     def normalize(self):
         """

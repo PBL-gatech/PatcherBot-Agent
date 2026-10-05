@@ -20,6 +20,7 @@ from patcherbot.interface.patchConfig import PatchConfig
 from patcherbot.interface.protocolConfig import ProtocolConfig
 
 from .base import TaskController, RequestedSuccessException
+from patcherbot.deepLearning.AdaptiveSlidingModeController import AdaptiveSlidingModeController
 import threading
 # import locking package
 from threading import Lock
@@ -1612,11 +1613,14 @@ class AutoPatcher(TaskController):
             currPressure = -5
             self.pressure.set_pressure(currPressure)
             self.pressure.set_ATM(atm=False)
-            prevpressure = currPressure
-            speed = 1
-            bad_cell_count = 0
-            # this is already negative, e.g. -30 mbar
-            max_pressure = self.config.pressure_ramp_max
+            asmc = AdaptiveSlidingModeController(
+                target_resistance_mohm=float(self.config.gigaseal_R),
+            )
+            asmc.reset(
+                initial_resistance_mohm=float(avg_resistance),
+                initial_pressure_mbar=currPressure,
+                initial_voltage_v=0.0,
+            )
 
         holding_switched = False
         last_progress_time = time.time()
@@ -1741,56 +1745,27 @@ class AutoPatcher(TaskController):
                     self.pressure.set_pressure(currPressure)
                     self.pressure.set_ATM(atm=False)
             elif adaptivePressure:
-                # adjust currPressure by ±5 based on rate_mohm_per_sec, speed, etc.
-                increase_gate = self.config.increase_slope_gate
-                constant_gate = self.config.constant_slope_gate
-                decrease_gate = self.config.decrease_slope_gate
-
-                increase_thresh = self.config.gigaseal_R / increase_gate
-                constant_thresh = self.config.gigaseal_R / constant_gate
-                decrease_thresh = self.config.gigaseal_R / decrease_gate
-
-                if rate_mohm_per_sec < increase_thresh:
-                    currPressure -= 5; speed = 3; max_pressure = self.config.pressure_ramp_max
-                elif rate_mohm_per_sec <= constant_thresh:
-                    speed = 1  # maintain
-                elif rate_mohm_per_sec <= decrease_thresh:
-                    max_pressure = self.config.pressure_ramp_max; currPressure += 5; speed = 3
-
-                currPressure = min(currPressure, -5.0)
-                currPressure = max(currPressure, self.config.pressure_ramp_max)
-
-                if currPressure != prevpressure:
-                    self.pressure.set_pressure(currPressure)
-                    prevpressure = currPressure
-                    self.sleep(5 / speed)
-
-                if currPressure <= max_pressure:
-                    self.pressure.set_ATM(True)
-                    self.sleep(5)
-                    testresistance = self.resistanceRamp(
-                        num_measurements=num_slope_samples,
-                        interval=sample_interval,
-                    )
-                    difference = testresistance - avg_resistance
-                    self.info(f'Test resistance: {testresistance} MΩ; difference: {difference} MΩ')
-                    if difference < 0:
-                        bad_cell_count += 1
-                        if bad_cell_count > 5:
-                            raise AutopatchError('Bad cell detected')
-
-                    currPressure = -5
-                    self.pressure.set_pressure(currPressure)
-                    self.pressure.set_ATM(atm=False)
+                command = asmc.update(
+                    resistance_mohm=avg_resistance,
+                    measurement_window_s=num_slope_samples * sample_interval,
+                )
+                if command.pressure_mbar is not None:
+                    self.pressure.set_pressure(command.pressure_mbar)
+                if command.atmospheric is not None:
+                    self.pressure.set_ATM(atm=command.atmospheric)
+                if command.holding_voltage_v is not None:
+                    self.amplifier.set_holding(command.holding_voltage_v)
+                if command.holding_enabled is not None:
+                    self.amplifier.switch_holding(command.holding_enabled)
             # ---------------------------------------------------------------
 
             # Holding potential switch
-            if avg_resistance >= self.config.gigaseal_R / self.config.hold_switch and not holding_switched:
+            if not adaptivePressure and avg_resistance >= self.config.gigaseal_R / self.config.hold_switch and not holding_switched:
                 self.amplifier.set_holding(self.protocol_config.vclamp_hold)
                 self.amplifier.switch_holding(True)
                 holding_switched = True
 
-            # Success check with consecutive-hit filter
+            # All modes use the existing three-consecutive-reading seal check.
             if avg_resistance >= self.config.gigaseal_R:
                 consecutive_success += 1
             else:

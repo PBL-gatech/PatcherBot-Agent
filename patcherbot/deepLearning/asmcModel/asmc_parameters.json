@@ -1,0 +1,54 @@
+{
+    "documentation": {
+        "status": "discretized implementation of supplemental equations S1-S4",
+        "resistance_unit": "MOhm",
+        "pressure_unit": "mbar",
+        "voltage_unit": "mV",
+        "note": "Equation (16) is implemented explicitly. Resistance is converted from MOhm to Ohm, then to membrane length in meters. Values marked as implementation choices are not specified in the paper and must be validated before hardware use.",
+        "pressure_limit_note": "pressure_min_mbar is the more-negative numeric lower bound; pressure_max_mbar is the less-negative numeric upper bound. The controller starts at -5 mbar and may move toward -30 mbar.",
+        "voltage_limit_note": "Voltage is in volts. Negative values are more hyperpolarized; voltage_min_v is the most-negative allowed command."
+        ,"implementation_assumptions": [
+            "Equation (16) is interpreted as L = R * 2*pi*Rp*h/rho, which follows from a uniformly distributed resistance along the adhered region.",
+            "The paper does not specify initial adaptive estimates, so initial_theta_hat and initial_disturbance_estimates are set to zero.",
+            "The paper does not specify the mapping from mathematical pressure u1 in Pa to this rig's valve command, so u1 is converted from Pa to mbar directly.",
+            "The paper does not specify the valve's pressure sign convention; negative u1 is therefore retained as negative pressure and clipped by the configured limits.",
+            "The paper's voltage input u2 is defined as -psi_p, so the physical amplifier command is -u2 in volts."
+        ]
+    },
+    "trajectory": {
+        "initial_acceleration_mohm_per_s2": 4.0,
+        "constant_rate_mohm_per_s": 52.0,
+        "note": "The paper reports these trajectory values in the simulation description, while the controller state is converted to meters using equation (16)."
+    },
+    "controller": {
+        "alpha_per_s": 1.1,
+        "k1": 1000.0,
+        "k2": 10.0,
+        "gamma1": 0.1,
+        "gamma2": 0.05,
+        "gamma3": 0.1,
+        "gamma4": 0.01,
+        "gamma5": 0.01,
+        "gamma6": 0.01,
+        "lambda1": 0.2,
+        "lambda2": 0.1,
+        "pressure_min_mbar": -90.0,
+        "pressure_max_mbar": -5.0,
+        "voltage_min_v": -0.11,
+        "voltage_max_v": 0.0,
+        "initial_disturbance_estimates": [0.0, 0.0]
+    },
+    "model": {
+        "pipette_radius_um": 1.0,
+        "membrane_mass_g": 1.017e-11,
+        "elastic_coefficient_n_per_m": 1.3e-3,
+        "viscous_coefficient_kg_per_s": 9.6e-3,
+        "adhesion_friction_n_per_m2": 600.0,
+        "relative_permittivity": 80.0,
+        "liquid_layer_thickness_nm": 1.0,
+        "membrane_surface_potential_mv": 60.0,
+        "pipette_surface_potential_mv": 30.0,
+        "surface_potential_gradient_mv_per_nm": 30.0,
+        "seal_media_resistivity_ohm_m": 0.85
+    }
+}
