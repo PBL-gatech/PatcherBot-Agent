@@ -1,6 +1,5 @@
 import time
 import csv
-
 from numbers import Integral, Real
 import numpy as np
 from patcherbot.devices.amplifier.amplifier import Amplifier
@@ -9,7 +8,6 @@ from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, Calibr
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.pressurecontroller import PressureController
 from patcherbot.devices.lamp import Lamp
-from patcherbot.devices.laser import Laser
 from patcherbot.devices.manipulator.helpers.AgentHelper import AgentHelper
 from patcherbot.devices.manipulator.helpers.Observer import Observer
 from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser2
@@ -38,23 +36,6 @@ import threading
 
 class AutoPatcher(TaskController):
     # region Initialization and readiness
-    def __init__(
-        self,
-        amplifier: Amplifier,
-        daq: NiDAQ,
-        pressure: PressureController,
-        calibrated_unit: CalibratedUnit,
-        microscope: Microscope,
-        calibrated_stage: CalibratedStage,
-        lamp: Lamp,
-        laser=None,
-        config: PatchConfig | None = None,
-        protocol_config: ProtocolConfig | None = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.protocol_config = protocol_config
-
     def __init__(
         self,
         amplifier: Amplifier,
@@ -1288,6 +1269,72 @@ class AutoPatcher(TaskController):
         self.calibrated_stage.safe_move(np.array(cell_pos_planar))
         self.calibrated_stage.wait_until_still()
 
+    @record_state("whole_cell")
+    def whole_cell(self, cell=None):
+        """ method similar to patch, but starts from gigaseal stage
+        """
+        self._in_patch = True
+        self._get_state_recorder()
+
+        def _run_phase(phase_callable, *phase_args, sleep_after=None):
+            """
+            Execute a patching phase while ignoring manual success interrupts so
+            the full sequence can continue. Any other exception still bubbles up.
+            """
+            try:
+                phase_callable(*phase_args)
+            except RequestedSuccessException:
+                return
+            finally:
+                # Reset the flag so follow-up phases do not see a stale request.
+                self.success_requested = False
+            if sleep_after:
+                self.sleep(sleep_after)
+
+        cleanup_performed = False
+
+        try:
+            # ------ rig preparation -------------------------------#
+            self.isrigready()
+            if self.rig_ready is False:
+                raise AutopatchError("Rig not ready for patching")
+
+            if cell is None:
+                raise AutopatchError("No cell given to patch!")
+
+            self.info("Starting patching process")
+
+            #! Phase 2: attempt to form a gigaseal
+            _run_phase(self.gigaseal, sleep_after=3)
+
+            #! Phase 3: break into cell
+            _run_phase(self.break_in)
+            self.info("Whole-cell achieved, resting for 5 seconds")
+            self.sleep(5)
+
+            if not self.protocol_config.custom_cclamp_protocol:
+                    #! Phase 4: run protocols
+                    self.info(f"Running protocol")
+                    _run_phase(self.run_protocols)
+
+            self.success_requested = True
+            cleanup_performed = True
+
+        finally:
+            if not cleanup_performed:
+                try:
+                    self.info("Patch attempt interrupted, running escape cleanup")
+                    if self.config.auto_clean_pipette:
+                        self.escape()
+                except RequestedSuccessException:
+                    # Escape may also set success; clear it so teardown can finish.
+                    self.success_requested = False
+                except Exception as cleanup_error:
+                    self.warning(f"Cleanup escape failed: {cleanup_error}")
+            # ---- teardown so the next call starts a fresh attempt ----
+            self._state_recorder = None
+            self._in_patch = False
+
     def move_to_safe_space(self):
         '''
         Moves the pipette to the safe space.
@@ -1660,6 +1707,7 @@ class AutoPatcher(TaskController):
         self.lamp.set_filter(new_slot)
 
     def toggle_laser_output(self):
+        """Toggle laser output using the device's excite logic."""
         if self.laser is None:
             self.warning("No laser configured; skipping output toggle.")
             return

@@ -1705,8 +1705,7 @@ class ButtonTabWidget(QtWidgets.QWidget):
         Returns:
             list: List of button tuples for the section.
         """
-                    completion_color="rgba(0, 0, 255, 0.3)", change_color_during=None,
-                    extra_widget=None):
+        completion_color=("rgba(0, 0, 255, 0.3)", change_color_during=None, extra_widget=None):
         # Use CollapsibleGroupBox instead of QGroupBox
         box = CollapsibleGroupBox(box_name)
         rows = QtWidgets.QVBoxLayout()
@@ -1890,7 +1889,16 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         # Add a box for movement commands 
         buttonList = [
-            ["Calibrate Pipette"],
+            ['Move to Safe Position','Move to Home Position'],
+            ['Move to cell plane','Focus Stage'],
+            ['Store corners', 'Start Scan'],
+            ['Move group up', 'Move group down'],
+            ['Center Pipette','Clean pipette','Focus Pipette'],
+        ]
+        cmds = [
+            [self.patch_interface.move_to_safe_space, self.patch_interface.move_to_home_space],
+
+            [self.pipette_interface.go_to_floor,self.pipette_interface.focus_stage],
             [
                 "Store Cleaning Position",
                 "Clear Calibration",
@@ -2055,6 +2063,56 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         self.setLayout(layout)
 
+    def toggle_constant_disturbance(self):
+        if self.constant_disturbance_active:
+            self.stop_constant_disturbance()
+        else:
+            self.start_constant_disturbance()
+
+    def start_constant_disturbance(self):
+        self.constant_disturbance_active = True
+        self._update_constant_disturbance_button(True)
+        self.start_recording()
+
+        cmd = self.patch_interface.constant_disturbance
+        interface = cmd.__self__
+
+        def on_finished(exit_code, message):
+            try:
+                interface.task_finished.disconnect(on_finished)
+            except Exception:
+                pass
+            if self.constant_disturbance_active:
+                self.constant_disturbance_active = False
+                self._update_constant_disturbance_button(False)
+                QtCore.QTimer.singleShot(5000, self.stop_recording)
+
+        interface.task_finished.connect(on_finished)
+        self.start_task(cmd.task_description, interface)
+        if interface in self.interface_signals:
+            command_signal, _ = self.interface_signals[interface]
+            command_signal.emit(cmd, None)
+        else:
+            cmd(None)
+
+    def stop_constant_disturbance(self):
+        self.constant_disturbance_active = False
+        self._update_constant_disturbance_button(False)
+        self.patch_interface.stop_constant_disturbance()
+        QtCore.QTimer.singleShot(5000, self.stop_recording)
+
+    def _update_constant_disturbance_button(self, active):
+        if self.constant_disturbance_button is None:
+            return
+        self.constant_disturbance_button.blockSignals(True)
+        self.constant_disturbance_button.setChecked(active)
+        self.constant_disturbance_button.blockSignals(False)
+        if active:
+            self.constant_disturbance_button.setText("Stop Disturbance")
+            self.constant_disturbance_button.setStyleSheet("background-color: red; color: white;border-radius: 5px; padding: 5px;")
+        else:
+            self.constant_disturbance_button.setText("Constant Disturbance")
+            self.constant_disturbance_button.setStyleSheet("")
     def set_origin_busy(self, busy):
         for button in self.origin_buttons.values():
             button.setEnabled(not busy)
@@ -2216,6 +2274,31 @@ class ClassicPatchButtons(ButtonTabWidget):
         for i, ind in enumerate(indices):
             label = self.pos_labels[ind]
             label.setText(f'{label.text().split(":")[0]}: {currPos[i]:.2f}')
+
+    def tare_stage_x(self):
+        xPos = self.pipette_interface.calibrated_stage.position(0)
+        self.currx_stage_pos = [xPos, 0, 0]
+        # update pipette controller stage tare at x position as a numpy array
+        self.pipette_interface.tare_stage[0] = xPos
+        print("Tare stage x: ", self.currx_stage_pos)
+        self.pipette_interface.write_tare()
+
+    def tare_stage_y(self):
+        yPos = self.pipette_interface.calibrated_stage.position(1)
+        self.curry_stage_pos = [0, yPos, 0]
+        # update pipette controller stage tare at y position as a numpy array
+        self.pipette_interface.tare_stage[1] = yPos
+        print("Tare stage y: ", self.curry_stage_pos)
+        self.pipette_interface.write_tare()
+
+    def tare_stage_z(self):
+        zPos = self.pipette_interface.microscope.position()
+        self.currz_stage_pos = [0, 0, zPos]
+        # update pipette controller stage tare at z position as a numpy array
+        z_scale = self.pipette_interface.calibrated_unit.config.microscope_units_per_um
+        self.pipette_interface.tare_stage[2] = zPos / z_scale
+        print("Tare stage z: ", self.currz_stage_pos)
+        self.pipette_interface.write_tare()
 
     def update_stage_pos_labels(self, indices):
         """

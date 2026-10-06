@@ -933,11 +933,6 @@ class EPhysGraph(QWidget):
             pressureX = [i * self.updateDt / 1000 for i in range(len(self.pressureData))]
             self.pressurePlot.clear()
             self.pressurePlot.plot(pressureX, list(self.pressureData))
-            pressure_target = abs(pressure)
-            if pressure_target < 1:
-                pressure_target = 1
-            max_abs_pressure = pressure_target * 2
-            self.pressurePlot.setYRange(-max_abs_pressure, max_abs_pressure, padding=0.0)
             # Update the slider only if the user is not interacting with it.
             if not self.pressureCommandSlider.isSliderDown():
                 self.pressureCommandSlider.setValue(pressure)
@@ -974,8 +969,6 @@ class EPhysGraph(QWidget):
                 x_vals = list(range(len(self.resistanceDeque)))
                 self.resistancePlot.clear()
                 self.resistancePlot.plot(x_vals, list(self.resistanceDeque), pen="k")
-                max_resistance = max(totalResistance * 2, 1)
-                self.resistancePlot.setYRange(0, max_resistance, padding=0.0)
             if accessResistance is not None:
                 self.accessResistanceLabel.setText(f"Access Resistance: {accessResistance:.2f} MΩ")
             if membraneResistance is not None:

@@ -16,8 +16,10 @@
                                              "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
                                              "params":  {
                                                             "serial":  {
-                                                                           "port":  "COM9",
-                                                                           "baudrate":  9600
+                                                                           "port":  "COM5",
+                                                                           "baudrate":  9600,
+                                                                           "timeout": 1,
+                                                                           "write_timeout": 1
                                                                        },
                                                             "max_speed":  100000,
                                                             "max_accel":  1000,
@@ -28,7 +30,7 @@
                                                "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
                                                "params":  {
                                                               "serial":  {
-                                                                             "port":  "COM16",
+                                                                             "port":  "COM8",
                                                                              "baudrate":  9600
                                                                          },
                                                               "max_speed":  100000,
@@ -66,11 +68,11 @@
                                 "class":  "patcherbot.devices.amplifier.DAQ.NiDAQ",
                                 "params":  {
                                                "readDev":  "Dev1",
-                                               "readChannel":  "ai17",
+                                               "readChannel":  "ai19",
                                                "cmdDev":  "Dev1",
                                                "cmdChannel":  "ao0",
                                                "respDev":  "Dev1",
-                                               "respChannel":  "ai19"
+                                               "respChannel":  "ai17"
                                            }
                             },
                     "amplifier":  {
@@ -84,12 +86,12 @@
                                      "params":  {
                                                     "channel":  1,
                                                     "controllerSerial":  {
-                                                                             "port":  "COM7",
+                                                                             "port":  "COM4",
                                                                              "baudrate":  9600,
                                                                              "timeout":  0
                                                                          },
                                                     "readerSerial":  {
-                                                                         "port":  "COM8",
+                                                                         "port":  "COM3",
                                                                          "baudrate":  9600,
                                                                          "timeout":  0
                                                                      },

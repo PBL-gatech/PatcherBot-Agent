@@ -1,3 +1,17 @@
+position_update: 1000
+autofocus_dist: 50
+stage_diag_move: 500
+frame_lag: 4
+y_delta_scan: 1340
+pipette_diag_move: 200
+stage_x_axis_flip: false
+stage_y_axis_flip: true
+pipette_z_rotation: -20.0105
+pipette_y_rotation: 25
+pipette_k_scale: 0.79156
+microscope_units_per_um: 1.0
+home_position_delta_um: -1000
+safe_position_delta_um: -18000
 native_zero: 2033
 native_per_mbar: 2.9263
 reader_offset: 515.975015533536

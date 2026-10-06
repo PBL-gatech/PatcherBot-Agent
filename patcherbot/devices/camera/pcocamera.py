@@ -4,6 +4,7 @@ Camera for a PCO Panda Camera
 import numpy as np
 
 from . import *
+from .camera import Camera
 import warnings
 import pco
 

@@ -108,7 +108,7 @@ class PipetteDetector1(PipetteDetector):
         """
         super().__init__()
         cur_file = Path(__file__).parent.absolute()
-        default_model = cur_file / "pipetteModel" / "pipette-small.onnx"
+        default_model = cur_file / "pipetteModel" / "BoPipetteDetectorNet.onnx"
         self.model_path = Path(model_path) if model_path is not None else default_model
         self.yolo_net = cv2.dnn.readNetFromONNX(str(self.model_path))
         layer_names = self.yolo_net.getLayerNames()
@@ -414,7 +414,7 @@ class PipetteDetectorYOLO1(PipetteDetector):
         from ultralytics import YOLO
 
         cur_file = Path(__file__).parent.absolute()
-        default_model = cur_file / "pipetteModel" / "pipetteDetectorNet7.pt"
+        default_model = cur_file / "pipetteModel" / "BoRigCombo.pt"
         self.model_path = Path(model_path) if model_path is not None else default_model
 
         self.yolo_model = YOLO(str(self.model_path))
@@ -671,6 +671,13 @@ if __name__ == '__main__':
     # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\3333_1787864986.209094.webp"
     # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\8352_1787865160.058934.webp"
     path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-18_41\camera_frames\1864_1787870571.912273.webp"
+    # detector = PipetteDetectorYOLO1()
+    # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_01_27-14_57\camera_frames\22276_1769544568.447358.webp"
+    # # detector = PipetteDetector4()
+    # # # path = r"C:\Users\sa-forest\Documents\GitHub\Neuron_Detection\codex_training\personal_training\combined_net6\test\images\2026_08_26-16_43__2298_1787777086.380385.webp"
+    # # # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\3333_1787864986.209094.webp"
+    # # # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\8352_1787865160.058934.webp"
+    # # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-18_41\camera_frames\1864_1787870571.912273.webp"
     
     img = cv2.imread(path)
 

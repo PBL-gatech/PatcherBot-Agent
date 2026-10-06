@@ -117,7 +117,7 @@ def main():
     daq = rig_devices["daq"]
     pressure = rig_devices["pressure"]
     lamp = rig_devices["lamp"]
-    laser = rig_devices["laser"]
+    laser = rig_devices.get("laser")
 
     recording_state_manager = RecordingStateManager()
 

@@ -46,7 +46,7 @@ class AutoPatchInterface(TaskInterface):
     def __init__(
         self,
         amplifier: Amplifier,
-        daq: NiDAQ,
+        daq: DAQ, #check daq import
         pressure: PressureController,
         pipette_interface: PipetteInterface,
         recording_state_manager: RecordingStateManager,
@@ -226,6 +226,17 @@ class AutoPatchInterface(TaskInterface):
     def start_scan(self):
         self.execute(self.autopatcher.scan_area)
 
+    @blocking_command(category='Stage',
+                      description='Move pipette and stage in -X at constant speed',
+                      task_description='Running Constant Disturbance')
+    def constant_disturbance(self):
+        self.recording_state_manager.increment_sample_number()
+        self.execute(self.current_autopatcher.constant_disturbance)
+
+    def stop_constant_disturbance(self):
+        if self.current_autopatcher is None:
+            return
+        self.current_autopatcher.stop_constant_disturbance()
     @blocking_command(category='Stage',
                       description='Move stage to the stored scan start coordinate',
                       task_description='Moving to scan start')

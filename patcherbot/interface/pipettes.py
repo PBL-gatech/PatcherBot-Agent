@@ -57,25 +57,25 @@ class PipetteInterface(TaskInterface):
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
         self.time_truth = datetime.now()
         self.folder_path = "experiments/Data/calibration_data/" + self.time_truth.strftime("%Y_%m_%d-%H_%M") + "/"
-        self.folder_created = False  # Flag to track folder creation
+        self.folder_created = True  # Flag to track folder creation
 
    
-        # if config_filename is not None:
-        #     #read calibration from file
-        #     if os.path.isfile(config_filename):
-        #         with open(config_filename, 'rb') as f:
-        #             cal = pickle.load(f)
-        #             self.calibrated_unit.load_configuration(cal['manip'])
-        #             self.calibrated_stage.load_configuration(cal['stage'])
+        if config_filename is not None:
+            #read calibration from file
+            if os.path.isfile(config_filename):
+                with open(config_filename, 'rb') as f:
+                    cal = pickle.load(f)
+                    self.calibrated_unit.load_configuration(cal['manip'])
+                    self.calibrated_stage.load_configuration(cal['stage'])
 
-        #             print('Loaded calibration from file!')
-        #             print('Manipulator calibration:')
-        #             print(cal['manip'])
-        #             print('Stage calibration:')
-        #             print(cal['stage'])
-        #     else:
-        #         pass
-        #         print('No calibration file found, need to calibrate before usage!')
+                    print('Loaded calibration from file!')
+                    print('Manipulator calibration:')
+                    print(cal['manip'])
+                    print('Stage calibration:')
+                    print(cal['stage'])
+            else:
+                pass
+                print('No calibration file found, need to calibrate before usage!')
 
 
         self.cleaning_bath_position = None

@@ -604,6 +604,7 @@ class CellTrackHelper:
             Optional[np.ndarray]: Centroid of the segmented region if successful, otherwise None.
         """
         segmentor = self._ensure_segmentor()
+        """Run SAM2 once and return its centroid."""
         point = np.asarray(seed_point, dtype=np.float32)
         if point.shape != (2,):
             point = point.reshape(2)

@@ -47,6 +47,133 @@ class ScientificaSerialEncoder(Manipulator):
     Handles serial communication, movement commands, and encoder-based Z
     position correction.
     """
+    SET_OBJECTIVE = 'OBJ {}\r'
+
+
+_number_re = re.compile(r'-?\d+')
+
+
+def _parse_scientifica_int(response):
+    if response is None:
+        return None
+    resp = str(response).strip()
+    if not resp or resp.startswith('E,'):
+        return None
+    match = _number_re.search(resp)
+    if match is None:
+        return None
+    return int(match.group(0))
+
+
+class EncoderCorrectionAcquisitionThread(threading.Thread):
+    """Background encoder + stage polling for ScientificaSerialEncoder."""
+
+    def __init__(self, parent, z_axis_port, polling_freq):
+        super().__init__(daemon=True, name="encoder_correction_thread")
+        self._parent = parent
+        self._z_axis_port = z_axis_port
+        self._polling_freq = polling_freq
+        self._encoder_seq = 0
+        self._encoder_lock = threading.Lock()
+        self._encoder_buffer = bytearray()
+        self._encoder_expect_value = False
+        self._stage_pos = [0, 0, 0]
+
+    def run(self):
+        self.run_loop()
+
+    def run_loop(self, freq=None):
+        if freq is None:
+            freq = self._polling_freq
+        while True:
+            start_time = time.time()
+            try:
+                self._poll_encoder_stream()
+            except Exception:
+                pass
+
+            try:
+                xyz = self._parent._sendCmd(SerialCommands.GET_X_Y_Z)
+                xyz = xyz.split('\t')
+                x_pos = int(xyz[0]) / 10.0
+                y_pos = int(xyz[1]) / 10.0
+                z_pos = int(xyz[2]) / 10.0
+                self._stage_pos = [x_pos, y_pos, z_pos]
+            except Exception:
+                print('error reading position')
+
+            encoder_z, _ = self.get_encoder_state()
+            self._parent.current_pos = [self._stage_pos[0], self._stage_pos[1], encoder_z]
+
+            sleep_time = 1 / freq - (time.time() - start_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def get_encoder_state(self):
+        with self._encoder_lock:
+            return self._parent.encoderZ, self._encoder_seq
+
+    def get_stage_z(self):
+        return self._stage_pos[2]
+
+    def wait_for_update(self, last_seq, timeout_s):
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            _, seq = self.get_encoder_state()
+            if seq != last_seq:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _update_encoder_from_count(self, count):
+        with self._encoder_lock:
+            self._parent.encoderZ = count * self._parent.stageUnitsPerEncoderPulse
+            self._encoder_seq += 1
+
+    def _consume_encoder_bytes(self, data):
+        if not data:
+            return
+        self._encoder_buffer.extend(data)
+        while b'\n' in self._encoder_buffer:
+            line, _, remainder = self._encoder_buffer.partition(b'\n')
+            self._encoder_buffer = remainder
+            line = line.strip()
+            if not line:
+                continue
+            if line == b'ENC':
+                self._encoder_expect_value = True
+                continue
+            if self._encoder_expect_value:
+                self._encoder_expect_value = False
+                try:
+                    count = int(line.decode('ascii', errors='ignore').strip())
+                except ValueError:
+                    continue
+                self._update_encoder_from_count(count)
+                continue
+
+            # Backward compatibility: support plain integer line streams.
+            try:
+                count = int(line.decode('ascii', errors='ignore').strip())
+            except ValueError:
+                continue
+            self._update_encoder_from_count(count)
+
+    def _poll_encoder_stream(self):
+        try:
+            waiting = self._z_axis_port.in_waiting
+        except Exception:
+            return
+        if not waiting:
+            return
+        try:
+            data = self._z_axis_port.read(waiting)
+        except Exception:
+            return
+        self._consume_encoder_bytes(data)
+
+
+class ScientificaSerialEncoder(Manipulator):
     DEFAULT_STAGE_UNITS_PER_ENCODER_PULSE = 1.45
     DEFAULT_MAX_SPEED = 10000
     DEFAULT_MAX_ACCEL = 100

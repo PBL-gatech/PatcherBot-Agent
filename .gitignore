@@ -65,10 +65,9 @@ patcherbot/deepLearning/patchModel/PipetteFinder/models/bc_PipetteFinder_v0_003.
 /testing/GoalAgentv0_400
 /patcherbot/deepLearning/patchModel/robomimic
 /patcherbot/deepLearning/pipetteModel
-/codex
 /Emory_temp_folder
 /experiments/Analysis/Rig_Recorder/Reconstruct/controlsystems
-/manuals
+/temp_folder
 /testing/PipetteFinderinitialtesting
 /temp
 /temp_folder
@@ -91,3 +90,8 @@ patcherbot/deepLearning/patchModel/PipetteFinder/models/bc_PipetteFinder_v0_003.
 /experiments/Analysis/neuron_z_stack_results
 *.hdf5
 experiments/Datasets/temp_dataset.hdf5
+experiments/Datasets/temp_dataset.hdf5
+/codex
+/manuals
+testing/test_hunt_cell_phase.py
+/patcherbot/deepLearning/trackModel
