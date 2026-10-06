@@ -615,7 +615,7 @@ class RigConfigManager:
             if slot not in devices_cfg:
                 raise RigConfigError(f"Missing device slot '{slot}' in configuration.")
             curr_device = devices_cfg[slot]
-            
+
             if isinstance(curr_device, list):
                 if slot not in PIPETTE_DEVICE_SLOTS:
                     raise RigConfigError(f"Shared device slot '{slot}' cannot contain multiple devices.")
@@ -631,7 +631,8 @@ class RigConfigManager:
                             "Expected a device mapping."
                         )
 
-                    instance_key = f"{slot}_{i}"
+                    # Canonical key per pipette across all pipette-owned device slots.
+                    instance_key = f"pipette_{i}"
 
                     instance = self._instantiate_slot(
                         instance_key,
@@ -689,12 +690,9 @@ class RigConfigManager:
                 camera.stageManip = stage_controller
             if hasattr(camera, "pipetteManip"):
                 if isinstance(pipette_controllers, dict):
-                    camera.pipetteManip = list(pipette_controllers.values())[0]
+                    camera.pipetteManip = pipette_controllers
                 else:
-                    if isinstance(pipette_controllers, dict):
-                    camera.pipetteManip = list(pipette_controllers.values())[0]
-                else:
-                    camera.pipetteManip = pipette_controller
+                    camera.pipetteManip = pipette_controllers
             if (getattr(camera, "_acquisition_thread", None) is None
                     and getattr(camera, "stageManip", None) is not None
                     and getattr(camera, "pipetteManip", None) is not None):

@@ -41,9 +41,10 @@ class FakeCalCamera(Camera):
         if isinstance(pipetteManip, dict):
             self.pipetteManip = {}
             self.pipette = {}
-            for i, (id, controller) in enumerate(pipetteManip.items()):
-                self.pipetteManip[id] = controller
-                self.pipette[id] = FakePipette(controller, self.pixels_per_micron)
+            for pipette_id, controller in pipetteManip.items():
+                canonical_id = str(pipette_id)
+                self.pipetteManip[canonical_id] = controller
+                self.pipette[canonical_id] = FakePipette(controller, self.pixels_per_micron)
         else:
             self.pipetteManip : Manipulator = pipetteManip
             self.pipette = FakePipette(self.pipetteManip, self.pixels_per_micron)
@@ -90,7 +91,12 @@ class FakeCalCamera(Camera):
     def pipetteManip(self, manipulator):
         self._pipetteManip = manipulator
         if hasattr(self, 'pipette'):
-            self.pipette.manipulator = manipulator
+            if isinstance(self.pipette, dict):
+                for pipette_id, pipette_obj in self.pipette.items():
+                    if pipette_id in manipulator:
+                        pipette_obj.manipulator = manipulator[pipette_id]
+            else:
+                self.pipette.manipulator = manipulator
 
     def normalize(self):
         """
