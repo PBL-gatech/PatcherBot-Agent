@@ -12,6 +12,9 @@ class PatchConfig(Config):
     max_R = NumberWithUnit(25e6, bounds=(0, 1000e6), doc='Maximum normal resistance', unit='MΩ', magnitude=1e6)
     max_R_increase = NumberWithUnit(1e6, bounds=(0, 500e6), doc='Increase in resistance over time', unit='MΩ', magnitude=1e6)
     cell_distance = NumberWithUnit(20, bounds=(0, 100), doc='Initial distance above target cell', unit='μm') # 50 for Neurons, 20 for HEK cells
+    max_locate_speed = NumberWithUnit(1000, bounds=(0, 10000), doc='Maximum speed for cell locating', unit='μm/s')
+    approach_cell_max_shift = NumberWithUnit(256, bounds=(1, 10000), doc='Maximum cell-centering shift per axis during approach', unit='px')
+    approach_pipette_speed = NumberWithUnit(20, bounds=(1, 10000), doc='Pipette-centering speed during approach', unit='μm/s')
     slice_start_distance = NumberWithUnit(75, bounds=(0, 100), doc='Initial distance above target cell in slice', unit='μm') # 20 um default
     max_distance = NumberWithUnit(30, bounds=(0, 100), doc='Maximum movement during approach', unit='μm')
     max_descent_speed = Number(-10,bounds=(-50,50),doc='Maximum descent speed for Neuron Hunting')
@@ -50,17 +53,16 @@ class PatchConfig(Config):
     lamp = Selector(default= '2', objects = ['1', '2', '3','4','5','6'], doc='default fluorescence cube slot')
     auto_capture_fluo = Boolean(False, doc='Capture fluorescence image on cell selection')
     categories = [
-        ('Approach', ['min_R', 'max_R', 'max_R_increase', 'pressure_near', 'cell_distance',
-                      'slice_start_distance', 'max_distance', 'max_descent_speed', 'cell_R_increase',
-                      'use_centroid', 'track_cell']),
-        ('Sealing', ['gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch',
-                     'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate',
-                     'measurement_speed', 'seal_min_time', 'seal_deadline',
-                     'pressure_ramp_increment', 'pressure_ramp_max']),
-        ('Break-in', ['zap', 'pulse_pressure_break_in', 'pulse_pressure_duration',
-                      'max_cell_R', 'max_access_R', 'min_cell_C']),
-        ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette',
-                          'constant_disturbance_speed']),
+        ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
+                      'max_locate_speed', 'approach_cell_max_shift', 'approach_pipette_speed',
+                      'max_clearing_speed', 'use_centroid', 'track_cell',
+                      'tracking_mode', 'track_max_fast_jump_px']),
+        ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin',
+                  'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
+                  'hunt_target_radius', 'hunt_contact_distance']),
+        ('Sealing', ['pressure_sealing', 'gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch', 'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate', 'measurement_speed', 'Vramp_amplitude', 'seal_min_time', 'seal_deadline']),
+        ('Break-in', ['zap', 'pressure_ramp_increment', 'pressure_ramp_max', 'pressure_ramp_duration','pulse_pressure_break_in','pulse_pressure_duration', 'max_cell_R','max_access_R','min_cell_C']),
+        ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette']),
         ('Fluorescence', ['lamp', 'auto_capture_fluo'])  
     ]
 
