@@ -21,6 +21,8 @@ class PatchConfig(Config):
     min_cell_C = NumberWithUnit(5e-12, bounds=(0, 1), doc='Minimum cell capacitance', unit='pF', magnitude=1e-12)
     cell_distance = NumberWithUnit(20, bounds=(0, 100), doc='Initial distance above target cell', unit='μm') # 50 for Neurons, 20 for HEK cells
     max_locate_speed = NumberWithUnit(1000, bounds=(0, 10000), doc='Maximum speed for cell locating', unit='μm/s')
+    approach_cell_max_shift = NumberWithUnit(256, bounds=(1, 10000), doc='Maximum cell-centering shift per axis during approach', unit='px')
+    approach_pipette_speed = NumberWithUnit(20, bounds=(1, 10000), doc='Pipette-centering speed during approach', unit='μm/s')
     slice_start_distance = NumberWithUnit(75, bounds=(0, 100), doc='Initial distance above target cell in slice', unit='μm') # 20 um default
     max_distance = NumberWithUnit(30, bounds=(0, 100), doc='Maximum movement during hunt', unit='μm')
     hunt_limit_target_radius = Boolean(True, doc='Limit detection matching to the selected target radius')
@@ -68,7 +70,8 @@ class PatchConfig(Config):
     auto_capture_fluo = Boolean(False, doc='Capture fluorescence image on cell selection')
     categories = [
         ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
-                      'max_locate_speed', 'max_clearing_speed', 'use_centroid', 'track_cell',
+                      'max_locate_speed', 'approach_cell_max_shift', 'approach_pipette_speed',
+                      'max_clearing_speed', 'use_centroid', 'track_cell',
                       'tracking_mode', 'track_max_fast_jump_px']),
         ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin',
                   'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
