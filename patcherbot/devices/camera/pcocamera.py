@@ -44,7 +44,7 @@ class PcoCamera(Camera):
         print(f"CAMERA {self.cam}")
 
         # self.ca .sdk.set_timestamp_mode('binary & ascii')
-        config = {'exposure time': 5e-3,
+        config = {'exposure time': 20e-3,
                     'roi': (385, 385, 1664, 1664),
                     'timestamp': 'off',
                     'trigger': 'auto sequence',

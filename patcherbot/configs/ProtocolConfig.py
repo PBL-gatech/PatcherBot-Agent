@@ -1,4 +1,4 @@
-from patcherbot.utils.config import Config, NumberWithUnit, Boolean, Selector
+from .Config import Config, NumberWithUnit, Boolean, Selector
 import logging
 
 
@@ -22,7 +22,7 @@ class ProtocolConfig(Config):
     cclamp_step = NumberWithUnit(30, bounds=(0, 3000), doc='Step Current', unit='pA', magnitude=1)
     cclamp_start = NumberWithUnit(-500, bounds=(-30000, 0), doc='Start Current', unit='pA', magnitude=1)
     cclamp_end = NumberWithUnit(500, bounds=(0, 30000), doc='End Current', unit='pA', magnitude=1)
-    cclamp_hold = NumberWithUnit(-20, bounds=(-200, 200), doc='Holding Current (always applied)', unit='pA', magnitude=1)
+    cclamp_hold = NumberWithUnit(-20, bounds=(-400, 400), doc='Holding Current (always applied)', unit='pA', magnitude=1)
     cclamp_recording_time_ms = NumberWithUnit(500, bounds=(50, 5000), doc='Current protocol step duration', unit='ms', magnitude=1)
     cclamp_duty_cycle = NumberWithUnit(0.5, bounds=(0.05, 0.95), doc='Current protocol duty cycle', unit='%', magnitude=0.01)
     hclamp_duration = NumberWithUnit(30, bounds=(0, 600), doc='Holding Protocol Duration', unit='s')
@@ -55,4 +55,4 @@ class ProtocolConfig(Config):
                                   'opto_wavelength_power', 'opto_power_wavelength']),
     ]
 
-    logging.info("ProtocolConfig initialized successfully.")
+    logging.getLogger().info("ProtocolConfig initialized successfully.")

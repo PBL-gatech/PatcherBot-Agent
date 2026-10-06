@@ -7,14 +7,14 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import PyQt5.QtGui as QtGui
 import numpy as np
 import logging
-import time
 
 from PyQt5.QtWidgets import QFileDialog, QTabWidget, QWidget,QMessageBox
 import qtawesome as qta
 
 from patcherbot.controller import TaskController
-from patcherbot.gui.camera import ConfigGui
-from patcherbot.gui.experiment_book_tab import ExperimentBookSession, ExperimentBookTab
+from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
+from patcherbot.gui.tabs.atlas_widget import AtlasWindow
+from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.experimentBookConfig import ExperimentBookConfig
 from patcherbot.interface.patch import AutoPatchInterface
@@ -200,216 +200,110 @@ class PatchGui(ManipulatorGui):
         self.show_cells_button = QtWidgets.QPushButton("Show Cells")
         self.show_cells_button.setCheckable(True)
         self.show_cells_button.clicked.connect(self.toggle_cell_list_window)
-
-        # self.status_bar.insertPermanentWidget(1, self.show_cells_button)
+        self.status_bar.insertPermanentWidget(0, self.show_cells_button)
+        self.atlas_window = AtlasWindow(self)
+        self.atlas_window.finished.connect(self._atlas_window_closed)
+        self.show_atlas_button = QtWidgets.QPushButton("Show Atlas")
+        self.show_atlas_button.setCheckable(True)
+        self.show_atlas_button.clicked.connect(self.toggle_atlas_window)
+        self.status_bar.insertPermanentWidget(1, self.show_atlas_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
         self._cell_list_timer.timeout.connect(self._refresh_cell_list_window)
 
-        self.patch_toolbar = QtWidgets.QToolBar("Patch Controls")
-        self.addToolBar(Qt.TopToolBarArea, self.patch_toolbar)
-        self.patch_toolbar.addWidget(self.show_cells_button)
-
-        self.pipette_status_window = PipetteStatusWindow(self.patch_interfaces, self)
-        self.pipette_status_window.setWindowFlag(Qt.Tool)
-        self.show_pipette_status_button = QtWidgets.QPushButton("Pipette Status")
-        self.pipette_status_window.closed.connect(self._pipette_status_window_closed)
-        self.show_pipette_status_button.setCheckable(True)
-        self.show_pipette_status_button.clicked.connect(self.toggle_pipette_status_window)
-        # self.status_bar.insertPermanentWidget(1, self.show_pipette_status_button)
-        self.pipette_status_timer = QtCore.QTimer(self)
-        self.pipette_status_timer.setInterval(100)
-        self.pipette_status_timer.timeout.connect(self.pipette_status_window.update_status)
-        self.patch_toolbar.addWidget(self.show_pipette_status_button)
-
-        self.switch_manipulator_box = QtWidgets.QComboBox()
-        self.patch_toolbar.addSeparator()
-        self.patch_toolbar.addWidget(QtWidgets.QLabel("Active Pipette: "))
-        self.patch_toolbar.addWidget(self.switch_manipulator_box)
-        # self.status_bar.insertPermanentWidget(1, self.switch_manipulator_box)
-
-        self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
-        self.experiment_book_session = ExperimentBookSession(self.experiment_book_config)
-        self.snapshot_captured.connect(self.experiment_book_session.handle_snapshot)
-
-        self.config_tabs = QtWidgets.QTabWidget()
-        self.config_tabs.setTabBar(
-            NoWheelTabBar(self.config_tabs)
+        self.patch_interface.moveToThread(pipette_interface.thread())
+        self._display_position_timer = QtCore.QTimer(self)
+        self._display_position_timer.setInterval(50)
+        self._display_position_timer.timeout.connect(
+            lambda: self.patch_interface.update_camera_cell_list())
+        self._display_position_timer.start()
+        self.interface_signals[self.patch_interface] = (self.patch_command_signal,
+                                                        self.patch_reset_signal)
+        self.add_config_gui(self.patch_interface.config)
+        self.add_config_gui(self.patch_interface.protocol_config)
+        self.experiment_book_tab = self.add_config_gui(
+            self.patch_interface.experiment_book_config,
+            gui_class=ExperimentBookTab,
         )
-
-        self.classic_tab = PipetteStackTab()
-        self.calibration_tab = PipetteStackTab()
-        self.patch_config_tab = PipetteStackTab()
-        self.protocol_tab = PipetteStackTab()
-
-        self.classic_tabs = {}
-        self.calibration_guis = {}
-        self.patch_config_guis = {}
-        self.protocol_guis = {}
-
-        # Experiment book is currently a shared session, so only
-        # construct one GUI for it.
-        self.experiment_book_tab = ExperimentBookTab(
-            self.experiment_book_session
+        self.experiment_book_tab.attach_recording_state_manager(
+            self.recording_state_manager
         )
-
-        self._unique_patch_signals = {}
-
-        self.rig_recorder = rig_recorder
-        if movement_recorder is None:
-            raise ValueError(
-                "PatchGui requires a shared movement_recorder"
-            )
-
-        self.movement_recorder = movement_recorder
-
-        self.shared_rig_controls = SharedRigControls(
-            pipette_interfaces=self.pipette_interfaces,
-            patch_interfaces=self.patch_interfaces,
-            start_task=self.start_task,
-            interface_signals=self.interface_signals,
-            recording_state_manager=self.recording_state_manager,
-            movement_recorder=self.movement_recorder,
-            graph_recorder=self.graph_recorder,
+        self.patch_interface.state_press_tally_changed.connect(
+            self.experiment_book_tab.handle_state_press_tally
         )
-
-        for id, curr_pipette_interface in self.pipette_interfaces.items():
-            curr_patch_interface = self.patch_interfaces[id]
-
-            self.switch_manipulator_box.addItem(f"{id}")
-            curr_patch_interface.moveToThread(self.control_threads[id])
-
-            signals = PatchSignals()
-            self._unique_patch_signals[id] = signals
-            self.interface_signals[curr_patch_interface] = (signals.command, signals.reset)
-
-            logging.debug("Added config GUI.")
-
-            classic_gui = ClassicPatchButtons(
-                curr_patch_interface,
-                curr_pipette_interface,
-                self.start_task,
-                self.interface_signals,
-                self.recording_state_manager,
-                self.movement_recorder,
-                self.shared_rig_controls,
-            )
-
-            self.classic_tabs[id] = classic_gui
-
-            self.classic_tab.add_pipette_widget(
-                id,
-                classic_gui,
-            )
-
-            calibration_gui = ConfigGui(
-                curr_pipette_interface.calibration_config
-            )
-
-            self.calibration_guis[id] = calibration_gui
-
-            self.calibration_tab.add_pipette_widget(
-                id,
-                calibration_gui,
-            )
-
-            patch_config_gui = ConfigGui(
-                curr_patch_interface.config
-            )
-
-            self.patch_config_guis[id] = patch_config_gui
-
-            self.patch_config_tab.add_pipette_widget(
-                id,
-                patch_config_gui,
-            )
-
-            protocol_gui = ConfigGui(
-                curr_patch_interface.protocol_config
-            )
-
-            self.protocol_guis[id] = protocol_gui
-
-            self.protocol_tab.add_pipette_widget(
-                id,
-                protocol_gui,
-            )
-
-        self.config_tabs.addTab(
-            self.classic_tab,
-            "Classic Patching",
+        self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
+        self._origin_busy = False
+        self.patch_interface.origin_saved.connect(self._origin_saved)
+        self.patch_interface.task_finished.connect(self._origin_task_finished)
+        logging.debug("Added config GUI.")
+        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
+        self.classic_patching_tab = classic_patching_tab
+        classic_patching_tab.origin_requested.connect(self._request_origin)
+        self.add_tab(classic_patching_tab, 'PatcherBot Agent', index = 0)
+        self.record_button.clicked.disconnect(self.toggle_recording)
+        self.record_button.clicked.connect(classic_patching_tab.toggle_recording)
+        self.record_button.setToolTip('Start/stop recording')
+        self._recording_indicator_timer = QtCore.QTimer(self)
+        self._recording_indicator_timer.timeout.connect(
+            lambda: self.record_button.setChecked(self.recording_state_manager.is_recording_enabled())
         )
+        self._recording_indicator_timer.start(100)
 
-        self.config_tabs.addTab(
-            self.calibration_tab,
-            "Calibration",
-        )
+    def close(self):
+        self._display_position_timer.stop()
+        self.pipette_interface.display_positions = None
+        return super(PatchGui, self).close()
 
-        self.config_tabs.addTab(
-            self.patch_config_tab,
-            "Patch Config",
-        )
+    def _origin_experiment_details(self):
+        book = self.experiment_book_tab
+        if book.active_details is not None:
+            return dict(book.active_details)
+        return {key: str(getattr(book.config, key, "")) for key in
+                ("experiment_name", "strain_culture", "gender", "age")}
 
-        self.config_tabs.addTab(
-            self.protocol_tab,
-            "Protocols",
-        )
+    @QtCore.pyqtSlot(str)
+    def _request_origin(self, axis):
+        if self._origin_busy:
+            return
+        if (getattr(self, "running_task", None) is not None
+                or self.patch_interface._current_controller is not None
+                or self.pipette_interface._current_controller is not None):
+            self.classic_patching_tab.set_origin_status(
+                "Wait for the current movement/task to finish.", error=True)
+            return
+        request = {
+            "experiment": self._origin_experiment_details(),
+            "logger": self.experiment_book_tab.logger,
+            "camera_interface": self.main_interface,
+        }
+        command = (self.patch_interface.save_x_origin if axis == "x"
+                   else self.patch_interface.save_y_origin)
+        self._origin_busy = True
+        self.classic_patching_tab.set_origin_busy(True)
+        self.classic_patching_tab.set_origin_status("Saving origin and microscope image...")
+        self.start_task(command.task_description, self.patch_interface)
+        self.patch_command_signal.emit(command, request)
 
-        self.config_tabs.addTab(
-            self.experiment_book_tab,
-            "Experiment Book",
-        )
+    @QtCore.pyqtSlot(object, object)
+    def _origin_saved(self, record, frame):
+        if self._origin_experiment_details() != record["experiment"]:
+            self.classic_patching_tab.set_origin_status(
+                "Origin recorded for the previous experiment; current origin unchanged.", error=True)
+            return
+        self.patch_command_signal.emit(self.patch_interface.accept_origin, record)
+        self.experiment_book_tab.add_origin_entry(record, frame)
+        self.classic_patching_tab.set_origin_status(
+            record["axis"].upper() + " origin saved to Experiment Book.")
 
-        self.current_tab = self.config_tabs
-
-        # Container that remains constant when pipettes switch.
-        self.config_panel = QtWidgets.QWidget()
-
-        config_panel_layout = QtWidgets.QVBoxLayout(
-            self.config_panel
-        )
-
-        config_panel_layout.setContentsMargins(
-            0, 0, 0, 0
-        )
-
-        # Always-visible shared rig controls.
-        config_panel_layout.addWidget(
-            self.shared_rig_controls
-        )
-
-        # Existing per-pipette tab sets temporarily live here.
-        config_panel_layout.addWidget(
-            self.config_tabs,
-            1,
-        )
-
-        self.config_scroll_area = QtWidgets.QScrollArea()
-        self.config_scroll_area.setWidgetResizable(True)
-
-        self.config_scroll_area.setWidget(
-            self.config_panel
-        )
-
-        self.config_scroll_area.setMinimumWidth(100) 
-        
-        self.splitter.addWidget(self.config_scroll_area)
-        self.splitter.setSizes([2000, 500])
-        self.splitter.setStretchFactor(0, 1) 
-        self.splitter.setStretchFactor(1, 0)
-
-        self.switch_manipulator_box.currentTextChanged.connect(self.switch_active_pipette)
-        self.switch_manipulator_box.currentIndexChanged.connect(self.set_active_pipette_camera_index)
-
-        self.active_patch_interface = list(self.patch_interfaces.values())[0] if isinstance(patch_interfaces, dict) else patch_interfaces
-
-        self.main_toolbar_default_style = self.main_toolbar.styleSheet()
-        self.patch_toolbar_default_style = self.patch_toolbar.styleSheet()
-        # self.config_tab_default_style = list(self.config_tabs.values())[0].styleSheet()
-        self.cell_list_window_default_style = self.cell_list_window.styleSheet()
-        self.pipette_status_window_default_style = self.pipette_status_window.styleSheet()
-
-        self.apply_theme("light")
+    @QtCore.pyqtSlot(int, object)
+    def _origin_task_finished(self, exit_code, result):
+        if not self._origin_busy:
+            return
+        self._origin_busy = False
+        self.classic_patching_tab.set_origin_busy(False)
+        if exit_code:
+            self.classic_patching_tab.set_origin_status(
+                "Origin not saved; see the task error for details.", error=True)
 
     def register_commands(self):
         """
@@ -697,6 +591,21 @@ class PatchGui(ManipulatorGui):
         self.task_abort_button.setEnabled(False)
         self.task_success_button.setEnabled(False)
         self.active_patch_interface.abort_task()
+
+    def toggle_atlas_window(self, checked=None):
+        if checked is None:
+            checked = self.show_atlas_button.isChecked()
+        if checked:
+            self.show_atlas_button.setText("Hide Atlas")
+            self.atlas_window.show()
+            self.atlas_window.raise_()
+            self.atlas_window.activateWindow()
+        else:
+            self.atlas_window.close()
+
+    def _atlas_window_closed(self, _result=None):
+        self.show_atlas_button.setChecked(False)
+        self.show_atlas_button.setText("Show Atlas")
 
     def toggle_cell_list_window(self, checked=None):
         if checked is None:
@@ -1067,219 +976,6 @@ class PipetteStatusWindow(QtWidgets.QWidget):
                 display_timestamp = datetime.fromtimestamp(raw_timestamp).strftime("%H:%M:%S")
                 time_item.setText(display_timestamp)
 
-class CellListWindow(QtWidgets.QDialog):
-    """Dialog window displaying a list of selected cells with images and stage positions."""
-    closed = QtCore.pyqtSignal()
-
-    def __init__(self, parent=None, thumbnail_size=96):
-        """
-        Initialize a cell list window.
-
-        Args:
-            parent (QWidget, optional): Parent widget. Defaults to None.
-            thumbnail_size (int, optional): Size of cell image thumbnails in pixels. Defaults to 96.
-        """
-        super().__init__(parent=parent)
-        self.setWindowTitle("Selected Cells")
-        self.setWindowFlags(self.windowFlags() | Qt.Tool)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-
-        self.thumbnail_size = thumbnail_size
-        self.table = QtWidgets.QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels([
-            "Image",
-            "Fluo Image",
-            "Cell",
-            "Pipette Index (0-based)",
-            "Pipette Queue (0-based)",
-            "Overall Queue (0-based)",
-            "Stage (px)",
-            "Stage (um)",
-        ])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.setWordWrap(False)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.table.verticalHeader().setDefaultSectionSize(self.thumbnail_size + 12)
-
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.table)
-        self.setLayout(layout)
-
-    def closeEvent(self, event):
-        """
-        Overridden close event to emit the 'closed' signal.
-
-        Args:
-            event (QCloseEvent): Close event.
-        """
-        self.closed.emit()
-        super().closeEvent(event)
-
-    def update_cells(self, cells, stage_reference=None, assignment_map=None, full_refresh=True):
-        """
-        Update the table with current cell information.
-
-        Args:
-            cells (list): List of cells to display.
-            stage_reference (optional): Reference stage position.
-            assignment_map (dict, optional): Cell index to pipette id mapping.
-            full_refresh (bool, optional): Whether to force full update. Defaults to True.
-        """
-        if self.table.rowCount() != len(cells):
-            self.table.setRowCount(len(cells))
-            full_refresh = True
-
-        assignment_map = assignment_map or {}
-
-        for row, cell in enumerate(cells):
-            stage_px, img, stage_um, img_fluo = self._unpack_cell(cell)
-
-            if full_refresh:
-                self._set_image_cell(row, 0, img)
-                self._set_image_cell(row, 1, img_fluo, empty_text="N/A")
-                self._set_item(row, 2, str(row + 1))
-                self._set_item(row, 6, self._format_vec(stage_px))
-                self._set_item(row, 7, self._format_vec(stage_um))
-
-            assignment = assignment_map.get(row) or {}
-            self._set_item(row, 3, str(assignment.get("pipette_index", "unassigned")))
-            self._set_item(row, 4, str(assignment.get("pipette_queue_index", "")))
-            self._set_item(row, 5, str(assignment.get("overall_queue_index", "")))
-
-    def _unpack_cell(self, cell):
-        """
-        Unpack a cell tuple into stage positions and images.
-
-        Args:
-            cell (tuple or None): Cell data tuple.
-
-        Returns:
-            tuple: (stage_px, img, stage_um, img_fluo)
-        """
-        if cell is None:
-            return None, None, None, None
-        if len(cell) >= 4:
-            return cell[0], cell[1], cell[2], cell[3]
-        if len(cell) == 3:
-            return cell[0], cell[1], cell[2], None
-        return None, None, None, None
-
-    def _set_item(self, row, col, text):
-        """
-        Set a text item in the table at specified row and column.
-
-        Args:
-            row (int): Row index.
-            col (int): Column index.
-            text (str): Text to set.
-        """
-        item = self.table.item(row, col)
-        if item is None:
-            item = QtWidgets.QTableWidgetItem()
-            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
-            self.table.setItem(row, col, item)
-        item.setText(text)
-
-    def _set_image_cell(self, row, col, image, empty_text=""):
-        """
-        Set a cell widget in the table with an image or placeholder text.
-
-        Args:
-            row (int): Row index.
-            col (int): Column index.
-            image (ndarray or None): Image to display.
-            empty_text (str, optional): Text if image is None. Defaults to "".
-        """
-        if image is None:
-            self.table.removeCellWidget(row, col)
-            item = QtWidgets.QTableWidgetItem(empty_text)
-            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
-            self.table.setItem(row, col, item)
-            return
-
-        pixmap = self._image_to_pixmap(image)
-        label = QtWidgets.QLabel()
-        label.setAlignment(Qt.AlignCenter)
-        if pixmap is not None:
-            label.setPixmap(
-                pixmap.scaled(
-                    self.thumbnail_size,
-                    self.thumbnail_size,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-            )
-        self.table.setCellWidget(row, col, label)
-
-    def _image_to_pixmap(self, image):
-        """
-        Convert a NumPy image array to QPixmap for display.
-
-        Args:
-            image (ndarray): Input image.
-
-        Returns:
-            QPixmap or None: Pixmap to display, or None if image is invalid.
-        """
-        if image is None:
-            return None
-        img = np.array(image)
-        if img.ndim == 2:
-            img8 = self._normalize_to_uint8(img)
-            q_image = QtGui.QImage(
-                img8.data,
-                img8.shape[1],
-                img8.shape[0],
-                img8.strides[0],
-                QtGui.QImage.Format_Grayscale8,
-            ).copy()
-        else:
-            img8 = self._normalize_to_uint8(img[..., 0])
-            q_image = QtGui.QImage(
-                img8.data,
-                img8.shape[1],
-                img8.shape[0],
-                img8.strides[0],
-                QtGui.QImage.Format_Grayscale8,
-            ).copy()
-        return QtGui.QPixmap.fromImage(q_image)
-
-    def _normalize_to_uint8(self, img):
-        """
-        Normalize a NumPy image to 8-bit range [0, 255].
-
-        Args:
-            img (ndarray): Input image.
-
-        Returns:
-            ndarray: 8-bit normalized image.
-        """
-        img = img.astype(np.float32)
-        min_val = float(np.min(img))
-        max_val = float(np.max(img))
-        if max_val > min_val:
-            img = (img - min_val) / (max_val - min_val) * 255.0
-        else:
-            img = np.zeros_like(img, dtype=np.float32)
-        return img.astype(np.uint8)
-
-    def _format_vec(self, vec):
-        """
-        Format a numeric vector for display in the table.
-
-        Args:
-            vec (array-like or None): Vector to format.
-
-        Returns:
-            str: Comma-separated formatted string or "N/A".
-        """
-        if vec is None:
-            return "N/A"
-        arr = np.array(vec).astype(float).ravel()
-        return ", ".join(f"{v:.1f}" for v in arr)
 
 class ButtonTabWidget(QtWidgets.QWidget):
     """
@@ -1579,25 +1275,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
 
     def addButtonList(self, box_name: str, layout: QtWidgets.QVBoxLayout, buttonNames: list[list[str]], 
                     cmds, freq=None, sequential=False, change_color_on_complete=False, 
-                    completion_color="rgba(0, 0, 255, 0.3)",
-                    change_color_during=None):
-        """
-        Adds a collapsible box containing a list of buttons arranged in rows, with optional sequential execution
-        and color-change behavior on completion or during execution.
-
-        Args:
-            box_name (str): Title of the collapsible section.
-            layout (QVBoxLayout): Parent layout to add the box to.
-            buttonNames (list of list of str): Names of buttons arranged by rows.
-            cmds (list or list of list of callables): Commands corresponding to each button.
-            sequential (bool, optional): Whether to run commands sequentially. Defaults to False.
-            change_color_on_complete (bool, optional): Whether to change button color when commands complete. Defaults to False.
-            completion_color (str, optional): Color to apply on completion. Defaults to blue overlay.
-            change_color_during (list or bool, optional): Button names to style during execution, or True for all.
-
-        Returns:
-            list: List of button tuples for the section.
-        """
+                    completion_color="rgba(0, 0, 255, 0.3)", change_color_during=None,
+                    extra_widget=None):
         # Use CollapsibleGroupBox instead of QGroupBox
         box = CollapsibleGroupBox(box_name)
         rows = QtWidgets.QVBoxLayout()
@@ -1655,6 +1334,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 active_names = set(change_color_during)
             self.active_buttons_by_section[box_name] = active_names
 
+        if extra_widget is not None:
+            rows.addWidget(extra_widget)
         box.setContentLayout(rows)
         layout.addWidget(box)
         return section_buttons
@@ -1694,21 +1375,9 @@ class FileSelector(QWidget):
             # Emit the signal with the selected file path
             self.fileSelected.emit(file_name)
 class ClassicPatchButtons(ButtonTabWidget):
-    """
-    GUI widget that provides grouped controls for calibration, movement,
-    testing, lighting, patching, and recording in an automated patch-clamp system.
-    """
-    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager, movement_recorder, shared_rig_controls):
-        """
-        Initializes the ClassicPatchButtons GUI and sets up all control sections.
+    origin_requested = QtCore.pyqtSignal(str)
 
-        Args:
-            patch_interface (AutoPatchInterface): Interface for patching operations.
-            pipette_interface (PipetteInterface): Interface for pipette control.
-            start_task (callable): Function to start tasks.
-            interface_signals (dict): Signals for interfacing with controllers.
-            recording_state_manager (RecordingStateManager): Recording state manager.
-        """
+    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager):
         super().__init__()
         self.patch_interface = patch_interface
         self.pipette_interface = pipette_interface
@@ -1744,6 +1413,37 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.pipette_cleaning_calibration = [self.patch_interface.store_cleaning_position,self.patch_interface.move_pipette_up,self.patch_interface.move_to_safe_space]
 
 
+        origin_controls = QtWidgets.QWidget()
+        origin_layout = QtWidgets.QVBoxLayout(origin_controls)
+        origin_layout.setContentsMargins(0, 0, 0, 0)
+        origin_row = QtWidgets.QHBoxLayout()
+        self.origin_buttons = {}
+        for axis in ("x", "y"):
+            button = QtWidgets.QPushButton(axis.upper() + " Origin")
+            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            button.setMinimumSize(50, 50)
+            button.clicked.connect(lambda checked, a=axis: self.origin_requested.emit(a))
+            self.origin_buttons[axis] = button
+            origin_row.addWidget(button)
+        origin_layout.addLayout(origin_row)
+        self.origin_status = QtWidgets.QLabel()
+        self.origin_status.setWordWrap(True)
+        self.origin_status.hide()
+        origin_layout.addWidget(self.origin_status)
+
+        # Add a box for calibration setup
+        # buttonList = [['Calibrate Stage','Calibrate Pipette'],['set home space','set safe space'],['Store Cleaning Position'],['Clear Calibration']]
+        buttonList = [['Calibrate Stage','Calibrate Pipette'],['Store Cleaning Position'],['Load Calibration','Clear Calibration']]
+        cmds = [[self.stage_calibration, self.pipette_calibration],
+                # [self.patch_interface.store_home_position, self.patch_interface.store_safe_position],
+                [self.pipette_cleaning_calibration],
+                [self.load_calibration, self.patch_interface.clear_positions]
+        ]
+        self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
+                        change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)",
+                        extra_widget=origin_controls)
+
+        # Add a box for movement commands 
         buttonList = [
             ["Calibrate Pipette"],
             [
@@ -1858,26 +1558,37 @@ class ClassicPatchButtons(ButtonTabWidget):
         # Find Pipette path
         self.pipette_location = [self.pipette_interface.center_pipette,self.pipette_interface.focus_pipette,self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
         # add a box for testing controllability of the pipette and stage
-        buttonList = [['Find Pipette','Test Pipette Movement']]
-        cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity]]
-        freq = [[1, 3]]
-        self.addButtonList('Testing', layout, buttonList, cmds, freq=freq, sequential=True)
+        buttonList = [['Find Pipette','Test Pipette Movement'],
+                      ['Detect Pipette','Detect Cells']]
+        cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity],
+                [self.pipette_interface.detect_pipette, self.patch_interface.detect_cells]]
+        freq = [[1, 3],
+                [1, 1]]
+        self.addButtonList('testing', layout, buttonList, cmds, freq=freq, sequential=True)
+
+        # # Add a box for lamp commands
+        buttonList = [['toggle shutter', 'toggle fluorescense'],['move cube left','move cube right']]
+        cmds = [[ self.patch_interface.toggle_shutter, self.patch_interface.toggle_fluorescence],
+                [self.patch_interface.move_cube_left, self.patch_interface.move_cube_right]
+        ]
+        self.addButtonList('fluorescence', layout, buttonList, cmds, sequential=True)
 
         # Add a box for patching commands
         buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
-                      ['Locate Cell','Hunt Cell','Gigaseal'],
-                      ['Break-in','Escape Cell'],
+                      ['Locate Cell','Approach Cell','Hunt Cell'],
+                      ['Gigaseal','Break-in','Escape Cell'],
                       ['Patch Cell','Run Protocols']]
         cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell],
-                [self.patch_interface.locate_cell,
-                 [self.shared_rig_controls.start_recording,self.patch_interface.hunt_cell],[self.patch_interface.gigaseal]],
-                [[ self.patch_interface.break_in],
-                 [self.shared_rig_controls.stop_recording,  self.patch_interface.escape_cell]],
-                [[self.shared_rig_controls.start_recording,  self.patch_interface.patch, self.shared_rig_controls.stop_recording],
-                 [self.shared_rig_controls.stop_recording,  self.patch_interface.run_protocols]]
-                ]
-        self.addButtonList('Patching', layout, buttonList, cmds, sequential=True, change_color_during={
+                [self.patch_interface.locate_cell, self.patch_interface.approach_cell,
+                 [self.start_recording,self.patch_interface.hunt_cell]],
+                [[self.patch_interface.gigaseal], [self.patch_interface.break_in],
+                 [self.stop_recording,  self.patch_interface.escape_cell]],
+                [[self.start_recording,  self.patch_interface.patch, self.stop_recording],
+                 [self.stop_recording,  self.patch_interface.run_protocols]]
+]
+        self.addButtonList('patching', layout, buttonList, cmds, sequential=True, change_color_during={
             'Locate Cell',
+            'Approach Cell',
             'Hunt Cell',
             'Gigaseal',
             'Break-in',
@@ -1886,6 +1597,16 @@ class ClassicPatchButtons(ButtonTabWidget):
         })
 
         self.setLayout(layout)
+
+    def set_origin_busy(self, busy):
+        for button in self.origin_buttons.values():
+            button.setEnabled(not busy)
+
+    def set_origin_status(self, message, error=False):
+        self.origin_status.setText(message)
+        self.origin_status.setVisible(error)
+        for button in self.origin_buttons.values():
+            button.setToolTip(message)
 
     def load_calibration(self):
         """Opens a file dialog and connects selection to calibration loading."""

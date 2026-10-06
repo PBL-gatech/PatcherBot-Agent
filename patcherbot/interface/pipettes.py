@@ -8,7 +8,7 @@ from datetime import datetime
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
-from patcherbot.devices.manipulator.CalibrationConfig import CalibrationConfig
+from patcherbot.configs.CalibrationConfig import CalibrationConfig
 from patcherbot.devices.cellsorter import CalibratedCellSorter
 import time
 
@@ -42,6 +42,7 @@ class PipetteInterface(TaskInterface):
         self.pipette_index = int(suffix) if suffix.isdigit() else 0
         self.microscope = microscope
         self.camera = camera
+        self.display_positions = None
         # Create a common calibration configuration for all stages/manipulators
         self.calibration_config = CalibrationConfig(name='Calibration')
         self.calibration_config.pipette_id = self.pipette_id
@@ -243,14 +244,16 @@ class PipetteInterface(TaskInterface):
         if config_filename is not None and os.path.isfile(config_filename):
             with open(config_filename, 'rb') as f:
                 cal = pickle.load(f)
+                home = np.asarray(cal['home'], dtype=float).reshape(-1)
+                safe = np.asarray(cal['safe'], dtype=float).reshape(-1)
+                if home.shape != (6,) or safe.shape != (6,) or not np.isfinite(np.r_[home, safe]).all():
+                    raise ValueError('Saved home and safe anchors must each contain six finite coordinates')
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
-                home = np.asarray(cal['home'], dtype=float)
-                safe = np.asarray(cal['safe'], dtype=float)
-                self.home_position = home[:3]
-                self.home_stage_position = home[3:6]
-                self.safe_position = safe[:3]
-                self.safe_stage_position = safe[3:6]
+                self.home_position = home[:3].copy()
+                self.home_stage_position = home[3:].copy()
+                self.safe_position = safe[:3].copy()
+                self.safe_stage_position = safe[3:].copy()
                 self.cleaning_bath_position = cal['bath']
 
                 print('Loaded calibration from file!')
@@ -403,6 +406,12 @@ class PipetteInterface(TaskInterface):
     def calibrate_manipulator(self):
         """Perform calibration of the manipulator."""
         self.execute([self.calibrated_unit.calibrate_pipette])
+
+    @blocking_command(category='Manipulators',
+                      description='Detect the pipette',
+                      task_description='Detecting the pipette')
+    def detect_pipette(self):
+        self.execute(self.calibrated_unit.detect_pipette)
     @blocking_command(category='Manipulators',
                         description='Home the manipulator',
                         task_description='Homing the manipulator')

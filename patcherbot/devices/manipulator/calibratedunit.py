@@ -22,10 +22,10 @@ from patcherbot.devices.manipulator import *
 
 from numpy.linalg import inv, pinv, norm
 from threading import Thread
-from .CalibrationConfig import CalibrationConfig
-from .StageCalHelper import FocusHelper, StageCalHelper
-from .StageScanHelper import StageScanHelper
-from .PipetteCalHelper import PipetteCalHelper, PipetteFocusHelper
+from .helpers.StageCalHelper import FocusHelper, StageCalHelper
+from .helpers.StageScanHelper import StageScanHelper
+from .helpers.PipetteCalHelper import PipetteCalHelper, PipetteFocusHelper
+from .helpers.CellDetectHelper import CellDetectHelper
 
 __all__ = ['CalibratedUnit', 'CalibrationError', 'CalibratedStage']
 
@@ -106,7 +106,26 @@ class CalibratedUnit(ManipulatorUnit):
 
         #setup pipette calibration helper class
         self.pipetteCalHelper = PipetteCalHelper(unit, self.microscope, camera, stage, config=self.config)
-        self.pipetteFocusHelper = PipetteFocusHelper(unit, camera, config=self.config)
+        self.pipetteFocusHelper = PipetteFocusHelper(
+            unit, camera, config=self.config, detector=self.pipetteCalHelper.pipetteDetector
+        )
+
+    def detect_pipette(self):
+        frame = self.camera.last_raw_frame_data()
+        if frame is None or frame[2] is None:
+            self.camera.show_circles([])
+            return None
+        point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame[2])
+        if point is None:
+            self.camera.show_circles([])
+            return None
+        point = np.asarray(point, dtype=float).reshape(-1)
+        if point.size < 2 or not np.all(np.isfinite(point[:2])):
+            self.camera.show_circles([])
+            return None
+        point = tuple(np.rint(point[:2]).astype(int))
+        self.camera.show_circle(point)
+        return point
 
     def save_state(self):
         """Save the current position of the manipulator, stage, and microscope."""
@@ -393,17 +412,19 @@ class CalibratedUnit(ManipulatorUnit):
         self.autofocus_pipette()
         self.wait_until_still()
 
-    def center_pipette(self):
+
+    def center_pipette(self, speed=None):
         """
         Moves the pipette so that its detected position in the camera image is centered.
         """
-        self.direct_pipette()
+        self.direct_pipette(speed=speed)
 
-    def direct_pipette(self, desired_px=None):
+    def direct_pipette(self, desired_px=None, speed=None):
         """
         Moves the pipette so that its detected position matches the requested image coordinates.
         If no coordinates are provided, the pipette is centered in the camera view.
-        
+        An explicit speed (um/s) uses velocity control to support slow centering.
+
         Args:
             desired_px (array-like, optional): Target pixel position. Defaults to image center.
         """
@@ -429,7 +450,8 @@ class CalibratedUnit(ManipulatorUnit):
             # Default to the image center when no target coordinates are supplied.
             desired_px = np.array([w / 2.0, h / 2.0, 0])
         else:
-            self.unit.set_max_speed(500)
+            if speed is None:
+                self.unit.set_max_speed(500)
             desired_px = np.array(desired_px)
             if desired_px.size == 2:
                 desired_px = np.append(desired_px, 0)
@@ -447,6 +469,11 @@ class CalibratedUnit(ManipulatorUnit):
         # (5) Convert the pixel error into a correction (in microns).
         # pixels_to_um_relative() expects a 3-element vector.
         error_um = self.pixels_to_um_relative(error_px)
+        if speed is not None:
+            if not np.isfinite(speed) or speed <= 0:
+                raise ValueError("Pipette centering speed must be finite and positive.")
+            self._velocity_move_by_displacement(error_um, speed)
+            return
         # self.debug("DEBUG: Correction in microns (from pixel error):", error_um)
         
         # (6) Get the current manipulator (pipette) position (in microns) and compute the target.
@@ -468,7 +495,7 @@ class CalibratedUnit(ManipulatorUnit):
         #(1) get image from raw frame queue
         _, _, _, img = self.camera.raw_frame_queue[0]
         #(2) get detected pipette position from deep learning detector
-        detected_px = np.array(self.pipetteCalHelper.pipetteDetector.detect_pipette(img))
+        detected_px = self.pipetteCalHelper.pipetteDetector.detect_pipette(img)
         #(3) extract planar values from desired_px3D
         if detected_px is None:
             self.error("No pipette detected in the current frame.")
@@ -703,7 +730,7 @@ class CalibratedUnit(ManipulatorUnit):
             self.stop()
             self.wait_until_still()
 
-    def move_pipette_random_velocity(self, movement = 100, speed = 200):
+    def move_pipette_random_velocity(self, movement = 500, speed = 200):
         '''
         Moves the pipette randomly in xy plane, method used for testing/calibration/data collection.
         For speeds below 1000 um/s, this uses velocity commands instead of
@@ -769,7 +796,8 @@ class CalibratedUnit(ManipulatorUnit):
             self.info(f"Reset pipette speed to {self.get_max_speed()} um/s after random movement.")
             self.info("Finished random pipette movement.")
 
-    def move_pipette_random(self, movement=100):
+
+    def move_pipette_random(self, movement=500):
         '''
         Moves pipette randomly in xyz. This is used for testing find_pipette.
         '''
@@ -842,9 +870,10 @@ class CalibratedStage(CalibratedUnit):
         self.focusHelper = FocusHelper(microscope, camera)
         self.stageCalHelper = StageCalHelper(unit, camera, self.config.frame_lag)
         self.stageScanHelper = StageScanHelper(camera, config=self.config)
+        self.cellDetectHelper = CellDetectHelper(camera)
         self.cellTrackHelper = None
         if self.config.use_ai_features:
-            from .CellTrackHelper import CellTrackHelper
+            from .helpers.CellTrackHelper import CellTrackHelper
             self.cellTrackHelper = CellTrackHelper(self, camera)
         self.pipette_cal_position = np.zeros(2)
         self.unit = unit
@@ -853,13 +882,16 @@ class CalibratedStage(CalibratedUnit):
         if len(self.axes) != 2:
             raise CalibrationError('The unit should have exactly two axes for horizontal calibration.')
 
+    def detect_cells(self):
+        return self.cellDetectHelper.detect_cells()
+
     def _ensure_cell_track_helper(self):
         if not self.config.use_ai_features:
             raise NotImplementedError(
                 "Cell tracking is disabled. Set calibration.use_ai_features to true before use."
             )
         if self.cellTrackHelper is None:
-            from .CellTrackHelper import CellTrackHelper
+            from .helpers.CellTrackHelper import CellTrackHelper
             self.cellTrackHelper = CellTrackHelper(self, self.camera)
         return self.cellTrackHelper
 
@@ -1057,10 +1089,11 @@ class CalibratedStage(CalibratedUnit):
         return big_image
     
 
-    def center_on_cell(self, cell, check_same_cell=False, use_centroid = True):
+    def center_on_cell(self, cell, check_same_cell=False, use_centroid = True, max_error_px=None):
         """
         Find the cell centroid in pixel space and nudge the stage so the centroid
         is centred in the camera view.
+        max_error_px limits each axis; None retains the camera-width / 20 limit.
 
         Returns `self.wait_until_still` (callable) so the GUI's `execute([...])`
         pipeline keeps working.
@@ -1117,7 +1150,10 @@ class CalibratedStage(CalibratedUnit):
 
         # ------------------------------------------------------------------
         # Clamp extreme pixel errors so we do not command huge stage jumps.
-        max_error_px = self.camera.width / 20 # max 1/20 of image width
+        if max_error_px is None:
+            max_error_px = self.camera.width / 20
+        if not np.isfinite(max_error_px) or max_error_px <= 0:
+            raise ValueError("Cell centering limit must be finite and positive.")
         if np.any(np.abs(error_px) > max_error_px):
             self.warning(f"Clamping extreme pixel error (>{max_error_px} px).")
             error_px = np.clip(error_px, -max_error_px, max_error_px)

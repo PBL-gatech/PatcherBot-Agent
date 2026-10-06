@@ -664,7 +664,88 @@ class CellSegmentor2(BaseSegmentor):
             # so passing reshaped_input_sizes positionally will break.
             return self.processor.post_process_masks(pred_masks, original_sizes)
 
-        return self.processor.image_processor.post_process_masks(pred_masks, original_sizes)
+        return self.processor.image_processor.post_process_masks(pred_masks, original_sizes, reshaped_input_sizes)
+
+    @staticmethod
+    def _normalize_masks(masks):
+        if isinstance(masks, (list, tuple)):
+            masks = masks[0]
+        if not isinstance(masks, torch.Tensor):
+            masks = torch.as_tensor(masks)
+        while masks.ndim > 3:
+            masks = masks[0]
+        masks = masks > 0
+        return masks.detach().cpu().numpy()
+
+    @staticmethod
+    def _normalize_scores(iou_scores):
+        if not isinstance(iou_scores, torch.Tensor):
+            iou_scores = torch.as_tensor(iou_scores)
+        scores = iou_scores.detach().cpu()
+        if scores.ndim == 3:
+            scores = scores[0, 0]
+        elif scores.ndim == 2:
+            scores = scores[0]
+        return scores.numpy()
+
+    def _cache_image_embeddings(self):
+        if hasattr(self.model, "get_image_embeddings"):
+            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                return self.model.get_image_embeddings(inputs["pixel_values"])
+        return None
+
+
+# ================= SAM2 SEGMENTOR (CellSegmentor2) =================
+class CellSegmentor2(BaseSegmentor):
+    """Segmentor powered by SAM2 via Transformers.
+
+    Note: Meta's public SAM2 checkpoints on the Hugging Face Hub are `sam2_video` models. For single-image
+    segmentation we run `Sam2VideoModel._single_frame_forward(...)` under the hood (same prompts / outputs),
+    which matches the behavior of the upstream SAM2 repo for interactive image segmentation.
+    """
+
+    def __init__(self, sam_checkpoint=None, model_cfg=None, device=None, cache_image_embeddings: bool = True):
+        # Keep signature for compatibility.
+        # sam_checkpoint now means "HF model id or local HF-exported folder".
+        # The official Facebook/Meta checkpoints are `sam2_video`, but they support single-image interactive
+        # segmentation as well (we call the model's single-frame forward).
+        self.model_id_or_path = sam_checkpoint or "facebook/sam2.1-hiera-tiny"
+
+        # model_cfg kept only so existing callers don't break; not used by Transformers loader.
+        self.model_cfg = model_cfg
+        self._image_original_sizes = None
+
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        super().__init__(device=device, cache_image_embeddings=cache_image_embeddings)
+
+    def set_image(self):
+        # Sizes and embeddings belong to the same image, even when a camera reuses its buffer.
+        self._image_original_sizes = None
+        return super().set_image()
+
+    def _load_model(self):
+        from transformers import AutoConfig, Sam2Model, Sam2Processor, Sam2VideoModel, Sam2VideoProcessor
+
+        cfg = AutoConfig.from_pretrained(self.model_id_or_path)
+        model_type = getattr(cfg, "model_type", None)
+
+        if model_type == "sam2_video":
+            self.model = Sam2VideoModel.from_pretrained(self.model_id_or_path).to(self.device)
+            try:
+                self.processor = Sam2VideoProcessor.from_pretrained(self.model_id_or_path, use_fast=True)
+            except OSError:
+                self.processor = Sam2VideoProcessor.from_pretrained("facebook/sam2.1-hiera-tiny", use_fast=True)
+        else:
+            self.model = Sam2Model.from_pretrained(self.model_id_or_path).to(self.device)
+            try:
+                self.processor = Sam2Processor.from_pretrained(self.model_id_or_path, use_fast=True)
+            except OSError:
+                # Some exported checkpoints ship weights/config only (no processor files). Fall back to a
+                # compatible processor from the official checkpoint hub.
+                self.processor = Sam2Processor.from_pretrained("facebook/sam2.1-hiera-tiny", use_fast=True)
+
+        self.model.eval()
 
     @staticmethod
     def _wrap_points_labels(input_point, input_label):
@@ -688,7 +769,11 @@ class CellSegmentor2(BaseSegmentor):
         return [[box.astype(float).tolist()]]
 
     def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
-        proc_kwargs = {"images": self._raw_image_pil, "return_tensors": "pt"}
+        proc_kwargs = {"return_tensors": "pt"}
+        if self._image_embeddings is not None and self._image_original_sizes is not None:
+            proc_kwargs["original_sizes"] = self._image_original_sizes
+        else:
+            proc_kwargs["images"] = self._raw_image_pil
         if input_point is not None and input_label is not None:
             pts, lbls = self._wrap_points_labels(input_point, input_label)
             proc_kwargs["input_points"] = pts
@@ -755,9 +840,15 @@ class CellSegmentor2(BaseSegmentor):
 
     def _cache_image_embeddings(self):
         if hasattr(self.model, "get_image_embeddings"):
-            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt").to(self.device)
+            inputs = self.processor(images=self._raw_image_pil, return_tensors="pt")
+            original_sizes = inputs.get("original_sizes")
+            if isinstance(original_sizes, torch.Tensor):
+                original_sizes = original_sizes.detach().cpu().clone()
+            inputs = inputs.to(self.device)
             with torch.inference_mode():
-                return self.model.get_image_embeddings(inputs["pixel_values"])
+                embeddings = self.model.get_image_embeddings(inputs["pixel_values"])
+            self._image_original_sizes = original_sizes
+            return embeddings
         return None
 
 

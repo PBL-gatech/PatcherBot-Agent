@@ -186,33 +186,38 @@ class CameraInterface(TaskInterface):
         if frameno is None or raw_frame is None or frame_time is None:
             return
         try:
-            time_value = frame_time.timestamp()
-            frame_to_save = raw_frame.copy() if hasattr(raw_frame, "copy") else raw_frame
+            return self.save_snapshot(frameno, frame_time, raw_frame)
         except (AttributeError, TypeError, ValueError, OverflowError):
             return
-        if frame_to_save is None:
+        except OSError as exc:
+            logging.error("Error creating snap image folder: %s", exc)
             return
+
+    def save_snapshot(self, frame_number, captured_at, frame, wait=False):
+        """Save a supplied frame using the normal snapshot path and image format.
+
+        With ``wait=True``, writing completes here and failures reach the caller.
+        """
+        if frame_number is None or captured_at is None or frame is None:
+            raise ValueError("Snapshot requires a frame number, timestamp, and frame.")
+        time_value = captured_at.timestamp()
+        frame_to_save = frame.copy() if hasattr(frame, "copy") else frame
+        if frame_to_save is None:
+            raise ValueError("Snapshot frame cannot be empty.")
         recorder = self.snap_image_recorder
         if not recorder.folder_created:
-            try:
-                recorder.create_folder()
-            except OSError as exc:
-                logging.error(
-                    "Error creating snap image folder: %s",
-                    exc,
-                )
-                return
+            os.makedirs(recorder.camera_folder_path, exist_ok=True)
+            os.makedirs(recorder.aux_camera_folder_path, exist_ok=True)
+            recorder.folder_created = True
         image_path = os.path.join(
             recorder.camera_folder_path,
-            f"{self.source_id}_{frameno}_{time_value}.{recorder.image_type}",
+            f"{frame_number}_{time_value}.{recorder.image_type}",
         )
-
-        recorder._save_image(frame_to_save, image_path)
-
+        recorder._save_image(frame_to_save, image_path, wait=wait)
+        #flagging for possible incompatibility debugging, previous version also included "source_id": self.source_id,
         return {
-            "source_id": self.source_id,
-            "frame_number": frameno,
-            "captured_at": frame_time,
+            "frame_number": frame_number,
+            "captured_at": captured_at,
             "image_path": image_path,
             "frame": frame_to_save,
         }

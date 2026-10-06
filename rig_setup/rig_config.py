@@ -967,14 +967,14 @@ class RigConfigManager:
 
         PatchConfig = None
         try:
-            from patcherbot.interface.patchConfig import PatchConfig as PatchConfigType
+            from patcherbot.configs.PatchConfig import PatchConfig as PatchConfigType
             PatchConfig = PatchConfigType
         except Exception as exc:
             LOGGER.warning("Patch overlay disabled because imports failed: %s", exc)
 
         ProtocolConfig = None
         try:
-            from patcherbot.interface.protocolConfig import ProtocolConfig as ProtocolConfigType
+            from patcherbot.configs.ProtocolConfig import ProtocolConfig as ProtocolConfigType
             ProtocolConfig = ProtocolConfigType
         except Exception as exc:
             LOGGER.warning("Protocol overlay disabled because imports failed: %s", exc)

@@ -88,6 +88,8 @@ class PatchMatcher:
                 - If ``current_center`` is not provided and cannot be inferred.
                 - If ``current_center`` is not a valid length-2 coordinate.
         """
+
+        preprocess.setdefault("include_overlay", False)
         result = self._matcher.match(reference_image, current_image, load_conf=load_conf, **preprocess)
         shift = result.get("center_shift")
         if not shift:

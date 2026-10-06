@@ -239,16 +239,53 @@ class PipetteFocuser:
             pred_microns = norm_pred * self.z_std + self.z_mean
         return pred_microns
 
+class PipetteFocuser2:
+    """Expose an existing detector's Z prediction through the focuser interface.
+
+    Shares the supplied detector without loading a model. Each call performs
+    detection; Z is returned in microns without changing its sign or offset.
+    """
+
+    def __init__(self, detector):
+        if not callable(getattr(detector, "get_pipette_z", None)):
+            raise TypeError("detector must implement get_pipette_z(image)")
+        self.detector = detector
+
+    def get_pipette_focus_value(self, img):
+        """Return finite detector depth, raising if no valid depth is available."""
+        z = self.detector.get_pipette_z(img)
+        if z is None or not np.isfinite(z):
+            raise RuntimeError("No valid pipette depth prediction")
+        return float(z)
+
+
 if __name__ == '__main__':
-    focuser = PipetteFocuser()
+    import sys
+
+    # Support direct script execution as well as package/module execution.
+    repository_root = str(Path(__file__).resolve().parents[2])
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+    from patcherbot.deepLearning.pipetteDetector import PipetteDetector4
+    detector = PipetteDetector4()
+    focuser = PipetteFocuser2(detector=detector)
+    # focuser = PipetteFocuser()
     
     # Adjust image path as needed
     # cur_dir = Path(__file__).parent.absolute()
     # image_path = os.path.join(cur_dir, "", "neg7_focus.png")
-    image_path = r"C:\Users\sa-forest\GaTech Dropbox\Benjamin Magondu\YOLOretrainingdata\Pipette CNN Training Data\20191016\3654098923.png"
-    # image_path = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\compiled\cropped_camera_frames\2051_1770343660.202234.webp" # cropped example
-    # image_path = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\compiled\cropped_camera_frames\2051_1769809540.821779.webp" # cropped example, different focus
-    image_path = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\compiled\cropped_camera_frames\2070_1770056951.261588.webp" # cropped example, different focus
+    #far above brain tissue
+
+    # image_path = r"C:\Users\sa-forest\GaTech Dropbox\Benjamin Magondu\YOLOretrainingdata\Pipette CNN Training Data\20191016\3654098923.png"
+    # image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_09_21-15_56\camera_frames\65057_1790022798.161865.webp" # in focus
+    # image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_09_21-15_56\camera_frames\65492_1790022812.733168.webp" # above focus
+    # image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_09_21-15_56\camera_frames\65643_1790022817.8053.webp" # below focus
+
+
+    # in brain tissue
+    image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_09_21-15_56\camera_frames\76096_1790023192.679933.webp" # in focus
+    # image_path =r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_09_21-15_56\camera_frames\76572_1790023208.737614.webp" # above focus
+    # image_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_09_21-15_56\camera_frames\76806_1790023216.681116.webp" # below focus
     
     if not os.path.exists(image_path):
         print(f"Image not found: {image_path}")

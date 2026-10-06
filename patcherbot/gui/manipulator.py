@@ -49,8 +49,13 @@ class ManipulatorGui(CameraGui):
         self._unique_pipette_signals = {}
         
         self.setWindowTitle("Pipette GUI")
+
         self.microscope_camera = camera
-        self.pipette_cameras = pipette_cameras
+        self.pipette_camera = aux_camera
+        for video in (self.main_video, self.aux_video):
+            if video is not None:
+                video.recording_config = self.interface.calibration_config
+
         self.interfaces = pipette_interfaces
         if not isinstance(self.interfaces, dict):
             self.control_threads["pipette"] = QtCore.QThread()
@@ -294,37 +299,52 @@ class ManipulatorGui(CameraGui):
             return
 
     def show_tip(self, pixmap):
-        """
-        Display the pipette tip on the provided pixmap if show_tip_on is True.
-
-        Args:
-            pixmap (QPixmap): Image to draw the tip on.
-        """
-        # Show the tip of the electrode
-        if self.show_tip_on:
-            if getattr(self, 'active_camera_role', 'main') != 'main':
-                return
-            active_pipette = self.active_pipette
-            scale = 1.0 * self.camera.width / pixmap.size().width()
-            pixel_per_um = getattr(self.camera, 'pixel_per_um', None)
-            if pixel_per_um is None:
-                pixel_per_um = active_pipette.calibrated_unit.stage.pixel_per_um()[0]
-            painter = QtGui.QPainter(pixmap)
-            pen = QtGui.QPen(QtGui.QColor(0, 0, 200, 125))
-            pen.setWidth(3)
-            painter.setPen(pen)
-
-            x, y = self.tip_x, self.tip_y
-            painter.translate(x / scale, y / scale)
-
-            if x is not None:
-                painter.drawRect(-10, -10, 10, 10)
+        """Draw supplied calibrated coordinates and the existing temporary tip marker."""
+        if (getattr(self, 'active_camera_role', 'main') != 'main'
+                or not getattr(self, 'show_overlay', True)):
+            return
+        width, height = self.camera.width, self.camera.height
+        painter = QtGui.QPainter(pixmap)
+        try:
+            painter.scale(pixmap.width() / width, pixmap.height() / height)
+            positions = getattr(self.interface, "display_positions", None)
+            if (positions is not None
+                    and positions["image_shape"] == (height, width)
+                    and 0 <= time.monotonic() - positions["at"] <= 1.):
+                point = np.asarray(positions["pipette_xy"], dtype=float).copy()
+                direction = np.asarray(positions.get("pipette_direction_xy"), dtype=float).copy()
+                if direction.shape != (2,) or not np.isfinite(direction).all():
+                    direction = np.zeros(2)
+                if self.camera.flipped:
+                    point[0] = width - 1 - point[0]
+                    direction[0] = -direction[0]
+                length = np.linalg.norm(direction)
+                # Match cell overlays: hide when the position leaves the image.
+                if (np.isfinite(point).all() and np.isfinite(length) and length > 0
+                        and 0 <= point[0] < width and 0 <= point[1] < height):
+                    unit = direction / length
+                    side = np.array([-unit[1], unit[0]])
+                    pen = QtGui.QPen(QtGui.QColor("#ffba45"), 2)
+                    pen.setCosmetic(True)
+                    painter.setPen(pen)
+                    painter.drawLine(QtCore.QPointF(*(point - 24 * unit)), QtCore.QPointF(*point))
+                    painter.drawPolyline(QtGui.QPolygonF([
+                        QtCore.QPointF(*(point - 9 * unit + 5 * side)), QtCore.QPointF(*point),
+                        QtCore.QPointF(*(point - 9 * unit - 5 * side))]))
+            if self.show_tip_on:
+                if self.tip_x is not None and self.tip_y is not None:
+                    x = width - 1 - self.tip_x if self.camera.flipped else self.tip_x
+                    pen = QtGui.QPen(QtGui.QColor(0, 0, 200, 125), 3)
+                    pen.setCosmetic(True)
+                    painter.setPen(pen)
+                    scale = width / pixmap.width()
+                    painter.drawRect(QtCore.QRectF(x - 10 * scale, self.tip_y - 10 * scale,
+                                                  10 * scale, 10 * scale))
+                if time.time() > self.tip_t0 + 1.:
+                    self.show_tip_on = False
+        finally:
             painter.end()
 
-            # Display for just one second
-            if time.time()>self.tip_t0+1.:
-                self.show_tip_on = False
-    
     @command(category='Camera',
              description='Save the current image to the outputs folder')
     def save_image(self):

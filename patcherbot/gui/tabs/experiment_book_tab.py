@@ -10,6 +10,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from patcherbot.utils.experiment_book import ExperimentBookLogger
+from patcherbot.gui.ParamConfig import ParamConfig
 
 class ExperimentBookSession(QtCore.QObject):
     """Shared state and behavior for one Experiment Book session."""
@@ -17,6 +18,11 @@ class ExperimentBookSession(QtCore.QObject):
     event_added = QtCore.pyqtSignal(object)
     status_changed = QtCore.pyqtSignal(str, bool)
     active_changed = QtCore.pyqtSignal(bool)
+    
+class ExperimentBookTab(ParamConfig):
+    """Experiment detail form with an append-only chat-style timeline."""
+
+    THUMBNAIL_SIZE = QtCore.QSize(160, 120)
 
     def __init__(
         self,
@@ -26,9 +32,7 @@ class ExperimentBookSession(QtCore.QObject):
         session_time=None,
         parent=None,
     ):
-        super().__init__(parent)
-
-        self.config = config
+        super().__init__(config, parent=parent, build_ui=False)
         self.logger = logger if logger is not None else ExperimentBookLogger(
             folder_path=storage_root,
             session_time=session_time,
@@ -238,6 +242,10 @@ class ExperimentBookTab(QtWidgets.QWidget):
 
         # Widgets themselves still belong to this individual view.
         self.timeline_cards = []
+        self.recording_state_manager = None
+        self.state_tally_card = None
+        self.state_tally_header = None
+        self.state_tally_body = None
 
         self._build_ui()
 
@@ -278,38 +286,23 @@ class ExperimentBookTab(QtWidgets.QWidget):
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
 
-        details_group = QtWidgets.QGroupBox("Experiment Details")
-        details_layout = QtWidgets.QFormLayout(details_group)
-        self.experiment_name_edit = QtWidgets.QLineEdit(self.config.experiment_name)
-        self.strain_culture_edit = QtWidgets.QLineEdit(self.config.strain_culture)
-        self.gender_edit = QtWidgets.QLineEdit(self.config.gender)
-        self.age_edit = QtWidgets.QLineEdit(self.config.age)
-        self.detail_edits = {
-            "experiment_name": self.experiment_name_edit,
-            "strain_culture": self.strain_culture_edit,
-            "gender": self.gender_edit,
-            "age": self.age_edit,
-        }
-        for name, edit in self.detail_edits.items():
-            edit.setObjectName(name)
-            edit.textChanged.connect(
-                lambda value, config_name=name: self._set_config_value(
-                    config_name,
-                    value,
-                )
-            )
-        details_layout.addRow("Experiment Name:", self.experiment_name_edit)
-        details_layout.addRow("Strain/Culture:", self.strain_culture_edit)
-        details_layout.addRow("Gender:", self.gender_edit)
-        details_layout.addRow("Age:", self.age_edit)
+        category, names = next(
+            (category, names) for category, names in self.config.categories
+            if category == "Experiment Details"
+        )
+        details_group = self._create_config_group(category, names)
+        details_layout = details_group.layout()
+        self.detail_edits = {name: self.value_widgets[name] for name in names}
+        for name, widget in self.detail_edits.items():
+            setattr(self, f"{name}_edit", widget)
 
         self.save_details_button = QtWidgets.QPushButton("Save Details")
         self.save_details_button.clicked.connect(self.save_details)
-        details_layout.addRow(self.save_details_button)
+        details_layout.addWidget(self.save_details_button)
 
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
-        details_layout.addRow(self.status_label)
+        details_layout.addWidget(self.status_label)
         layout.addWidget(details_group)
 
         timeline_label = QtWidgets.QLabel("Experiment Timeline")
@@ -333,12 +326,9 @@ class ExperimentBookTab(QtWidgets.QWidget):
 
         notes_group = QtWidgets.QGroupBox("General Notes")
         notes_layout = QtWidgets.QVBoxLayout(notes_group)
-        self.notes_edit = QtWidgets.QPlainTextEdit()
+        self.notes_edit = self._create_value_widget("general_notes", multiline=True)
         self.notes_edit.setPlaceholderText("Type a note for this experiment...")
         self.notes_edit.setMaximumHeight(100)
-        self.notes_edit.setObjectName("general_notes")
-        self.notes_edit.setPlainText(self.config.general_notes)
-        self.notes_edit.textChanged.connect(self._notes_changed)
         notes_layout.addWidget(self.notes_edit)
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.setEnabled(False)
@@ -346,8 +336,116 @@ class ExperimentBookTab(QtWidgets.QWidget):
         notes_layout.addWidget(self.send_button, alignment=QtCore.Qt.AlignRight)
         layout.addWidget(notes_group)
 
+    def attach_recording_state_manager(self, recording_state_manager):
+        """Attach the shared manager that owns the experiment's press counts."""
+        self.recording_state_manager = recording_state_manager
+
     def save_details(self):
-        return self.session.save_details()
+        was_active = self.book_active
+        details = {
+            name: str(getattr(self.config, name)).strip()
+            for name in self.detail_edits
+        }
+        if not details["experiment_name"]:
+            self._set_status("Experiment name is required.", error=True)
+            return False
+        for name, value in details.items():
+            if getattr(self.config, name) != value:
+                setattr(self.config, name, value)
+
+        timestamp = datetime.now().astimezone()
+        try:
+            normalized = self.logger.write_details(details, timestamp)
+        except OSError:
+            logging.getLogger(__name__).exception("Unable to save experiment details")
+            self._set_status("Experiment details could not be saved.", error=True)
+            return False
+
+        self.active_details = normalized
+        self.book_active = True
+        self.send_button.setEnabled(True)
+        detail_text = "\n".join([
+            f"Experiment name: {normalized['experiment_name']}",
+            f"Strain/Culture: {normalized['strain_culture']}",
+            f"Gender: {normalized['gender']}",
+            f"Age: {normalized['age']}",
+        ])
+        self._add_text_card("Details", detail_text, timestamp)
+        tally_initialized = True
+        if not was_active:
+            tally_initialized = self._initialize_state_press_tally(timestamp)
+        if tally_initialized:
+            self._set_status("Experiment details saved.")
+        return True
+
+    def _initialize_state_press_tally(self, timestamp):
+        if self.recording_state_manager is None:
+            return True
+        try:
+            snapshot = self.recording_state_manager.reset_state_press_counts()
+        except Exception:
+            logging.getLogger(__name__).exception("Unable to reset state press tally")
+            self._set_status("The state tally could not be initialized.", error=True)
+            return False
+        return self._record_state_press_tally(snapshot, timestamp)
+
+    @QtCore.pyqtSlot(object)
+    def handle_state_press_tally(self, snapshot):
+        """Persist a manager snapshot and refresh the one live tally card."""
+        return self._record_state_press_tally(
+            snapshot,
+            datetime.now().astimezone(),
+        )
+
+    def _record_state_press_tally(self, snapshot, timestamp):
+        if not self.book_active or self.recording_state_manager is None:
+            return False
+        state_labels = getattr(
+            self.recording_state_manager,
+            "STATE_PRESS_LABELS",
+            None,
+        )
+        if not isinstance(snapshot, Mapping) or not isinstance(state_labels, Mapping):
+            return False
+        try:
+            normalized = self.logger.write_state_tally(
+                snapshot,
+                state_labels,
+                timestamp,
+            )
+        except (TypeError, ValueError):
+            return False
+        except OSError:
+            logging.getLogger(__name__).exception("Unable to save state press tally")
+            self._set_status("The state tally could not be saved.", error=True)
+            return False
+
+        self._update_state_tally_card(normalized, state_labels, timestamp)
+        self._set_status("State tally updated.")
+        return True
+
+    def _update_state_tally_card(self, counts, state_labels, timestamp):
+        tally_text = "\n".join(
+            f"{state_labels[state_name]}: {counts[state_name]}"
+            for state_name in state_labels
+        )
+        if self.state_tally_card is None:
+            card, card_layout = self._new_card("State Tally", timestamp)
+            body = QtWidgets.QLabel(tally_text)
+            body.setTextFormat(QtCore.Qt.PlainText)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            card_layout.addWidget(body)
+            self.state_tally_card = card
+            self.state_tally_header = card_layout.itemAt(0).widget()
+            self.state_tally_body = body
+            self._append_card(card)
+            return
+
+        self.state_tally_header.setText(
+            f"State Tally  |  {timestamp.strftime('%H:%M:%S')}"
+        )
+        self.state_tally_body.setText(tally_text)
 
     def send_note(self):
         return self.session.send_note()
@@ -413,6 +511,45 @@ class ExperimentBookTab(QtWidgets.QWidget):
         self._add_snapshot_card(frame, camera_role, captured_at)
         self._set_status("Snapshot added to the experiment timeline.")
         return True
+
+    def add_origin_entry(self, record, frame):
+        """Append one already-persisted origin card without further disk writes."""
+        timestamp = datetime.fromisoformat(record["saved_at"])
+        axis = record["axis"].upper()
+        card, card_layout = self._new_card(f"Origin {axis}", timestamp)
+        xyz = record["stage_xyz_um"]
+        origins = record["origins_um"]
+        origin_text = ", ".join(
+            f"{name.upper()}: {origins[name]:.2f} um"
+            if origins.get(name) is not None else f"{name.upper()}: not saved"
+            for name in ("x", "y")
+        )
+        body = QtWidgets.QLabel(
+            f"Saved {axis} origin\n"
+            f"Stage X: {xyz[0]:.2f}, Y: {xyz[1]:.2f}, Z: {xyz[2]:.2f} um\n"
+            f"Origins: {origin_text}\n"
+            f"Image: {record['image_path']}"
+        )
+        body.setTextFormat(QtCore.Qt.PlainText)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        card_layout.addWidget(body)
+        preview = QtWidgets.QLabel()
+        preview.setObjectName("origin_thumbnail")
+        preview.setAlignment(QtCore.Qt.AlignCenter)
+        try:
+            preview.setPixmap(self._frame_to_pixmap(frame).scaled(
+                self.THUMBNAIL_SIZE,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            ))
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Origin snapshot saved but preview unavailable", exc_info=True
+            )
+            preview.setText("Preview unavailable")
+        card_layout.addWidget(preview)
+        self._append_card(card)
 
     def _add_text_card(self, entry_type, text, timestamp):
         card, card_layout = self._new_card(entry_type, timestamp)

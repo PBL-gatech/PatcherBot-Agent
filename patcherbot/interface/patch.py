@@ -16,6 +16,9 @@ from patcherbot.devices.laser import Laser
 from .patchConfig import PatchConfig
 from .experimentBookConfig import ExperimentBookConfig
 from .protocolConfig import ProtocolConfig
+from patcherbot.configs.PatchConfig import PatchConfig
+from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
+from patcherbot.configs.ProtocolConfig import ProtocolConfig
 from PyQt5 import QtCore
 import time
 
@@ -41,6 +44,21 @@ class AutoPatchInterface(TaskInterface):
             config_data (dict, optional): Configuration values for patching.
             protocol_data (dict, optional): Configuration values for protocols.
         """
+    state_press_tally_changed = QtCore.pyqtSignal(object)
+    origin_saved = QtCore.pyqtSignal(object, object)
+
+    def __init__(
+        self,
+        amplifier: Amplifier,
+        daq: DAQ,
+        pressure: PressureController,
+        pipette_interface: PipetteInterface,
+        recording_state_manager: RecordingStateManager,
+        lamp: Lamp,
+        laser=None,
+        config_data=None,
+        protocol_data=None,
+    ):
         super().__init__()
         self.config = PatchConfig(name='Patch')
         if config_data:
@@ -83,6 +101,40 @@ class AutoPatchInterface(TaskInterface):
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_camera_cell_list)
         self.timer.start(50)
+        self.cells_to_patch = []
+        self.origins = {"x": None, "y": None}
+        self.movement_file_path = ''
+
+
+    @blocking_command(category='Calibration', description='Save X origin',
+                      task_description='Saving X origin and microscope image')
+    def save_x_origin(self, request):
+        self._save_origin("x", request)
+
+    @blocking_command(category='Calibration', description='Save Y origin',
+                      task_description='Saving Y origin and microscope image')
+    def save_y_origin(self, request):
+        self._save_origin("y", request)
+
+    def _save_origin(self, axis, request):
+        if (self._current_controller is not None
+                or self.pipette_controller._current_controller is not None):
+            raise ValueError("Wait for the current movement/task to finish.")
+        capture = dict(request)
+        capture.update(
+            axis=axis, origins_um=dict(self.origins),
+            movement_busy=lambda: self.pipette_controller._current_controller is not None,
+            completed=self.origin_saved.emit)
+        self.execute(self.current_autopatcher.save_origin, argument=capture)
+
+    def accept_origin(self, record):
+        """Commit a successful save after the GUI confirms its experiment."""
+        self.origins = dict(record["origins_um"])
+
+    def _record_state_press(self, state):
+        counts = self.recording_state_manager.increment_state_press(state)
+        self.state_press_tally_changed.emit(counts)
+        return counts
 
     def _microscope_z_um(self) -> float:
         """
@@ -179,6 +231,7 @@ class AutoPatchInterface(TaskInterface):
     
     def break_in(self):
         """Perform membrane break-in for a patched cell."""
+        self._record_state_press("break_in")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.break_in)
 
@@ -186,12 +239,19 @@ class AutoPatchInterface(TaskInterface):
                       task_description='GigaSealing the cell')
     def gigaseal(self):
         """Attempt to form a gigaohm seal with the cell membrane."""
+        self._record_state_press("gigaseal")
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.gigaseal)
 
     def start_selecting_cells(self):
         """Enable cell selection mode for adding cells to the patch queue."""
         self.is_selecting_cells = True
+
+    @blocking_command(category='Patch',
+                      description='Detect cells',
+                      task_description='Detecting cells')
+    def detect_cells(self):
+        self.execute(self.pipette_controller.calibrated_stage.detect_cells)
 
     def start_selecting_corners(self):
         self.is_selecting_corners = True
@@ -242,6 +302,15 @@ class AutoPatchInterface(TaskInterface):
         else:
             self.info("remove_last_cell called but there are no cells to remove")
 
+
+    def _remove_first_cell(self) -> None:
+        """Remove the first queued cell after escape or automatic cleanup."""
+        if self.cells_to_patch:
+            first_cell = self.cells_to_patch[0]
+            self.info(f"Removing first queued cell {first_cell}")
+            self.cells_to_patch = self.cells_to_patch[1:]
+        else:
+            self.info("_remove_first_cell called but there are no cells to remove")
 
     @blocking_command(category='Cell Sorter',
             description='Move the cell sorter to a cell',
@@ -377,7 +446,6 @@ class AutoPatchInterface(TaskInterface):
                 self._local_cells_to_patch.append(cell_entry)
             self.is_selecting_cells = False
 
-    # Update the cell list to store both cell coordinates and image.
     def update_camera_cell_list(self) -> None:
         """Update the camera's internal list of detected cells for display."""
         self.autopatcher.calibrated_unit.camera.cell_list = []
@@ -385,6 +453,40 @@ class AutoPatchInterface(TaskInterface):
             camera_pos = -cell + self.autopatcher.calibrated_stage.reference_position()
             self.autopatcher.calibrated_unit.camera.cell_list.append((camera_pos[0:2].astype(int), img,pos))
             
+        """Publish calibrated display coordinates from the devices' cached positions."""
+        controller = self.current_autopatcher
+        unit, stage = controller.calibrated_unit, controller.calibrated_stage
+        camera = unit.camera
+        self.pipette_controller.display_positions = None
+        camera.cell_list = []
+        if not stage.calibrated or getattr(stage, "must_be_recalibrated", False):
+            return
+        try:
+            stage_pixels = np.asarray(stage.reference_position(), dtype=float)
+            if not np.isfinite(stage_pixels).all():
+                return
+            camera.cell_list = [
+                ((stage_pixels - cell)[:2].astype(int), image, position)
+                for cell, image, position, _ in tuple(self.cells_to_patch)]
+            if not unit.calibrated or getattr(unit, "must_be_recalibrated", False):
+                return
+            home = np.asarray(controller.home_position, dtype=float)
+            stage_home = np.asarray(controller.home_stage_position, dtype=float)
+            if (home.shape != (3,) or stage_home.shape != (3,)
+                    or not np.isfinite(home).all() or not np.isfinite(stage_home).all()):
+                return
+            # HOME aligns the tip with image center; only displacement moves the arrow.
+            tip = (np.array([camera.width / 2., camera.height / 2.])
+                   + unit.um_to_pixels_relative(unit.position() - home)[:2]
+                   + stage.um_to_pixels_relative(stage.position() - stage_home[:2])[:2])
+            if np.isfinite(tip).all():
+                self.pipette_controller.display_positions = dict(
+                    pipette_xy=tip.copy(), at=time.monotonic(),
+                    pipette_direction_xy=np.asarray(unit.M, dtype=float)[:2, 0].copy(),
+                    image_shape=(camera.height, camera.width))
+        except (RuntimeError, ValueError, TypeError, OSError):
+            return
+
     @command(category='Test', 
              description='Send movement file to the autopatcher', 
              success_message='Path sent')
@@ -417,6 +519,8 @@ class AutoPatchInterface(TaskInterface):
         """Execute the full patching procedure on the first queued cell."""
         cell_entry = self._next_cell(mark_attempted=True)
         if cell_entry is None:
+        self._record_state_press("patch")
+        if not self.cells_to_patch:
             self.warning("No cells queued for patching; skipping patch command")
             return
 
@@ -451,6 +555,12 @@ class AutoPatchInterface(TaskInterface):
         else:
             self.info("Patch command completed successfully; escaping cell and cleaning pipette")
             self._remove_cell(cell_entry)
+            self._remove_first_cell()
+        elif not success and not self.current_autopatcher.config.auto_clean_pipette:
+             self.error("Patch command did not complete and auto escape not enabled; leaving cell in queue for manual follow-up.")
+        else:
+            self.info("Patch command completed successfully; escaping cell and cleaning pipette")
+            self._remove_first_cell()
 
     @blocking_command(
         category='Patch',
@@ -494,6 +604,12 @@ class AutoPatchInterface(TaskInterface):
         else:
             self.info("Whole-cell command completed successfully; escaping cell and cleaning pipette")
             self._remove_cell(cell_entry)
+            self._remove_first_cell()
+        elif not success and not self.current_autopatcher.config.auto_clean_pipette:
+            self.error("Whole-cell command did not complete and auto escape not enabled; leaving cell in queue for manual follow-up.")
+        else:
+            self.info("Whole-cell command completed successfully; escaping cell and cleaning pipette")
+            self._remove_first_cell()
 
     @blocking_command(category='Patch',
                         description='Locate the cell',
@@ -505,11 +621,24 @@ class AutoPatchInterface(TaskInterface):
             self.warning("No cells assigned to this pipette")
             return
         cell, img, pos, img_fluo = cell_entry
+        self._record_state_press("locate_cell")
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.locate_cell,
                       argument = (cell, img, pos))
         time.sleep(2)
  
+    @blocking_command(category='Patch',
+                      description='Approach the cell',
+                      task_description='Approaching the cell')
+    def approach_cell(self):
+        self._record_state_press("approach_cell")
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
+        self.recording_state_manager.increment_sample_number()
+        self.execute(self.current_autopatcher.approach_cell,
+                     argument=(cell, img, pos))
+        time.sleep(2)
+
     @blocking_command(category='Stage',
                      description = 'Center the stage on cell',
                       task_description='Centering the stage on cell')
@@ -558,6 +687,8 @@ class AutoPatchInterface(TaskInterface):
             self.warning("No cells assigned to this pipette")
             return
         cell, img, pos, img_fluo = cell_entry
+        self._record_state_press("hunt_cell")
+        cell, img, pos, img_fluo = self.cells_to_patch[0]
         self.recording_state_manager.increment_sample_number()
         self.execute(self.autopatcher.hunt_cell,
                       argument = (cell, img, pos))
@@ -575,6 +706,10 @@ class AutoPatchInterface(TaskInterface):
         # self.cells_to_patch = self.cells_to_patch[1:]
         if cell_entry is not None:
             self._remove_cell(cell_entry)
+        self._record_state_press("escape")
+        self.execute(self.current_autopatcher.escape)
+        time.sleep(2)
+        self._remove_first_cell()
 
     @blocking_command(category='Patch',
                         description='find the pipette',
@@ -605,6 +740,11 @@ class AutoPatchInterface(TaskInterface):
             and self.pipette_controller.safe_stage_position is not None
         ):
             self.pipette_controller.write_calibration()
+        self.current_autopatcher.cleaning_bath_position = self.pipette_controller.calibrated_unit.position()
+        self.current_autopatcher.calibrated_unit.config.bath_position = tuple(self.current_autopatcher.cleaning_bath_position)
+        self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position.copy()
+        # save calibration to file
+        self.pipette_controller.write_calibration()
 
     @command(category='Patch',
                 description='Store the position of the safe space',
@@ -715,6 +855,12 @@ class AutoPatchInterface(TaskInterface):
         self.autopatcher.calibrated_stage.config.safe_position_stage = None
         self.autopatcher.calibrated_unit.config.cleaning_bath_position = None
         # self.autopatcher.calibrated_unit.config.rinsing_bath_position = None    
+        self.current_autopatcher.calibrated_unit.config.home_position = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.safe_position = (0., 0., 0.)
+        self.current_autopatcher.calibrated_stage.config.home_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_stage.config.safe_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.bath_position = (0., 0., 0.)
+        # self.current_autopatcher.calibrated_unit.config.rinsing_bath_position = None    
         self.info('All positions cleared')
 
 
