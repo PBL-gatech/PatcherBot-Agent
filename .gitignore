@@ -68,3 +68,7 @@ patcherbot/deepLearning/patchModel/PipetteFinder/models/bc_PipetteFinder_v0_003.
 /Emory_temp_folder
 /experiments/Analysis/Rig_Recorder/Reconstruct/controlsystems
 /temp_folder
+/codex
+/manuals
+testing/test_hunt_cell_phase.py
+/patcherbot/deepLearning/trackModel
