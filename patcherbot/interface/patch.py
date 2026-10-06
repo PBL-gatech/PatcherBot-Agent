@@ -10,7 +10,7 @@ from patcherbot.utils import EPhysLogger, RecordingStateManager
 from patcherbot.devices.pressurecontroller.BasePressureController import PressureController
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
-from patcherbot.devices.amplifier.DAQ import NiDAQ
+from patcherbot.devices.amplifier.DAQ import DAQ
 from patcherbot.devices.lamp import Lamp
 from patcherbot.configs.PatchConfig import PatchConfig
 from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
@@ -30,7 +30,7 @@ class AutoPatchInterface(TaskInterface):
     def __init__(
         self,
         amplifier: Amplifier,
-        daq: NiDAQ,
+        daq: DAQ,
         pressure: PressureController,
         pipette_interface: PipetteInterface,
         recording_state_manager: RecordingStateManager,
