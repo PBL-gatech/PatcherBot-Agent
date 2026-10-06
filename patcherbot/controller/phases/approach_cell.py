@@ -121,10 +121,12 @@ class ApproachCellPhase(PhaseController):
             if command["method"] == "shift":
                 if command["target"] == "cell":
                     state["cell_focus_z"] = state["observation"]["stage_positions"][2]
-                    self.controller.calibrated_stage.center_on_cell(state["cell"], use_centroid=self.controller.config.use_centroid)
+                    self.controller.calibrated_stage.center_on_cell(
+                        state["cell"], use_centroid=self.controller.config.use_centroid,
+                        max_error_px=self.controller.config.approach_cell_max_shift)
                 else:
                     state["pipette_z"] = state["observation"]["stage_positions"][2]
-                    self.controller.calibrated_unit.center_pipette()
+                    self.controller.calibrated_unit.center_pipette(speed=self.controller.config.approach_pipette_speed)
                 state["step"] += 1
                 command = command["next_move"]
             if command["method"] in ("search", "scan"):
@@ -266,12 +268,14 @@ class ApproachCellPhase(PhaseController):
 
         if self.controller.config.cell_type_toggle:
             self.controller.info("centering on cell")
-            self.controller.calibrated_stage.center_on_cell(cell,use_centroid)
+            self.controller.calibrated_stage.center_on_cell(
+                cell, use_centroid=use_centroid,
+                max_error_px=self.controller.config.approach_cell_max_shift)
             self.controller.calibrated_stage.wait_until_still()
             self.controller.info(f"correcting pipette position, moving microscope by {zdistleft} um")
             self.controller.microscope.relative_move(-cell_distance)
             self.controller.microscope.wait_until_still()
-            self.controller.calibrated_unit.center_pipette()
+            self.controller.calibrated_unit.center_pipette(speed=self.controller.config.approach_pipette_speed)
             self.controller.calibrated_unit.wait_until_still()
             self.controller.microscope.relative_move(cell_distance)
             self.controller.microscope.wait_until_still()

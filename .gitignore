@@ -92,3 +92,7 @@ patcherbot/deepLearning/patchModel/PipetteFinder/models/bc_PipetteFinder_v0_003.
 *.hdf5
 experiments/Datasets/temp_dataset.hdf5
 experiments/Datasets/temp_dataset.hdf5
+/codex
+/manuals
+testing/test_hunt_cell_phase.py
+/patcherbot/deepLearning/trackModel
