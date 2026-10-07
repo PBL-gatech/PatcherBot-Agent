@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 from types import MethodType
 import time
 
@@ -111,7 +111,7 @@ class ManipulatorGui(CameraGui):
             painter.drawLine(int(c_x), c_y,
                              int(c_x + round(length_in_um*scaled_length)), c_y)
             if text:
-                painter.drawText(c_x, c_y - 10, '{}µm'.format(length_in_um))
+                painter.drawText(c_x, c_y - 10, '{}Âµm'.format(length_in_um))
             painter.end()
 
     def register_commands(self, manipulator_keys = True):
@@ -129,7 +129,7 @@ class ManipulatorGui(CameraGui):
                                                     '/'.join(QtGui.QKeySequence(mod).toString()
                                                                  if mod is not Qt.NoModifier else 'No modifier'
                                                              for mod in modifiers),
-                                                    'Move stage by ' + '/'.join(str(x) for x in distances) + ' µm')
+                                                    'Move stage by ' + '/'.join(str(x) for x in distances) + ' Âµm')
             self.help_window.register_custom_action('Manipulators', 'A/S/W/D',
                                                     'Move pipette by in x/y direction')
             self.help_window.register_custom_action('Manipulators', 'Q/E',
@@ -138,7 +138,7 @@ class ManipulatorGui(CameraGui):
                                                     '/'.join(QtGui.QKeySequence(mod).toString()
                                                                  if mod is not Qt.NoModifier else 'No modifier'
                                                              for mod in modifiers),
-                                                    'Move pipette by ' + '/'.join(str(x) for x in distances) + ' µm')
+                                                    'Move pipette by ' + '/'.join(str(x) for x in distances) + ' Âµm')
 
             for modifier, distance in zip(modifiers, distances):
                 self.register_key_action(Qt.Key_Up, modifier,
@@ -206,7 +206,7 @@ class ManipulatorGui(CameraGui):
         key_string = (QtGui.QKeySequence(Qt.Key_PageUp).toString() + '/' +
                       QtGui.QKeySequence(Qt.Key_PageDown).toString())
         self.help_window.register_custom_action('Microscope', key_string,
-                                                'Move microscope up/down by 10µm')
+                                                'Move microscope up/down by 10Âµm')
         self.register_key_action(Qt.Key_F, None,
                                  self.interface.set_floor)
         self.register_key_action(Qt.Key_G, None,
@@ -239,7 +239,10 @@ class ManipulatorGui(CameraGui):
         painter = QtGui.QPainter(pixmap)
         try:
             painter.scale(pixmap.width() / width, pixmap.height() / height)
-            positions = getattr(self.interface, "display_positions", None)
+            indicator_active = getattr(self.camera, 'pipette_indicator_active', False)
+            positions = self.camera.get_pipette_indicator() if indicator_active else None
+            if positions is None:
+                positions = getattr(self.interface, "display_positions", None)
             if (positions is not None
                     and positions["image_shape"] == (height, width)
                     and 0 <= time.monotonic() - positions["at"] <= 1.):
@@ -256,14 +259,16 @@ class ManipulatorGui(CameraGui):
                         and 0 <= point[0] < width and 0 <= point[1] < height):
                     unit = direction / length
                     side = np.array([-unit[1], unit[0]])
-                    pen = QtGui.QPen(QtGui.QColor("#ffba45"), 2)
+                    color = QtGui.QColor("#ff0000")
+                    pen = QtGui.QPen(color, 1)
                     pen.setCosmetic(True)
                     painter.setPen(pen)
-                    painter.drawLine(QtCore.QPointF(*(point - 24 * unit)), QtCore.QPointF(*point))
-                    painter.drawPolyline(QtGui.QPolygonF([
-                        QtCore.QPointF(*(point - 9 * unit + 5 * side)), QtCore.QPointF(*point),
-                        QtCore.QPointF(*(point - 9 * unit - 5 * side))]))
-            if self.show_tip_on:
+                    painter.setBrush(color)
+                    painter.drawPolygon(QtGui.QPolygonF([
+                        QtCore.QPointF(*point),
+                        QtCore.QPointF(*(point - 12 * unit + 5 * side)),
+                        QtCore.QPointF(*(point - 12 * unit - 5 * side))]))
+            if self.show_tip_on and not indicator_active:
                 if self.tip_x is not None and self.tip_y is not None:
                     x = width - 1 - self.tip_x if self.camera.flipped else self.tip_x
                     pen = QtGui.QPen(QtGui.QColor(0, 0, 200, 125), 3)

@@ -892,7 +892,8 @@ class AutoPatcher(TaskController):
                 frame_retrieval_started_at=timing.get("retrieval_started_at"),
                 frame_available_at=timing.get("available_at"), source_image_shape=None if frame is None else frame.shape,
                 _source_image=frame, source_positions={}, source_position_metadata={}, positions_sampled_at=None,
-                pipette_position=None, pipette_focus=None, cell_detections=None, status={}, confidence={}, errors={})
+                pipette_position=None, pipette_focus=None, cell_detections=None, status={}, confidence={}, errors={},
+                pipette_focus_confidence_supported=None)
             if visual and frame is not None:
                 image = np.asarray(frame).copy()
                 evidence["_source_image"] = image
@@ -911,6 +912,9 @@ class AutoPatcher(TaskController):
                     shared_depth = (focuser is not None and getattr(focuser, "detector", None) is detector
                         and getattr(focuser.get_pipette_focus_value, "__func__", None)
                         is PipetteFocuser2.get_pipette_focus_value)
+                    model = getattr(getattr(detector, "adapter", None), "model", None)
+                    if shared_depth and hasattr(model, "z_confidence_head"):
+                        evidence["pipette_focus_confidence_supported"] = model.z_confidence_head is not None
                     if visual & {"pipette_image_xy", "deep_learning"} or shared_depth:
                         readers["pipette_detector"] = detector.detect_pipette_details
                     if focus_requested and not shared_depth:

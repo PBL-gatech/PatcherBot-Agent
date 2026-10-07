@@ -1,6 +1,7 @@
 """Historical Hunt behavior within the shared phase lifecycle."""
 
 import collections
+import logging
 import sys
 import time
 import numpy as np
@@ -8,6 +9,7 @@ import numpy as np
 from ..errors import AutopatchError
 from ..PhaseController import PhaseController
 from .approach_cell import ApproachCellPhase
+from .spear_motion import SpearMotion
 
 
 class HuntCellPhase(PhaseController):
@@ -22,7 +24,16 @@ class HuntCellPhase(PhaseController):
 
     def run(self, cell=None):
         state = None
+        camera = None
+        indicator_owner = object()
+        self._hunt_marker_warning_shown = False
         try:
+            try:
+                camera = self.controller.calibrated_stage.camera
+                camera.begin_pipette_indicator(indicator_owner)
+            except Exception as error:
+                logging.getLogger('patcherbot.detection_overlay').warning(
+                    f'Could not start Hunt pipette indicator: {error}. Hunt continues.')
             state = self.prepare(cell)
             while True:
                 observation = self.observe(state=state)
@@ -30,7 +41,15 @@ class HuntCellPhase(PhaseController):
                 command = self.decide(calculated, state)
                 self.act(command, state)
         finally:
-            self.finish(state)
+            try:
+                self.finish(state)
+            finally:
+                if camera is not None:
+                    try:
+                        camera.end_pipette_indicator(indicator_owner)
+                    except Exception as error:
+                        logging.getLogger('patcherbot.detection_overlay').warning(
+                            f'Could not restore pipette indicator after Hunt: {error}.')
 
     def prepare(self, cell=None):
         self.failure_gate()
@@ -72,9 +91,33 @@ class HuntCellPhase(PhaseController):
                     else controller.resistanceRamp())
         controller.observer.annotate(self, observation, fields={
             "mode": mode, "baseline_resistance": baseline})
+        self._show_pipette_indicator(observation)
         self.failure_gate()
         self.success_gate()
         return observation
+
+    def _show_pipette_indicator(self, observation):
+        """Display existing tip evidence, with calibrated motion between frames."""
+        try:
+            unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
+            vision = observation.get('deep_learning', {})
+            if vision.get('stale', True):
+                return
+            tip = vision.get('pipette_position')
+            if tip is None:
+                return
+            tip = np.asarray(tip, dtype=float)
+            if tip.shape != (2,) or not np.isfinite(tip).all():
+                return
+            position_reader = lambda: (unit.um_to_pixels_relative(unit.position())[:2]
+                                       + stage.um_to_pixels_relative(stage.position())[:2])
+            stage.camera.show_detection_marker('pipette', tip, color=(255, 0, 0),
+                shape='triangle', direction=unit.M[:2, 0], position_reader=position_reader)
+        except Exception as error:
+            if not getattr(self, '_hunt_marker_warning_shown', False):
+                self._hunt_marker_warning_shown = True
+                logging.getLogger('patcherbot.detection_overlay').warning(
+                    f'Could not display Hunt pipette indicator: {error}. Hunt continues.')
 
     def calculate(self, observation=None, state=None):
         self.failure_gate()
@@ -150,7 +193,7 @@ class HuntCellPhase(PhaseController):
                                              and state["confirmed_readings"] >= self.CONTACT_READINGS))
             if state["step"] == 3:
                 calculated["spear_target"] = observation["manipulator_position"][2] + state["cell_focus_z"] - state["pipette_z"]
-            calculated["spear_speed"] = abs(config.max_descent_speed)
+            calculated["spear_speed"] = min(abs(config.max_descent_speed), 100.0)
         self.controller.observer.annotate(self, observation, calculations={
             "window_ready": ready, "resistance_delta": delta, "travel_um": travel})
         return calculated
@@ -244,13 +287,17 @@ class HuntCellPhase(PhaseController):
                     if state["step"] == 0:
                         state["step"] = 1
                     elif state["step"] == 4:
+                        motion = state.pop("spear_motion", None)
+                        if motion is not None:
+                            motion.stop()
                         controller.calibrated_unit.stop()
                         state.update(step=1, speared=True, pipette_z=command["pipette_plane"])
                     controller.microscope.absolute_move_velocity(command["speed"])
                 elif command["method"] == "spear":
                     state.update(step=4, spear_target=command["target"],
                                  spear_start_z=state["observation"]["manipulator_position"][2])
-                    controller.calibrated_unit.absolute_move(command["target"], axis=2, speed=command["speed"])
+                    motion = state["spear_motion"] = SpearMotion(controller, command["target"], command["speed"])
+                    motion.start()
         elif kind == "descend":
             velocity = tuple(command["value"])
             if velocity != state["last_velocity"]:
@@ -360,7 +407,10 @@ class HuntCellPhase(PhaseController):
     def finish(self, state=None, *, success=False, mode=None):
         controller = self.controller
         primary_error, stop_error = sys.exc_info()[1], None
-        for device in (controller.calibrated_stage, controller.calibrated_unit, controller.microscope):
+        devices = [controller.calibrated_stage, controller.calibrated_unit, controller.microscope]
+        if state is not None and state.get("spear_motion") is not None:
+            devices.insert(0, state["spear_motion"])
+        for device in devices:
             try:
                 device.stop()
             except BaseException as error:

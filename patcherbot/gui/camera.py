@@ -291,6 +291,16 @@ class LogNotifyHandler(logging.Handler):
             message = '{} ({})'.format(record.msg, str(exc))
         self.signal.emit(message)
 
+
+class DetectionOverlayNotifyHandler(logging.Handler):
+    """Forward overlay warnings to the GUI thread without blocking acquisition."""
+    def __init__(self, signal):
+        super().__init__(level=logging.WARNING)
+        self.signal = signal
+
+    def emit(self, record):
+        self.signal.emit(record.getMessage())
+
 class RecordingDialog(QDialog):
     def __init__(self, base_directory, frame_rate, pixels, settings, parent=None):
         super(RecordingDialog, self).__init__(parent=parent)
@@ -410,6 +420,7 @@ class CameraGui(QtWidgets.QMainWindow):
         ``False``.
     '''
     log_signal = QtCore.pyqtSignal('QString')
+    detection_overlay_warning_signal = QtCore.pyqtSignal('QString')
     camera_signal = QtCore.pyqtSignal(MethodType, object)
     camera_reset_signal = QtCore.pyqtSignal(TaskController)
     aux_camera_signal = QtCore.pyqtSignal(MethodType, object)
@@ -620,6 +631,27 @@ class CameraGui(QtWidgets.QMainWindow):
         logging.getLogger('patcherbot').addHandler(handler)
         self.log_signal.connect(self.error_status)
 
+        self._detection_overlay_message_box = None
+        self._detection_overlay_handler = DetectionOverlayNotifyHandler(self.detection_overlay_warning_signal)
+        self.detection_overlay_warning_signal.connect(self.show_detection_overlay_warning, Qt.QueuedConnection)
+        logging.getLogger('patcherbot.detection_overlay').addHandler(self._detection_overlay_handler)
+
+    @QtCore.pyqtSlot(str)
+    def show_detection_overlay_warning(self, message):
+        """Show one reusable, nonmodal warning for detection overlay failures."""
+        if self._detection_overlay_message_box is None:
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Warning)
+            box.setWindowTitle('Detection display warning')
+            box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+            box.setTextFormat(Qt.PlainText)
+            box.setModal(False)
+            box.setWindowModality(Qt.NonModal)
+            self._detection_overlay_message_box = box
+        self._detection_overlay_message_box.setText(message)
+        self._detection_overlay_message_box.show()
+        self._detection_overlay_message_box.raise_()
+
     def _update_switch_button_text(self):
         if not hasattr(self, 'switch_view_button') or self.switch_view_button is None:
             return
@@ -804,6 +836,7 @@ class CameraGui(QtWidgets.QMainWindow):
         return image
 
     def closeEvent(self, evt):
+       logging.getLogger('patcherbot.detection_overlay').removeHandler(self._detection_overlay_handler)
        self.close()
        return super(CameraGui, self).closeEvent(evt)
 

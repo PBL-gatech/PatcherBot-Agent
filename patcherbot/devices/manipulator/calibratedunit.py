@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 """
 A class to handle a manipulator unit with coordinates calibrated to the reference system of a camera.
 It contains methods to calibrate the unit.
@@ -333,7 +333,7 @@ class CalibratedUnit(ManipulatorUnit):
         """
         Moves the pipette so that its detected position in the camera image is centered.
         """
-        self.direct_pipette(speed=speed)
+        return self.direct_pipette(speed=speed)
 
     def direct_pipette(self, desired_px=None, speed=None):
         """
@@ -341,6 +341,7 @@ class CalibratedUnit(ManipulatorUnit):
         If no coordinates are provided, the pipette is centered in the camera view.
         An explicit speed (um/s) uses velocity control to support slow centering.
         """
+        self.last_pipette_move_failure = None
         self.abort_if_requested()
         # (1) Retrieve an image from the raw frame queue.
         _, _, _, img = self.camera.raw_frame_queue[0]
@@ -350,8 +351,9 @@ class CalibratedUnit(ManipulatorUnit):
         # (2) Get the detected pipette position (in pixels) from the deep-learning detector.
         detected_px = self.pipetteCalHelper.pipetteDetector.detect_pipette(img)
         if detected_px is None:
-            self.error("No pipette detected in the current frame.")
-            return
+            self.last_pipette_move_failure = "No pipette detected in the current frame."
+            self.error(self.last_pipette_move_failure)
+            return False
         detected_px = np.array(detected_px)
         # Ensure the detected position is expressed as a 3D vector.
         if detected_px.size == 2:
@@ -385,8 +387,7 @@ class CalibratedUnit(ManipulatorUnit):
         if speed is not None:
             if not np.isfinite(speed) or speed <= 0:
                 raise ValueError("Pipette centering speed must be finite and positive.")
-            self._velocity_move_by_displacement(error_um, speed)
-            return
+            return self._velocity_move_by_displacement(error_um, speed)
         # self.debug("DEBUG: Correction in microns (from pixel error):", error_um)
         
         # (6) Get the current manipulator (pipette) position (in microns) and compute the target.
@@ -590,49 +591,79 @@ class CalibratedUnit(ManipulatorUnit):
         This is used for low-speed motion where firmware clamps can prevent
         `relative_move` from honoring requested speeds.
         """
+        self.last_pipette_move_failure = None
         movement_vector = np.asarray(movement_vector, dtype=float)
         distance = float(norm(movement_vector))
         if distance == 0:
-            return
+            return True
 
         speed = abs(float(speed))
         if speed == 0:
             raise ValueError("Speed must be non-zero for velocity moves.")
 
+        # Allow Scientifica's 0.1 um readback resolution; short moves still require positive progress.
+        position_tolerance = min(0.1, distance * 0.1)
         direction = movement_vector / distance
-        velocity = self.velocity_position_control(movement_vector, speed)
+        # Match FindPipettePhase's displacement-to-velocity convention: the
+        # velocity command has the opposite sign to positional displacement.
+        velocity = (-np.asarray(self.velocity_position_control(movement_vector, speed), dtype=float)).tolist()
         start_pos = np.asarray(self.position(), dtype=float)
         expected_time = distance / speed
-        timeout = max(2.0, expected_time * 5.0)
+        # VJ command magnitude is not a measured encoder speed. The short
+        # watchdog limits time without forward progress, not total move time.
+        progress_timeout = max(2.0, expected_time * 5.0)
+        overall_timeout = max(10.0, expected_time * 20.0)
         start_time = time.perf_counter()
+        last_progress_time = start_time
+        best_progress = 0.0
+        signed_traveled = 0.0
+        elapsed = 0.0
         opposite_direction_warned = False
+        completed = False
+        self.info(f"Pipette velocity move: target={distance:.2f} um; velocity_command={velocity}; "
+                  f"no_progress_timeout_s={progress_timeout:.2f}; overall_timeout_s={overall_timeout:.2f}")
 
         self.absolute_move_group_velocity(velocity)
         try:
             while not self.abort_requested:
                 curr_pos = np.asarray(self.position(), dtype=float)
                 signed_traveled = float(np.dot(curr_pos - start_pos, direction))
-                # Use absolute progress (same spirit as hunt_cell's abs z-distance check)
-                # so axis sign conventions do not stall the move.
-                traveled = abs(signed_traveled)
-                if traveled >= distance:
+                now = time.perf_counter()
+                elapsed = now - start_time
+                if signed_traveled >= distance - position_tolerance:
+                    completed = True
                     break
                 if (signed_traveled < 0) and (not opposite_direction_warned):
                     self.warning(
-                        "Velocity move is progressing opposite commanded direction; "
-                        "using absolute displacement criterion."
+                        "Velocity move is progressing away from the target position."
                     )
                     opposite_direction_warned = True
-                if (time.perf_counter() - start_time) > timeout:
-                    self.warning(
-                        f"Velocity move timeout after {timeout:.2f}s "
-                        f"(target {distance:.2f} um, traveled {signed_traveled:.2f} um signed)."
-                    )
+                if signed_traveled <= -distance:
+                    self.last_pipette_move_failure = "Pipette moved away from its target"
+                    break
+                if signed_traveled >= best_progress + position_tolerance:
+                    best_progress = signed_traveled
+                    last_progress_time = now
+                if elapsed > overall_timeout:
+                    self.last_pipette_move_failure = f"Overall movement timeout after {elapsed:.2f}s"
+                    break
+                if now - last_progress_time > progress_timeout:
+                    self.last_pipette_move_failure = (
+                        f"No forward progress for {now - last_progress_time:.2f}s")
                     break
                 self.sleep(poll_interval)
         finally:
             self.stop()
             self.wait_until_still()
+        if not completed:
+            reason = self.last_pipette_move_failure or "Pipette movement aborted"
+            self.last_pipette_move_failure = (
+                f"{reason}; target={distance:.2f} um; traveled={signed_traveled:.2f} um; elapsed={elapsed:.2f}s")
+            self.warning(self.last_pipette_move_failure)
+        else:
+            self.info(f"Pipette velocity move finished: target={distance:.2f} um; "
+                      f"traveled={signed_traveled:.2f} um; elapsed={elapsed:.2f}s")
+        return completed
 
     def move_pipette_random_velocity(self, movement = 500, speed = 200):
         '''
@@ -992,7 +1023,7 @@ class CalibratedStage(CalibratedUnit):
                             self.camera.height / 2])[:n_axes]
 
         # ------------------------------------------------------------------
-        # Pixel error  → stage move (same sign).  
+        # Pixel error  â†’ stage move (same sign).  
         # (Stage motion and image motion are opposite, so this cancels the error.)
         # ------------------------------------------------------------------
         error_px = desired_px - centroid[:n_axes] 
@@ -1015,11 +1046,11 @@ class CalibratedStage(CalibratedUnit):
 
         # ------------------------------------------------------------------
 
-        self.reference_relative_move(error_px)   # px → µm handled inside
+        self.reference_relative_move(error_px)   # px â†’ Âµm handled inside
         self.wait_until_still()
 
-        # more debug (final position in µm and px)
-        self.info(f"new stage µm position: {self.position()}")
+        # more debug (final position in Âµm and px)
+        self.info(f"new stage Âµm position: {self.position()}")
         # self.info(f"new stage px offset  : {self.reference_position()}")
 
 
