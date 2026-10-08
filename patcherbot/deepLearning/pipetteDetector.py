@@ -484,22 +484,59 @@ class PipetteDetector4(PipetteDetector):
             logger.warning("PipetteDetector4 tracking inference failed: %s", exc)
             return dict(tip_xy=None, mask=None, frame=None)
 
-    def detect_pipette_details(self, img: np.ndarray) -> dict:
+    def detect_pipette_details(self, img: np.ndarray, *, expected_tip_xy=None,
+                               pixels_to_um=None, radius_um=50.0) -> dict:
         """Return XY, depth in microns, box confidence and optional Z confidence.
 
         Uses one inference pass. Missing/invalid predictions are None; box
         confidence is not a substitute for the optional Z-confidence head.
         """
-        prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None)
+        prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
+                          box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
+                           radius_rejected_count=0)
         if img is None:
             return prediction
         try:
             gray = self._to_uint8_grayscale(img)
-            result = self.adapter.predict(gray, native_mask=False)
+            if expected_tip_xy is None:
+                result = self.adapter.predict(gray, native_mask=False)
+                prediction["candidate_count"] = int(result.get("tip_xy") is not None)
+                prediction["accepted_candidate_count"] = prediction["candidate_count"]
+            else:
+                expected = np.asarray(expected_tip_xy, dtype=float)
+                if expected.shape != (2,) or not np.isfinite(expected).all() or not callable(pixels_to_um):
+                    raise ValueError("A finite expected XY and calibrated pixel-to-micron converter are required")
+                if not np.isfinite(radius_um) or radius_um <= 0:
+                    raise ValueError("Pipette candidate radius must be positive and finite")
+                decoded = self.adapter.predict(gray, native_mask=False, max_detections=100)
+                candidates = decoded.get("candidates", [])
+                prediction["candidate_count"] = len(candidates)
+                accepted = []
+                for candidate in candidates:
+                    tip = np.asarray(candidate.get("tip_xy"), dtype=float)
+                    confidence = candidate.get("box_confidence")
+                    if tip.shape != (2,) or not np.isfinite(tip).all() or confidence is None or not np.isfinite(confidence):
+                        continue
+                    offset = np.asarray(pixels_to_um(tip - expected), dtype=float).reshape(-1)[:2]
+                    if offset.size != 2 or not np.isfinite(offset).all():
+                        continue
+                    if np.linalg.norm(offset) > radius_um:
+                        prediction["radius_rejected_count"] += 1
+                        continue
+                    accepted.append(candidate)
+                prediction["accepted_candidate_count"] = len(accepted)
+                if not accepted:
+                    return prediction
+                result = max(accepted, key=lambda candidate: candidate["box_confidence"])
             tip = result["tip_xy"]
             if tip is None:
                 return prediction
             prediction["tip_xy"] = tuple(int(round(v)) for v in tip)
+            box = result.get("box_xyxy")
+            if box is not None:
+                box = np.asarray(box, dtype=float)
+                if box.shape == (4,) and np.isfinite(box).all():
+                    prediction["box_xyxy"] = tuple(float(value) for value in box)
             for key in ("z_um", "box_confidence", "z_confidence"):
                 value = result.get(key)
                 if value is not None and np.isfinite(value):
@@ -509,7 +546,9 @@ class PipetteDetector4(PipetteDetector):
             return prediction
         except Exception as exc:
             logger.warning("PipetteDetector4 inference failed: %s", exc)
-            return dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None)
+            return dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
+                        box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
+                         radius_rejected_count=0)
 
     def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
         """Preserve the existing integer XY-only detection interface."""

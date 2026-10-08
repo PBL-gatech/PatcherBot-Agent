@@ -926,11 +926,19 @@ class AutoPatcher(TaskController):
                     try:
                         if name == "cell_detector":
                             read = read().detect_cells
-                        result = read(image.copy())
+                        if name == "pipette_detector" and "pipette_expected_xy" in evidence["source_positions"]:
+                            result = read(image.copy(),
+                                expected_tip_xy=evidence["source_positions"]["pipette_expected_xy"],
+                                pixels_to_um=stage.pixels_to_um_relative, radius_um=50.0)
+                        else:
+                            result = read(image.copy())
                         if name == "pipette_detector":
                             result = result or {}
                             evidence["pipette_position"] = result.get("tip_xy")
                             evidence["confidence"]["pipette_detector"] = result.get("box_confidence")
+                            evidence["pipette_box_xyxy"] = result.get("box_xyxy")
+                            evidence["pipette_candidate_counts"] = {key: result.get(key) for key in
+                                ("candidate_count", "accepted_candidate_count", "radius_rejected_count")}
                             if shared_depth:
                                 evidence["pipette_focus"] = result.get("z_um")
                                 evidence["confidence"]["pipette_focuser"] = result.get("z_confidence")
@@ -950,6 +958,16 @@ class AutoPatcher(TaskController):
                             evidence["errors"]["pipette_focuser"] = str(error)
                             evidence["confidence"]["pipette_focuser"] = None
         return evidence
+
+    def expected_pipette_xy(self):
+        """Detector-corrected tip anchor propagated by calibrated device displacement."""
+        unit, stage = self.calibrated_unit, self.calibrated_stage
+        tracked = unit.tracked_tip_position(trusted=True)
+        if tracked is not None:
+            return tracked
+        return (np.array([stage.camera.width / 2., stage.camera.height / 2.])
+                + unit.um_to_pixels_relative(unit.position() - self.home_position)[:2]
+                + stage.um_to_pixels_relative(stage.position() - self.home_stage_position[:2])[:2])
 
     def resistanceRamp(self, num_measurements=5, interval=0.200):
         return self._safe_average(
@@ -1069,6 +1087,7 @@ class AutoPatcher(TaskController):
 
         self.calibrated_stage.set_max_speed(10000)
         self.calibrated_unit.set_max_speed(100000)
+        self.calibrated_unit.refresh_tip_reference(expected_xy=self.expected_pipette_xy())
         self.info("Located Cell")
         self.success_requested = True
         self.success_if_requested()

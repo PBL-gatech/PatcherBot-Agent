@@ -109,8 +109,67 @@ class CalibratedUnit(ManipulatorUnit):
             self.camera.show_circles([])
             return None
         point = tuple(np.rint(point[:2]).astype(int))
+        self.refresh_tip_reference()
         self.camera.show_circle(point)
         return point
+
+    def tracked_tip_position(self, trusted=False):
+        anchor = getattr(self, '_trusted_tip_reference' if trusted else '_tip_reference', None)
+        if anchor is None:
+            return None
+        tip, position, stage_position = anchor
+        return (tip + self.um_to_pixels_relative(self.position() - position)[:2]
+                + self.stage.um_to_pixels_relative(self.stage.position() - stage_position)[:2])
+
+    def set_tip_reference(self, tip, position=None, stage_position=None, trusted=True):
+        """Anchor image XY to supplied sampling positions, or current positions."""
+        if position is None:
+            position = self.position()
+        if stage_position is None:
+            stage_position = self.stage.position()
+        self._tip_reference = (np.asarray(tip, dtype=float)[:2].copy(),
+                                np.asarray(position, dtype=float).copy(),
+                                np.asarray(stage_position, dtype=float).copy())
+        if trusted:
+            self._trusted_tip_reference = tuple(value.copy() for value in self._tip_reference)
+
+    def refresh_tip_reference(self, expected_xy=None):
+        """Refresh the normal triangle from stable detections without moving devices."""
+        try:
+            if getattr(self.camera, 'pipette_indicator_active', False):
+                return None
+            expected = self.tracked_tip_position() if expected_xy is None else np.asarray(expected_xy)
+            if expected is None:
+                expected = np.array([self.camera.width / 2., self.camera.height / 2.])
+            points, seen = [], set()
+            for _ in range(8):
+                self.abort_if_requested()
+                frame = self.camera.last_raw_frame_data()
+                if frame is None or frame[0] in seen:
+                    self.sleep(0.05)
+                    continue
+                seen.add(frame[0])
+                result = self.pipetteCalHelper.pipetteDetector.detect_pipette_details(
+                    frame[2], expected_tip_xy=expected,
+                    pixels_to_um=self.stage.pixels_to_um_relative, radius_um=50.0)
+                tip = result.get('tip_xy')
+                if tip is None or (result.get('box_confidence') or 0) < 0.5:
+                    points.clear()
+                    continue
+                point = np.asarray(tip, dtype=float)
+                if any(np.linalg.norm(self.stage.pixels_to_um_relative(point - old)[:2]) > 5 for old in points):
+                    points.clear()
+                points.append(point)
+                if len(points) == 3:
+                    point = np.median(points, axis=0)
+                    self.set_tip_reference(point)
+                    self.info(f'Pipette reference refreshed: xy={point}; 3 stable detections; radius_um=50')
+                    return point
+            self.warning('Pipette reference not refreshed: no 3 stable confident detections; keeping calibrated marker')
+        except Exception as error:
+            self.abort_if_requested()
+            self.warning(f'Pipette reference display refresh failed: {error}; keeping calibrated marker')
+        return None
 
     def save_state(self):
         if self.stage is not None:
@@ -329,13 +388,16 @@ class CalibratedUnit(ManipulatorUnit):
         self.wait_until_still()
 
 
-    def center_pipette(self, speed=None):
+    def center_pipette(self, speed=None, detected_px=None, expected_px=None, max_deviation_um=None):
         """
         Moves the pipette so that its detected position in the camera image is centered.
         """
-        return self.direct_pipette(speed=speed)
+        options = {} if detected_px is None else {"detected_px": detected_px}
+        if max_deviation_um is not None:
+            options.update(expected_px=expected_px, max_deviation_um=max_deviation_um)
+        return self.direct_pipette(speed=speed, **options)
 
-    def direct_pipette(self, desired_px=None, speed=None):
+    def direct_pipette(self, desired_px=None, speed=None, detected_px=None, expected_px=None, max_deviation_um=None):
         """
         Moves the pipette so that its detected position matches the requested image coordinates.
         If no coordinates are provided, the pipette is centered in the camera view.
@@ -349,12 +411,36 @@ class CalibratedUnit(ManipulatorUnit):
         # self.debug("DEBUG: Camera image dimensions: width =", w, "height =", h)
         
         # (2) Get the detected pipette position (in pixels) from the deep-learning detector.
-        detected_px = self.pipetteCalHelper.pipetteDetector.detect_pipette(img)
+        supplied_detection = detected_px is not None
+        # Sample beside image retrieval, before inference can delay the anchor.
+        # These are cached device positions, not camera exposure timestamps.
+        reference_position = np.asarray(self.position(), dtype=float).copy()
+        reference_stage_position = np.asarray(self.stage.position(), dtype=float).copy()
+        if not supplied_detection:
+            detected_px = self.pipetteCalHelper.pipetteDetector.detect_pipette(img)
         if detected_px is None:
             self.last_pipette_move_failure = "No pipette detected in the current frame."
             self.error(self.last_pipette_move_failure)
             return False
         detected_px = np.array(detected_px)
+        if detected_px.shape not in ((2,), (3,)) or not np.isfinite(detected_px).all():
+            self.last_pipette_move_failure = 'Invalid confirmed pipette XY'
+            return False
+        if max_deviation_um is not None:
+            expected = np.asarray(expected_px, dtype=float)
+            if (expected.shape != (2,) or not np.isfinite(expected).all()
+                    or not np.isfinite(max_deviation_um) or max_deviation_um <= 0):
+                self.last_pipette_move_failure = 'Missing valid calibrated pipette reference; SHIFT cancelled'
+                self.warning(self.last_pipette_move_failure)
+                return False
+            offset = np.asarray(self.stage.pixels_to_um_relative(detected_px[:2] - expected), dtype=float)[:2]
+            if not np.isfinite(offset).all() or np.linalg.norm(offset) > max_deviation_um:
+                self.last_pipette_move_failure = 'Pipette detection disagrees with calibrated position; SHIFT cancelled'
+                self.warning(f'{self.last_pipette_move_failure}; detected_xy={detected_px[:2]}; '
+                             f'expected_xy={expected}; tolerance_um={max_deviation_um}')
+                return False
+        self.set_tip_reference(detected_px[:2], position=reference_position,
+                               stage_position=reference_stage_position, trusted=not supplied_detection)
         # Ensure the detected position is expressed as a 3D vector.
         if detected_px.size == 2:
             detected_px = np.append(detected_px, 0)
@@ -384,6 +470,8 @@ class CalibratedUnit(ManipulatorUnit):
         # (5) Convert the pixel error into a correction (in microns).
         # pixels_to_um_relative() expects a 3-element vector.
         error_um = self.pixels_to_um_relative(error_px)
+        self.info(f'Pipette XY correction: detected={detected_px[:2]}; desired={desired_px[:2]}; '
+                  f'displacement_um={error_um}; source={"confirmed scan" if supplied_detection else "fresh detector"}')
         if speed is not None:
             if not np.isfinite(speed) or speed <= 0:
                 raise ValueError("Pipette centering speed must be finite and positive.")
@@ -982,7 +1070,7 @@ class CalibratedStage(CalibratedUnit):
         return big_image
     
 
-    def center_on_cell(self, cell, check_same_cell=False, use_centroid = True, max_error_px=None):
+    def center_on_cell(self, cell, check_same_cell=False, use_centroid = True, max_error_px=None, reference_point=None, detected_px=None):
         """
         Find the cell centroid in pixel space and nudge the stage so the centroid
         is centred in the camera view.
@@ -1003,17 +1091,19 @@ class CalibratedStage(CalibratedUnit):
 
         # reference thumbnails are cropped around the cell, so default to the crop centre
         ref_h, ref_w = reference_image.shape[:2]
-        template_prompt = np.array([ref_w / 2.0, ref_h / 2.0], dtype=np.float32)
+        template_prompt = (np.array([ref_w / 2.0, ref_h / 2.0], dtype=np.float32)
+                           if reference_point is None else np.asarray(reference_point, dtype=np.float32))
 
         self.info(f"Centering on cell at approx. {expected_px} px")
-        cell_track_helper = self._ensure_cell_track_helper()
-        centroid = cell_track_helper.find_centroid(
-            reference_image,
-            image,
-            use_centroid=use_centroid,
-            prompt_point=template_prompt,
-            expected_point=expected_px,
-        )
+        if detected_px is None:
+            cell_track_helper = self._ensure_cell_track_helper()
+            centroid = cell_track_helper.find_centroid(
+                reference_image, image, use_centroid=use_centroid,
+                prompt_point=template_prompt, expected_point=expected_px)
+        else:
+            centroid = np.asarray(detected_px, dtype=float)
+            if centroid.shape != (2,) or not np.isfinite(centroid).all():
+                raise ValueError("Supplied cell position must be finite XY coordinates.")
         if centroid is None:
             return self.wait_until_still        # keep call chain consistent
 

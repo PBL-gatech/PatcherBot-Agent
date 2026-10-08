@@ -27,10 +27,14 @@ class PatchConfig(Config):
     slice_start_distance = NumberWithUnit(75, bounds=(0, 100), doc='Initial distance above target cell in slice', unit='μm') # 20 um default
     max_distance = NumberWithUnit(30, bounds=(0, 100), doc='Maximum movement during hunt', unit='μm')
     hunt_limit_target_radius = Boolean(True, doc='Limit detection matching to the selected target radius')
+    hunt_timeout = NumberWithUnit(200, bounds=(1, 3600), unit='s',
+                                 doc='Overall time allowed for Adaptive Hunt')
     hunt_target_radius = NumberWithUnit(50, bounds=(1, 1000), unit='μm',
                                        doc='Maximum detection distance from the expected target when radius limiting is enabled')
     hunt_contact_distance = NumberWithUnit(5, bounds=(0.1, 100), unit='μm',
                                           doc='Maximum image-plane tip-to-cell distance for Adaptive contact success')
+    hunt_contact_plane_tolerance_um = NumberWithUnit(2, bounds=(0.1, 100), unit='\u03bcm',
+        doc='Maximum pipette-to-cell Z-plane difference for Adaptive contact confirmation')
     hunt_search_margin = NumberWithUnit(5, bounds=(0, 100),
                                        doc='Extra microscope Search travel after preceding Spear descent', unit='\u03bcm')
     hunt_progress_cycles = Number(4, bounds=(1, 100),
@@ -40,6 +44,8 @@ class PatchConfig(Config):
     max_descent_speed = Number(-10,bounds=(-50,50),doc='Maximum descent speed for Neuron Hunting')
     max_clearing_speed = Number(-100,bounds=(-200,200),doc='Maximum speed for clearing Tissue during Neuron Hunting')
     use_centroid = Boolean(True, doc='Use centroid for pipette alignment during approach')
+    cell_shift_fusion = Boolean(True,
+        doc='Combine detector, calibration and template evidence for every Adaptive Approach/Hunt cell SHIFT; disable for template-based centering')
     track_cell = Boolean(False, doc='Track cell position during approach')
     tracking_mode = Selector(default='fast', objects=['fast', 'cellbody', 'hybrid'], doc='Cell tracking strategy during approach')
     track_max_fast_jump_px = Number(80, bounds=(1, 10000), doc='Maximum accepted fast-tracking jump in pixels')
@@ -72,11 +78,11 @@ class PatchConfig(Config):
     categories = [
         ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
                       'max_locate_speed', 'search_speed', 'approach_cell_max_shift', 'approach_pipette_speed',
-                      'max_clearing_speed', 'use_centroid', 'track_cell',
+                      'max_clearing_speed', 'use_centroid', 'cell_shift_fusion', 'track_cell',
                       'tracking_mode', 'track_max_fast_jump_px']),
-        ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin',
+        ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin', 'hunt_timeout',
                   'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
-                  'hunt_target_radius', 'hunt_contact_distance']),
+                  'hunt_target_radius', 'hunt_contact_distance', 'hunt_contact_plane_tolerance_um']),
         ('Sealing', ['pressure_sealing', 'gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch', 'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate', 'measurement_speed', 'Vramp_amplitude', 'seal_min_time', 'seal_deadline']),
         ('Break-in', ['zap', 'pressure_ramp_increment', 'pressure_ramp_max', 'pressure_ramp_duration','pulse_pressure_break_in','pulse_pressure_duration', 'max_cell_R','max_access_R','min_cell_C']),
         ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette']),

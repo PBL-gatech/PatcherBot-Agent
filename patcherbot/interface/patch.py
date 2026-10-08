@@ -351,9 +351,9 @@ class AutoPatchInterface(TaskInterface):
                     or not np.isfinite(home).all() or not np.isfinite(stage_home).all()):
                 return
             # HOME aligns the tip with image center; only displacement moves the arrow.
-            tip = (np.array([camera.width / 2., camera.height / 2.])
-                   + unit.um_to_pixels_relative(unit.position() - home)[:2]
-                   + stage.um_to_pixels_relative(stage.position() - stage_home[:2])[:2])
+            tip = unit.tracked_tip_position()
+            if tip is None:
+                tip = controller.expected_pipette_xy()
             if np.isfinite(tip).all():
                 self.pipette_controller.display_positions = dict(
                     pipette_xy=tip.copy(), at=time.monotonic(),

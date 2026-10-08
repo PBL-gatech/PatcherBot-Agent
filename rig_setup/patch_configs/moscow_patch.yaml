@@ -18,14 +18,17 @@ approach_pipette_speed: 20
 slice_start_distance: 75
 max_distance: 30
 hunt_limit_target_radius: true
+hunt_timeout: 200
 hunt_target_radius: 50
 hunt_contact_distance: 5
+hunt_contact_plane_tolerance_um: 2
 hunt_search_margin: 5
 hunt_progress_cycles: 4
 hunt_min_progress_percent: 25
 max_descent_speed: -10
 max_clearing_speed: -100
 use_centroid: true
+cell_shift_fusion: true
 track_cell: false
 tracking_mode: fast
 track_max_fast_jump_px: 80

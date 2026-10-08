@@ -45,6 +45,7 @@ class ApproachCellPhase(PhaseController):
         self.success_gate()
         self.begin_observations()
         self._adaptive = self.controller.config.mode == "Adaptive"
+        self.controller._approach_cell_focus = None
         self._vision = False
         self._marker_warning_shown = False
         if self._adaptive:
@@ -54,15 +55,19 @@ class ApproachCellPhase(PhaseController):
                 logging.getLogger("patcherbot.detection_overlay").warning(
                     f"Could not reset detection markers: {error}. Approach continues.")
         self.controller.info(f"Approach START: mode={self.controller.config.mode}")
-        return {"cell": cell, "fields": [], "step": 0, "display_detection_markers": True, "bounded_focus": True}
+        return {"cell": cell, "original_cell_reference": None if cell is None else cell[0],
+                "fields": [], "step": 0, "display_detection_markers": True,
+                "bounded_focus": True, "cell_search_radius_um": 50.0}
 
     def observe(self, *, state=None, **kwargs):
         searching = self._vision and state is not None and state["step"] == 1
         if self._vision:
             if state is not None and state.get("bounded_focus"):
+                self.frame_context["pipette_expected_xy"] = self.controller.expected_pipette_xy
                 self.frame_context["focus_z"] = lambda: (self.controller.microscope.position()
                     / self.controller.calibrated_unit.config.microscope_units_per_um)
                 if searching:
+                    self.frame_context["stage_xy"] = self.controller.calibrated_stage.position
                     kwargs["fields"] = [*kwargs.get("fields", state.get("fields", [])), "camera_image"]
             inference_fields = ["pipette_image_xy", "pipette_defocus_um"]
             if searching:
@@ -74,6 +79,13 @@ class ApproachCellPhase(PhaseController):
         if self._vision:
             vision = observation["deep_learning"]
             tip = vision.get("pipette_position")
+            if state is not None and state.get('step') == 2:
+                confirmation = state.get('focus_confirmation')
+                sweep = state.get('focus_sweep')
+                tip = (confirmation.confirmed_tip_xy if confirmation is not None and confirmation.confirmed
+                       else getattr(sweep, 'best_tip_xy', None))
+                if tip is None:
+                    tip = self.controller.expected_pipette_xy()
             if tip is not None:
                 self._show_detection_marker("pipette", tip, (255, 0, 0))
         return observation
@@ -94,19 +106,152 @@ class ApproachCellPhase(PhaseController):
                 logging.getLogger("patcherbot.detection_overlay").warning(
                     f"Could not display {name} detection marker: {error}. Approach continues.")
 
+    def _fuse_cell_tracks(self, candidates, expected_xy, template_xy=None, previous_xy=None):
+        """Soft spatial support selects a real soma before combining nearby estimates.
+
+        Weights are reliability heuristics, not calibrated model probabilities.
+        Calibration is a weak prior; disagreement reduces influence continuously.
+        """
+        stage = self.controller.calibrated_stage
+        scale = FocusConfirmation.TIP_STABILITY_UM
+        def support(a, b):
+            delta = stage.pixels_to_um_relative(np.asarray(a)[:2] - np.asarray(b)[:2])
+            return 1.0 / (1.0 + (np.linalg.norm(delta[:2]) / scale) ** 2)
+        def rank(candidate):
+            xy = np.asarray(candidate[:2])
+            evidence = 0.35 * support(xy, expected_xy)
+            if template_xy is not None:
+                evidence += support(xy, template_xy)
+            if previous_xy is not None:
+                evidence += 0.5 * support(xy, previous_xy)
+            return float(candidate[2]) * evidence
+        selected = max(candidates, key=rank, default=None)
+        if selected is None:
+            return None, None
+        xy = np.asarray(selected[:2], dtype=float)
+        confidence = max(float(selected[2]), 1e-6)
+        points = [xy, np.asarray(expected_xy, dtype=float)]
+        reliability = [confidence, 0.35]
+        if template_xy is not None:
+            points.append(np.asarray(template_xy, dtype=float))
+            reliability.append(1.0)
+        # No source supports itself: even a confident detector must earn support.
+        weights = [quality * sum(support(point, other)
+                                 for j, other in enumerate(points) if j != i)
+                   for i, (point, quality) in enumerate(zip(points, reliability))]
+        return selected, np.average(points, axis=0, weights=weights)
+
+    def _cell_template_evidence(self, observation, state, expected):
+        """Refresh independent identity evidence only on a stationary SEARCH frame."""
+        state['cell_template_evidence'] = None
+        image = observation.get('camera_image')
+        if image is None:
+            return
+        stage = self.controller.calibrated_stage
+        try:
+            helper = stage._ensure_cell_track_helper()
+            point = helper.find_centroid(state['cell'][1], image,
+                use_centroid=self.controller.config.use_centroid,
+                prompt_point=state.get('cell_template_point'), expected_point=expected)
+            evidence = getattr(helper, 'last_match_evidence', {})
+            if point is not None and evidence.get('independent', False):
+                source = observation['deep_learning'].get('source_positions', {})
+                source_xy = np.asarray(source.get('stage_xy', observation['stage_positions'][:2]))[:2]
+                state['cell_template_evidence'] = (stage.M @ source_xy + stage.r0)[:2] - np.asarray(point[:2])
+            self.controller.info(f'Cell template: evidence={evidence}; xy={point}; '
+                                 'stage fallback is not counted as an independent template match')
+        except Exception as error:
+            self.controller.info(f'Cell template unavailable: {error}; using calibration and detector evidence')
+
+    def _shift_cell_from_evidence(self, state):
+        """Use one accepted detector/template/calibration estimate for marker and motion."""
+        controller, raw = self.controller, state['observation']
+        stage = controller.calibrated_stage
+        if not getattr(controller.config, 'cell_shift_fusion', True):
+            controller.info('Cell SHIFT consensus disabled; using existing template centering')
+            return stage.center_on_cell(state['cell'], use_centroid=controller.config.use_centroid,
+                max_error_px=controller.config.approach_cell_max_shift)
+        detection, image = raw.get('cell_detection'), raw.get('camera_image')
+        options = {}
+        if detection is not None and image is not None:
+            source_xy = np.asarray(raw['deep_learning'].get('source_positions', {}).get(
+                'stage_xy', raw['stage_positions'][:2]))[:2]
+            expected = (stage.M @ source_xy + stage.r0)[:2] - state['cell'][0][:2]
+            self._cell_template_evidence(raw, state, expected)
+            template = state.get('cell_template_evidence')
+            template_xy = None if template is None else (stage.M @ source_xy + stage.r0)[:2] - template
+            recheck = state.pop('cell_shift_recheck', None)
+            frame = raw['deep_learning'].get('source_frame', raw.get('observation_id'))
+            ambiguous = False
+            if template_xy is not None:
+                points = [np.asarray(detection[:2]), expected, template_xy]
+                gaps = [np.linalg.norm(stage.pixels_to_um_relative(points[i] - points[j])[:2])
+                        for i in range(3) for j in range(i)]
+                ambiguous = min(gaps) > FocusConfirmation.TIP_STABILITY_UM
+                if ambiguous and frame is not None and recheck is None:
+                    state['cell_shift_recheck'] = (frame, np.asarray(detection[:2]).copy())
+                    controller.info('Cell SHIFT: all three estimates disagree; requesting one fresh settled observation before motion')
+                    return False
+            _, fused = self._fuse_cell_tracks([detection], expected, template_xy)
+            if recheck is not None:
+                stable = np.linalg.norm(stage.pixels_to_um_relative(
+                    np.asarray(detection[:2]) - recheck[1])[:2]) <= FocusConfirmation.TIP_STABILITY_UM
+                if frame is None or frame == recheck[0] or raw['deep_learning'].get('stale', False) or not stable:
+                    fused = expected.copy()
+                    controller.warning('Cell SHIFT: recheck lacks fresh stable evidence for the selected cell; retaining calibration estimate')
+            if ambiguous:
+                correction = fused - expected
+                distance = np.linalg.norm(stage.pixels_to_um_relative(correction)[:2])
+                if distance > FocusConfirmation.TIP_STABILITY_UM:
+                    fused = expected + correction * (FocusConfirmation.TIP_STABILITY_UM / distance)
+                controller.warning('Cell SHIFT: no agreeing pair; model correction limited to 5 um from calibration estimate')
+            reference = np.array(state['cell'][0], dtype=float, copy=True)
+            reference[:2] = (stage.M @ source_xy + stage.r0)[:2] - fused
+            reference[2] = state['cell_focus_z']
+            state.setdefault('original_cell_reference', state['cell'][0])
+            state['cell'] = (reference, np.asarray(image).copy(), np.append(source_xy, state['cell_focus_z']))
+            state['tracked_cell_reference'] = reference[:2].copy()
+            state['cell_template_point'] = fused.copy()
+            current_xy = fused + (stage.M @ (np.asarray(stage.position())[:2] - source_xy))[:2]
+            options['detected_px'] = current_xy
+            self._show_detection_marker('cell', current_xy, (0, 0, 255))
+            controller.info(f'Cell SHIFT consensus: prior_xy={expected}; template_xy={template_xy}; '
+                f'detector_xy={detection[:2]}; detector_confidence={detection[2]}; '
+                f'fused_source_xy={fused}; current_xy={current_xy}; z={reference[2]}; '
+                'weights=confidence and pairwise spatial support, not calibrated probabilities')
+        else:
+            if state.pop('cell_shift_recheck', None) is not None:
+                options['detected_px'] = (stage.M @ np.asarray(stage.position())[:2] + stage.r0)[:2] - state['cell'][0][:2]
+                self._show_detection_marker('cell', options['detected_px'], (0, 0, 255))
+                controller.warning('Cell SHIFT: recheck missing detector or source image; retaining calibration estimate')
+            else:
+                controller.info('Cell SHIFT consensus unavailable: missing detector or source image; using existing template centering')
+        stage.center_on_cell(state['cell'], use_centroid=controller.config.use_centroid,
+            max_error_px=controller.config.approach_cell_max_shift, **options)
+
     def calculate(self, observation=None, state=None):
         if not self._adaptive:
             return super().calculate(observation, state)
         state["observation"] = observation
         if self._vision:
             observation["cell_focus_error"] = observation["stage_positions"][2] - state["cell_focus_z"]
-            if state["step"] == 1:
+            if state["step"] == 1 and not observation.get("cell_selection_locked", False):
                 expected_xy = (self.controller.calibrated_stage.M @ observation["stage_positions"][:2]
                                + self.controller.calibrated_stage.r0)[:2] - state["cell"][0][:2]
                 detections = observation["deep_learning"].get("cell_detections") or []
-                observation["cell_detection"] = min(detections,
+                candidates = detections
+                radius_um = state.get("cell_search_radius_um")
+                if radius_um is not None:
+                    stage = self.controller.calibrated_stage
+                    candidates = [cell for cell in detections
+                        if np.isfinite(cell[:3]).all()
+                        and cell[2] >= stage.cellDetectHelper.cellDetector.conf_threshold
+                        and np.linalg.norm(stage.pixels_to_um_relative(
+                            np.asarray(cell[:2]) - expected_xy)[:2]) <= radius_um]
+                observation["cell_detection"] = min(candidates,
                     key=lambda cell: sum((cell[:2] - expected_xy) ** 2), default=None)
                 self.controller.info(f"Cell SEARCH: candidates={len(detections)}; "
+                    f"accepted_candidates={len(candidates)}; radius_um={radius_um}; "
                     f"expected_xy={expected_xy}; selected={observation['cell_detection']}; "
                     f"focus_error_um={observation['cell_focus_error']}")
                 cell = observation["cell_detection"]
@@ -160,7 +305,7 @@ class ApproachCellPhase(PhaseController):
             if pipette_confident and focus_confidence is None and not state.get("logged_optional_focus_confidence"):
                 self.controller.info("Pipette focus: checkpoint has no Z-confidence head; "
                     f"depth_um={depth}; detector_confidence={confidence.get('pipette_detector')}; "
-                    + ("Z focus is advisory; XY detection confirms pipette presence" if state.get("bounded_focus") else
+                    + ("Z confidence is ignored; SCAN uses predicted defocus and XY confidence" if state.get("bounded_focus") else
                        "using valid depth, detector confidence, and existing position/focus tolerances"))
                 state["logged_optional_focus_confidence"] = True
             ready = (step == 0 or (step == 1 and observation["cell_focus_error"] >= 0 and cell is not None
@@ -183,6 +328,8 @@ class ApproachCellPhase(PhaseController):
                 ready = confirmation.update(observation, valid)
                 if ready is not True:
                     return None
+                if step == 2:
+                    state["confirmed_tip_xy"] = confirmation.confirmed_tip_xy
             if step == 2 and not ready:
                 speed = observation["scan_speed"] if pipette_confident and observation["pipette_z_error"] <= 5 else observation["up_speed"]
                 return {**command, "route": "adaptive", **self.scan(speed)}
@@ -242,8 +389,10 @@ class ApproachCellPhase(PhaseController):
                     sweep.start()
                 elif sweep.update(state["observation"], self._focus_score(state)):
                     state["focus_done"] = state["step"]
+                    confirmation_options = ({'selected_tip_xy': sweep.best_tip_xy} if state['step'] == 2
+                                            else {'selected_cell_xy': sweep.best_cell_xy})
                     state["focus_confirmation"] = FocusConfirmation(
-                        self.controller, "cell" if state["step"] == 1 else "pipette")
+                        self.controller, "cell" if state["step"] == 1 else "pipette", **confirmation_options)
                 return
             if command["method"] != "scan":
                 self.controller.microscope.stop()
@@ -251,12 +400,16 @@ class ApproachCellPhase(PhaseController):
                 self.controller.info(f"Approach SHIFT {command['target']}: starting")
                 if command["target"] == "cell":
                     state["cell_focus_z"] = state["observation"]["stage_positions"][2]
-                    self.controller.calibrated_stage.center_on_cell(
-                        state["cell"], use_centroid=self.controller.config.use_centroid,
-                        max_error_px=self.controller.config.approach_cell_max_shift)
+                    if self._shift_cell_from_evidence(state) is False:
+                        return
                 else:
                     state["pipette_z"] = state["observation"]["stage_positions"][2]
-                    centered = self.controller.calibrated_unit.center_pipette(speed=self.controller.config.approach_pipette_speed)
+                    options = ({"detected_px": state.pop("confirmed_tip_xy")} if "confirmed_tip_xy" in state else {})
+                    if options:
+                        options.update(expected_px=self.controller.expected_pipette_xy(),
+                                       max_deviation_um=50.0)
+                        self._show_detection_marker('pipette', options['detected_px'], (255, 0, 0))
+                    centered = self.controller.calibrated_unit.center_pipette(speed=self.controller.config.approach_pipette_speed, **options)
                     self.failure_gate()
                     self.success_gate()
                     if centered is False:
@@ -381,28 +534,19 @@ class ApproachCellPhase(PhaseController):
         observation = state["observation"]
         vision = observation["deep_learning"]
         if state["step"] == 2:
-            depth = vision.get("pipette_focus")
             confidence = vision.get("confidence", {})
-            z_confidence = confidence.get("pipette_focuser")
-            z_ok = (z_confidence is not None and np.isfinite(z_confidence) and z_confidence >= 0.5
-                    or z_confidence is None and vision.get("pipette_focus_confidence_supported") is False)
-            if (depth is not None and np.isfinite(depth) and z_ok
-                    and vision.get("status", {}).get("pipette_focuser") == "ok"
-                    and (confidence.get("pipette_detector") or 0) >= self.controller.calibrated_unit.pipetteCalHelper.pipetteDetector.adapter.threshold):
-                return -abs(depth)
+            score = confidence.get("pipette_detector")
+            tip = vision.get("pipette_position")
+            if (tip is not None and np.shape(tip) == (2,) and np.isfinite(tip).all()
+                    and score is not None and np.isfinite(score)
+                    and score >= self.controller.calibrated_unit.pipetteCalHelper.pipetteDetector.adapter.threshold):
+                return float(score)
             return None
         cell = observation.get("cell_detection")
-        image = observation.get("camera_image")
-        if cell is None or image is None or cell[2] < self.controller.calibrated_stage.cellDetectHelper.cellDetector.conf_threshold:
+        if (cell is None or len(cell) < 3 or not np.isfinite(cell[:3]).all()
+                or cell[2] < self.controller.calibrated_stage.cellDetectHelper.cellDetector.conf_threshold):
             return None
-        x, y = map(int, cell[:2])
-        roi = np.asarray(image)[max(0, y - 32):y + 33, max(0, x - 32):x + 33].astype(float)
-        if roi.ndim == 3:
-            roi = roi.mean(axis=2)
-        if min(roi.shape, default=0) < 3:
-            return None
-        laplacian = roi[2:, 1:-1] + roi[:-2, 1:-1] + roi[1:-1, 2:] + roi[1:-1, :-2] - 4 * roi[1:-1, 1:-1]
-        return float(np.var(laplacian))
+        return float(cell[2])
 
     def _move_microscope(self, speed, state, *, method):
         """Log motion transitions while retaining continuous Search/Scan movement."""
@@ -489,6 +633,11 @@ class ApproachCellPhase(PhaseController):
         if state is not None:
             state["finished"] = True
         if success:
+            if self._vision and state is not None and "cell_focus_z" in state:
+                self.controller._approach_cell_focus = {
+                    "cell_reference": state.get("original_cell_reference", state["cell"][0]),
+                    "z": float(state["cell_focus_z"]), "tracked_cell": state["cell"],
+                    "template_point": state.get("cell_template_point")}
             self.controller.calibrated_stage.set_max_speed(10000)
             self.controller.calibrated_unit.set_max_speed(100000)
             self.controller.info("Approached Cell")

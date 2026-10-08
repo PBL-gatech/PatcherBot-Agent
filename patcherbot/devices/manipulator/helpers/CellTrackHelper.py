@@ -309,6 +309,7 @@ class CellTrackHelper:
             **preprocess: Forwarded to ``PatchMatcher.find_target``.
         """
         tmpl_np = self._ensure_numpy(reference_image)
+        self.last_match_evidence = {"independent": False, "refined": False}
         curr_np = self._ensure_numpy(image)
         if tmpl_np is None or curr_np is None:
             logging.error("CellTrackHelper: expected numpy arrays for matching.")
@@ -393,6 +394,7 @@ class CellTrackHelper:
                 return None
             coarse_point = np.asarray(target_point, dtype=np.float32) + ref_offset
         coarse_point = self._clamp_point(coarse_point, curr_width, curr_height)
+        independent_match = True
 
         offsets_to_use: Iterable[Tuple[float, float]] = (
             offsets if offsets is not None else self._DEFAULT_SEGMENTATION_OFFSETS
@@ -407,6 +409,7 @@ class CellTrackHelper:
                     delta_expected,
                 )
                 coarse_point = expected.copy()
+                independent_match = False
             else:
                 offset_vec = expected - coarse_point
                 if np.any(np.abs(offset_vec) > 1e-3):
@@ -425,6 +428,8 @@ class CellTrackHelper:
             final_point = refined if refined is not None else coarse_point
         else:
             final_point = coarse_point
+        self.last_match_evidence = {"independent": independent_match,
+                                   "refined": bool(use_centroid and refined is not None)}
         return final_point.astype(np.float32)
 
     # ------------------------------------------------------------------ #
