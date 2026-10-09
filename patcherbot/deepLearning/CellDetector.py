@@ -8,20 +8,12 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 import torch
-import importlib.util
+from patcherbot.deepLearning import _import_module_from_path
 
 
 logger = logging.getLogger(__name__)
 
 
-def _import_module_from_path(module_name: str, module_path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load module {module_name} from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules[module_name] = module
-    return module
 
 
 class CellDetector(ABC):

@@ -6,15 +6,50 @@ from patcherbot.devices.manipulator import Manipulator
 from patcherbot.devices.camera import Camera
 from threading import Thread
 import math
+from statistics import median
 
 
 class FocusHelper():
     FOCUSING_MAX_SPEED = 25
     NORMAL_MAX_SPEED = 10000
+    RADIUS_UM = 5.0
+    ENDPOINT_TOLERANCE_UM = 0.2
+    BOUNDARY_TOLERANCE_UM = 1.0
+    TIP_STABILITY_UM = 5.0
+    DEPTH_TOLERANCE_UM = 2.0
+    MIN_STABLE_SAMPLES = 3
+    MIN_PIPETTE_SAMPLES = 3
+    MIN_CELL_SAMPLES = 2
+    CONFIRM_TIMEOUT_S = 5.0
+    CONFIRM_MAX_FRAMES = 8
 
     def __init__(self, microscope: Microscope, camera: Camera):
         self.microscope = microscope
         self.camera = camera
+
+    @staticmethod
+    def reset_state(state, *extra_keys):
+        for key in ("focus_sweep", *extra_keys):
+            state.pop(key, None)
+
+
+    def relocate(self, target):
+        self.microscope.absolute_move(target)
+        self.microscope.wait_until_still()
+
+    def retry_search(self, state, origin, *, bounds, reason, info):
+        """Restart a bounded sweep; the phase owns when recovery is permitted."""
+        sweep = state.pop('focus_sweep', None)
+        if sweep is not None:
+            self.cancel_sweep(sweep)
+        state.update(cell_reacquisition_attempt=state.get('cell_reacquisition_attempt', 0) + 1,
+                     cell_search_bounds=tuple(origin + offset for offset in bounds))
+        info(f"Hunt SEARCH retry {state['cell_reacquisition_attempt']}: reason={reason}; "
+             f"bounds={state['cell_search_bounds']}; maximum_deeper_search_um={bounds[1]:g}; "
+             "last confirmed cell plane retained")
+        return True
+
+
 
     def _distance_scale(self):
         if getattr(self.microscope, "config", None) is not None:
@@ -74,6 +109,302 @@ class FocusHelper():
         # print(f"FinalPosition: {finalPos}")
         self.microscope.absolute_move(finalPos)
         self.microscope.wait_until_still()
+
+
+    def start_sweep(self, center_z, speed, *, motion, pixels_to_um_relative,
+                    abort_check, info, warning, confidence_threshold, bounds=None, label='SEARCH', pipette=False):
+        """Return per-attempt focus state; the caller owns confidence and retry policy."""
+        abort_check()
+        center_z, speed = float(center_z), float(speed)
+        if not math.isfinite(center_z) or not math.isfinite(speed) or speed <= 0:
+            raise ValueError('Focus sweep needs a finite center and positive search speed')
+        low, high = bounds if bounds is not None else (center_z-self.RADIUS_UM, center_z+self.RADIUS_UM)
+        state = dict(center_z=center_z, low=low, high=high, label=label, pipette=pipette,
+            stage='idle', target=None, best_z=None, best_score=-math.inf, best_rank=None,
+            samples=0, seen_frames=set(), tip_samples=[], empty=False,
+            best_xy=None, best_depth=None,
+            deadline=time.monotonic()+max(60.0, 4.0*20.0/speed*20.0), speed=speed,
+            endpoint_correction=False, motion=None, motion_device=motion,
+            pixels_to_um_relative=pixels_to_um_relative, confidence_threshold=confidence_threshold,
+            abort_check=abort_check, info=info, warning=warning)
+        self.microscope.stop()
+        info(f'{label} FOCUS SWEEP: bounds=({low}, {high}); speed={speed}; '
+             f'boundary_tolerance_um={self.BOUNDARY_TOLERANCE_UM}')
+        self._move_focus(state, 'seek_start', low)
+        return state
+
+    def _move_focus(self, state, stage, target):
+        """Advance the objective trajectory without taking over motor monitoring."""
+        state.update(stage=stage, target=float(target), endpoint_correction=False)
+        if stage in ('down', 'up'):
+            speed, deadline = float(state['speed']), float(state['deadline'])
+            if not all(math.isfinite(value) for value in (target, speed, deadline)) or speed <= 0:
+                raise ValueError('Focus motion requires a finite target, deadline and positive speed')
+            reversal_tolerance = float(self.BOUNDARY_TOLERANCE_UM)
+            if not math.isfinite(reversal_tolerance) or reversal_tolerance < 0:
+                raise ValueError('Focus reversal tolerance must be finite and nonnegative')
+
+            def read_position():
+                scale = self._distance_scale()
+                if not math.isfinite(scale) or scale <= 0:
+                    raise RuntimeError('Focus sweep has an invalid microscope position scale')
+                z = float(self.microscope.position()) / scale
+                if not math.isfinite(z):
+                    raise RuntimeError('Focus sweep has no valid objective position')
+                return z
+
+            state['motion'] = state['motion_device'].start(
+                self.microscope, target=float(target), deadline=deadline,
+                read_position=read_position,
+                move_velocity=lambda direction: self.microscope.absolute_move_velocity(-direction * speed),
+                abort_check=state['abort_check'], info=state['info'],
+                label=f'{state["label"]} focus sweep',
+                reversal_tolerance=reversal_tolerance, reversal_slack=1e-6)
+        else:
+            self.microscope.absolute_move(float(target))
+
+    @classmethod
+    def _focus_sample_rank(cls, sample):
+        """Prefer confident pipette XY near focus without consulting Z confidence."""
+        score, _, _, depth = sample
+        if depth is None:
+            return (0, score, 0)
+        error = abs(depth)
+        return (2, score, -error) if error <= cls.DEPTH_TOLERANCE_UM else (1, -error, score)
+
+    def _record_focus_sample(self, state, *, frame_id, focus_z, xy, score, stale, depth=None):
+        """Select an actually sampled plane supported by three stable XY detections."""
+        seen, samples = state['seen_frames'], state['tip_samples']
+        if score is None or focus_z is None or stale or frame_id is None or frame_id in seen:
+            if frame_id not in seen:
+                samples.clear()
+            return
+        seen.add(frame_id)
+        score, focus_z = float(score), float(focus_z)
+        if not math.isfinite(score) or not math.isfinite(focus_z) or not state['low'] <= focus_z <= state['high']:
+            samples.clear()
+            return
+        state['samples'] += 1
+        if xy is None or len(xy) < 2 or not all(math.isfinite(float(value)) for value in xy[:2]):
+            samples.clear()
+            return
+        xy = tuple(float(value) for value in xy[:2])
+        try:
+            depth = float(depth)
+        except (TypeError, ValueError):
+            depth = math.nan
+        depth = depth if math.isfinite(depth) else None
+        if any(not np.linalg.norm(state['pixels_to_um_relative'](np.r_[np.subtract(xy, previous[2]), 0.])[:2]) <= self.TIP_STABILITY_UM for previous in samples):
+            samples.clear()
+        samples.append((score, focus_z, xy, depth))
+        del samples[:-self.MIN_STABLE_SAMPLES]
+        if len(samples) < self.MIN_STABLE_SAMPLES:
+            return
+        rank_sample = self._focus_sample_rank if state['pipette'] else lambda sample: (sample[0],)
+        candidate = sorted(samples, key=rank_sample)[len(samples)//2]
+        rank = rank_sample(candidate)
+        if state['best_rank'] is None or rank > state['best_rank']:
+            score, focus_z, xy, depth = candidate
+            state.update(best_rank=rank, best_score=score, best_z=focus_z,
+                         best_xy=xy, best_depth=depth if state['pipette'] else None)
+
+    @staticmethod
+    def _focus_evidence(state, vision, cell):
+        """Read detector evidence using the caller's current acceptance threshold."""
+        if state['pipette']:
+            xy, score = vision.get('pipette_position'), vision.get('confidence', {}).get('pipette_detector')
+            if (xy is not None and np.shape(xy) == (2,) and np.isfinite(xy).all()
+                    and score is not None and np.isfinite(score)
+                    and score >= state['confidence_threshold']()):
+                return xy, float(score)
+            return xy, None
+        xy = None if cell is None else cell[:2]
+        if (cell is None or len(cell) < 3 or not np.isfinite(cell[:3]).all()
+                or cell[2] < state['confidence_threshold']()):
+            return xy, None
+        return xy, float(cell[2])
+
+    def update_sweep(self, state, actual_z, vision, cell=None, **start_options):
+        """Consume one scored frame and advance the bounded focus trajectory."""
+        if state is None:
+            return self.start_sweep(**start_options)
+        frame_id, focus_z = vision.get('source_frame'), vision.get('source_positions', {}).get('focus_z')
+        xy, score = self._focus_evidence(state, vision, cell)
+        stale, depth = vision.get('stale', True), vision.get('pipette_focus')
+        state['abort_check']()
+        stage, label = state['stage'], state['label']
+        if stage in ('done', 'empty'):
+            return state
+        if stage == 'idle':
+            raise RuntimeError('Focus sweep has not started')
+        motion_done = (state['motion_device'].is_complete(state['motion'])
+                       if state['motion'] is not None else True)
+        if time.monotonic() > state['deadline']:
+            if state['endpoint_correction']:
+                raise RuntimeError(f'{label} focus sweep endpoint correction timed out; '
+                    f'leg={stage}; target_z={state["target"]}; actual_z={actual_z}')
+            raise RuntimeError(f'{label} focus sweep timed out during {stage}')
+        if stage in ('down', 'up') and not state['endpoint_correction']:
+            self._record_focus_sample(state, frame_id=frame_id, focus_z=focus_z, xy=xy,
+                                      score=score, stale=stale, depth=depth)
+        z = float(actual_z)
+        if not math.isfinite(z):
+            raise RuntimeError(f'{label} focus sweep has no valid objective position')
+        if stage in ('down', 'up') and not motion_done:
+            return state
+        tolerance = (self.BOUNDARY_TOLERANCE_UM if stage in ('down', 'up') and not state['endpoint_correction']
+                     else self.ENDPOINT_TOLERANCE_UM)
+        target = state['target']
+        if abs(z-target) > tolerance+1e-6:
+            direction = 1 if stage == 'down' else -1
+            if stage in ('down', 'up') and not state['endpoint_correction'] and direction*(z-target) > self.BOUNDARY_TOLERANCE_UM:
+                state['endpoint_correction'] = True
+                state['info'](f'{label} FOCUS SWEEP: correcting stopped endpoint overshoot; '
+                    f'leg={stage}; actual_z={z}; target_z={target}; error_um={abs(z-target):.3f}; one absolute correction')
+                self.microscope.absolute_move(target)
+            return state
+        if stage in ('seek_start', 'down'):
+            next_stage, endpoint = ('down', 'high') if stage == 'seek_start' else ('up', 'low')
+            self._move_focus(state, next_stage, state[endpoint])
+        elif stage == 'up':
+            if state['best_z'] is None:
+                if not state['pipette']:
+                    state.update(empty=True, stage='empty')
+                    return state
+                state['best_z'] = state['center_z']
+                state['warning'](f'{label} FOCUS SWEEP: no stable pipette XY samples; '
+                    f'returning to saved pipette plane z={state["center_z"]}; fresh XY detection still required')
+            elif state['pipette'] and (state['best_depth'] is None
+                    or abs(state['best_depth']) > self.DEPTH_TOLERANCE_UM):
+                state['warning'](f'{label} FOCUS SWEEP: no stable near-focus XY candidate; '
+                    f'using best available XY fallback; predicted_defocus_um={state["best_depth"]}; '
+                    f'box_confidence={state["best_score"]}; target_z={state["best_z"]}; Z confidence ignored')
+            self._move_focus(state, 'return', state['best_z'])
+        elif stage == 'return':
+            self.cancel_sweep(state)
+            state['stage'] = 'done'
+            state['info'](f'{label} FOCUS SWEEP: finished; best_z={state["best_z"]}; '
+                          f'score={state["best_score"]}; valid_samples={state["samples"]}')
+            self.start_confirmation(state)
+        return state
+
+    def cancel_sweep(self, state):
+        """Stop an active focus leg before its owning phase changes tasks."""
+        if state.get('motion') is not None:
+            state['motion_device'].cancel(state['motion'])
+        else:
+            self.microscope.stop()
+
+    def start_confirmation(self, sweep):
+        """Create a stationary-frame accumulator after returning to a focus plane."""
+        pipette, selected_xy = sweep['pipette'], sweep.get('best_xy')
+        if pipette and selected_xy is not None:
+            try:
+                selected_xy = tuple(float(value) for value in selected_xy)
+            except (TypeError, ValueError):
+                selected_xy = ()
+            if len(selected_xy) != 2 or not all(math.isfinite(value) for value in selected_xy):
+                selected_xy = ()
+        sweep['confirmation'] = dict(label='pipette' if pipette else 'cell', pipette=pipette, selected_xy=selected_xy,
+            pixels_to_um_relative=sweep['pixels_to_um_relative'], info=sweep['info'], warning=sweep['warning'],
+            started_at=time.monotonic(), valid_samples=0, depths=[], depth_advisory=sweep.get('depth_advisory', True),
+            depth_warnings=set(), seen_frames=set(), last_frame=None, last_vision={}, confirmed=False,
+            xy_samples=[], confirmed_tip_xy=None)
+
+    @staticmethod
+    def _confirmation_failed(state, reason):
+        """Report settled-evidence failure without deciding the phase's retry policy."""
+        vision = state['last_vision']
+        depth = median(state['depths']) if state['depths'] else None
+        raise RuntimeError(f'{state["label"]} focus confirmation failed: {reason}; '
+            f'fresh_frames={len(state["seen_frames"])}; valid_samples={state["valid_samples"]}; '
+            f'median_abs_depth_um={depth}; last_depth_um={vision.get("pipette_focus")}; '
+            f'confidence={vision.get("confidence")}; model_status={vision.get("status")}')
+
+    def update_confirmation(self, sweep, vision, cell=None):
+        """Accept distinct settled frames with stable XY; pipette depth stays advisory."""
+        xy, score = self._focus_evidence(sweep, vision, cell)
+        valid, state = score is not None, sweep['confirmation']
+        frame_id, retrieved_at = vision.get('source_frame'), vision.get('frame_retrieval_started_at')
+        stale, confidence = vision.get('stale', True), vision.get('confidence', {})
+        depth, focus_status = vision.get('pipette_focus'), vision.get('status', {}).get('pipette_focuser')
+        if state['confirmed']:
+            return True
+        if time.monotonic()-state['started_at'] >= self.CONFIRM_TIMEOUT_S:
+            self._confirmation_failed(state, 'timed out waiting for settled camera evidence')
+        if (stale or frame_id is None or frame_id in state['seen_frames'] or retrieved_at is None
+                or not math.isfinite(retrieved_at) or retrieved_at < state['started_at']):
+            return None
+        state['seen_frames'].add(frame_id)
+        state['last_frame'] = frame_id
+        state['last_vision'] = dict(pipette_focus=depth, confidence=confidence,
+                                   status={'pipette_focuser': focus_status})
+        sample_valid = (bool(valid) and xy is not None and len(xy) >= 2
+                        and all(math.isfinite(float(value)) for value in xy[:2]))
+        expected, samples = state['selected_xy'], state['xy_samples']
+        if sample_valid:
+            xy = tuple(float(value) for value in xy[:2])
+            if expected is not None:
+                distance = np.linalg.norm(state['pixels_to_um_relative'](np.r_[np.subtract(xy, expected), 0.])[:2]) if len(expected) >= 2 else math.inf
+                sample_valid = math.isfinite(distance) and distance <= self.TIP_STABILITY_UM
+                if not sample_valid:
+                    state['info'](f'{state["label"]} FOCUS CONFIRM: XY rejected; current_xy={xy}; '
+                        f'selected_xy={expected}; selected_error_um={distance}; tolerance_um={self.TIP_STABILITY_UM}')
+        if sample_valid:
+            if any(not np.linalg.norm(state['pixels_to_um_relative'](np.r_[np.subtract(xy, previous), 0.])[:2]) <= self.TIP_STABILITY_UM for previous in samples):
+                samples.clear()
+            samples.append(xy)
+        else:
+            samples.clear()
+        state['valid_samples'] = len(samples)
+        if state['pipette'] and sample_valid and state['depth_advisory']:
+            try:
+                numeric_depth = float(depth)
+            except (TypeError, ValueError):
+                numeric_depth = math.nan
+            if math.isfinite(numeric_depth):
+                state['depths'].append(abs(numeric_depth))
+            else:
+                state['depth_warnings'].add('missing or non-finite Z estimate')
+            if focus_status != 'ok':
+                state['depth_warnings'].add(f'Z model status={focus_status}')
+        aggregate = median(state['depths']) if state['depths'] else None
+        state['confirmed'] = state['valid_samples'] >= (self.MIN_PIPETTE_SAMPLES if state['pipette'] else self.MIN_CELL_SAMPLES)
+        if state['confirmed'] and state['pipette']:
+            candidate = tuple(median(point[axis] for point in samples) for axis in (0, 1))
+            distance = np.linalg.norm(state['pixels_to_um_relative'](np.r_[np.subtract(candidate, expected), 0.])[:2]) if expected is not None else 0.0
+            if not math.isfinite(distance) or distance > self.TIP_STABILITY_UM:
+                state['confirmed'] = False
+                state['valid_samples'] = 0
+                samples.clear()
+                state['info'](f'{state["label"]} FOCUS CONFIRM: median XY rejected; selected_tip_error_um={distance}')
+            else:
+                state['confirmed_tip_xy'] = candidate
+                if aggregate is not None and aggregate > self.DEPTH_TOLERANCE_UM:
+                    state['depth_warnings'].add('median Z estimate exceeds 2 um')
+                if state['depth_warnings']:
+                    state['warning'](f'{state["label"]} FOCUS CONFIRM: reliable pipette XY accepted; '
+                        f'Z focus remains advisory: {"; ".join(sorted(state["depth_warnings"]))}; '
+                        f'median_abs_depth_um={aggregate}; confidence={confidence}')
+        if state['confirmed']:
+            return True
+        if len(state['seen_frames']) >= self.CONFIRM_MAX_FRAMES:
+            self._confirmation_failed(state, 'no reliable focus confirmation within the fresh-frame limit')
+        return None
+
+
+    def confirmed_evidence(self, sweep, vision, *, pipette=False, used_frames=()):
+        """Return settled confirmation only when this frame is fresh and unused."""
+        confirmation, frame = sweep.get('confirmation'), vision.get('source_frame')
+        if confirmation is None or confirmation['confirmed'] is not True:
+            return None
+        minimum = self.MIN_PIPETTE_SAMPLES if pipette else self.MIN_CELL_SAMPLES
+        if (bool(not confirmation['pipette']) == pipette
+                or confirmation['valid_samples'] < minimum or len(confirmation['seen_frames']) < minimum
+                or vision.get('stale', True) or frame is None or frame != confirmation.get('last_frame')
+                or frame not in confirmation['seen_frames'] or frame in used_frames):
+            return None
+        return confirmation
 
 
 class FocusUpdater(Thread):

@@ -1,4 +1,4 @@
-﻿# coding=utf-8
+# coding=utf-8
 """
 A class to handle a manipulator unit with coordinates calibrated to the reference system of a camera.
 It contains methods to calibrate the unit.
@@ -10,18 +10,16 @@ Should this be in devices/ ? Maybe in a separate calibration folder
 """
 from __future__ import print_function
 from __future__ import absolute_import
-from typing import List
 from .manipulatorunit import *
-from numpy import (array, zeros, dot, arange, vstack, sign, pi, arcsin,
-                   mean, std, isnan)
+from numpy import array, zeros, dot, isnan
 import cv2
 import numpy as np
 import time
 import math
 from patcherbot.devices.manipulator import *
 
-from numpy.linalg import inv, pinv, norm
-from threading import Thread
+from numpy.linalg import pinv, norm
+from .helpers.ActionHelper import ActionHelper
 from .helpers.StageCalHelper import FocusHelper, StageCalHelper
 from .helpers.StageScanHelper import StageScanHelper
 from .helpers.PipetteCalHelper import PipetteCalHelper, PipetteFocusHelper
@@ -86,6 +84,7 @@ class CalibratedUnit(ManipulatorUnit):
         self.r0 = zeros(3) # offset for px -> um conversion
         self.r0_inv = zeros(3) # offset for um -> px conversion
         self.unit = unit
+        self.actionHelper = ActionHelper()
 
         self.emperical_offset = np.zeros(3) # offset for pipette position in px based on deep learning model
 
@@ -95,12 +94,25 @@ class CalibratedUnit(ManipulatorUnit):
             unit, camera, config=self.config, detector=self.pipetteCalHelper.pipetteDetector
         )
 
-    def detect_pipette(self):
-        frame = self.camera.last_raw_frame_data()
-        if frame is None or frame[2] is None:
-            self.camera.show_circles([])
-            return None
-        point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame[2])
+
+    def detect_pipette(self, observer=None):
+        evidence = None
+        if observer is None:
+            frame = self.camera.last_raw_frame_data()
+            if frame is None or frame[2] is None:
+                self.camera.show_circles([])
+                return None
+            point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame[2])
+        else:
+            anchor = getattr(self, '_tip_reference', None)
+            evidence = observer.infer_frame(["pipette_image_xy"], frame_context={
+                "pipette_expected_xy": lambda: (self.reference_position(anchor=anchor)[:2] if anchor is not None
+                    else np.array([self.camera.width / 2., self.camera.height / 2.])),
+                "pipette_xyz": self.position, "stage_xy": self.stage.position},
+                confirmation={"confidence_threshold": lambda: 0.5})
+            point = evidence.get("confirmed_tip_xy")
+            if point is None:
+                point = evidence.get("pipette_position")
         if point is None:
             self.camera.show_circles([])
             return None
@@ -109,17 +121,13 @@ class CalibratedUnit(ManipulatorUnit):
             self.camera.show_circles([])
             return None
         point = tuple(np.rint(point[:2]).astype(int))
-        self.refresh_tip_reference()
+        if evidence is not None and evidence.get("confirmed_tip_xy") is not None:
+            source = evidence["source_positions"]
+            self.set_tip_reference(evidence["confirmed_tip_xy"], source["pipette_xyz"], source["stage_xy"])
         self.camera.show_circle(point)
         return point
 
-    def tracked_tip_position(self, trusted=False):
-        anchor = getattr(self, '_trusted_tip_reference' if trusted else '_tip_reference', None)
-        if anchor is None:
-            return None
-        tip, position, stage_position = anchor
-        return (tip + self.um_to_pixels_relative(self.position() - position)[:2]
-                + self.stage.um_to_pixels_relative(self.stage.position() - stage_position)[:2])
+
 
     def set_tip_reference(self, tip, position=None, stage_position=None, trusted=True):
         """Anchor image XY to supplied sampling positions, or current positions."""
@@ -133,43 +141,6 @@ class CalibratedUnit(ManipulatorUnit):
         if trusted:
             self._trusted_tip_reference = tuple(value.copy() for value in self._tip_reference)
 
-    def refresh_tip_reference(self, expected_xy=None):
-        """Refresh the normal triangle from stable detections without moving devices."""
-        try:
-            if getattr(self.camera, 'pipette_indicator_active', False):
-                return None
-            expected = self.tracked_tip_position() if expected_xy is None else np.asarray(expected_xy)
-            if expected is None:
-                expected = np.array([self.camera.width / 2., self.camera.height / 2.])
-            points, seen = [], set()
-            for _ in range(8):
-                self.abort_if_requested()
-                frame = self.camera.last_raw_frame_data()
-                if frame is None or frame[0] in seen:
-                    self.sleep(0.05)
-                    continue
-                seen.add(frame[0])
-                result = self.pipetteCalHelper.pipetteDetector.detect_pipette_details(
-                    frame[2], expected_tip_xy=expected,
-                    pixels_to_um=self.stage.pixels_to_um_relative, radius_um=50.0)
-                tip = result.get('tip_xy')
-                if tip is None or (result.get('box_confidence') or 0) < 0.5:
-                    points.clear()
-                    continue
-                point = np.asarray(tip, dtype=float)
-                if any(np.linalg.norm(self.stage.pixels_to_um_relative(point - old)[:2]) > 5 for old in points):
-                    points.clear()
-                points.append(point)
-                if len(points) == 3:
-                    point = np.median(points, axis=0)
-                    self.set_tip_reference(point)
-                    self.info(f'Pipette reference refreshed: xy={point}; 3 stable detections; radius_um=50')
-                    return point
-            self.warning('Pipette reference not refreshed: no 3 stable confident detections; keeping calibrated marker')
-        except Exception as error:
-            self.abort_if_requested()
-            self.warning(f'Pipette reference display refresh failed: {error}; keeping calibrated marker')
-        return None
 
     def save_state(self):
         if self.stage is not None:
@@ -212,6 +183,7 @@ class CalibratedUnit(ManipulatorUnit):
             return np.array([xy[0], xy[1], 0])
         else: #3x3 pipette movement
             return dot(self.Minv, pos_pixels)
+
     
     def um_to_pixels(self, pos_microns):
         '''
@@ -228,7 +200,7 @@ class CalibratedUnit(ManipulatorUnit):
 
 
 
-    def reference_position(self, include_offset = True):
+    def reference_position(self, include_offset=True, *, anchor=None):
         '''
         Position of the pipette in pixels (camera coordinate frame)
 
@@ -244,6 +216,12 @@ class CalibratedUnit(ManipulatorUnit):
             pos_pixels = self.um_to_pixels(pos_um) + self.stage.reference_position() + self.emperical_offset
         else:
             pos_pixels = self.um_to_pixels(pos_um) + self.stage.reference_position()
+        if anchor is not None:
+            tip, position, stage_position = anchor
+            pos_pixels = np.asarray(pos_pixels, dtype=float).copy()
+            pos_pixels[:2] = (np.asarray(tip, dtype=float)[:2]
+                + self.um_to_pixels_relative(pos_um - position)[:2]
+                + self.stage.um_to_pixels_relative(self.stage.position() - stage_position)[:2])
         return pos_pixels # position vector (pixels) in camera system
 
     def reference_move(self, pos_pixels):
@@ -433,8 +411,7 @@ class CalibratedUnit(ManipulatorUnit):
                 self.last_pipette_move_failure = 'Missing valid calibrated pipette reference; SHIFT cancelled'
                 self.warning(self.last_pipette_move_failure)
                 return False
-            offset = np.asarray(self.stage.pixels_to_um_relative(detected_px[:2] - expected), dtype=float)[:2]
-            if not np.isfinite(offset).all() or np.linalg.norm(offset) > max_deviation_um:
+            if not np.linalg.norm(self.stage.pixels_to_um_relative(np.r_[detected_px[:2] - expected, 0.])[:2]) <= max_deviation_um:
                 self.last_pipette_move_failure = 'Pipette detection disagrees with calibrated position; SHIFT cancelled'
                 self.warning(f'{self.last_pipette_move_failure}; detected_xy={detected_px[:2]}; '
                              f'expected_xy={expected}; tolerance_um={max_deviation_um}')
@@ -702,44 +679,27 @@ class CalibratedUnit(ManipulatorUnit):
         progress_timeout = max(2.0, expected_time * 5.0)
         overall_timeout = max(10.0, expected_time * 20.0)
         start_time = time.perf_counter()
-        last_progress_time = start_time
-        best_progress = 0.0
-        signed_traveled = 0.0
-        elapsed = 0.0
-        opposite_direction_warned = False
-        completed = False
         self.info(f"Pipette velocity move: target={distance:.2f} um; velocity_command={velocity}; "
                   f"no_progress_timeout_s={progress_timeout:.2f}; overall_timeout_s={overall_timeout:.2f}")
 
+        def sample(expired):
+            curr_pos = np.asarray(self.position(), dtype=float)
+            traveled = float(np.dot(curr_pos - start_pos, direction))
+            return traveled, traveled, time.perf_counter()
+
         self.absolute_move_group_velocity(velocity)
         try:
-            while not self.abort_requested:
-                curr_pos = np.asarray(self.position(), dtype=float)
-                signed_traveled = float(np.dot(curr_pos - start_pos, direction))
-                now = time.perf_counter()
-                elapsed = now - start_time
-                if signed_traveled >= distance - position_tolerance:
-                    completed = True
-                    break
-                if (signed_traveled < 0) and (not opposite_direction_warned):
-                    self.warning(
-                        "Velocity move is progressing away from the target position."
-                    )
-                    opposite_direction_warned = True
-                if signed_traveled <= -distance:
-                    self.last_pipette_move_failure = "Pipette moved away from its target"
-                    break
-                if signed_traveled >= best_progress + position_tolerance:
-                    best_progress = signed_traveled
-                    last_progress_time = now
-                if elapsed > overall_timeout:
-                    self.last_pipette_move_failure = f"Overall movement timeout after {elapsed:.2f}s"
-                    break
-                if now - last_progress_time > progress_timeout:
-                    self.last_pipette_move_failure = (
-                        f"No forward progress for {now - last_progress_time:.2f}s")
-                    break
-                self.sleep(poll_interval)
+            result = self.actionHelper.monitor(sample, endpoint=distance - position_tolerance,
+                tolerance=position_tolerance, start_time=start_time,
+                deadline=overall_timeout,
+                cancelled=lambda: self.abort_requested, pause=lambda: self.sleep(poll_interval),
+                reversed=lambda progress: progress <= -distance,
+                report_drift=lambda progress: self.warning(
+                    "Velocity move is progressing away from the target position."),
+                progress_timeout=progress_timeout)
+            completed, signed_traveled, elapsed = result.reached, result.traveled, result.elapsed
+            self.last_pipette_move_failure = (
+                "Pipette moved away from its target" if result.failure == 'reverse' else result.failure)
         finally:
             self.stop()
             self.wait_until_still()
@@ -1113,7 +1073,7 @@ class CalibratedStage(CalibratedUnit):
                             self.camera.height / 2])[:n_axes]
 
         # ------------------------------------------------------------------
-        # Pixel error  â†’ stage move (same sign).  
+        # Pixel error -> stage move (same sign).
         # (Stage motion and image motion are opposite, so this cancels the error.)
         # ------------------------------------------------------------------
         error_px = desired_px - centroid[:n_axes] 
@@ -1136,11 +1096,11 @@ class CalibratedStage(CalibratedUnit):
 
         # ------------------------------------------------------------------
 
-        self.reference_relative_move(error_px)   # px â†’ Âµm handled inside
+        self.reference_relative_move(error_px)   # px → µm handled inside
         self.wait_until_still()
 
-        # more debug (final position in Âµm and px)
-        self.info(f"new stage Âµm position: {self.position()}")
+        # more debug (final position in µm and px)
+        self.info(f"new stage µm position: {self.position()}")
         # self.info(f"new stage px offset  : {self.reference_position()}")
 
 

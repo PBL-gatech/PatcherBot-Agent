@@ -285,21 +285,12 @@ class LogNotifyHandler(logging.Handler):
     def emit(self, record):
         self.format(record)
         if record.exc_info is None:
-            message = record.msg
+            message = record.message
         else:
             _, exc, _ = record.exc_info
-            message = '{} ({})'.format(record.msg, str(exc))
+            message = '{} ({})'.format(record.message, str(exc))
         self.signal.emit(message)
 
-
-class DetectionOverlayNotifyHandler(logging.Handler):
-    """Forward overlay warnings to the GUI thread without blocking acquisition."""
-    def __init__(self, signal):
-        super().__init__(level=logging.WARNING)
-        self.signal = signal
-
-    def emit(self, record):
-        self.signal.emit(record.getMessage())
 
 class RecordingDialog(QDialog):
     def __init__(self, base_directory, frame_rate, pixels, settings, parent=None):
@@ -420,7 +411,6 @@ class CameraGui(QtWidgets.QMainWindow):
         ``False``.
     '''
     log_signal = QtCore.pyqtSignal('QString')
-    detection_overlay_warning_signal = QtCore.pyqtSignal('QString')
     camera_signal = QtCore.pyqtSignal(MethodType, object)
     camera_reset_signal = QtCore.pyqtSignal(TaskController)
     aux_camera_signal = QtCore.pyqtSignal(MethodType, object)
@@ -627,30 +617,10 @@ class CameraGui(QtWidgets.QMainWindow):
 
         # Display error messages directly in the status bar
         handler = LogNotifyHandler(self.log_signal)
-        handler.setLevel(logging.ERROR)
+        handler.setLevel(logging.WARNING)
+        handler.addFilter(lambda record: record.levelno >= logging.ERROR or bool(getattr(record, "detection_overlay", False)))
         logging.getLogger('patcherbot').addHandler(handler)
-        self.log_signal.connect(self.error_status)
-
-        self._detection_overlay_message_box = None
-        self._detection_overlay_handler = DetectionOverlayNotifyHandler(self.detection_overlay_warning_signal)
-        self.detection_overlay_warning_signal.connect(self.show_detection_overlay_warning, Qt.QueuedConnection)
-        logging.getLogger('patcherbot.detection_overlay').addHandler(self._detection_overlay_handler)
-
-    @QtCore.pyqtSlot(str)
-    def show_detection_overlay_warning(self, message):
-        """Show one reusable, nonmodal warning for detection overlay failures."""
-        if self._detection_overlay_message_box is None:
-            box = QtWidgets.QMessageBox(self)
-            box.setIcon(QtWidgets.QMessageBox.Warning)
-            box.setWindowTitle('Detection display warning')
-            box.setStandardButtons(QtWidgets.QMessageBox.Ok)
-            box.setTextFormat(Qt.PlainText)
-            box.setModal(False)
-            box.setWindowModality(Qt.NonModal)
-            self._detection_overlay_message_box = box
-        self._detection_overlay_message_box.setText(message)
-        self._detection_overlay_message_box.show()
-        self._detection_overlay_message_box.raise_()
+        self.log_signal.connect(self.error_status, Qt.QueuedConnection)
 
     def _update_switch_button_text(self):
         if not hasattr(self, 'switch_view_button') or self.switch_view_button is None:
@@ -836,7 +806,6 @@ class CameraGui(QtWidgets.QMainWindow):
         return image
 
     def closeEvent(self, evt):
-       logging.getLogger('patcherbot.detection_overlay').removeHandler(self._detection_overlay_handler)
        self.close()
        return super(CameraGui, self).closeEvent(evt)
 
@@ -1015,6 +984,37 @@ class CameraGui(QtWidgets.QMainWindow):
     def status_message_updated(self, message):
         if not message:
             self.status_bar.setStyleSheet('QStatusBar{color: black;}')
+
+
+    def draw_position_markers(self, painter, markers, camera, *, cell_only=False):
+        """Render supplied image geometry with shared overlay styles and flipping."""
+        width, height = camera.width, camera.height
+        styles = {"selected": (5, "#00ff00"), "cell": (4, "#0000ff"), "pipette": (0, "#ff0000")}
+        for kind, coordinates, calibrated_direction in markers:
+            if kind == "pipette" and cell_only:
+                continue
+            point = coordinates.copy()
+            if camera.flipped:
+                point[0] = width - 1 - point[0]
+            if not (0 <= point[0] < width and 0 <= point[1] < height):
+                continue
+            radius, color = styles[kind]
+            pen = QtGui.QPen(QtGui.QColor(color), 1)
+            pen.setCosmetic(True)
+            painter.setPen(Qt.NoPen if kind == "cell" else pen)
+            painter.setBrush(Qt.NoBrush if kind == "selected" else QtGui.QColor(color))
+            if kind != "pipette":
+                painter.drawEllipse(QtCore.QPointF(*point), radius, radius)
+                continue
+            direction = calibrated_direction.copy()
+            if camera.flipped:
+                direction[0] = -direction[0]
+            side = (-direction[1], direction[0])
+            painter.drawPolygon(QtGui.QPolygonF([
+                QtCore.QPointF(*point),
+                QtCore.QPointF(*(point[i] - 12 * direction[i] + 5 * side[i] for i in (0, 1))),
+                QtCore.QPointF(*(point[i] - 12 * direction[i] - 5 * side[i] for i in (0, 1)))]))
+
 
     @QtCore.pyqtSlot('QString')
     def error_status(self, message):

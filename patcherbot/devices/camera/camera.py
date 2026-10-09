@@ -122,9 +122,6 @@ class Camera(object):
         self.stop_show_time = 0
         self.point_to_show = None
         self._transient_circles = ((), 0.0)
-        self._detection_markers = {}
-        self._detection_marker_errors = set()
-        self._pipette_indicator_owner = None
         self.cell_list = []
         self._frame_pair_lock = threading.Lock()
         self._last_frame_pair = None
@@ -149,130 +146,6 @@ class Camera(object):
         self._transient_circles = (circles, stop_show_time)
         self.point_to_show = list(circles[0]) if len(circles) == 1 else None
         self.stop_show_time = stop_show_time
-
-    @property
-    def pipette_indicator_active(self):
-        return self._pipette_indicator_owner is not None
-
-    def begin_pipette_indicator(self, owner):
-        if owner is None:
-            raise ValueError("Pipette indicator requires an owner token")
-        self._pipette_indicator_owner = owner
-        markers = dict(self._detection_markers)
-        markers.pop('pipette', None)
-        self._detection_markers = markers
-
-    def end_pipette_indicator(self, owner):
-        if self._pipette_indicator_owner is not owner:
-            return
-        try:
-            markers = dict(self._detection_markers)
-            markers.pop('pipette', None)
-            self._detection_markers = markers
-        finally:
-            self._pipette_indicator_owner = None
-
-    def get_pipette_indicator(self):
-        if not self.pipette_indicator_active:
-            return None
-        marker = self._detection_markers.get('pipette')
-        if marker is None:
-            return None
-        try:
-            point, _, _, position_reader, anchor, _, direction = marker
-            point = np.asarray(point, dtype=float)
-            if position_reader is not None:
-                current = np.asarray(position_reader(), dtype=float).reshape(-1)
-                if current.size != 2 or not np.isfinite(current).all():
-                    raise ValueError("Pipette indicator position is unavailable")
-                point = point + current - anchor
-            if direction is None:
-                return None
-            return dict(pipette_xy=point.copy(), pipette_direction_xy=np.asarray(direction).copy(),
-                        image_shape=(self.height, self.width), at=time.monotonic())
-        except Exception as error:
-            self._warn_detection_marker('pipette', error)
-            return None
-
-    def show_detection_marker(self, name, point, color=(255, 0, 0), radius=4, *, position_reader=None, shape='circle', direction=None):
-        """Retain an RGB dot, optionally tracking a calibrated pixel-position reader."""
-        try:
-            coordinates = np.asarray(point, dtype=float).reshape(-1)
-            if coordinates.size != 2 or not np.isfinite(coordinates).all():
-                raise ValueError("Detection marker needs two finite coordinates")
-            rgb = tuple(int(channel) for channel in color)
-            if len(rgb) != 3 or any(channel < 0 or channel > 255 for channel in rgb):
-                raise ValueError("Detection marker needs an RGB color")
-            if int(radius) < 1:
-                raise ValueError("Detection marker radius must be positive")
-            if shape not in ('circle', 'triangle'):
-                raise ValueError("Unknown detection marker shape")
-            if shape == 'triangle':
-                direction = np.asarray(direction, dtype=float).reshape(-1)
-                if direction.size != 2 or not np.isfinite(direction).all() or np.linalg.norm(direction) == 0:
-                    raise ValueError("Triangle marker needs a finite nonzero calibrated direction")
-                direction = direction / np.linalg.norm(direction)
-            anchor = None
-            if position_reader is not None:
-                anchor = np.asarray(position_reader(), dtype=float).reshape(-1)
-                if anchor.size != 2 or not np.isfinite(anchor).all():
-                    raise ValueError("Detection marker needs a finite calibrated pixel position")
-                anchor = anchor.copy()
-            marker = (tuple(coordinates), int(radius), rgb[::-1], position_reader, anchor, shape, direction)
-            self._detection_markers = dict(self._detection_markers, **{str(name): marker})
-            return True
-        except Exception as error:
-            if position_reader is not None:
-                markers = dict(self._detection_markers)
-                markers.pop(str(name), None)
-                self._detection_markers = markers
-            self._warn_detection_marker(name, error)
-            return False
-
-    def clear_detection_markers(self):
-        self._detection_markers = {}
-        self._detection_marker_errors.clear()
-
-    def _warn_detection_marker(self, name, error):
-        message = f"Could not display detection marker {name}: {error}. Patching continues."
-        if message not in self._detection_marker_errors:
-            self._detection_marker_errors.add(message)
-            try:
-                logging.getLogger('patcherbot.detection_overlay').warning(message)
-            except Exception:
-                pass  # A failed warning display must not interrupt acquisition or patching.
-
-    def _draw_detection_markers(self, img):
-        markers = self._detection_markers
-        if not markers:
-            return img
-        try:
-            if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            for name, (point, radius, bgr, position_reader, anchor, shape, direction) in markers.items():
-                if name == 'pipette' and self.pipette_indicator_active:
-                    continue
-                try:
-                    if position_reader is not None:
-                        current = np.asarray(position_reader(), dtype=float).reshape(-1)
-                        if current.size != 2 or not np.isfinite(current).all():
-                            raise ValueError("Detection marker position is unavailable")
-                        point = np.asarray(point) + current - anchor
-                    point = tuple(int(round(value)) for value in point)
-                    if shape == 'triangle':
-                        side = np.array([-direction[1], direction[0]])
-                        tip = np.asarray(point, dtype=float)
-                        vertices = np.rint([tip, tip - 12 * direction + 5 * side,
-                                            tip - 12 * direction - 5 * side]).astype(np.int32)
-                        img = cv2.fillConvexPoly(img, vertices, bgr)
-                    else:
-                        img = cv2.circle(img, point, radius, bgr, -1)
-                except Exception as error:
-                    self._warn_detection_marker(name, error)
-            return img
-        except Exception as error:
-            self._warn_detection_marker('overlay', error)
-            return img
 
     def start_acquisition(self):
         self._acquisition_thread = AcquisitionThread(camera=self,
@@ -380,8 +253,6 @@ class Camera(object):
 
                 # cv2.drawContours(img, contours, -1, (0, 255, 0), thickness=1)
             img = cv2.circle(img, (int(x), int(y)), 5, (0, 255, 0), 1)
-
-        img = self._draw_detection_markers(img)
 
         if self.flipped:
             img = img[:, ::-1]

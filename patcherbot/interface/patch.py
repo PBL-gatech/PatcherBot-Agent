@@ -207,6 +207,7 @@ class AutoPatchInterface(TaskInterface):
                 f"removing last cell {last_cell}... {self.is_selecting_cells}, at {self.cells_to_patch}"
             )
             self.cells_to_patch = self.cells_to_patch[:-1]
+            self.update_camera_cell_list()
         else:
             self.info("remove_last_cell called but there are no cells to remove")
 
@@ -217,6 +218,7 @@ class AutoPatchInterface(TaskInterface):
             first_cell = self.cells_to_patch[0]
             self.info(f"Removing first queued cell {first_cell}")
             self.cells_to_patch = self.cells_to_patch[1:]
+            self.update_camera_cell_list()
         else:
             self.info("_remove_first_cell called but there are no cells to remove")
 
@@ -327,40 +329,93 @@ class AutoPatchInterface(TaskInterface):
             self.cells_to_patch.append((np.array(stage_pos_pixels), img, stage_pos_um, img_fluo))
             self.is_selecting_cells = False
 
-    def update_camera_cell_list(self) -> None:
-        """Publish calibrated display coordinates from the devices' cached positions."""
-        controller = self.current_autopatcher
-        unit, stage = controller.calibrated_unit, controller.calibrated_stage
-        camera = unit.camera
+    def update_camera_cell_list(self):
+        """Project accepted observation anchors into one camera snapshot."""
         self.pipette_controller.display_positions = None
-        camera.cell_list = []
-        if not stage.calibrated or getattr(stage, "must_be_recalibrated", False):
-            return
+        controller = self.current_autopatcher
+        warning = self.warning
+        unit, stage = controller.calibrated_unit, controller.calibrated_stage
+        unit.camera.cell_list = []
+        if not stage.calibrated or getattr(stage, 'must_be_recalibrated', False):
+            return None
         try:
             stage_pixels = np.asarray(stage.reference_position(), dtype=float)
             if not np.isfinite(stage_pixels).all():
-                return
-            camera.cell_list = [
-                ((stage_pixels - cell)[:2].astype(int), image, position)
-                for cell, image, position, _ in tuple(self.cells_to_patch)]
-            if not unit.calibrated or getattr(unit, "must_be_recalibrated", False):
-                return
-            home = np.asarray(controller.home_position, dtype=float)
-            stage_home = np.asarray(controller.home_stage_position, dtype=float)
-            if (home.shape != (3,) or stage_home.shape != (3,)
-                    or not np.isfinite(home).all() or not np.isfinite(stage_home).all()):
-                return
-            # HOME aligns the tip with image center; only displacement moves the arrow.
-            tip = unit.tracked_tip_position()
-            if tip is None:
-                tip = controller.expected_pipette_xy()
-            if np.isfinite(tip).all():
-                self.pipette_controller.display_positions = dict(
-                    pipette_xy=tip.copy(), at=time.monotonic(),
-                    pipette_direction_xy=np.asarray(unit.M, dtype=float)[:2, 0].copy(),
-                    image_shape=(camera.height, camera.width))
+                return None
+            evidence = getattr(controller, 'alignment_display', None) or {}
+            owner, reference = evidence.get('owner'), evidence.get('cell_reference')
+            if getattr(self, '_display_owner', None) is not owner:
+                self._display_owner, self._display_errors = owner, set()
+            if not hasattr(self, '_display_errors'):
+                self._display_errors = set()
+            captured_at, markers, pipette_shown = time.monotonic(), [], False
+            selected = [(cell, (stage_pixels - cell)[:2].copy()) for cell, _, _, _ in tuple(self.cells_to_patch)]
+            for key in ('cell', 'pipette', 'fallback'):
+                name, marker = ('pipette' if key == 'fallback' else key), evidence.get(key)
+                if ((marker is None and key != 'fallback') or (name == 'pipette' and pipette_shown)
+                        or (name == 'cell' and not any(cell is reference for cell, _ in selected))):
+                    continue
+                try:
+                    if marker is None:
+                        if not unit.calibrated or getattr(unit, 'must_be_recalibrated', False):
+                            continue
+                        homes = np.asarray([controller.home_position, controller.home_stage_position], dtype=float)
+                        if homes.shape != (2, 3) or not np.isfinite(homes).all():
+                            continue
+                        anchor = (getattr(unit, '_tip_reference', None)
+                                  or getattr(unit, '_trusted_tip_reference', None)
+                                  or (np.array([unit.camera.width / 2., unit.camera.height / 2.]), homes[0], homes[1][:2]))
+                        point = unit.reference_position(anchor=anchor)[:2]
+                        point = np.asarray(point, dtype=float).copy()
+                    else:
+                        point, anchor = np.asarray(marker['xy'], dtype=float).copy(), np.asarray(marker['stage_xy'], dtype=float)
+                        if (point.shape != (2,) or anchor.shape != (2,)
+                                or not np.isfinite(point).all() or not np.isfinite(anchor).all()):
+                            raise ValueError('Marker needs finite image and stage XY coordinates')
+                        point += stage.um_to_pixels_relative(stage.position() - anchor)[:2]
+                        if name == 'pipette':
+                            anchor = np.asarray(marker['pipette_xyz'], dtype=float)
+                            if anchor.shape != (3,) or not np.isfinite(anchor).all():
+                                raise ValueError('Pipette marker needs finite XYZ coordinates')
+                            point += unit.um_to_pixels_relative(unit.position() - anchor)[:2]
+                    if point is None:
+                        continue
+                    direction = None
+                    if name == 'pipette':
+                        direction = np.asarray(unit.M, dtype=float)[:2, 0].copy()
+                        length = np.linalg.norm(direction)
+                        if direction.shape != (2,) or not np.isfinite(direction).all() or length == 0:
+                            raise ValueError('Pipette marker needs a calibrated direction')
+                        if not np.isfinite(length):
+                            if point.shape != (2,) or not np.isfinite(point).all():
+                                raise ValueError('Marker position is unavailable')
+                            pipette_shown = True
+                            continue
+                        direction /= length
+                    if point.shape != (2,) or not np.isfinite(point).all():
+                        raise ValueError('Marker position is unavailable')
+                    markers.append((name, point, direction))
+                    pipette_shown = name == 'pipette'
+                except Exception as error:
+                    if marker is None:
+                        if not isinstance(error, (RuntimeError, ValueError, TypeError, OSError)):
+                            raise
+                        continue
+                    message = f'Could not display {name} detection marker: {error}. Patching continues.'
+                    if message not in self._display_errors:
+                        self._display_errors.add(message)
+                        try:
+                            warning(message, extra={'detection_overlay': True})
+                        except Exception:
+                            pass
+            markers = [('selected', point, None) for _, point in selected
+                       if point.shape == (2,) and np.isfinite(point).all()] + [
+                marker for marker in markers if marker[0] != 'cell'
+                or any(cell is reference for cell, _ in selected)]
+            self.pipette_controller.display_positions = dict(alignment_active=owner is not None, at=captured_at,
+                        image_shape=(unit.camera.height, unit.camera.width), markers=tuple(markers))
         except (RuntimeError, ValueError, TypeError, OSError):
-            return
+            return None
 
     @command(category='Test', 
              description='Send movement file to the autopatcher', 

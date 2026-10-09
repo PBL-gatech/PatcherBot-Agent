@@ -8,20 +8,12 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 import torch
-import importlib.util
+from patcherbot.deepLearning import _import_module_from_path
 
 
 logger = logging.getLogger(__name__)
 
 
-def _import_module_from_path(module_name: str, module_path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load module {module_name} from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules[module_name] = module
-    return module
 
 
 class PipetteDetector(ABC):
@@ -448,7 +440,6 @@ class PipetteDetector4(PipetteDetector):
             if peak > 1.0:
                 if peak > 255.0:
                     raise ValueError("Image intensity exceeds uint8 range")
-                img = img
             else:
                 img = img * 255.0
             img = np.clip(img, 0, 255).astype(np.uint8)
@@ -491,11 +482,12 @@ class PipetteDetector4(PipetteDetector):
         Uses one inference pass. Missing/invalid predictions are None; box
         confidence is not a substitute for the optional Z-confidence head.
         """
-        prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
-                          box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
-                           radius_rejected_count=0)
+        empty_prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
+                                box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
+                                radius_rejected_count=0)
         if img is None:
-            return prediction
+            return empty_prediction
+        prediction = empty_prediction.copy()
         try:
             gray = self._to_uint8_grayscale(img)
             if expected_tip_xy is None:
@@ -546,9 +538,7 @@ class PipetteDetector4(PipetteDetector):
             return prediction
         except Exception as exc:
             logger.warning("PipetteDetector4 inference failed: %s", exc)
-            return dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
-                        box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
-                         radius_rejected_count=0)
+            return empty_prediction
 
     def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
         """Preserve the existing integer XY-only detection interface."""
@@ -558,31 +548,13 @@ class PipetteDetector4(PipetteDetector):
         """Infer depth in microns, or None when unavailable."""
         return self.detect_pipette_details(img)["z_um"]
 
-    def get_pipette_confidence(self, img: np.ndarray) -> Optional[float]:
-        """Infer box detection confidence, or None when unavailable."""
-        return self.detect_pipette_details(img)["box_confidence"]
-
-    def get_pipette_z_confidence(self, img: np.ndarray) -> Optional[float]:
-        """Infer Z confidence, or None if the checkpoint has no such head."""
-        return self.detect_pipette_details(img)["z_confidence"]
 
 
-_DEFAULT_DETECTOR = None
 
 
-def configure_pipette_detector(detector):
-    """Select a loaded detector for the optional module-level point API."""
-    if not callable(getattr(detector, "detect_pipette", None)):
-        raise TypeError("detector must implement detect_pipette(image)")
-    global _DEFAULT_DETECTOR
-    _DEFAULT_DETECTOR = detector
 
 
-def detect_pipette(img):
-    """Return a tip or None using the detector selected at application startup."""
-    if _DEFAULT_DETECTOR is None:
-        raise RuntimeError("Call configure_pipette_detector with a loaded detector first")
-    return _DEFAULT_DETECTOR.detect_pipette(img)
+
 
 
 

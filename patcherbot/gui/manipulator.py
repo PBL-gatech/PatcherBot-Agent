@@ -1,8 +1,9 @@
 ﻿# coding=utf-8
 from types import MethodType
+import logging
 import time
 
-from PyQt5 import QtCore, QtGui
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 import numpy as np
@@ -11,7 +12,7 @@ import numpy as np
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
 from patcherbot.controller import TaskController
 from patcherbot.gui import CameraGui
-from patcherbot.interface import command, blocking_command
+from patcherbot.interface import command
 from patcherbot.devices.manipulator.calibratedunit import CalibrationError
 import datetime
 import cv2
@@ -55,7 +56,6 @@ class ManipulatorGui(CameraGui):
         self.recording_state_manager = recording_state_manager
         if recording_state_manager is None:
             raise ValueError("RecordingStateManager must be provided")
-
 
     def display_manipulator(self, pixmap):
         '''
@@ -230,57 +230,51 @@ class ManipulatorGui(CameraGui):
         except CalibrationError:  # not yet calibrated
             return
 
-    def show_tip(self, pixmap):
-        """Draw supplied calibrated coordinates and the existing temporary tip marker."""
-        if (getattr(self, 'active_camera_role', 'main') != 'main'
-                or not getattr(self, 'show_overlay', True)):
+    def display_edit(self, pixmap, *, camera=None):
+        if camera is self.main_camera and camera is not self.active_camera:
+            # Cell overlays also belong in microscope recordings while the
+            # operator views the auxiliary camera; pipette UI stays view-local.
+            self.show_tip(pixmap, camera=camera, cell_only=True)
             return
-        width, height = self.camera.width, self.camera.height
+        super().display_edit(pixmap, camera=camera)
+
+    def show_tip(self, pixmap, *, camera=None, cell_only=False):
+        """Render interface-supplied cell/pipette positions and the temporary tip."""
+        if camera is None:
+            if getattr(self, 'active_camera_role', 'main') != 'main':
+                return
+            camera = self.camera
+        if not getattr(self, 'show_overlay', True):
+            return
+        width, height = camera.width, camera.height
         painter = QtGui.QPainter(pixmap)
         try:
             painter.scale(pixmap.width() / width, pixmap.height() / height)
-            indicator_active = getattr(self.camera, 'pipette_indicator_active', False)
-            positions = self.camera.get_pipette_indicator() if indicator_active else None
-            if positions is None:
-                positions = getattr(self.interface, "display_positions", None)
+            positions = getattr(self.interface, "display_positions", None)
+            indicator_active = bool(positions and positions.get("alignment_active", False))
             if (positions is not None
                     and positions["image_shape"] == (height, width)
                     and 0 <= time.monotonic() - positions["at"] <= 1.):
-                point = np.asarray(positions["pipette_xy"], dtype=float).copy()
-                direction = np.asarray(positions.get("pipette_direction_xy"), dtype=float).copy()
-                if direction.shape != (2,) or not np.isfinite(direction).all():
-                    direction = np.zeros(2)
-                if self.camera.flipped:
-                    point[0] = width - 1 - point[0]
-                    direction[0] = -direction[0]
-                length = np.linalg.norm(direction)
-                # Match cell overlays: hide when the position leaves the image.
-                if (np.isfinite(point).all() and np.isfinite(length) and length > 0
-                        and 0 <= point[0] < width and 0 <= point[1] < height):
-                    unit = direction / length
-                    side = np.array([-unit[1], unit[0]])
-                    color = QtGui.QColor("#ff0000")
-                    pen = QtGui.QPen(color, 1)
-                    pen.setCosmetic(True)
-                    painter.setPen(pen)
-                    painter.setBrush(color)
-                    painter.drawPolygon(QtGui.QPolygonF([
-                        QtCore.QPointF(*point),
-                        QtCore.QPointF(*(point - 12 * unit + 5 * side)),
-                        QtCore.QPointF(*(point - 12 * unit - 5 * side))]))
-            if self.show_tip_on and not indicator_active:
-                if self.tip_x is not None and self.tip_y is not None:
-                    x = width - 1 - self.tip_x if self.camera.flipped else self.tip_x
-                    pen = QtGui.QPen(QtGui.QColor(0, 0, 200, 125), 3)
-                    pen.setCosmetic(True)
-                    painter.setPen(pen)
-                    scale = width / pixmap.width()
-                    painter.drawRect(QtCore.QRectF(x - 10 * scale, self.tip_y - 10 * scale,
-                                                  10 * scale, 10 * scale))
-                if time.time() > self.tip_t0 + 1.:
-                    self.show_tip_on = False
+                self.draw_position_markers(painter, positions['markers'], camera, cell_only=cell_only)
+            self._draw_temporary_tip(painter, pixmap, camera,
+                indicator_active=indicator_active, cell_only=cell_only)
         finally:
             painter.end()
+
+    def _draw_temporary_tip(self, painter, pixmap, camera, *, indicator_active, cell_only):
+        width = camera.width
+        if self.show_tip_on and not indicator_active and not cell_only:
+            if self.tip_x is not None and self.tip_y is not None:
+                x = width - 1 - self.tip_x if camera.flipped else self.tip_x
+                pen = QtGui.QPen(QtGui.QColor(0, 0, 200, 125), 3)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                scale = width / pixmap.width()
+                painter.drawRect(QtCore.QRectF(x - 10 * scale, self.tip_y - 10 * scale,
+                                              10 * scale, 10 * scale))
+            if time.time() > self.tip_t0 + 1.:
+                self.show_tip_on = False
+
 
     @command(category='Camera',
              description='Save the current image to the outputs folder')

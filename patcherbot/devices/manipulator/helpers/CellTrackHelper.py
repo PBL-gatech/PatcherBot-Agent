@@ -80,6 +80,130 @@ class CellTrackHelper:
         self._fast_tracker: Optional[PointTracker1] = None
         self._last_tracked_point: Optional[np.ndarray] = None
         self.last_tracking_status: dict[str, object] = {"status": "idle", "method": None}
+        self.last_match_evidence = {"independent": False, "refined": False}
+
+    @staticmethod
+    def template_evidence(stage, observation, state, expected, *, use_centroid, info):
+        """Refresh independent identity evidence only on a stationary SEARCH frame."""
+        state['cell_template_evidence'] = None
+        image = observation.get('camera_image')
+        if image is None:
+            return
+        try:
+            helper = stage._ensure_cell_track_helper()
+            match = helper.find_centroid(state['cell'][1], image,
+                use_centroid=use_centroid,
+                prompt_point=state.get('cell_template_point'), expected_point=expected,
+                reference_stage_xy=lambda: np.asarray(observation['deep_learning'].get(
+                    'source_positions', {}).get('stage_xy', observation['stage_positions'][:2]))[:2])
+            point, state['cell_template_evidence'] = (None, None) if match is None else match
+            evidence = getattr(helper, 'last_match_evidence', {})
+            info(f'Cell template: evidence={evidence}; xy={point}; '
+                                 'stage fallback is not counted as an independent template match')
+        except Exception as error:
+            info(f'Cell template unavailable: {error}; using calibration and detector evidence')
+
+
+    @staticmethod
+    def cell_shift_options(stage, raw, state, *, use_centroid, info, warning):
+        """Return accepted centering coordinates, or False while awaiting a recheck."""
+        detection, image = raw.get('cell_detection'), raw.get('camera_image')
+        options = {}
+        if detection is not None and image is not None:
+            source_xy = np.asarray(raw['deep_learning'].get('source_positions', {}).get(
+                'stage_xy', raw['stage_positions'][:2]))[:2]
+            expected = (stage.M @ source_xy + stage.r0)[:2] - state['cell'][0][:2]
+            CellTrackHelper.template_evidence(stage, raw, state, expected, use_centroid=use_centroid, info=info)
+            template = state.get('cell_template_evidence')
+            template_xy = None if template is None else (stage.M @ source_xy + stage.r0)[:2] - template
+            recheck = state.pop('cell_shift_recheck', None)
+            frame = raw['deep_learning'].get('source_frame', raw.get('observation_id'))
+            ambiguous = False
+            if template_xy is not None:
+                points = [np.asarray(detection[:2]), expected, template_xy]
+                gaps = [np.linalg.norm(stage.pixels_to_um_relative(points[i] - points[j])[:2])
+                        for i in range(3) for j in range(i)]
+                ambiguous = min(gaps) > stage.focusHelper.TIP_STABILITY_UM
+                if ambiguous and frame is not None and recheck is None:
+                    state['cell_shift_recheck'] = (frame, np.asarray(detection[:2]).copy())
+                    info('Cell SHIFT: all three estimates disagree; requesting one fresh settled observation before motion')
+                    return False
+            _, fused = CellTrackHelper.fuse_candidates(stage, [detection], expected, template_xy)
+            if recheck is not None:
+                stable = np.linalg.norm(stage.pixels_to_um_relative(
+                    np.asarray(detection[:2]) - recheck[1])[:2]) <= stage.focusHelper.TIP_STABILITY_UM
+                if frame is None or frame == recheck[0] or raw['deep_learning'].get('stale', False) or not stable:
+                    fused = expected.copy()
+                    warning('Cell SHIFT: recheck lacks fresh stable evidence for the selected cell; retaining calibration estimate')
+            if ambiguous:
+                correction = fused - expected
+                distance = np.linalg.norm(stage.pixels_to_um_relative(correction)[:2])
+                if distance > stage.focusHelper.TIP_STABILITY_UM:
+                    fused = expected + correction * (stage.focusHelper.TIP_STABILITY_UM / distance)
+                warning('Cell SHIFT: no agreeing pair; model correction limited to 5 um from calibration estimate')
+            reference = np.array(state['cell'][0], dtype=float, copy=True)
+            reference[:2] = (stage.M @ source_xy + stage.r0)[:2] - fused
+            reference[2] = state['cell_focus_z']
+            state.setdefault('original_cell_reference', state['cell'][0])
+            state['cell'] = (reference, np.asarray(image).copy(), np.append(source_xy, state['cell_focus_z']))
+            state['tracked_cell_reference'] = reference[:2].copy()
+            state['cell_template_point'] = fused.copy()
+            current_xy = fused + (stage.M @ (np.asarray(stage.position())[:2] - source_xy))[:2]
+            options['detected_px'] = current_xy
+            info(f'Cell SHIFT consensus: prior_xy={expected}; template_xy={template_xy}; '
+                f'detector_xy={detection[:2]}; detector_confidence={detection[2]}; '
+                f'fused_source_xy={fused}; current_xy={current_xy}; z={reference[2]}; '
+                'weights=confidence and pairwise spatial support, not calibrated probabilities')
+        else:
+            if state.pop('cell_shift_recheck', None) is not None:
+                options['detected_px'] = (stage.M @ np.asarray(stage.position())[:2] + stage.r0)[:2] - state['cell'][0][:2]
+                warning('Cell SHIFT: recheck missing detector or source image; retaining calibration estimate')
+            else:
+                info('Cell SHIFT consensus unavailable: missing detector or source image; using existing template centering')
+
+        return options
+
+
+    @staticmethod
+    def fuse_candidates(stage, candidates, expected_xy, template_xy=None, previous_xy=None):
+        """Select a detected soma and combine spatially supported XY estimates.
+
+        Reliability weights are heuristics, not calibrated probabilities. The
+        calibrated stage supplies image geometry and the shared stability scale.
+        """
+        scale_um = stage.focusHelper.TIP_STABILITY_UM
+        def support(point, reference):
+            try:
+                offset = np.subtract(np.asarray(point, dtype=float).reshape(-1)[:2],
+                                     np.asarray(reference, dtype=float).reshape(-1)[:2])
+                distance = np.linalg.norm(stage.pixels_to_um_relative(np.r_[offset, 0.])[:2])
+                return 1.0 / (1.0 + (distance / scale_um) ** 2) if np.isfinite(distance) else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        references = [(expected_xy, 0.35)]
+        if template_xy is not None:
+            references.append((template_xy, 1.0))
+
+        def rank(candidate):
+            xy = np.asarray(candidate[:2])
+            evidence = sum(weight * support(xy, point) for point, weight in references)
+            if previous_xy is not None:
+                evidence += 0.5 * support(xy, previous_xy)
+            return float(candidate[2]) * evidence
+
+        selected = max(candidates, key=rank, default=None)
+        if selected is None:
+            return None, None
+        xy = np.asarray(selected[:2], dtype=float)
+        confidence = max(float(selected[2]), 1e-6)
+        points = [xy] + [np.asarray(point, dtype=float) for point, _ in references]
+        reliability = [confidence] + [weight for _, weight in references]
+        # A confident source must still be supported by a different source.
+        weights = [quality * sum(support(point, other)
+                                 for j, other in enumerate(points) if j != i)
+                   for i, (point, quality) in enumerate(zip(points, reliability))]
+        return selected, np.average(points, axis=0, weights=weights)
 
     @classmethod
     def _matcher_key(cls, matcher_kwargs: dict[str, object]) -> Tuple[Tuple[str, str], ...]:
@@ -283,11 +407,12 @@ class CellTrackHelper:
         *,
         prompt_point: Optional[Tuple[float, float]] = None,
         expected_point: Optional[Tuple[float, float]] = None,
+        reference_stage_xy=None,
         load_conf: Optional[MatcherConfig] = None,
         offsets: Optional[Sequence[Tuple[float, float]]] = None,
         max_refine_distance: float = 120.0,
         **preprocess: object,
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[np.ndarray | Tuple[np.ndarray, Optional[np.ndarray]]]:
         """
         Return the estimated cell centroid (in pixels) for *image*.
 
@@ -302,6 +427,8 @@ class CellTrackHelper:
             expected_point: Optional prediction (x, y) of the cell position in the
                 current frame, typically derived from stage bookkeeping. Used to
                 gate LightGlue outliers and as an extra seed for refinement.
+            reference_stage_xy: When supplied, return (point, independent reference)
+                using this lazy sampled-position reader; unsuccessful matches stay None.
             load_conf: Configuration forwarded to ``PatchMatcher``.
             offsets: Extra seed offsets (px) for the refinement segmentation step.
             max_refine_distance: Reject segmentation results that stray further than
@@ -430,7 +557,12 @@ class CellTrackHelper:
             final_point = coarse_point
         self.last_match_evidence = {"independent": independent_match,
                                    "refined": bool(use_centroid and refined is not None)}
-        return final_point.astype(np.float32)
+        point = final_point.astype(np.float32)
+        reference = None
+        if reference_stage_xy is not None and independent_match:
+            reference = (
+                self.stage.M @ reference_stage_xy() + self.stage.r0)[:2] - np.asarray(point[:2])
+        return point if reference_stage_xy is None else (point, reference)
 
     # ------------------------------------------------------------------ #
     def _refine_with_segmentation(

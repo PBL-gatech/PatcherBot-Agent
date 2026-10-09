@@ -1,61 +1,19 @@
 """Historical Hunt behavior within the shared phase lifecycle."""
 
 import collections
-import logging
 import sys
 import time
 import numpy as np
 
 from ..errors import AutopatchError
-from ..PhaseController import PhaseController
 from .approach_cell import ApproachCellPhase
-from .spear_motion import SpearMotion
-from .approach_focus import EmptyFocusEvidence, FocusSweep
-from .approach_focus_confirmation import FocusConfirmation
 
 
-class HuntCellPhase(PhaseController):
-    search = ApproachCellPhase.search
-    shift = ApproachCellPhase.shift
-    scan = ApproachCellPhase.scan
-    spear = ApproachCellPhase.spear
-    _fuse_cell_tracks = ApproachCellPhase._fuse_cell_tracks
-    _cell_template_evidence = ApproachCellPhase._cell_template_evidence
-    _shift_cell_from_evidence = ApproachCellPhase._shift_cell_from_evidence
-    _focus_score = ApproachCellPhase._focus_score
-    _show_detection_marker = ApproachCellPhase._show_detection_marker
+class HuntCellPhase(ApproachCellPhase):
+    phase_name = "Hunt"
     CONTACT_READINGS = 5
     CONTACT_TIMEOUT_S = 5.0
     DEPTH_TOLERANCE_UM = 2.0
-
-    def run(self, cell=None):
-        state = None
-        camera = None
-        indicator_owner = object()
-        self._hunt_marker_warning_shown = False
-        try:
-            try:
-                camera = self.controller.calibrated_stage.camera
-                camera.begin_pipette_indicator(indicator_owner)
-            except Exception as error:
-                logging.getLogger('patcherbot.detection_overlay').warning(
-                    f'Could not start Hunt pipette indicator: {error}. Hunt continues.')
-            state = self.prepare(cell)
-            while True:
-                observation = self.observe(state=state)
-                calculated = self.calculate(observation, state)
-                command = self.decide(calculated, state)
-                self.act(command, state)
-        finally:
-            try:
-                self.finish(state)
-            finally:
-                if camera is not None:
-                    try:
-                        camera.end_pipette_indicator(indicator_owner)
-                    except Exception as error:
-                        logging.getLogger('patcherbot.detection_overlay').warning(
-                            f'Could not restore pipette indicator after Hunt: {error}.')
 
     def prepare(self, cell=None):
         self.failure_gate()
@@ -67,6 +25,7 @@ class HuntCellPhase(PhaseController):
         if cell is None:
             self.failure_gate(message="No cell given to patch!")
         self.begin_observations()
+        controller.alignment_display = dict(owner=self, cell_reference=cell[0])
         self.observation_windows = {}
         self.frame_context = {}
         controller.info("Hunting for cell")
@@ -80,10 +39,9 @@ class HuntCellPhase(PhaseController):
                     last_confirmation_id=None)
         if controller.config.mode == "Adaptive":
             self._adaptive = self._vision = True
-            self._marker_warning_shown = False
             controller.info("Hunt WARMUP: 3 inference samples before motion")
             for sample in range(3):
-                controller.infer_frame(["pipette_image_xy", "pipette_defocus_um", "cell_detections"])
+                controller.observer.infer_frame(["pipette_image_xy", "pipette_defocus_um", "cell_detections"])
                 self.failure_gate()
                 self.success_gate()
                 controller.info(f"Hunt WARMUP {sample + 1}/3: finished")
@@ -101,8 +59,7 @@ class HuntCellPhase(PhaseController):
                          cell_focus_z=cell_focus_z,
                          pipette_z=controller.microscope.position() / controller.calibrated_unit.config.microscope_units_per_um)
             controller.info(f"Hunt RELOCATE cell: target_z={state['cell_focus_z']}; pipette_z={state['pipette_z']}")
-            controller.microscope.absolute_move(state["cell_focus_z"])
-            controller.microscope.wait_until_still()
+            self.controller.calibrated_stage.focusHelper.relocate(state["cell_focus_z"])
             self.failure_gate()
             self.success_gate()
             state["started_at"] = time.monotonic()
@@ -121,8 +78,10 @@ class HuntCellPhase(PhaseController):
         evidence = {}
         if mode == "Adaptive":
             fields += ["stage_positions", "deep_learning"]
-            self.frame_context["pipette_expected_xy"] = controller.expected_pipette_xy
-            self.frame_context["pipette_tracking_xy"] = controller.calibrated_unit.tracked_tip_position
+            self.frame_context["pipette_expected_xy"] = lambda: controller.calibrated_unit.reference_position(anchor=getattr(controller.calibrated_unit, '_trusted_tip_reference', None) or (np.array([controller.calibrated_unit.camera.width / 2., controller.calibrated_unit.camera.height / 2.]), controller.home_position, np.asarray(controller.home_stage_position)[:2]))[:2]
+            self.frame_context["pipette_tracking_xy"] = lambda: (controller.calibrated_unit.reference_position(
+                anchor=controller.calibrated_unit._tip_reference)[:2]
+                if getattr(controller.calibrated_unit, '_tip_reference', None) is not None else None)
             self.frame_context["pipette_xyz"] = controller.calibrated_unit.position
             self.frame_context["stage_xy"] = controller.calibrated_stage.position
             inference_fields = ["pipette_image_xy", "pipette_defocus_um"]
@@ -132,77 +91,53 @@ class HuntCellPhase(PhaseController):
                 fields.append("camera_image")
             self.frame_context["focus_z"] = lambda: (controller.microscope.position()
                 / controller.calibrated_unit.config.microscope_units_per_um)
-            evidence = controller.infer_frame(inference_fields, frame_context=self.frame_context)
+            evidence = controller.observer.infer_frame(inference_fields, frame_context=self.frame_context)
         observation = super().observe(fields=fields,
             evidence=evidence, raw_resistance=True)
         if mode == "Adaptive" and state["step"] == 4:
-            self._track_spear_tip(observation)
+            vision = observation.get('deep_learning', {})
+            source = vision.get('source_positions', {})
+            expected = source.get('pipette_expected_xy')
+            if expected is not None:
+                expected = np.asarray(expected, dtype=float)
+                if expected.shape == (2,) and np.isfinite(expected).all():
+                    tip = vision.get('pipette_position')
+                    accepted = False
+                    radius = self.controller.calibrated_unit.config.pipette_detection_radius_um
+                    if tip is not None and not vision.get('stale', True):
+                        delta = self.controller.calibrated_stage.pixels_to_um_relative(np.asarray(tip)[:2] - expected)
+                        accepted = np.linalg.norm(delta[:2]) <= radius
+                    if not accepted:
+                        if tip is not None:
+                            self.controller.info(f'Hunt SPEAR pipette: rejected detection={tip}; expected_xy={expected}; '
+                                                 f'plausibility_radius_um={radius}; following calibrated trajectory')
+                        vision['pipette_position'] = None
+                    tracking = source.get('pipette_tracking_xy')
+                    vision['pipette_tracking_position'] = expected if tracking is None else np.asarray(tracking)[:2]
+                    vision['pipette_tracking_source'] = 'calibrated trajectory from last accepted tip'
         baseline = (controller.first_res if state["initialized"]
                     else controller.resistanceRamp())
         controller.observer.annotate(self, observation, fields={
             "mode": mode, "baseline_resistance": baseline})
-        self._show_pipette_indicator(observation, state)
+        try:
+            vision = observation.get("deep_learning", {})
+            if not vision.get("stale", True) or "pipette_tracking_position" in vision:
+                tip = vision.get("pipette_tracking_position", vision.get("pipette_position"))
+                if state.get("step") == 2:
+                    sweep = state.get("focus_sweep") or {}
+                    confirmation = sweep.get("confirmation")
+                    tip = (confirmation["confirmed_tip_xy"] if confirmation and confirmation["confirmed"]
+                           else sweep.get("best_xy"))
+                    if tip is None:
+                        tip = self.frame_context["pipette_expected_xy"]()
+                if tip is not None and np.shape(tip) == (2,) and np.isfinite(tip).all():
+                    self.controller.observer.annotate(self, observation, markers={"pipette": tip},
+                        source_positions=vision.get("source_positions", {}))
+        except Exception as error:
+            controller.warning(f"Could not display pipette detection marker: {error}. Hunt continues.", extra={"detection_overlay": True})
         self.failure_gate()
         self.success_gate()
         return observation
-
-    def _track_spear_tip(self, observation):
-        """Keep the calibrated trajectory authoritative during an ongoing Spear."""
-        vision = observation.get('deep_learning', {})
-        source = vision.get('source_positions', {})
-        expected = source.get('pipette_expected_xy')
-        if expected is None:
-            return
-        expected = np.asarray(expected, dtype=float)
-        if expected.shape != (2,) or not np.isfinite(expected).all():
-            return
-        tip = vision.get('pipette_position')
-        accepted = False
-        if tip is not None and not vision.get('stale', True):
-            delta = self.controller.calibrated_stage.pixels_to_um_relative(np.asarray(tip)[:2] - expected)
-            accepted = np.linalg.norm(delta[:2]) <= 50.0
-        if not accepted:
-            if tip is not None:
-                self.controller.info(f'Hunt SPEAR pipette: rejected detection={tip}; expected_xy={expected}; '
-                                     'plausibility_radius_um=50; following calibrated trajectory')
-            vision['pipette_position'] = None
-        tracking = source.get('pipette_tracking_xy')
-        vision['pipette_tracking_position'] = expected if tracking is None else np.asarray(tracking)[:2]
-        vision['pipette_tracking_source'] = 'calibrated trajectory from last accepted tip'
-
-    def _show_pipette_indicator(self, observation, state=None):
-        """Display existing tip evidence, with calibrated motion between frames."""
-        try:
-            unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
-            vision = observation.get('deep_learning', {})
-            if vision.get('stale', True) and 'pipette_tracking_position' not in vision:
-                return
-            tip = vision.get('pipette_tracking_position', vision.get('pipette_position'))
-            if state is not None and state.get('step') == 2:
-                confirmation = state.get('focus_confirmation')
-                sweep = state.get('focus_sweep')
-                tip = (confirmation.confirmed_tip_xy if confirmation is not None and confirmation.confirmed
-                       else getattr(sweep, 'best_tip_xy', None))
-                if tip is None:
-                    tip = self.controller.expected_pipette_xy()
-            if tip is None:
-                return
-            tip = np.asarray(tip, dtype=float)
-            if tip.shape != (2,) or not np.isfinite(tip).all():
-                return
-            position_reader = lambda: (unit.um_to_pixels_relative(unit.position())[:2]
-                                       + stage.um_to_pixels_relative(stage.position())[:2])
-            source = vision.get('source_positions', {})
-            if 'pipette_xyz' in source and 'stage_xy' in source:
-                tip = (tip + unit.um_to_pixels_relative(unit.position() - np.asarray(source['pipette_xyz']))[:2]
-                       + stage.um_to_pixels_relative(stage.position() - np.asarray(source['stage_xy']))[:2])
-            stage.camera.show_detection_marker('pipette', tip, color=(255, 0, 0),
-                shape='triangle', direction=unit.M[:2, 0], position_reader=position_reader)
-        except Exception as error:
-            if not getattr(self, '_hunt_marker_warning_shown', False):
-                self._hunt_marker_warning_shown = True
-                logging.getLogger('patcherbot.detection_overlay').warning(
-                    f'Could not display Hunt pipette indicator: {error}. Hunt continues.')
 
     def calculate(self, observation=None, state=None):
         self.failure_gate()
@@ -245,14 +180,17 @@ class HuntCellPhase(PhaseController):
                      if np.isfinite(cell[:3]).all()
                      and cell[2] >= stage.cellDetectHelper.cellDetector.conf_threshold]
             if state['step'] == 1 and 'cell_template_evidence' not in state:
-                self._cell_template_evidence(observation, state, expected)
+                from ...devices.manipulator.helpers.CellTrackHelper import CellTrackHelper
+                CellTrackHelper.template_evidence(stage, observation, state, expected,
+                    use_centroid=config.use_centroid, info=self.controller.info)
             template = state.get('cell_template_evidence')
             template_xy = (None if template is None else
                 (stage.M @ source_stage + stage.r0)[:2] - template)
             previous = state.get('cell_detector_reference')
             previous_xy = (None if previous is None else
                 (stage.M @ source_stage + stage.r0)[:2] - previous)
-            cell, fused = self._fuse_cell_tracks(cells, expected, template_xy, previous_xy)
+            from ...devices.manipulator.helpers.CellTrackHelper import CellTrackHelper
+            cell, fused = CellTrackHelper.fuse_candidates(stage, cells, expected, template_xy, previous_xy)
             displaced_search = state['step'] == 4 or 'cell_reacquisition_origin_z' in state
             if cell is not None and config.hunt_limit_target_radius and not displaced_search:
                 offset = unit.pixels_to_um_relative(np.append(cell[:2] - expected, 0))
@@ -261,11 +199,11 @@ class HuntCellPhase(PhaseController):
             observation["cell_detection"] = cell
             observation['cell_selection_locked'] = True
             observation['cell_fused_xy'] = fused if cell is not None else None
-            calculated.update(ApproachCellPhase.calculate(self, observation, state))
+            calculated.update(super().calculate(observation, state))
             if fresh and cell is not None:
                 state['cell_detector_reference'] = (stage.M @ source_stage + stage.r0)[:2] - np.asarray(cell[:2])
                 display_xy = np.asarray(cell[:2]) + (stage.M @ (observation['stage_positions'][:2] - source_stage))[:2]
-                self._show_detection_marker("cell", display_xy, (0, 0, 255))
+                self.controller.observer.annotate(self, observation, markers={"cell": display_xy})
                 if state['step'] == 1:
                     self.controller.info(f'Hunt Cell SEARCH: candidates={len(cells)}; prior_xy={expected}; '
                         f'template_xy={template_xy}; selected={cell}; fused_xy={fused}; '
@@ -313,7 +251,7 @@ class HuntCellPhase(PhaseController):
                                              and state["confirmed_readings"] >= self.CONTACT_READINGS))
             if state["step"] == 3:
                 calculated["spear_target"] = observation["manipulator_position"][2] + state["cell_focus_z"] - state["pipette_z"]
-            calculated["spear_speed"] = min(abs(config.max_descent_speed), 100.0)
+            calculated["spear_speed"] = abs(config.max_descent_speed)
         self.controller.observer.annotate(self, observation, calculations={
             "window_ready": ready, "resistance_delta": delta, "travel_um": travel})
         return calculated
@@ -370,11 +308,11 @@ class HuntCellPhase(PhaseController):
                 return {**command, 'kind': 'adaptive', 'method': 'search',
                         'pipette_plane': calculated['pipette_plane']}
             try:
-                move = ApproachCellPhase.decide(self, calculated, state)
+                move = super().decide(calculated, state)
             except AutopatchError as error:
                 if (str(error).startswith('cell focus confirmation failed:')
-                        and state['step'] == 1 and state.get('focus_confirmation') is not None
-                        and self._retry_cell_search(state, str(error))):
+                        and state['step'] == 1 and state.get('focus_sweep', {}).get('confirmation') is not None
+                        and self.failure_gate(state, message=str(error), recover=True)):
                     return None
                 raise
             if move is None:
@@ -411,28 +349,15 @@ class HuntCellPhase(PhaseController):
             controller = self.controller
             method = command["method"]
             if method == "focus":
-                sweep = state.get("focus_sweep")
-                if sweep is None:
-                    kind = "SEARCH" if state["step"] == 1 else "SCAN"
-                    center = state["cell_focus_z"] if state["step"] == 1 else state["pipette_z"]
-                    controller.info(f"Hunt {kind}: focus sweep around z={center}")
-                    sweep = state["focus_sweep"] = FocusSweep(controller, center, kind)
-                    if state["step"] == 1 and "cell_search_bounds" in state:
-                        sweep.low, sweep.high = state["cell_search_bounds"]
-                    sweep.start()
-                else:
-                    try:
-                        finished = sweep.update(state["observation"], self._focus_score(state))
-                    except EmptyFocusEvidence as error:
-                        if not self._retry_cell_search(state, str(error)):
-                            raise
-                        finished = False
-                    if finished:
-                        state["focus_done"] = state["step"]
-                        confirmation_options = ({'selected_tip_xy': sweep.best_tip_xy} if state['step'] == 2
-                                                else {'selected_cell_xy': sweep.best_cell_xy})
-                        state["focus_confirmation"] = FocusConfirmation(
-                            controller, "cell" if state["step"] == 1 else "pipette", **confirmation_options)
+                try:
+                    state["focus_sweep"] = controller.calibrated_stage.focusHelper.update_sweep(
+                        state.get("focus_sweep"), **command["focus"])
+                except (RuntimeError, ValueError) as error:
+                    raise AutopatchError(str(error)) from error
+                if state["focus_sweep"].get("empty"):
+                    reason = "SEARCH focus sweep found no valid samples"
+                    if not self.failure_gate(state, message=reason, recover=True):
+                        raise AutopatchError(reason)
                 state["mode"] = command["mode"]
                 return
             if method != "scan":
@@ -450,28 +375,51 @@ class HuntCellPhase(PhaseController):
                 controller.info(f"Hunt SHIFT {command['target']}: starting")
                 if command["target"] == "cell":
                     state["cell_focus_z"] = state["observation"]["stage_positions"][2]
-                    self._update_travel_allowance(state)
-                    if self._shift_cell_from_evidence(state) is False:
-                        return
                 else:
                     state["pipette_z"] = state["observation"]["stage_positions"][2]
-                    options = ({"detected_px": state.pop("confirmed_tip_xy")} if "confirmed_tip_xy" in state else {})
-                    if 'detected_px' in options:
-                        options.update(expected_px=controller.expected_pipette_xy(),
-                                       max_deviation_um=50.0)
-                        self._show_detection_marker('pipette', options['detected_px'], (255, 0, 0))
-                    centered = controller.calibrated_unit.center_pipette(speed=controller.config.approach_pipette_speed, **options)
+                    options = (dict(detected_px=state.pop('confirmed_tip_xy'),
+                             expected_px= self.frame_context["pipette_expected_xy"](),
+                             max_deviation_um=controller.calibrated_unit.config.pipette_detection_radius_um)
+                        if 'confirmed_tip_xy' in state else {})
+                    if options:
+                        controller.observer.annotate(self, state["observation"], markers={"pipette": options["detected_px"]})
+                    centered = controller.calibrated_unit.center_pipette(
+                        speed=controller.config.approach_pipette_speed, **options)
                     self.failure_gate()
                     self.success_gate()
                     if centered is False:
                         reason = getattr(controller.calibrated_unit, "last_pipette_move_failure", None)
                         if not isinstance(reason, str) or not reason:
                             reason = "pipette centering did not complete"
-                        raise AutopatchError(f"Hunt pipette SHIFT failed: {reason}; SPEAR cancelled")
-                    self._rebase_travel_allowance(state)
+                        next_action = "final alignment incomplete" if state.get("speared") else "SPEAR cancelled"
+                        raise AutopatchError(f"{self.phase_name} pipette SHIFT failed: {reason}; {next_action}")
+                rebase = command['target'] != 'cell'
+                cell = state.get("confirmed_travel_cell") if rebase else None
+                if not rebase or (cell is not None and cell["z"] == state["cell_focus_z"]):
+                    history = "travel_rebase_frames" if rebase else "travel_allowance_frames"
+                    confirmation = controller.calibrated_stage.focusHelper.confirmed_evidence(
+                        state.get("focus_sweep", {}), state.get("observation", {}).get("deep_learning", {}),
+                        pipette=rebase, used_frames=state.get(history, set()))
+                    if confirmation is not None:
+                        cell_z = cell["z"] if rebase else float(state["cell_focus_z"])
+                        position = float(controller.calibrated_unit.position()[2])
+                        target = position + cell_z - float(state["pipette_z"])
+                        start = float(state["start_position"][2])
+                        if np.isfinite([position, target, start]).all():
+                            previous = float(state.get("hunt_travel_limit_um", controller.config.max_distance))
+                            required = abs(target - start) + controller.calibrated_unit.actionHelper.MOTION_ENDPOINT_TOLERANCE_UM
+                            state.setdefault(history, set()).update(confirmation["seen_frames"])
+                            if not rebase:
+                                state["confirmed_travel_cell"] = {"z": cell_z}
+                            state["hunt_travel_limit_um"] = max(previous, required)
+                            source = "rebased from confirmed pipette and cell" if rebase else "fresh confirmed cell evidence"
+                            controller.info(f"Hunt travel allowance: confirmed_cell_z={cell_z}; "
+                                f"accepted_samples={confirmation['valid_samples']}; target_pipette_z={target}; "
+                                f"previous_limit_um={previous:g}; limit_um={state['hunt_travel_limit_um']:g}; {source}")
+                if command["target"] == "cell" and self._shift_cell_from_evidence(state) is False:
+                    return
                 controller.info(f"Hunt SHIFT {command['target']}: finished")
-                for key in ("focus_sweep", "focus_done", "focus_confirmation", "cell_template_evidence", "cell_detector_reference"):
-                    state.pop(key, None)
+                self.controller.calibrated_stage.focusHelper.reset_state(state, "cell_template_evidence", "cell_detector_reference")
                 state["step"] += 1
                 self.failure_gate()
                 self.success_gate()
@@ -482,16 +430,14 @@ class HuntCellPhase(PhaseController):
                 if command["target"] == "pipette":
                     state["hover_z"] = target
                 controller.info(f"Hunt RELOCATE {'pipette' if command['target'] == 'cell' else 'cell contact plane'}: target_z={target}")
-                controller.microscope.absolute_move(target)
-                controller.microscope.wait_until_still()
+                self.controller.calibrated_stage.focusHelper.relocate(target)
                 self.failure_gate()
                 self.success_gate()
             elif method in ("search", "scan"):
                 if state["step"] == 0:
                     state["step"] = 1
                     controller.info(f"Hunt RELOCATE cell: target_z={state['cell_focus_z']}")
-                    controller.microscope.absolute_move(state["cell_focus_z"])
-                    controller.microscope.wait_until_still()
+                    self.controller.calibrated_stage.focusHelper.relocate(state["cell_focus_z"])
                     self.failure_gate()
                     self.success_gate()
                 elif state["step"] == 4:
@@ -500,7 +446,7 @@ class HuntCellPhase(PhaseController):
                     state.pop("stop_position", None)
                     motion = state.pop("spear_motion", None)
                     if motion is not None:
-                        motion.stop()
+                        self.controller.calibrated_unit.actionHelper.cancel(motion)
                     controller.calibrated_unit.stop()
                     actual_z = float(controller.calibrated_unit.position()[2])
                     travel = actual_z - float(state.get("spear_start_z", actual_z))
@@ -517,13 +463,11 @@ class HuntCellPhase(PhaseController):
                                      else command['pipette_plane'])
                     state.update(step=1, speared=False, pipette_z=stopped_plane)
                     controller.info(f"Hunt SPEAR complete: repeat alignment; cell_z={state['cell_focus_z']}")
-                    controller.microscope.absolute_move(state["cell_focus_z"])
-                    controller.microscope.wait_until_still()
+                    self.controller.calibrated_stage.focusHelper.relocate(state["cell_focus_z"])
                     self.failure_gate()
                     self.success_gate()
                 if state.get("bounded_focus"):
-                    for key in ("focus_sweep", "focus_done", "focus_confirmation"):
-                        state.pop(key, None)
+                    self.controller.calibrated_stage.focusHelper.reset_state(state)
                 else:
                     controller.microscope.absolute_move_velocity(command["speed"])
             elif method == 'check_contact':
@@ -531,17 +475,38 @@ class HuntCellPhase(PhaseController):
                 actual_z = float(controller.calibrated_unit.position()[2])
                 motion = state.pop('spear_motion', None)
                 if motion is not None:
-                    motion.stop()
+                    self.controller.calibrated_unit.actionHelper.cancel(motion)
                 state.update(step=4, spear_start_z=actual_z, spear_target=actual_z)
                 controller.info('Hunt SPEAR: no downward distance remains; '
                     f'pipette_plane={state["pipette_z"]}; cell_plane={state["cell_focus_z"]}; '
                     'checking fresh stopped contact evidence, otherwise repeating alignment')
             elif method == "spear":
                 controller.info(f"Hunt SPEAR: target_z={command['target']}; speed={command['speed']}")
-                state.update(step=4, spear_target=command["target"],
-                             spear_start_z=state["observation"]["manipulator_position"][2])
-                motion = state["spear_motion"] = SpearMotion(controller, command["target"], command["speed"])
-                motion.start()
+                state.update(step=4, spear_target=command['target'],
+                             spear_start_z=state['observation']['manipulator_position'][2])
+                unit, actions = controller.calibrated_unit, controller.calibrated_unit.actionHelper
+                try:
+                    target, speed = float(command['target']), float(command['speed'])
+                    if not np.isfinite([target, speed]).all() or speed <= 0:
+                        raise ValueError('Spear requires a finite target and positive finite speed')
+                    controller.abort_if_requested()
+                    start = float(unit.position()[2])
+                    if not np.isfinite(start):
+                        raise RuntimeError('Spear has no valid pipette Z position')
+                    if target < start - actions.MOTION_ENDPOINT_TOLERANCE_UM:
+                        raise ValueError('Spear target is behind the current pipette position')
+                    deadline = time.monotonic() + max(10.0, max(0.0, target - start) / speed * 20.0)
+                    unit.stop()
+                    unit.info(f'SPEAR motion: start_z={start}; target_z={target}; '
+                              f'velocity_command={-speed}; endpoint monitor active')
+                    state['spear_motion'] = actions.start(unit, target=target, deadline=deadline,
+                        read_position=lambda: float(unit.position()[2]),
+                        move_velocity=lambda direction: unit.absolute_move_group_velocity([0.0, 0.0, -direction * speed]),
+                        abort_check=controller.abort_if_requested, label='Spear motion', info=unit.info,
+                        direction=1.0, reversal_origin=start,
+                        reversal_tolerance=actions.MOTION_ENDPOINT_TOLERANCE_UM)
+                except (RuntimeError, ValueError) as error:
+                    raise AutopatchError(str(error)) from error
         elif kind == "descend":
             velocity = tuple(command["value"])
             if velocity != state["last_velocity"]:
@@ -613,7 +578,13 @@ class HuntCellPhase(PhaseController):
                     (command is None or command.get("model") == "hunt"))
         return False
 
-    def failure_gate(self, state=None, observation=None, *, message=None):
+    def failure_gate(self, state=None, observation=None, *, message=None, recover=False):
+        if recover:
+            if state is None or state.get('step') != 1 or 'cell_reacquisition_origin_z' not in state:
+                return False
+            return self.controller.calibrated_stage.focusHelper.retry_search(state,
+                state['cell_reacquisition_origin_z'], bounds=(5.0, 25.0), reason=message,
+                info=self.controller.info)
         self.controller.abort_if_requested()
         if message is not None:
             raise AutopatchError(message)
@@ -630,7 +601,7 @@ class HuntCellPhase(PhaseController):
             if "stage_positions" in raw and "cell_focus_z" in state:
                 low, high = sorted((state["cell_focus_z"], state["pipette_z"]))
                 sweep = state.get("focus_sweep")
-                tolerance = sweep.BOUNDARY_TOLERANCE_UM if sweep is not None else 0.0
+                tolerance = self.controller.calibrated_stage.focusHelper.BOUNDARY_TOLERANCE_UM if sweep is not None else 0.0
                 lower, upper = low - 5 - tolerance, high + 5 + tolerance
                 if state.get("step") == 1 and "cell_reacquisition_origin_z" in state:
                     origin = state["cell_reacquisition_origin_z"]
@@ -648,87 +619,6 @@ class HuntCellPhase(PhaseController):
                 "Cell not detected before reaching max hunt distance "
                 f"({travel:.1f} um >= {limit:g} um).")
 
-    def _update_travel_allowance(self, state):
-        """Extend Hunt travel only to a freshly confirmed cell target."""
-        confirmation = state.get("focus_confirmation")
-        vision = state.get("observation", {}).get("deep_learning", {})
-        frame = vision.get("source_frame")
-        if (confirmation is None or confirmation.confirmed is not True
-                or not confirmation.is_cell
-                or confirmation.valid_samples < confirmation.MIN_CELL_SAMPLES
-                or len(confirmation.seen_frames) < confirmation.MIN_CELL_SAMPLES
-                or vision.get("stale", True) or frame is None
-                or frame != confirmation.last_vision.get("source_frame")
-                or frame not in confirmation.seen_frames
-                or frame in state.get("travel_allowance_frames", set())):
-            return False
-        position = float(self.controller.calibrated_unit.position()[2])
-        target = position + float(state["cell_focus_z"]) - float(state["pipette_z"])
-        start = float(state["start_position"][2])
-        if not np.isfinite([position, target, start]).all():
-            return False
-        previous = float(state.get("hunt_travel_limit_um", self.controller.config.max_distance))
-        required = abs(target - start) + SpearMotion.ENDPOINT_TOLERANCE_UM
-        state.setdefault("travel_allowance_frames", set()).update(confirmation.seen_frames)
-        state["confirmed_travel_cell"] = dict(z=float(state["cell_focus_z"]),
-            valid_samples=confirmation.valid_samples)
-        state["hunt_travel_limit_um"] = max(previous, required)
-        self.controller.info(f"Hunt travel allowance: confirmed_cell_z={state['cell_focus_z']}; "
-            f"accepted_samples={confirmation.valid_samples}; target_pipette_z={target}; "
-            f"previous_limit_um={previous:g}; limit_um={state['hunt_travel_limit_um']:g}; "
-            "fresh confirmed cell evidence")
-        return True
-
-    def _rebase_travel_allowance(self, state):
-        """Retain cell evidence while refreshing the confirmed pipette plane."""
-        cell = state.get("confirmed_travel_cell")
-        confirmation = state.get("focus_confirmation")
-        vision = state.get("observation", {}).get("deep_learning", {})
-        frame = vision.get("source_frame")
-        if (cell is None or cell["z"] != state["cell_focus_z"]
-                or confirmation is None or confirmation.confirmed is not True
-                or confirmation.is_cell
-                or confirmation.valid_samples < confirmation.MIN_PIPETTE_SAMPLES
-                or len(confirmation.seen_frames) < confirmation.MIN_PIPETTE_SAMPLES
-                or vision.get("stale", True) or frame is None
-                or frame != confirmation.last_vision.get("source_frame")
-                or frame not in confirmation.seen_frames
-                or frame in state.get("travel_rebase_frames", set())):
-            return False
-        position = float(self.controller.calibrated_unit.position()[2])
-        target = position + cell["z"] - float(state["pipette_z"])
-        start = float(state["start_position"][2])
-        if not np.isfinite([position, target, start]).all():
-            return False
-        previous = float(state.get("hunt_travel_limit_um", self.controller.config.max_distance))
-        required = abs(target - start) + SpearMotion.ENDPOINT_TOLERANCE_UM
-        state.setdefault("travel_rebase_frames", set()).update(confirmation.seen_frames)
-        state["hunt_travel_limit_um"] = max(previous, required)
-        self.controller.info(f"Hunt travel allowance: confirmed_cell_z={cell['z']}; "
-            f"cell_samples={cell['valid_samples']}; pipette_samples={confirmation.valid_samples}; "
-            f"target_pipette_z={target}; previous_limit_um={previous:g}; "
-            f"limit_um={state['hunt_travel_limit_um']:g}; "
-            "rebased from confirmed pipette and cell")
-        return True
-
-    def _retry_cell_search(self, state, reason):
-        """Retry missing cell evidence once in the approved deeper search interval."""
-        if (state.get("step") != 1 or "cell_reacquisition_origin_z" not in state
-                or state.get("cell_reacquisition_attempt", 0) >= 1):
-            return False
-        sweep = state.pop("focus_sweep", None)
-        if sweep is not None:
-            sweep.stop()
-        origin = state["cell_reacquisition_origin_z"]
-        state.update(cell_reacquisition_attempt=1,
-                     cell_search_bounds=(origin + 5.0, origin + 25.0))
-        state.pop("focus_done", None)
-        state.pop("focus_confirmation", None)
-        self.controller.info(f"Hunt SEARCH retry: reason={reason}; "
-            f"bounds={state['cell_search_bounds']}; maximum_deeper_search_um=25; "
-            "last confirmed cell plane retained")
-        return True
-
     def success_gate(self, observation=None, state=None):
         super().success_gate()
         if self.awaiting_operator or observation is None or state is None:
@@ -736,7 +626,7 @@ class HuntCellPhase(PhaseController):
         if observation["stale"] or observation["mode"] != self.controller.config.mode:
             return False
         if observation["mode"] == "Adaptive":
-            return super().success_gate(observation["adaptive_goal"], state)
+            return super().success_gate(bool(observation["adaptive_goal"]), state)
         threshold = self.controller.config.cell_R_increase
         if ("cell_detected" not in observation
                 or observation["cell_detection_threshold"] != threshold):
@@ -744,19 +634,21 @@ class HuntCellPhase(PhaseController):
             observation["cell_detection_threshold"] = threshold
             self.controller.observer.annotate(self, observation["observation"], calculations={
                 "cell_detected": observation["cell_detected"], "cell_threshold": threshold})
-        return super().success_gate(observation["cell_detected"], state)
+        return super().success_gate(bool(observation["cell_detected"]), state)
 
     def finish(self, state=None, *, success=False, mode=None):
         controller = self.controller
         primary_error, stop_error = sys.exc_info()[1], None
-        devices = [controller.calibrated_stage, controller.calibrated_unit, controller.microscope]
+        if primary_error is not None:
+            controller.info(f"{self.phase_name} FAILED: {primary_error}; stopping motion")
+        stops = [controller.calibrated_stage.stop, controller.calibrated_unit.stop, controller.microscope.stop]
         if state is not None and state.get("focus_sweep") is not None:
-            devices.insert(0, state["focus_sweep"])
+            stops.insert(0, lambda: controller.calibrated_stage.focusHelper.cancel_sweep(state["focus_sweep"]))
         if state is not None and state.get("spear_motion") is not None:
-            devices.insert(0, state["spear_motion"])
-        for device in devices:
+            stops.insert(0, lambda: controller.calibrated_unit.actionHelper.cancel(state["spear_motion"]))
+        for stop in stops:
             try:
-                device.stop()
+                stop()
             except BaseException as error:
                 if stop_error is None:
                     stop_error = error
