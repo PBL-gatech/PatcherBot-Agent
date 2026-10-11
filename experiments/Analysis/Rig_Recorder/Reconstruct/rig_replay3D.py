@@ -34,6 +34,7 @@ def _bootstrap_repo_import_path():
     except Exception:
         return
     candidate_paths = [
+        Path(__file__).resolve().parent,
         repo_root,
         repo_root / "patcherbot" / "deepLearning",
     ]
@@ -52,6 +53,27 @@ _bootstrap_repo_import_path()
 
 CELL_DETECTOR_PIDNET = "pidnet"
 CELL_DETECTOR_YOLO = "yolo"
+
+from recorder_settings import RecorderSettingsDialog, load_settings, save_settings
+from recorder_geometry import (
+    uses_central_cell, select_central_cell, cell_inference_parameters,
+    reconstruction_positions,
+    load_moscow_geometry, phase_reference_for_timestamp,
+)
+
+
+def _create_pipette_detector(model_name):
+    from patcherbot.deepLearning import pipetteDetector
+    detector_classes = {
+        "yolo": "PipetteDetectorYOLO1", "onnx": "PipetteDetector1",
+        "dino": "PipetteDetector2", "netx": "PipetteDetector4",
+    }
+    name = str(model_name).strip().lower()
+    if name not in detector_classes:
+        raise ValueError(f"Unsupported pipette detector model: {model_name!r}")
+    if name == "netx":
+        return pipetteDetector.PipetteDetector4(model_path=load_moscow_geometry()["pipette_detector_model_path"])
+    return getattr(pipetteDetector, detector_classes[name])()
 
 
 def _create_cell_detector(model_name):
@@ -317,15 +339,11 @@ class GLViewWidgetWithGrid(gl.GLViewWidget):
 
         # Create Pipette as a rotated cylinder
         pipette_vertices, pipette_faces = create_cylinder_mesh(radius=0.2, height=3.0, sectors=32)
-        # Rotate 25 degrees with respect to the XY plane (i.e., 65 degrees away from the Z-axis)
-        pipette_vertices = rotate_vertices(pipette_vertices, 65, 'y')
+        geometry = load_moscow_geometry()
+        pipette_vertices = rotate_vertices(pipette_vertices, 90 - geometry["pipette_y_rotation"], 'y')
+        pipette_vertices = rotate_vertices(pipette_vertices, geometry["pipette_z_rotation"], 'z')
         self.pipette_mesh = gl.GLMeshItem(vertexes=pipette_vertices, faces=pipette_faces,
                                          smooth=True, color=(0, 0, 1, 1), shader='shaded', drawEdges=False)
-        # Adjust pipette position so that its bottom is at the origin
-        pipette_change = np.array([3.0 * np.cos(np.radians(65)), 0, 0])
-        self.pipette_mesh.translate(*pipette_change)
-        pipette_change = np.array([3.0 * (np.cos(np.radians(65))-np.sin(np.radians(65))), 0, 0])
-        self.pipette_mesh.translate(*pipette_change)
         self.addItem(self.pipette_mesh)
 
     def update_objects(self, microscope_z, stage_pos, pipette_pos):
@@ -857,12 +875,14 @@ class InferenceEnableWorker(QtCore.QObject):
         enable_cell_detector,
         enable_pipette_focuser,
         cell_detector_model=CELL_DETECTOR_PIDNET,
+        pipette_detector_model="netx",
     ):
         super().__init__()
         self.enable_pipette_detector = bool(enable_pipette_detector)
         self.enable_cell_detector = bool(enable_cell_detector)
         self.enable_pipette_focuser = bool(enable_pipette_focuser)
         self.cell_detector_model = str(cell_detector_model).strip().lower()
+        self.pipette_detector_model = str(pipette_detector_model).strip().lower()
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -879,12 +899,11 @@ class InferenceEnableWorker(QtCore.QObject):
             if self.enable_pipette_detector:
                 self.progress.emit("Initializing pipette detector...")
                 try:
-                    from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
-                    result["pipette_detector"] = PipetteDetectorYOLO1()
+                    result["pipette_detector"] = _create_pipette_detector(self.pipette_detector_model)
                 except Exception as exc:
                     result["pipette_detector_init_failed"] = True
                     result["warnings"].append(
-                        f"PipetteDetectorYOLO1 init failed; disabling pipette overlay: {exc}"
+                        f"{self.pipette_detector_model} pipette detector init failed: {exc}"
                     )
 
             if self.enable_cell_detector:
@@ -902,7 +921,7 @@ class InferenceEnableWorker(QtCore.QObject):
                 self.progress.emit("Initializing pipette focuser...")
                 try:
                     from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser
-                    result["pipette_focuser"] = PipetteFocuser()
+                    result["pipette_focuser"] = PipetteFocuser(model_path=load_moscow_geometry()["pipette_focuser_model_path"])
                 except Exception as exc:
                     result["pipette_focuser_init_failed"] = True
                     result["warnings"].append(
@@ -919,6 +938,7 @@ class IntegratedTimeline(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Integrated Timeline and 3D Visualization")
+        self.recorder_settings = load_settings()
         self.setGeometry(50, 50, 1600, 900)  # Adjusted size for better visibility
 
         # Central Widget
@@ -1133,6 +1153,8 @@ class IntegratedTimeline(QMainWindow):
         self.cell_detector_model_selector.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.cell_detector_model_selector.addItem("PIDNet", CELL_DETECTOR_PIDNET)
         self.cell_detector_model_selector.addItem("YOLO", CELL_DETECTOR_YOLO)
+        self.cell_detector_model_selector.setCurrentIndex(max(0, self.cell_detector_model_selector.findData(
+            self.recorder_settings["cell_detector_model"])))
         self.cell_detector_model_selector.setToolTip(
             "Choose the cell detector used when replay inference is enabled."
         )
@@ -1140,15 +1162,24 @@ class IntegratedTimeline(QMainWindow):
             self._on_cell_detector_model_changed
         )
         self.buttons_layout.addWidget(self.cell_detector_model_selector)
+        self.cell_detector_model_label.hide()
+        self.cell_detector_model_selector.hide()
+
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.clicked.connect(self.open_settings)
+        self.buttons_layout.addWidget(self.settings_button)
+        self.export_button = QPushButton("Export Videos")
+        self.export_button.clicked.connect(self.export_videos)
+        self.buttons_layout.addWidget(self.export_button)
 
         # Add a spacer to push buttons to the left
         self.buttons_layout.addStretch()
 
         # Add buttons layout to info_frame_layout
-        info_frame_layout.addLayout(self.buttons_layout)
 
         # Add info_frame to middle_layout
         self.middle_layout.addWidget(self.info_frame)
+        self.middle_layout.addLayout(self.buttons_layout)
 
         # Add middle_layout to main_layout
         self.main_layout.addLayout(self.middle_layout, stretch=1)  # Allocate less space
@@ -1158,10 +1189,11 @@ class IntegratedTimeline(QMainWindow):
 
         # Inference/overlay settings (configure in-file as needed)
         self.enable_replay_inference = False
-        self.enable_pipette_detector = True
-        self.enable_cell_detector = True
-        self.enable_pipette_focuser = True
+        self.enable_pipette_detector = self.recorder_settings["enable_pipette_detection"]
+        self.enable_cell_detector = self.recorder_settings["enable_cell_detection"]
+        self.enable_pipette_focuser = self.recorder_settings["enable_pipette_focus"]
         self.cell_detector_model = self.cell_detector_model_selector.currentData()
+        self.pipette_detector_model = self.recorder_settings["pipette_detector_model"]
         self.overlay_point_radius = 6
         self.overlay_text_margin = 10
 
@@ -1211,6 +1243,59 @@ class IntegratedTimeline(QMainWindow):
 
         # Styling
         self.apply_styles()
+
+    def open_settings(self):
+        if self._inference_enable_thread is not None and self._inference_enable_thread.isRunning():
+            return
+        was_playing = self.timer.isActive()
+        self.timer.stop()
+        previous_index = self.current_index
+        previous_tracking = self.recorder_settings["tracking_states"]
+        dialog = RecorderSettingsDialog(self.recorder_settings, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.recorder_settings = dialog.get_settings()
+            self.enable_pipette_detector = self.recorder_settings["enable_pipette_detection"]
+            self.enable_cell_detector = self.recorder_settings["enable_cell_detection"]
+            self.enable_pipette_focuser = self.recorder_settings["enable_pipette_focus"]
+            self.pipette_detector_model = self.recorder_settings["pipette_detector_model"]
+            self.cell_detector_model_selector.setCurrentIndex(
+                self.cell_detector_model_selector.findData(self.recorder_settings["cell_detector_model"]))
+            self._pipette_detector = self._cell_detector = self._pipette_focuser = None
+            self._pipette_detector_init_failed = False
+            self._cell_detector_init_failed = False
+            self._pipette_focuser_init_failed = False
+            self._reset_inference_state()
+            if previous_tracking != self.recorder_settings["tracking_states"]:
+                self._populate_chapters()
+                self.current_index = min(previous_index, max(0, len(self.data_manager.image_paths) - 1))
+                self.slider.blockSignals(True)
+                self.slider.setValue(self.current_index)
+                self.slider.blockSignals(False)
+            if self.enable_replay_inference:
+                self.toggle_replay_inference(True)
+            elif self.data_manager.image_paths:
+                self.update_view()
+        if was_playing and self._inference_enable_thread is None:
+            self.timer.start()
+
+    def export_videos(self):
+        if not self.check_data_loaded():
+            return
+        if self._inference_enable_thread is not None and self._inference_enable_thread.isRunning():
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Export videos to", self.directory or "")
+        if not directory:
+            return
+        try:
+            from recorder_export import export_recording
+            outputs = export_recording(self, self.recorder_settings, directory)
+            message = f"Exported {len(outputs)} video(s) to:\n{directory}"
+            if getattr(self, "_export_cancelled", False):
+                message += "\nExport cancelled; completed videos were retained."
+            QMessageBox.information(self, "Video export", message)
+        except Exception as exc:
+            logger.exception("Video export failed")
+            QMessageBox.critical(self, "Video export failed", str(exc))
 
     def apply_styles(self):
         """Apply dark theme styling to the application."""
@@ -1493,6 +1578,7 @@ class IntegratedTimeline(QMainWindow):
             enable_cell_detector=self.enable_cell_detector,
             enable_pipette_focuser=self.enable_pipette_focuser,
             cell_detector_model=self.cell_detector_model,
+            pipette_detector_model=self.pipette_detector_model,
         )
         self._inference_enable_worker.moveToThread(self._inference_enable_thread)
 
@@ -1581,6 +1667,11 @@ class IntegratedTimeline(QMainWindow):
         if selected_model is None:
             return
         self.cell_detector_model = str(selected_model).strip().lower()
+        self.recorder_settings["cell_detector_model"] = self.cell_detector_model
+        try:
+            save_settings(self.recorder_settings)
+        except OSError as exc:
+            logger.warning("Unable to persist cell model selection: %s", exc)
         self._cell_detector = None
         self._cell_detector_init_failed = False
         self._reset_inference_state()
@@ -1611,11 +1702,10 @@ class IntegratedTimeline(QMainWindow):
         if self._pipette_detector_init_failed:
             return None
         try:
-            from patcherbot.deepLearning.pipetteDetector import PipetteDetectorYOLO1
-            self._pipette_detector = PipetteDetectorYOLO1()
+            self._pipette_detector = _create_pipette_detector(self.pipette_detector_model)
         except Exception as exc:
             self._pipette_detector_init_failed = True
-            logger.warning("PipetteDetectorYOLO1 init failed; disabling pipette overlay: %s", exc)
+            logger.warning("%s pipette detector init failed: %s", self.pipette_detector_model, exc)
             self._pipette_detector = None
         return self._pipette_detector
 
@@ -1640,7 +1730,7 @@ class IntegratedTimeline(QMainWindow):
             return None
         try:
             from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser
-            self._pipette_focuser = PipetteFocuser()
+            self._pipette_focuser = PipetteFocuser(model_path=load_moscow_geometry()["pipette_focuser_model_path"])
         except Exception as exc:
             self._pipette_focuser_init_failed = True
             logger.warning("PipetteFocuser init failed; disabling focus readout: %s", exc)
@@ -1668,8 +1758,11 @@ class IntegratedTimeline(QMainWindow):
         self._frame_overlay_results = {
             "image_path": image_path,
             "pipette_point": None,
+            "pipette_parameters": None,
             "cell_points": [],
             "focus_value": None,
+            "target_cell": None,
+            "cell_parameters": None,
         }
 
         if not self.enable_replay_inference:
@@ -1700,7 +1793,12 @@ class IntegratedTimeline(QMainWindow):
             detector = self._ensure_pipette_detector()
             if detector is not None:
                 try:
-                    point = detector.detect_pipette(frame_bgr)
+                    if hasattr(detector, "detect_pipette_details"):
+                        details = detector.detect_pipette_details(frame_bgr)
+                        self._frame_overlay_results["pipette_parameters"] = details
+                        point = details.get("tip_xy")
+                    else:
+                        point = detector.detect_pipette(frame_bgr)
                     self._frame_overlay_results["pipette_point"] = self._normalize_point(point, w, h)
                 except Exception as exc:
                     logger.warning("Pipette detector inference failed on replay frame: %s", exc)
@@ -1715,6 +1813,16 @@ class IntegratedTimeline(QMainWindow):
                         for detection in detections
                         if (point := self._normalize_point(detection, w, h)) is not None
                     ]
+                    if self.recorder_settings["centered_cell_only"] or uses_central_cell(active_state):
+                        valid_detections = [d for d in detections if self._normalize_point(d, w, h) is not None]
+                        target = select_central_cell(valid_detections, w, h)
+                        self._frame_overlay_results["target_cell"] = target
+                        if target is not None and uses_central_cell(active_state):
+                            self._frame_overlay_results["cell_parameters"] = cell_inference_parameters(
+                                target, w, h, pipette_point=self._frame_overlay_results["pipette_point"])
+                        if self.recorder_settings["centered_cell_only"]:
+                            self._frame_overlay_results["cell_points"] = [] if target is None else [
+                                self._normalize_point(target, w, h)]
                 except Exception as exc:
                     logger.warning("Cell detector inference failed on replay frame: %s", exc)
 
@@ -1755,8 +1863,31 @@ class IntegratedTimeline(QMainWindow):
             self._frame_overlay_results.get("pipette_point"),
             QtGui.QColor(255, 0, 0),
         )
+        pipette_parameters = self._frame_overlay_results.get("pipette_parameters") or {}
+        if self._frame_overlay_results.get("pipette_point") is not None:
+            details = []
+            for key, label in (("z_um", "Z (um)"), ("box_confidence", "XY confidence"), ("z_confidence", "Z confidence")):
+                value = pipette_parameters.get(key)
+                if value is not None:
+                    details.append(f"{label}: {value:.2f}")
+            if details:
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 160, 150)))
+                painter.drawText(pixmap.rect().adjusted(10, 10, -10, -10), Qt.AlignBottom | Qt.AlignLeft, "  ".join(details))
         for cell_point in self._frame_overlay_results.get("cell_points", []):
-            self._draw_overlay_point(painter, cell_point, QtGui.QColor(0, 255, 0))
+            self._draw_overlay_point(painter, cell_point, QtGui.QColor(70, 150, 255))
+        target = self._frame_overlay_results.get("target_cell")
+        if target is not None:
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 220, 60), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QtCore.QPointF(float(target[0]), float(target[1])), 12.0, 12.0)
+            parameters = self._frame_overlay_results.get("cell_parameters") or {}
+            confidence = parameters.get("confidence")
+            label = f"Target cell ({int(target[0])}, {int(target[1])})"
+            if confidence is not None:
+                label += f"  confidence {confidence:.2f}"
+            if parameters.get("tip_distance_um") is not None:
+                label += f"  tip distance {parameters['tip_distance_um']:.1f} um (XY)"
+            painter.drawText(QtCore.QPointF(float(target[0]) + 16, max(20.0, float(target[1]) - 16)), label)
         focus_value = self._frame_overlay_results.get("focus_value")
         if focus_value is not None:
             text_rect = pixmap.rect().adjusted(
@@ -1794,7 +1925,8 @@ class IntegratedTimeline(QMainWindow):
             self.chapter_selector.addItem("Entire Replay", (0, full_end))
 
             occurrences = {}
-            for started, finished, state_name, outcome_code in self.data_manager.state_windows:
+            windows = self.data_manager.state_windows if self.recorder_settings["tracking_states"] else []
+            for started, finished, state_name, outcome_code in windows:
                 start_index = bisect.bisect_left(self.data_manager.timestamps, started)
                 end_index = bisect.bisect_right(self.data_manager.timestamps, finished) - 1
                 if start_index >= frame_count or end_index < start_index:
@@ -1912,6 +2044,8 @@ class IntegratedTimeline(QMainWindow):
         image_path = self.data_manager.image_paths[self.current_index]
         current_timestamp = self.data_manager.timestamps[self.current_index]
         active_state, outcome_code = self.data_manager.get_active_state_for_timestamp(current_timestamp)
+        if not self.recorder_settings["tracking_states"]:
+            active_state, outcome_code = None, None
         self._run_frame_inference(image_path, active_state)
         self.display_image(image_path)
         indicator_key = (active_state, outcome_code)
@@ -2032,7 +2166,7 @@ class IntegratedTimeline(QMainWindow):
         else:
             self.info.setText("No graph data available for this timestamp.")
 
-    def update_3d_view(self):
+    def update_3d_view(self, timestamp=None):
         """Update the 3D visualization based on the current timepoint."""
         if not self.check_data_loaded():
             return
@@ -2041,23 +2175,42 @@ class IntegratedTimeline(QMainWindow):
             return
 
         # Get the current image timestamp
-        current_timestamp = self.data_manager.timestamps[self.current_index]
+        current_timestamp = self.data_manager.timestamps[self.current_index] if timestamp is None else timestamp
 
         # Retrieve the closest movement data entry based on current_timestamp
         movement_entry = self.data_manager.get_closest_movement_entry(current_timestamp)
 
         if movement_entry:
-            time = movement_entry['time']
-            stage_x, stage_y = movement_entry['stage']       # Only 2 elements
-            microscope_z = movement_entry['microscope_z']     # Separate key
-            pipette_x, pipette_y, pipette_z = movement_entry['pipette']
-
-            # Update 3D objects
-            self.three_d_view.update_objects(
-                microscope_z=microscope_z,  # Corrected mapping
-                stage_pos=(stage_x, stage_y),
-                pipette_pos=(pipette_x, pipette_y, pipette_z)
+            reference, phase = phase_reference_for_timestamp(
+                self.data_manager.movement_data, self.data_manager.state_windows, current_timestamp)
+            settings = self.recorder_settings
+            overlay = self._frame_overlay_results or {}
+            image_size = QtGui.QImage(self.data_manager.image_paths[self.current_index]).size()
+            positions = reconstruction_positions(
+                movement_entry, reference,
+                microscope_offset_enabled=settings["apply_microscope_offset"],
+                microscope_offset_um=settings["microscope_offset_um"],
+                centered_pipette_enabled=settings["apply_cell_distance"],
+                pipette_cell_distance_um=settings["cell_distance_um"],
+                approach_cell_distance_um=settings["approach_cell_distance_um"],
+                active_state=phase,
+                cell_point=overlay.get("target_cell"),
+                image_size=(image_size.width(), image_size.height()),
             )
+            self.three_d_view.update_objects(
+                microscope_z=positions["microscope_z"],
+                stage_pos=positions["stage"],
+                pipette_pos=positions["pipette"]
+            )
+            if not hasattr(self, "_cell_3d_marker"):
+                self._cell_3d_marker = gl.GLScatterPlotItem(size=12, color=(1, .85, .2, 1), pxMode=True)
+                self.three_d_view.addItem(self._cell_3d_marker)
+            cell_position = positions.get("cell_position")
+            self._cell_3d_marker.setData(pos=np.array([cell_position]) if cell_position is not None else np.empty((0, 3)))
+            self._reconstruction_positions = positions
+            if (settings["apply_microscope_offset"] or settings["apply_cell_distance"]) and not getattr(self, "_geometry_camera_initialized", False):
+                self.three_d_view.opts['distance'] = max(8.0, settings["microscope_offset_um"] / 1000 * 4)
+                self._geometry_camera_initialized = True
         else:
             # Optionally, handle cases where no movement data is available
             pass
