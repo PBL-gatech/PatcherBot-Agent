@@ -51,6 +51,10 @@
     "lamp": {
       "class": "patcherbot.devices.lamp.lamp.FakeLamp",
       "params": {}
+    },
+    "laser": {
+      "class": "patcherbot.devices.laser.laser.FakeLaser",
+      "params": {}
     }
   }
 }

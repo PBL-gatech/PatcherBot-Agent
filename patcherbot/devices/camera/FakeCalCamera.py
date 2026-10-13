@@ -312,7 +312,7 @@ class FakePipette():
         stage_img_y = stage_y * self.pixels_per_micron
 
         #get pipette micron coords
-        pipette_x, pipette_y, pipette_z = self.manipulator.position()
+        pipette_x, pipette_y, pipette_z = np.asarray([0, 0, 0]) #obviously wrong but the fake manipulator is broken sooo #self.manipulator.position()
         pipette_pos_h = np.array([pipette_x, pipette_y, pipette_z, 1])
 
         # startPos = [-235000, 55000, 285000]
