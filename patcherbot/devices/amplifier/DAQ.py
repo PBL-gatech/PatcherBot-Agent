@@ -2147,7 +2147,7 @@ class FakeDAQ(DAQ):
     Eventually, this will be made ''state aware'' so that the recording corresponds to the bath or break in, but not now
     """
 
-    default_recorded_data_path = r'C:\Users\Dominic\Documents\GradSchoolLab\fake_rig_data\2026_10_07-22_06'
+    default_recorded_data = 'FakDAQ_graph_recording.csv'
 
     # Use unity conversions so that the base class computations work out of the
     # box.  These constants map DAQ units directly to physical units.
@@ -2161,9 +2161,8 @@ class FakeDAQ(DAQ):
         self.totalResistance = 6 * 10 ** 6  # baseline fake resistance
         self._last_wave_params = None
         self._last_command = None
-        self._recorded_traces = self._load_recorded_data(self.default_recorded_data_path)
+        self._recorded_traces = self._load_recorded_data(self.default_recorded_data)
         self._recorded_trace_index = 0
-        self._recorded_trace_lock = threading.Lock()
         self.start_acquisition(wave_freq=40, samplesPerSec=100000, dutyCycle=0.5,
                                 amplitude=0.5, recordingTime=0.025, interval=None)
 
@@ -2181,7 +2180,8 @@ class FakeDAQ(DAQ):
 
     def _restartAcquisition(self):
         time.sleep(0.01)
-        return self._setupAcquisition()
+        self._setupAcquisition()
+        return None
 
     def _setupAcquisition(self):
         '''
@@ -2238,7 +2238,7 @@ class FakeDAQ(DAQ):
         # ------------------------------------------------------------------
         # 1. prime buffer (0 V step)
         # ------------------------------------------------------------------
-        self.createSquareWaveVoltage(
+        zero_wave, _, num_samples = self.createSquareWaveVoltage(
             wave_freq=wave_freq,
             samplesPerSec=samplesPerSec,
             dutyCycle=dutyCycle,
@@ -2255,6 +2255,11 @@ class FakeDAQ(DAQ):
         return np.array([command, response], dtype=float)
 
     def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude, sweep_clip=None):
+        '''
+        because we are using recorded commands we don't know the amplitude that was set to generate them
+        so we have to measure that and then pass it to base class
+        whereas the NiDAQ already knows the amplitude and can just call the base class directly
+        '''
         command = np.asarray(raw_data[0], dtype=float)
         if command.size:
             low, high = np.percentile(command, [5, 95])
@@ -2310,16 +2315,9 @@ class FakeDAQ(DAQ):
 
     @classmethod
     def _load_recorded_data(cls, data_path):
-        path = Path(data_path)
-        if path.is_dir():
-            graph_file = path / "graph_recording.csv"
-            if not graph_file.is_file():
-                candidates = sorted(path.rglob("graph_recording.csv"))
-                if not candidates:
-                    raise FileNotFoundError(f"No graph_recording.csv found under {path}")
-                graph_file = candidates[0]
-        else:
-            graph_file = path
+        # Resolve relative to this .py file (not the working directory).
+        # If data_path is absolute, pathlib ignores the left side and uses it as-is.
+        graph_file = Path(__file__).parent / data_path
         if not graph_file.is_file():
             raise FileNotFoundError(f"Recorded DAQ data not found: {graph_file}")
 
@@ -2343,9 +2341,8 @@ class FakeDAQ(DAQ):
         return traces
 
     def _next_recorded_trace(self):
-        with self._recorded_trace_lock:
-            command, response = self._recorded_traces[self._recorded_trace_index]
-            self._recorded_trace_index = (self._recorded_trace_index + 1) % len(self._recorded_traces)
+        command, response = self._recorded_traces[self._recorded_trace_index]
+        self._recorded_trace_index = (self._recorded_trace_index + 1) % len(self._recorded_traces)
         return command.copy(), response.copy()
 
     @staticmethod
