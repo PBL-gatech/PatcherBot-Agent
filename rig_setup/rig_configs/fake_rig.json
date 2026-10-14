@@ -21,7 +21,9 @@
     "camera": {
       "class": "patcherbot.devices.camera.FakeCalCamera.FakeCalCamera",
       "params": {
-        "image_z": 100
+        "image_z": 100,
+        "stageManip": "$ref:stage_controller",
+        "pipetteManip": "$ref:pipette_controller"
       }
     },
     "pipette_camera": {
@@ -51,6 +53,12 @@
     "lamp": {
       "class": "patcherbot.devices.lamp.lamp.FakeLamp",
       "params": {}
+    },
+    "laser": {
+      "class": "patcherbot.devices.laser.laser.FakeLaser",
+      "params": {}
     }
+
+
   }
 }

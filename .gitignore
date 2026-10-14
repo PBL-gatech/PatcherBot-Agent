@@ -89,3 +89,4 @@ patcherbot/deepLearning/patchModel/PipetteFinder/models/bc_PipetteFinder_v0_003.
 *.hdf5
 experiments/Datasets/temp_dataset.hdf5
 experiments/Datasets/temp_dataset.hdf5
+/patcherbot/devices/amplifier/amplifier_utils

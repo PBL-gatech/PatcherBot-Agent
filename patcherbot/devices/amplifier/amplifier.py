@@ -1,3 +1,5 @@
+import ctypes
+
 from patcherbot.controller.base import TaskController
 
 all = ['Amplifier',  'FakeAmplifier']
@@ -164,6 +166,17 @@ class FakeAmplifier(Amplifier):
         self._holding = -70  # holding potential for voltage clamp, holding current for current clamp
         self._patching = False
         self._zap_duration = 0.1
+        self._fast_compensation_capacitance = 3e-12  # F; simulated default
+        self._slow_compensation_capacitance = 1e-12  # F; simulated default
+
+    def auto_fast_compensation(self):
+        self._fast_compensation_capacitance = 3e-12
+
+    def auto_slow_compensation(self):
+        self._slow_compensation_capacitance = 1e-12
+
+    def get_fast_compensation_capacitance(self):
+        return ctypes.c_double(self._fast_compensation_capacitance)
 
     def start_patch(self, pulse_amplitude=1e-2,
                     pulse_frequency=1e-2):  # Not clear what the units are for frequency
