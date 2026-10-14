@@ -1,5 +1,7 @@
 import threading
 import time
+import csv
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import scipy.optimize
@@ -2137,7 +2139,15 @@ class ArduinoDAQ(DAQ):
 #  FakeDAQ Subclass 
 # ========================================================
 class FakeDAQ(DAQ):
-    """DAQ implementation used for development or testing without hardware."""
+    """
+    DAQ implementation used for development or testing without hardware.
+    Overall goal: mirror every (non optogenetic) function in the NiDAQ class and return simulated or previously recorded data when applicable
+    Generally, copy the rig replay data loading but only for the voltage and current data, resistance should be calculated from those using the same techniques (this may be changed later depending on how well that works)
+    Have data take from the start and incement over all of it looping back around if the program is running long enough to do that
+    Eventually, this will be made ''state aware'' so that the recording corresponds to the bath or break in, but not now
+    """
+
+    default_recorded_data_path = r'C:\Users\Dominic\Documents\GradSchoolLab\fake_rig_data\2026_10_07-22_06'
 
     # Use unity conversions so that the base class computations work out of the
     # box.  These constants map DAQ units directly to physical units.
@@ -2151,45 +2161,436 @@ class FakeDAQ(DAQ):
         self.totalResistance = 6 * 10 ** 6  # baseline fake resistance
         self._last_wave_params = None
         self._last_command = None
+        self._recorded_traces = self._load_recorded_data(self.default_recorded_data_path)
+        self._recorded_trace_index = 0
+        self._recorded_trace_lock = threading.Lock()
         self.start_acquisition(wave_freq=40, samplesPerSec=100000, dutyCycle=0.5,
                                 amplitude=0.5, recordingTime=0.025, interval=None)
 
+    '''
+    formerly overwrote so that total resistance would have noise in it
+    changed so that the fake daq acquiring fake data updates totalResistance and adds noise there
+    ultimately, total resistance set in _squareWaveProcessor
+    which gets data in getDataFromSquareWave
+    which gets data from _readAnalogInput
+    which already had a noise addition implementation
     def resistance(self):
         return self.totalResistance + np.random.normal(0, 0.1 * 10 ** 6)
+    '''
 
-    # ------------------------------------------------------------------
-    # Hardware emulation helpers
-    # ------------------------------------------------------------------
+
+    def _restartAcquisition(self):
+        time.sleep(0.01)
+        return self._setupAcquisition()
+
+    def _setupAcquisition(self):
+        '''
+        Cache the signature of the fake continuous-acquisition waveform.
+        '''
+        self.createSquareWave(40, 100_000, 0.5, 0.5, 0.025)
+        self._cur_wave_freq  = 40            # matches the pre-built buffer
+        self._cur_wave_rate  = self._wave_rate
+        self._cur_wave_duty  = 0.5
+        self._cur_wave_amp   = 0.5
+        self._cur_wave_rtime = 0.025
+
+        return None
+
+    def _setupAcquisitionCurrent(self, recordingTime=500, dutyCycle=0.5):
+        '''
+        Hard coded copies of several variable assignments from the NiDAQ class
+        Sets the releavant square wave properties
+        creates a square wave with those properites for current
+        returns nothing
+        primes a buffer (there is no buffer yet, it would be needlessly complicated)
+        '''
+        samplesPerSec = 100_000
+        dutyCycle     = float(dutyCycle)
+        recordingTime = (float(recordingTime) * 1e-3)  # convert ms to seconds
+        wave_freq     = 1.0 / (recordingTime)  # 1 Hz square wave
+
+        # ------------------------------------------------------------------
+        # 1. prime buffer (0 pA test pulse)
+        # ------------------------------------------------------------------
+        self.createSquareWaveCurrent(
+            wave_freq=wave_freq, samplesPerSec=samplesPerSec,
+            dutyCycle=dutyCycle, amplitude=0.0,
+            recordingTime=recordingTime)
+
+        return None
+
+
+    def _setupAcquisitionVoltage(self,
+                                 *,
+                                 wave_freq: float,
+                                 samplesPerSec: int,
+                                 dutyCycle: float,
+                                 recordingTime: float,
+                                 exp_samples: int,
+                                 buffer_trains: int):
+        '''
+        Hard coded copies of several variable assignments from the NiDAQ class
+        creates a square wave with those properites for voltage
+        returns nothing
+        primes a buffer (there is no buffer yet, it would be needlessly complicated)
+        '''
+
+        # ------------------------------------------------------------------
+        # 1. prime buffer (0 V step)
+        # ------------------------------------------------------------------
+        self.createSquareWaveVoltage(
+            wave_freq=wave_freq,
+            samplesPerSec=samplesPerSec,
+            dutyCycle=dutyCycle,
+            amplitude=0.0,
+            recordingTime=recordingTime,
+            store=False,
+        )
+
+        return None
+
+    def _readAnalogInput(self, samplesPerSec, recordingTime):
+        """Return the next recorded command-voltage/current-response pair."""
+        command, response = self._next_recorded_trace()
+        return np.array([command, response], dtype=float)
+
+    def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude, sweep_clip=None):
+        command = np.asarray(raw_data[0], dtype=float)
+        if command.size:
+            low, high = np.percentile(command, [5, 95])
+            amplitude = (high - low) / self.V_CLAMP_VOLT_PER_VOLT
+        return super()._squareWaveProcessor(raw_data, samplesPerSec, amplitude, sweep_clip)
+
+
     def _sendSquareWave(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime):
         """Generate and store a square wave command."""
-        numSamples = int(samplesPerSec * recordingTime)
-        period = int(1 / wave_freq * samplesPerSec)
-        onTime = int(period * dutyCycle)
-
-        command = np.zeros(numSamples)
-        for i in range(0, numSamples, period):
-            command[i:i + onTime] = amplitude
-
+        command, rate, _ = self.createSquareWave(
+            wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime
+        )
         self._last_wave_params = (wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
         self._last_command = command
+        self._wave_rate = rate
         # Base class expects a task-like object; returning None is acceptable.
         return None
 
     def _sendSquareWaveCurrent(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime):
-        return self._sendSquareWave(wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
+        '''
+        Generate the next current-step wave
+        '''
+        wave, rate, numSamples = self.createSquareWaveCurrent(
+            wave_freq=wave_freq, samplesPerSec=samplesPerSec,
+            dutyCycle=dutyCycle, amplitude=amplitude,
+            recordingTime=recordingTime
+        )
+        self._last_command = wave
+        self._last_wave_params = (wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
+        return None
 
-    def _readAnalogInput(self, samplesPerSec, recordingTime):
-        """Return a simulated response to the previously generated command."""
-        numSamples = int(samplesPerSec * recordingTime)
-        if self._last_command is None or len(self._last_command) != numSamples:
-            # No command was sent; return zeros
-            command = np.zeros(numSamples)
+    def _sendSquareWaveVoltage(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime):
+        """
+        Generate the next voltage-step wave
+        """
+        wave, _, _ = self.createSquareWaveVoltage(
+            wave_freq=wave_freq,
+            samplesPerSec=samplesPerSec,
+            dutyCycle=dutyCycle,
+            amplitude=amplitude,
+            recordingTime=recordingTime,
+            store=False,
+        )
+        self._last_command = wave
+        self._last_wave_params = (wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
+        return None
+
+    @staticmethod
+    def _parse_recorded_array(value):
+        text = (value or "").strip().strip("[]")
+        text = text.replace("np.float64(", "").replace(")", "")
+        return np.fromstring(text, sep=",")
+
+    @classmethod
+    def _load_recorded_data(cls, data_path):
+        path = Path(data_path)
+        if path.is_dir():
+            graph_file = path / "graph_recording.csv"
+            if not graph_file.is_file():
+                candidates = sorted(path.rglob("graph_recording.csv"))
+                if not candidates:
+                    raise FileNotFoundError(f"No graph_recording.csv found under {path}")
+                graph_file = candidates[0]
         else:
-            command = self._last_command
+            graph_file = path
+        if not graph_file.is_file():
+            raise FileNotFoundError(f"Recorded DAQ data not found: {graph_file}")
 
-        # Simple ohmic response with noise
-        response = command / max(self.totalResistance, 1.0)
-        response += np.random.normal(0, 0.001, size=numSamples)
+        traces = []
+        with graph_file.open("r", newline="", encoding="utf-8-sig") as data_file:
+            reader = csv.DictReader(data_file, delimiter=";")
+            if reader.fieldnames is None:
+                raise ValueError(f"Missing header in recorded DAQ data: {graph_file}")
+            columns = {name.strip().lower(): name for name in reader.fieldnames}
+            if not {"current", "voltage"}.issubset(columns):
+                raise ValueError(f"{graph_file} must contain current and voltage columns")
+            for row in reader:
+                current = cls._parse_recorded_array(row.get(columns["current"]))
+                voltage = cls._parse_recorded_array(row.get(columns["voltage"]))
+                sample_count = min(current.size, voltage.size)
+                if sample_count:
+                    traces.append((voltage[:sample_count], current[:sample_count]))
 
-        return np.array([command, response], dtype=float)
+        if not traces:
+            raise ValueError(f"No paired current/voltage traces found in {graph_file}")
+        return traces
 
+    def _next_recorded_trace(self):
+        with self._recorded_trace_lock:
+            command, response = self._recorded_traces[self._recorded_trace_index]
+            self._recorded_trace_index = (self._recorded_trace_index + 1) % len(self._recorded_traces)
+        return command.copy(), response.copy()
+
+    @staticmethod
+    def _recorded_time(sample_count, rate_hz):
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be positive")
+        return np.arange(sample_count, dtype=float) / float(rate_hz)
+
+    @staticmethod
+    def _trace_targets(start, end, step):
+        if step == 0:
+            raise ValueError("step must be non-zero")
+        span = end - start
+        if span == 0:
+            return np.array([start], dtype=float)
+        step_signed = abs(step) if span > 0 else -abs(step)
+        targets = np.arange(start, end, step_signed, dtype=float)
+        if targets.size == 0 or abs(targets[-1] - end) > 1e-9:
+            targets = np.append(targets, end)
+        return targets
+
+    def getLeakSubtraction(
+            self,
+            *,
+            start_voltage: float,
+            end_voltage: float,
+            holding_voltage: float,
+            step_voltage: float = 20e-3,
+            wave_freq: float = 5.0,
+            samplesPerSec: int = 50_000,
+            dutyCycle: float = 0.5,
+            pulse_recording_time: float = 0.600,
+            repeats: int = 4,
+    ):
+        """
+        Execute a P/4 leak subtraction sequence prior to a voltage sweep.
+
+        For each sweep target, this generates ``repeats`` square pulses whose
+        amplitude is ``-(target - holding) / 4``.  Each pulse uses a 50 % duty
+        cycle square wave lasting ``pulse_recording_time / 3`` seconds inside a
+        baseline–pulse–baseline layout that mirrors ``getVoltageClampSweep``.
+        Averaged traces are stored on ``self.leak_subtraction_data`` for GUI /
+        logging consumers and the raw repeats are discarded after averaging.
+        """
+        if step_voltage == 0:
+            raise ValueError("step_voltage must be non-zero")
+        if repeats <= 0:
+            raise ValueError("repeats must be positive")
+        targets = self._trace_targets(start_voltage, end_voltage, step_voltage)
+        self.leak_subtraction_data = []
+        leak_steps = []
+        leak_targets = []
+
+        for target in targets:
+            leak_step = -(target - holding_voltage) / 4.0
+            leak_target = holding_voltage + leak_step
+            traces = [self._next_recorded_trace() for _ in range(repeats)]
+            sample_count = min(min(command.size, response.size) for command, response in traces)
+            commands = np.vstack([command[:sample_count] for command, _ in traces])
+            responses = np.vstack([response[:sample_count] for _, response in traces])
+            self.leak_subtraction_data.append({
+                "time": self._recorded_time(sample_count, samplesPerSec),
+                "response": responses.mean(axis=0),
+                "command": commands.mean(axis=0),
+                "target_voltage": target,
+                "leak_target_voltage": leak_target,
+                "leak_step_voltage": leak_step,
+                "repeat_count": repeats,
+            })
+            leak_steps.append(leak_step)
+            leak_targets.append(leak_target)
+
+        self.leak_subtraction_meta = {
+            "holding_voltage": holding_voltage,
+            "targets": targets,
+            "leak_target_voltages": np.asarray(leak_targets, dtype=float),
+            "leak_step_values": np.asarray(leak_steps, dtype=float),
+            "repeats": repeats,
+            "wave_freq": wave_freq,
+            "pulse_recording_time": pulse_recording_time,
+        }
+        return self.leak_subtraction_data
+
+    def getVoltageClampSweep(
+            self,
+            *,
+            start_voltage: float,
+            end_voltage: float,
+            holding_voltage: float,
+            step_voltage: float = 20e-3,
+            wave_freq: int = 4,
+            samplesPerSec: int = 50_000,
+            dutyCycle: float = 0.5,
+            recordingTime: float = 0.750
+    ):
+        targets = self._trace_targets(start_voltage, end_voltage, step_voltage)
+        self.vclamp_steps = targets
+        self.vclamp_hold_value = holding_voltage
+        self.voltage_protocol_data = []
+        for _ in targets:
+            command, response = self._next_recorded_trace()
+            sample_count = min(command.size, response.size)
+            time_data = self._recorded_time(sample_count, samplesPerSec)
+            self.voltage_protocol_data.append([
+                time_data,
+                response[:sample_count],
+                command[:sample_count],
+            ])
+        if targets.size and self.voltage_membrane_test is not None:
+            self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
+        return self.voltage_protocol_data
+
+    def getDataFromCurrentProtocol(self,
+                                   custom: bool = False,
+                                   factor: float | None = None,
+                                   startCurrentPicoAmp: float | None = None,
+                                   endCurrentPicoAmp: float | None = None,
+                                   stepCurrentPicoAmp: float = 10,
+                                   recordingTimeMs: float = 500,
+                                   dutyCycle: float = 0.5):
+        recording_time = float(recordingTimeMs) * 1e-3
+        if recording_time <= 0:
+            raise ValueError("recordingTimeMs must be positive")
+        if not custom:
+            capacitance = self.latestMembraneCapacitance
+            if capacitance is None or not np.isfinite(capacitance) or capacitance <= 0:
+                cap_pf = max(1, int(abs(stepCurrentPicoAmp)))
+            else:
+                cap_pf = max(1, int(abs(capacitance)))
+            startCurrentPicoAmp = -2 * cap_pf
+            endCurrentPicoAmp = 10 * cap_pf
+            stepCurrentPicoAmp = cap_pf
+        if startCurrentPicoAmp is None or endCurrentPicoAmp is None:
+            raise ValueError("Current protocol start and end currents are required")
+        if stepCurrentPicoAmp <= 0:
+            raise ValueError("stepCurrentPicoAmp must be positive")
+
+        startCurrentPicoAmp = max(float(startCurrentPicoAmp), -20_000)
+        endCurrentPicoAmp = min(float(endCurrentPicoAmp), 20_000)
+        pulses = np.arange(
+            startCurrentPicoAmp,
+            endCurrentPicoAmp + stepCurrentPicoAmp,
+            stepCurrentPicoAmp,
+            dtype=float,
+        )
+        if 0.0 not in pulses:
+            pulses = np.sort(np.append(pulses, 0.0))
+
+        self.pulses = pulses
+        self.pulseRange = len(pulses)
+        self.current_protocol_data = []
+        for _ in pulses:
+            command_voltage, response_current = self._next_recorded_trace()
+            sample_count = min(command_voltage.size, response_current.size)
+            command_current = response_current[:sample_count]
+            response_voltage = command_voltage[:sample_count]
+            if self.C_CLAMP_AMP_PER_VOLT not in (None, 0):
+                command_current = command_current / self.C_CLAMP_AMP_PER_VOLT
+            if self.C_CLAMP_VOLT_PER_VOLT not in (None, 0):
+                response_voltage = response_voltage / self.C_CLAMP_VOLT_PER_VOLT
+            self.current_protocol_data.append([
+                self._recorded_time(sample_count, 100_000),
+                response_voltage,
+                command_current,
+            ])
+        return self.current_protocol_data, self.pulses, self.pulseRange
+
+    def getDataFromHoldingProtocol(self, *, rate_hz: int = 50_000, duration_s: float = 60.0):
+        command, response = self._next_recorded_trace()
+        sample_count = min(command.size, response.size)
+        command = command[:sample_count]
+        response = response[:sample_count]
+        hold_voltage = self.holding_voltage
+        if hold_voltage is None:
+            hold_voltage = float(np.mean(command)) if sample_count else 0.0
+        command = np.full(sample_count, hold_voltage, dtype=float)
+        self.holding_protocol_data = np.array([
+            self._recorded_time(sample_count, rate_hz),
+            response,
+            command,
+        ])
+        return self.holding_protocol_data
+
+    def getDataFromVoltageProtocol(
+            self,
+            *,                       # keyword-only
+            wave_freq: int = 40,
+            samplesPerSec: int = 50_000,   # 50 kS/s
+            dutyCycle: float = 0.5,
+            amplitude: float = 0.5,
+            recordingTime: float = 0.025,  # 25 ms period
+            max_attempts: int = 15,
+            membrane_hold: float | None = None
+    ):
+        self.voltage_membrane_test = None
+        capacitances = []
+        first_result = None
+        attempts = 0
+        self._pause_evt.clear()
+        try:
+            while attempts < max_attempts and len(capacitances) < 5:
+                attempts += 1
+                result = self.getDataFromSquareWave(
+                    wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime
+                )
+                if first_result is None:
+                    first_result = result
+                membrane_capacitance = result[5]
+                if (membrane_capacitance is not None
+                        and np.isfinite(membrane_capacitance)
+                        and 0 < membrane_capacitance < 250):
+                    capacitances.append(membrane_capacitance)
+        finally:
+            self._pause_evt.set()
+
+        if first_result is None:
+            self.voltageMembraneCapacitance = None
+            return None
+
+        (self.voltage_protocol_data,
+         self.voltage_command_data,
+         self.voltageTotalResistance,
+         self.voltageMembraneResistance,
+         self.voltageAccessResistance,
+         _) = first_result
+        protocol_data, command_data = first_result[:2]
+        self.voltage_membrane_test = {
+            "time": protocol_data[0].copy(),
+            "response": protocol_data[1].copy(),
+            "command": command_data[1].copy(),
+            "step_mV": float(
+                (np.percentile(command_data[1], 95)
+                 - np.percentile(command_data[1], 5)) * 1e3
+            ),
+            "hold_mV": membrane_hold * 1e3 if membrane_hold is not None else None,
+            "color": "#000000",
+        }
+        self.voltageMembraneCapacitance = (
+            float(np.mean(capacitances)) if capacitances else None
+        )
+        self.latestMembraneCapacitance = self.voltageMembraneCapacitance
+        if self.voltageTotalResistance is not None:
+            self.totalResistance = self.voltageTotalResistance
+        if self.voltageMembraneResistance is not None:
+            self.latestMembraneResistance = self.voltageMembraneResistance
+        if self.voltageAccessResistance is not None:
+            self.latestAccessResistance = self.voltageAccessResistance
+        return self.voltageMembraneCapacitance
