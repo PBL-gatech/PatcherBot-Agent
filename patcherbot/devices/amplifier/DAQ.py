@@ -2139,13 +2139,7 @@ class ArduinoDAQ(DAQ):
 #  FakeDAQ Subclass 
 # ========================================================
 class FakeDAQ(DAQ):
-    """
-    DAQ implementation used for development or testing without hardware.
-    Overall goal: mirror every (non optogenetic) function in the NiDAQ class and return simulated or previously recorded data when applicable
-    Generally, copy the rig replay data loading but only for the voltage and current data, resistance should be calculated from those using the same techniques (this may be changed later depending on how well that works)
-    Have data take from the start and incement over all of it looping back around if the program is running long enough to do that
-    Eventually, this will be made ''state aware'' so that the recording corresponds to the bath or break in, but not now
-    """
+    """DAQ implementation using recorded traces for development or testing without hardware."""
 
     default_recorded_data = 'FakDAQ_graph_recording.csv'
 
@@ -2166,16 +2160,6 @@ class FakeDAQ(DAQ):
         self.start_acquisition(wave_freq=40, samplesPerSec=100000, dutyCycle=0.5,
                                 amplitude=0.5, recordingTime=0.025, interval=None)
 
-    '''
-    formerly overwrote so that total resistance would have noise in it
-    changed so that the fake daq acquiring fake data updates totalResistance and adds noise there
-    ultimately, total resistance set in _squareWaveProcessor
-    which gets data in getDataFromSquareWave
-    which gets data from _readAnalogInput
-    which already had a noise addition implementation
-    def resistance(self):
-        return self.totalResistance + np.random.normal(0, 0.1 * 10 ** 6)
-    '''
 
 
     def _restartAcquisition(self):
@@ -2197,13 +2181,7 @@ class FakeDAQ(DAQ):
         return None
 
     def _setupAcquisitionCurrent(self, recordingTime=500, dutyCycle=0.5):
-        '''
-        Hard coded copies of several variable assignments from the NiDAQ class
-        Sets the releavant square wave properties
-        creates a square wave with those properites for current
-        returns nothing
-        primes a buffer (there is no buffer yet, it would be needlessly complicated)
-        '''
+        """Initialize the fake current-step waveform."""
         samplesPerSec = 100_000
         dutyCycle     = float(dutyCycle)
         recordingTime = (float(recordingTime) * 1e-3)  # convert ms to seconds
@@ -2228,12 +2206,7 @@ class FakeDAQ(DAQ):
                                  recordingTime: float,
                                  exp_samples: int,
                                  buffer_trains: int):
-        '''
-        Hard coded copies of several variable assignments from the NiDAQ class
-        creates a square wave with those properites for voltage
-        returns nothing
-        primes a buffer (there is no buffer yet, it would be needlessly complicated)
-        '''
+        """Initialize the fake voltage-step waveform."""
 
         # ------------------------------------------------------------------
         # 1. prime buffer (0 V step)
@@ -2255,11 +2228,7 @@ class FakeDAQ(DAQ):
         return np.array([command, response], dtype=float)
 
     def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude, sweep_clip=None):
-        '''
-        because we are using recorded commands we don't know the amplitude that was set to generate them
-        so we have to measure that and then pass it to base class
-        whereas the NiDAQ already knows the amplitude and can just call the base class directly
-        '''
+        """Measure the recorded command amplitude before processing the trace."""
         command = np.asarray(raw_data[0], dtype=float)
         if command.size:
             low, high = np.percentile(command, [5, 95])
@@ -2377,16 +2346,7 @@ class FakeDAQ(DAQ):
             pulse_recording_time: float = 0.600,
             repeats: int = 4,
     ):
-        """
-        Execute a P/4 leak subtraction sequence prior to a voltage sweep.
-
-        For each sweep target, this generates ``repeats`` square pulses whose
-        amplitude is ``-(target - holding) / 4``.  Each pulse uses a 50 % duty
-        cycle square wave lasting ``pulse_recording_time / 3`` seconds inside a
-        baseline–pulse–baseline layout that mirrors ``getVoltageClampSweep``.
-        Averaged traces are stored on ``self.leak_subtraction_data`` for GUI /
-        logging consumers and the raw repeats are discarded after averaging.
-        """
+        """Average recorded traces for each target in a P/4 leak subtraction sequence."""
         if step_voltage == 0:
             raise ValueError("step_voltage must be non-zero")
         if repeats <= 0:
