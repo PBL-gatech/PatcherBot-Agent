@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.manipulator import Manipulator
 from patcherbot.devices.camera import Camera
@@ -45,6 +46,22 @@ def _resolve_model_path(model_name):
     return model_dir / path
 
 
+class _FakePipetteDetector(PipetteDetector):
+    def __init__(self, tip_provider):
+        super().__init__()
+        self.tip_provider = tip_provider
+        self.adapter = SimpleNamespace(threshold=0.5)
+
+    def detect_pipette(self, img):
+        tip = self.tip_provider()
+        if tip is None:
+            return None
+        return tuple(int(round(value)) for value in tip)
+
+    def get_pipette_z(self, img):
+        return 0.0
+
+
 class PipetteCalHelper():
     """
     A helper class to aid with 2D pipette calibration.
@@ -75,22 +92,26 @@ class PipetteCalHelper():
         device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
         model_name = getattr(self.config, "pipette_detector_model", None) if self.config is not None else None
         model_path = _resolve_model_path(model_name)
-        try:
-            # self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(
-            #     model_path=model_path,
-            #     device=device,
-            # )
-            self.pipetteDetector: PipetteDetector = PipetteDetector4(
-                model_path=model_path,
-                device=device,
-            )
-        except Exception as exc:
-            logging.warning(
-                "Failed to initialize PipetteDetector4 with model '%s' (%s); using default model path",
-                model_name,
-                exc,
-            )
-            self.pipetteDetector = PipetteDetector4(device=device)
+        fake_tip_provider = getattr(camera, "get_fake_pipette_tip_xy", None)
+        if callable(fake_tip_provider):
+            self.pipetteDetector = _FakePipetteDetector(fake_tip_provider)
+        else:
+            try:
+                # self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(
+                #     model_path=model_path,
+                #     device=device,
+                # )
+                self.pipetteDetector: PipetteDetector = PipetteDetector4(
+                    model_path=model_path,
+                    device=device,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "Failed to initialize PipetteDetector4 with model '%s' (%s); using default model path",
+                    model_name,
+                    exc,
+                )
+                self.pipetteDetector = PipetteDetector4(device=device)
         self.calibrated_stage = calibrated_stage
         # Each calibration point will be a tuple:
         #   (image_x, image_y, encoder_x, encoder_y)

@@ -81,6 +81,9 @@ class FakeCalCamera(Camera):
     def get_frame_no(self):
         return self.frameno
 
+    def get_fake_pipette_tip_xy(self):
+        return self.pipette.last_tip_xy
+
     def raw_snap(self):
         '''
         Returns the current image.
@@ -289,6 +292,7 @@ class FakePipette():
         self.pixels_per_micron = microscope_pixels_per_micron
         self.stage_to_pipette = stage_to_pipette #homoegeneous transform matrix from stage to pipette
         self.pipette_to_stage = np.linalg.inv(self.stage_to_pipette)
+        self.last_tip_xy = None
 
         #setup pipette image (PIL b/c of easy pasting)
         curFile = str(Path(__file__).parent.absolute())
@@ -312,7 +316,7 @@ class FakePipette():
         stage_img_y = stage_y * self.pixels_per_micron
 
         #get pipette micron coords
-        pipette_x, pipette_y, pipette_z = np.asarray([0, 0, 0]) #obviously wrong but the fake manipulator is broken sooo #self.manipulator.position()
+        pipette_x, pipette_y, pipette_z = self.manipulator.position()
         pipette_pos_h = np.array([pipette_x, pipette_y, pipette_z, 1])
 
         # startPos = [-235000, 55000, 285000]
@@ -330,6 +334,7 @@ class FakePipette():
         #get x,y - convert to int, make relative to frame
         pipette_img_x = int(pipette_pos_img_coords[0] - stage_img_x) - self.pipetteImg.size[0] #pipette_pos should correspond to tip of pipette (upper right) 
         pipette_img_y = int(pipette_pos_img_coords[1] - stage_img_y)
+        self.last_tip_xy = (pipette_img_x + self.pipetteImg.size[0] - 1, pipette_img_y)
 
         #blur pipette proportionally to distance between stage_z and pipette_z
         focusFactor = abs(stage_z - pipette_pos_stage_coords[2]) / 10
