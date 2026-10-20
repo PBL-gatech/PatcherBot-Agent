@@ -1,4 +1,5 @@
 import time
+from copy import deepcopy
 import cv2
 import numpy as np
 from patcherbot.devices.manipulator.microscope import Microscope
@@ -24,8 +25,92 @@ class FocusHelper():
     CONFIRM_MAX_FRAMES = 8
 
     def __init__(self, microscope: Microscope, camera: Camera):
+        """Bind focus devices and own at most one phase Search or Scan record."""
         self.microscope = microscope
         self.camera = camera
+        self._search = None
+
+    @property
+    def active_search(self):
+        """Whether this helper owns a Search or Scan record."""
+        return self._search is not None
+
+    @property
+    def confirmed(self):
+        """Whether the active search has enough settled confirming evidence."""
+        if self._search is None:
+            return False
+        confirmation = self._search.get('confirmation')
+        return confirmation is not None and confirmation['confirmed']
+
+    @property
+    def confirmed_tip_xy(self):
+        """Return confirmed detector XY without selecting a display marker."""
+        if not self.confirmed:
+            return None
+        return self._search['confirmation']['confirmed_tip_xy']
+
+    @property
+    def saved_tip_evidence(self):
+        """Return copied provisional Scan evidence with its original frame anchors."""
+        if self._search is None or not self._search['pipette']:
+            return None
+        evidence = self._search.get('best_tip_evidence')
+        if evidence is None or evidence['stage_xy'] is None or evidence['pipette_xyz'] is None:
+            return None
+        return deepcopy(evidence)
+
+    @property
+    def empty(self):
+        """Whether the active cell search finished without usable evidence."""
+        return self._search is not None and self._search['empty']
+
+    def confirm_search(self, vision, cell=None):
+        """Consume settled evidence without starting or advancing motor motion."""
+        if self._search is None or 'confirmation' not in self._search:
+            return False
+        return self.update_confirmation(self._search, vision, cell) is True
+
+    def advance_search(
+        self, *, actual_z, vision, cell, center_z, speed, motion, bounds,
+        pipette, pixels_to_um_relative, confidence_threshold,
+        abort_check, info, warning,
+    ):
+        """Advance Search or Scan while retaining ownership until explicit reset.
+
+        A cell search and a pipette scan cannot replace one another's active
+        trajectory; the owning phase must reset between those operations.
+        """
+        if self._search is not None:
+            if self._search['pipette'] != pipette:
+                raise RuntimeError('Reset the active focus search before changing its target')
+            if 'confirmation' in self._search:
+                return None
+        self._search = self.update_sweep(
+            self._search, actual_z, vision, cell,
+            center_z=center_z,
+            speed=speed,
+            motion=motion,
+            bounds=bounds,
+            label='SCAN' if pipette else 'SEARCH',
+            pipette=pipette,
+            pixels_to_um_relative=pixels_to_um_relative,
+            confidence_threshold=confidence_threshold,
+            abort_check=abort_check,
+            info=info,
+            warning=warning,
+        )
+        return None
+
+    def cancel_search(self):
+        """Stop the owned search, retaining its record until explicit reset."""
+        if self._search is not None:
+            self.cancel_sweep(self._search)
+
+    def reset_search(self):
+        """Release owned evidence only after its focus motion has been stopped."""
+        self.cancel_search()
+        self._search = None
 
     @staticmethod
     def reset_state(state, *extra_keys):
@@ -111,6 +196,64 @@ class FocusHelper():
         self.microscope.wait_until_still()
 
 
+    def read_search_frame(self, state, stage, detector, *, expected_xy=None, radius_um=50.0):
+        """Read one frame, its positions, and the selected detector's result."""
+        frame, _, image, timing = self.camera.last_raw_frame_data(include_timing=True) or (None, None, None, {})
+        image = None if image is None else image.copy()
+        focus_z = self.microscope.position() / self._distance_scale()
+        stage_xy = np.asarray(stage.position(), dtype=float)[:2].copy()
+        vision = dict(source_frame=frame, frame_retrieval_started_at=timing.get('retrieval_started_at'),
+            source_positions=dict(focus_z=focus_z, stage_xy=stage_xy),
+            pipette_position=None, pipette_focus=None, cell_detections=[], confidence={}, status={})
+        cell = None
+        if image is not None:
+            if state['pipette']:
+                result = detector.detect_pipette_details(image.copy(), expected_tip_xy=expected_xy,
+                    pixels_to_um=stage.pixels_to_um_relative, radius_um=radius_um)
+                vision.update(pipette_position=result['tip_xy'], pipette_focus=result['z_um'])
+                vision['confidence'] = dict(pipette_detector=result['box_confidence'],
+                                            pipette_focuser=result['z_confidence'])
+                vision['status']['pipette_focuser'] = 'ok' if result['z_um'] is not None else 'no_detection'
+            else:
+                cells = detector.detect_cells(image.copy())
+                vision['cell_detections'] = cells
+                candidates = [candidate for candidate in cells
+                    if np.isfinite(candidate[:3]).all() and candidate[2] >= state['confidence_threshold']()]
+                if expected_xy is None:
+                    cell = max(candidates, key=lambda candidate: candidate[2], default=None)
+                else:
+                    candidates = [candidate for candidate in candidates
+                        if np.linalg.norm(stage.pixels_to_um_relative(
+                            np.asarray(candidate[:2]) - expected_xy)[:2]) <= radius_um]
+                    cell = min(candidates, key=lambda candidate: np.linalg.norm(
+                        np.asarray(candidate[:2]) - expected_xy), default=None)
+        acquired = timing.get('retrieval_started_at')
+        age = None if acquired is None else time.monotonic() - acquired
+        vision.update(age_s=age, stale=age is None or not 0 <= age <= 1.0)
+        actual_z = self.microscope.position() / self._distance_scale()
+        return dict(camera_image=image, deep_learning=vision, cell_detection=cell,
+                    stage_positions=np.append(stage.position()[:2], actual_z))
+
+    def search(self, state, stage, detector, *, expected_xy=None, radius_um=50.0):
+        """Advance a start_sweep() state once; result holds confirmed XY and Z."""
+        if state['empty'] or state.get('result') is not None:
+            return state
+        try:
+            state['abort_check']()
+            observation = self.read_search_frame(state, stage, detector,
+                expected_xy=expected_xy, radius_um=radius_um)
+            state['observation'] = observation
+            vision, cell = observation['deep_learning'], observation['cell_detection']
+            if 'confirmation' not in state:
+                self.update_sweep(state, observation['stage_positions'][2], vision, cell)
+            elif self.update_confirmation(state, vision, cell):
+                state['result'] = dict(xy=np.median(state['confirmation']['xy_samples'], axis=0),
+                                       z=state['best_z'])
+            return state
+        except Exception:
+            self.cancel_sweep(state)
+            raise
+
     def start_sweep(self, center_z, speed, *, motion, pixels_to_um_relative,
                     abort_check, info, warning, confidence_threshold, bounds=None, label='SEARCH', pipette=False):
         """Return per-attempt focus state; the caller owns confidence and retry policy."""
@@ -122,7 +265,7 @@ class FocusHelper():
         state = dict(center_z=center_z, low=low, high=high, label=label, pipette=pipette,
             stage='idle', target=None, best_z=None, best_score=-math.inf, best_rank=None,
             samples=0, seen_frames=set(), tip_samples=[], empty=False,
-            best_xy=None, best_depth=None,
+            best_xy=None, best_depth=None, best_tip_evidence=None,
             deadline=time.monotonic()+max(60.0, 4.0*20.0/speed*20.0), speed=speed,
             endpoint_correction=False, motion=None, motion_device=motion,
             pixels_to_um_relative=pixels_to_um_relative, confidence_threshold=confidence_threshold,
@@ -166,13 +309,14 @@ class FocusHelper():
     @classmethod
     def _focus_sample_rank(cls, sample):
         """Prefer confident pipette XY near focus without consulting Z confidence."""
-        score, _, _, depth = sample
+        score, _, _, depth = sample[:4]
         if depth is None:
             return (0, score, 0)
         error = abs(depth)
         return (2, score, -error) if error <= cls.DEPTH_TOLERANCE_UM else (1, -error, score)
 
-    def _record_focus_sample(self, state, *, frame_id, focus_z, xy, score, stale, depth=None):
+    def _record_focus_sample(self, state, *, frame_id, focus_z, xy, score, stale,
+                             depth=None, source_positions=None):
         """Select an actually sampled plane supported by three stable XY detections."""
         seen, samples = state['seen_frames'], state['tip_samples']
         if score is None or focus_z is None or stale or frame_id is None or frame_id in seen:
@@ -196,7 +340,11 @@ class FocusHelper():
         depth = depth if math.isfinite(depth) else None
         if any(not np.linalg.norm(state['pixels_to_um_relative'](np.r_[np.subtract(xy, previous[2]), 0.])[:2]) <= self.TIP_STABILITY_UM for previous in samples):
             samples.clear()
-        samples.append((score, focus_z, xy, depth))
+        # The winning sample may precede this frame; keep its own copied anchors.
+        sources = source_positions or {}
+        evidence = deepcopy(dict(xy=xy, source_frame=frame_id,
+            stage_xy=sources.get('stage_xy'), pipette_xyz=sources.get('pipette_xyz')))
+        samples.append((score, focus_z, xy, depth, evidence))
         del samples[:-self.MIN_STABLE_SAMPLES]
         if len(samples) < self.MIN_STABLE_SAMPLES:
             return
@@ -204,9 +352,10 @@ class FocusHelper():
         candidate = sorted(samples, key=rank_sample)[len(samples)//2]
         rank = rank_sample(candidate)
         if state['best_rank'] is None or rank > state['best_rank']:
-            score, focus_z, xy, depth = candidate
+            score, focus_z, xy, depth = candidate[:4]
             state.update(best_rank=rank, best_score=score, best_z=focus_z,
-                         best_xy=xy, best_depth=depth if state['pipette'] else None)
+                         best_xy=xy, best_depth=depth if state['pipette'] else None,
+                         best_tip_evidence=candidate[4] if state['pipette'] else None)
 
     @staticmethod
     def _focus_evidence(state, vision, cell):
@@ -246,7 +395,8 @@ class FocusHelper():
             raise RuntimeError(f'{label} focus sweep timed out during {stage}')
         if stage in ('down', 'up') and not state['endpoint_correction']:
             self._record_focus_sample(state, frame_id=frame_id, focus_z=focus_z, xy=xy,
-                                      score=score, stale=stale, depth=depth)
+                                      score=score, stale=stale, depth=depth,
+                                      source_positions=vision.get('source_positions'))
         z = float(actual_z)
         if not math.isfinite(z):
             raise RuntimeError(f'{label} focus sweep has no valid objective position')

@@ -330,7 +330,11 @@ class AutoPatchInterface(TaskInterface):
             self.is_selecting_cells = False
 
     def update_camera_cell_list(self):
-        """Project accepted observation anchors into one camera snapshot."""
+        """Choose display evidence and project its saved anchors into camera pixels.
+
+        Read one completed phase snapshot. Model, calibrated, tracked, and
+        confirmed tip coordinates remain distinct until presentation selection.
+        """
         self.pipette_controller.display_positions = None
         controller = self.current_autopatcher
         warning = self.warning
@@ -342,8 +346,44 @@ class AutoPatchInterface(TaskInterface):
             stage_pixels = np.asarray(stage.reference_position(), dtype=float)
             if not np.isfinite(stage_pixels).all():
                 return None
-            evidence = getattr(controller, 'alignment_display', None) or {}
-            owner, reference = evidence.get('owner'), evidence.get('cell_reference')
+            owner = controller.alignment_phase
+            snapshot = None if owner is None else owner.alignment_snapshot
+            snapshot = snapshot or {}
+            reference = snapshot.get('cell_reference')
+            source = snapshot.get('source_positions', {})
+            stage_anchor = source.get('stage_xy')
+            if stage_anchor is None and snapshot.get('stage_position') is not None:
+                stage_anchor = np.asarray(snapshot['stage_position'])[:2]
+            pipette_anchor = source.get('pipette_xyz')
+            if pipette_anchor is None:
+                pipette_anchor = snapshot.get('manipulator_position')
+            evidence = {}
+            if snapshot.get('accepted_cell') is not None:
+                evidence['cell'] = snapshot['accepted_cell']
+            cell = snapshot.get('cell_detection')
+            if cell is not None and not snapshot.get('stale', True):
+                evidence['cell'] = dict(xy=np.asarray(cell)[:2], stage_xy=stage_anchor)
+            # Scan prefers confirmation, then its saved best sample, then calibration.
+            # Descent can use a tracked trajectory; other frames use detection.
+            tip = None
+            if owner is not None and snapshot.get('operation') == owner.scan:
+                tip = snapshot.get('confirmed_tip_xy')
+                saved_tip = snapshot.get('saved_tip_evidence')
+                if tip is None and saved_tip is not None:
+                    tip = saved_tip['xy']
+                    stage_anchor = saved_tip['stage_xy']
+                    pipette_anchor = saved_tip['pipette_xyz']
+                if tip is None:
+                    tip = snapshot.get('calibrated_tip_xy')
+            elif (owner is not None and snapshot.get('operation') == owner.spear
+                  and snapshot.get('spear_start_z') is not None):
+                tip = snapshot.get('tracked_tip_xy')
+                if tip is None:
+                    tip = snapshot.get('calibrated_tip_xy')
+            if tip is None and not snapshot.get('stale', True):
+                tip = snapshot.get('detected_tip_xy')
+            if tip is not None:
+                evidence['pipette'] = dict(xy=tip, stage_xy=stage_anchor, pipette_xyz=pipette_anchor)
             if getattr(self, '_display_owner', None) is not owner:
                 self._display_owner, self._display_errors = owner, set()
             if not hasattr(self, '_display_errors'):

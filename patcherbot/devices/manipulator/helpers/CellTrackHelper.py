@@ -83,20 +83,24 @@ class CellTrackHelper:
         self.last_match_evidence = {"independent": False, "refined": False}
 
     @staticmethod
-    def template_evidence(stage, observation, state, expected, *, use_centroid, info):
-        """Refresh independent identity evidence only on a stationary SEARCH frame."""
-        state['cell_template_evidence'] = None
+    def template_evidence(stage, observation, phase, expected, *, use_centroid, info):
+        """Refresh phase.cell_template_evidence on a stationary SEARCH frame.
+
+        Read the phase cell template and image-space prompt; record the matched
+        calibration-space reference without selecting or moving a motor.
+        """
+        phase.cell_template_evidence = None
         image = observation.get('camera_image')
         if image is None:
             return
         try:
             helper = stage._ensure_cell_track_helper()
-            match = helper.find_centroid(state['cell'][1], image,
+            match = helper.find_centroid(phase.cell[1], image,
                 use_centroid=use_centroid,
-                prompt_point=state.get('cell_template_point'), expected_point=expected,
+                prompt_point=phase.cell_template_point, expected_point=expected,
                 reference_stage_xy=lambda: np.asarray(observation['deep_learning'].get(
                     'source_positions', {}).get('stage_xy', observation['stage_positions'][:2]))[:2])
-            point, state['cell_template_evidence'] = (None, None) if match is None else match
+            point, phase.cell_template_evidence = (None, None) if match is None else match
             evidence = getattr(helper, 'last_match_evidence', {})
             info(f'Cell template: evidence={evidence}; xy={point}; '
                                  'stage fallback is not counted as an independent template match')
@@ -105,19 +109,25 @@ class CellTrackHelper:
 
 
     @staticmethod
-    def cell_shift_options(stage, raw, state, *, use_centroid, info, warning):
-        """Return accepted centering coordinates, or False while awaiting a recheck."""
-        detection, image = raw.get('cell_detection'), raw.get('camera_image')
+    def cell_shift_options(stage, observation, phase, *, use_centroid, info, warning):
+        """Return device centering options, or False while awaiting fresh evidence.
+
+        Read and update the phase cell reference, template, and recheck evidence.
+        Source-frame image pixels are projected to current-stage image pixels;
+        cell_focus_z retains the calibrated microscope micrometre convention.
+        """
+        detection, image = observation.get('cell_detection'), observation.get('camera_image')
         options = {}
         if detection is not None and image is not None:
-            source_xy = np.asarray(raw['deep_learning'].get('source_positions', {}).get(
-                'stage_xy', raw['stage_positions'][:2]))[:2]
-            expected = (stage.M @ source_xy + stage.r0)[:2] - state['cell'][0][:2]
-            CellTrackHelper.template_evidence(stage, raw, state, expected, use_centroid=use_centroid, info=info)
-            template = state.get('cell_template_evidence')
+            source_xy = np.asarray(observation['deep_learning'].get('source_positions', {}).get(
+                'stage_xy', observation['stage_positions'][:2]))[:2]
+            expected = (stage.M @ source_xy + stage.r0)[:2] - phase.cell[0][:2]
+            CellTrackHelper.template_evidence(stage, observation, phase, expected, use_centroid=use_centroid, info=info)
+            template = phase.cell_template_evidence
             template_xy = None if template is None else (stage.M @ source_xy + stage.r0)[:2] - template
-            recheck = state.pop('cell_shift_recheck', None)
-            frame = raw['deep_learning'].get('source_frame', raw.get('observation_id'))
+            recheck = phase.cell_shift_recheck
+            phase.cell_shift_recheck = None
+            frame = observation['deep_learning'].get('source_frame', observation.get('observation_id'))
             ambiguous = False
             if template_xy is not None:
                 points = [np.asarray(detection[:2]), expected, template_xy]
@@ -125,14 +135,14 @@ class CellTrackHelper:
                         for i in range(3) for j in range(i)]
                 ambiguous = min(gaps) > stage.focusHelper.TIP_STABILITY_UM
                 if ambiguous and frame is not None and recheck is None:
-                    state['cell_shift_recheck'] = (frame, np.asarray(detection[:2]).copy())
+                    phase.cell_shift_recheck = (frame, np.asarray(detection[:2]).copy())
                     info('Cell SHIFT: all three estimates disagree; requesting one fresh settled observation before motion')
                     return False
             _, fused = CellTrackHelper.fuse_candidates(stage, [detection], expected, template_xy)
             if recheck is not None:
                 stable = np.linalg.norm(stage.pixels_to_um_relative(
                     np.asarray(detection[:2]) - recheck[1])[:2]) <= stage.focusHelper.TIP_STABILITY_UM
-                if frame is None or frame == recheck[0] or raw['deep_learning'].get('stale', False) or not stable:
+                if frame is None or frame == recheck[0] or observation['deep_learning'].get('stale', False) or not stable:
                     fused = expected.copy()
                     warning('Cell SHIFT: recheck lacks fresh stable evidence for the selected cell; retaining calibration estimate')
             if ambiguous:
@@ -141,13 +151,12 @@ class CellTrackHelper:
                 if distance > stage.focusHelper.TIP_STABILITY_UM:
                     fused = expected + correction * (stage.focusHelper.TIP_STABILITY_UM / distance)
                 warning('Cell SHIFT: no agreeing pair; model correction limited to 5 um from calibration estimate')
-            reference = np.array(state['cell'][0], dtype=float, copy=True)
+            reference = np.array(phase.cell[0], dtype=float, copy=True)
             reference[:2] = (stage.M @ source_xy + stage.r0)[:2] - fused
-            reference[2] = state['cell_focus_z']
-            state.setdefault('original_cell_reference', state['cell'][0])
-            state['cell'] = (reference, np.asarray(image).copy(), np.append(source_xy, state['cell_focus_z']))
-            state['tracked_cell_reference'] = reference[:2].copy()
-            state['cell_template_point'] = fused.copy()
+            reference[2] = phase.cell_focus_z
+            phase.cell = (reference, np.asarray(image).copy(), np.append(source_xy, phase.cell_focus_z))
+            phase.tracked_cell_reference = reference[:2].copy()
+            phase.cell_template_point = fused.copy()
             current_xy = fused + (stage.M @ (np.asarray(stage.position())[:2] - source_xy))[:2]
             options['detected_px'] = current_xy
             info(f'Cell SHIFT consensus: prior_xy={expected}; template_xy={template_xy}; '
@@ -155,8 +164,10 @@ class CellTrackHelper:
                 f'fused_source_xy={fused}; current_xy={current_xy}; z={reference[2]}; '
                 'weights=confidence and pairwise spatial support, not calibrated probabilities')
         else:
-            if state.pop('cell_shift_recheck', None) is not None:
-                options['detected_px'] = (stage.M @ np.asarray(stage.position())[:2] + stage.r0)[:2] - state['cell'][0][:2]
+            recheck = phase.cell_shift_recheck
+            phase.cell_shift_recheck = None
+            if recheck is not None:
+                options['detected_px'] = (stage.M @ np.asarray(stage.position())[:2] + stage.r0)[:2] - phase.cell[0][:2]
                 warning('Cell SHIFT: recheck missing detector or source image; retaining calibration estimate')
             else:
                 info('Cell SHIFT consensus unavailable: missing detector or source image; using existing template centering')

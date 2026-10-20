@@ -85,6 +85,7 @@ class AutoPatcher(TaskController):
         # True  -> interpret model output as velocity (xy px/s, z um/s) and stream velocity commands.
         self.velocity_prediction = False
         self.observer = Observer(self)
+        self.alignment_phase = None
 
         # Phases share this controller's hardware, configuration, and request state.
         self.find_pipette_phase = FindPipettePhase(self)
@@ -147,7 +148,7 @@ class AutoPatcher(TaskController):
     def _get_state_recorder(self) -> StateMachineLogger:
         if self._state_recorder is None:
             self.attempt_counter += 1
-            self.observer.reset_attempt(self.attempt_counter)
+            self.observer = Observer(self, attempt_id=self.attempt_counter)
             self._state_recorder = StateMachineLogger(
                 base_path="experiments/Data/state_recorder_data/",
                 attempt_id=self.attempt_counter
@@ -960,7 +961,7 @@ class AutoPatcher(TaskController):
 
         self.calibrated_stage.set_max_speed(10000)
         self.calibrated_unit.set_max_speed(100000)
-        if not getattr(self, "alignment_display", None):
+        if self.alignment_phase is None:
             unit = self.calibrated_unit
             anchor = (getattr(unit, '_trusted_tip_reference', None)
                       or (np.array([unit.camera.width / 2., unit.camera.height / 2.]), self.home_position, np.asarray(self.home_stage_position)[:2]))
