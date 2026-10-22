@@ -1,7 +1,9 @@
 position_update: 1000
+record_overlays: false
 autofocus_dist: 15
 stage_diag_move: 500
 frame_lag: 4
+y_delta_scan: 750
 pipette_diag_move: 200
 stage_x_axis_flip: false
 stage_y_axis_flip: true
@@ -13,33 +15,38 @@ clean_move_order:
 - z
 pipette_k_scale: 1
 microscope_units_per_um: 5.0
+objective_lift_um: 10000
 home_position_delta_um: -1000
 safe_position_delta_um: -18000
 native_zero: 1962
 native_per_mbar: 2.7836
 reader_offset: 516.72
 reader_scale: 0.3923
-pipette_detector_model: 'PipetteDetectorNetX.pt'
-pipette_focuser_model: 'PipetteFocuserNet.pt'
+pipette_detector_model: PipetteDetectorNetX.pt
+pipette_detector_model_version: R02
+pipette_brain_slice_model: PipetteDetectorNetB.pt
+pipette_brain_slice_model_version: R12
+pipette_detection_radius_um: 3.0
+pipette_focuser_model: PipetteFocuserNet.pt
 pipette_focus_crop_feature: false
 use_ai_features: true
 home_position:
-- 0
-- 0
-- 0
+- 106702.9
+- -14363.5
+- 53377.5
 home_position_stage:
-- 0
-- 0
-- 0
+- 25762.1
+- -44891.2
+- 25867.2
 safe_position:
-- 0
-- 0
-- 0
+- 90389.35983334029
+- -14363.5
+- 45770.37128866741
 safe_position_stage:
-- 0
-- 0
-- 0
+- 25762.1
+- -44891.2
+- 25867.2
 bath_position:
-- 0
-- 0
-- 0
+- 92487.3
+- -6370.4
+- 51515.4

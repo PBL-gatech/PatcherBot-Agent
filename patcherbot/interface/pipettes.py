@@ -1,6 +1,8 @@
 # coding=utf-8
 import pickle
 import os
+import math
+from numbers import Real
 
 import numpy as np
 from datetime import datetime
@@ -18,7 +20,6 @@ class PipetteInterface(TaskInterface):
     '''
     Controller for the stage, the microscope, a pipette, and the cell sorter.
     '''
-
     def __init__(
         self,
         stage,
@@ -125,6 +126,12 @@ class PipetteInterface(TaskInterface):
             raise RuntimeError('Stage not calibrated')
         if not self.calibrated_unit.calibrated:
             raise RuntimeError('Manipulator not calibrated')
+
+        floor_z = self.microscope.floor_Z
+        if floor_z is not None:
+            if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
+                raise ValueError('Cell floor must be a finite coordinate or unset')
+            floor_z = float(floor_z)
         
         # concatenate home position and home stage position
         if self.home_position is None or self.home_stage_position is None:
@@ -155,6 +162,8 @@ class PipetteInterface(TaskInterface):
                     'home': self.home,
                     'safe': self.safe,
                     'bath': self.cleaning_bath_position,
+                    'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
+                    'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
                 }, f)
             self.info('Calibration written to file')
         except Exception as e:
@@ -170,17 +179,67 @@ class PipetteInterface(TaskInterface):
         if os.path.isfile(config_filename):
             with open(config_filename, 'rb') as f:
                 cal = pickle.load(f)
+                floor_z = cal.get('floor_Z')
+                if floor_z is not None:
+                    if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
+                        raise ValueError('Saved cell floor must be a finite coordinate or unset')
+                    floor_z = float(floor_z)
                 home = np.asarray(cal['home'], dtype=float).reshape(-1)
                 safe = np.asarray(cal['safe'], dtype=float).reshape(-1)
                 if home.shape != (6,) or safe.shape != (6,) or not np.isfinite(np.r_[home, safe]).all():
                     raise ValueError('Saved home and safe anchors must each contain six finite coordinates')
+                if floor_z is None:
+                    # Home contains pipette XYZ followed by stage XYZ, all in micrometres.
+                    delta = self.calibration_config.home_position_delta_um
+                    if isinstance(delta, bool) or not isinstance(delta, Real) or not math.isfinite(delta):
+                        raise ValueError('Home position offset must be finite')
+                    floor_z = float(home[5]) - float(delta)
+                    if not math.isfinite(floor_z):
+                        raise ValueError('Inferred cell floor must be finite')
+                # Validate calibrated formats, not the stage's temporary 3x2 startup matrix.
+                for key, expected_shape in (('manip', (3, 3)), ('stage', (2, 2))):
+                    matrix = np.asarray(cal[key]['M'], dtype=float)
+                    if matrix.shape != expected_shape or not np.isfinite(matrix).all():
+                        raise ValueError(
+                            f'Saved {key} calibration matrix must be finite with shape '
+                            f'{expected_shape}; got {matrix.shape}')
+                    cal[key]['M'] = matrix
+                bath = cal.get('bath')
+                if bath is not None:
+                    bath = np.asarray(bath, dtype=float)
+                    if bath.shape != (3,) or not np.isfinite(bath).all():
+                        raise ValueError('Saved bath position must contain three finite coordinates')
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
+                self.calibrated_unit._tip_reference = None
+                self.calibrated_unit._trusted_tip_reference = None
                 self.home_position = home[:3].copy()
                 self.home_stage_position = home[3:].copy()
                 self.safe_position = safe[:3].copy()
                 self.safe_stage_position = safe[3:].copy()
-                self.cleaning_bath_position = cal['bath']
+                self.cleaning_bath_position = bath
+                self.microscope.floor_Z = floor_z
+
+                source_saved_at = cal.get('saved_at')
+                try:
+                    if not isinstance(source_saved_at, str):
+                        source_saved_at = None
+                    else:
+                        datetime.fromisoformat(source_saved_at)
+                except ValueError:
+                    source_saved_at = None
+                source_file = os.path.abspath(config_filename)
+                self.loaded_calibration_reference = {
+                    'source_file': source_file,
+                    'source_saved_at': source_saved_at,
+                    'source_session': os.path.basename(os.path.dirname(source_file)),
+                    'reloaded_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+                }
+                self.info(
+                    f"Calibration reloaded from {source_file}; "
+                    f"file saved at: {source_saved_at or 'unknown'}; "
+                    f"source session folder: {self.loaded_calibration_reference['source_session']}; "
+                    f"reloaded at: {self.loaded_calibration_reference['reloaded_at']}")
 
                 print('Loaded calibration from file!')
                 print('Manipulator calibration:')

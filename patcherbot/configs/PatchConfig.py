@@ -28,6 +28,8 @@ class PatchConfig(Config):
         doc='Cell matching radius during Search in Adaptive Approach and Hunt; post-Spear Hunt reacquisition retains its 7 um limit')
     scan_z_radius_um = NumberWithUnit(5, bounds=(0.1, 1000), unit='\u03bcm',
         doc='Scan distance above and below the estimated pipette plane in Adaptive Approach and Hunt')
+    scan_confirm_defocus_um = NumberWithUnit(0.5, bounds=(0.01, 100), unit='\u03bcm',
+        doc='Maximum absolute predicted defocus on each settled Adaptive pipette Scan confirmation frame')
     approach_cell_max_shift = NumberWithUnit(256, bounds=(1, 10000), doc='Maximum cell-centering shift per axis during approach', unit='px')
     approach_pipette_speed = NumberWithUnit(20, bounds=(1, 10000), doc='Pipette-centering speed during approach', unit='μm/s')
     slice_start_distance = NumberWithUnit(75, bounds=(0, 100), doc='Initial distance above target cell in slice', unit='μm') # 20 um default
@@ -84,7 +86,7 @@ class PatchConfig(Config):
     categories = [
         ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
                       'max_locate_speed', 'search_speed', 'search_z_radius_um', 'search_xy_radius_um',
-                      'scan_z_radius_um', 'approach_cell_max_shift', 'approach_pipette_speed',
+                      'scan_z_radius_um', 'scan_confirm_defocus_um', 'approach_cell_max_shift', 'approach_pipette_speed',
                       'max_clearing_speed', 'use_centroid', 'cell_shift_fusion', 'track_cell',
                       'tracking_mode', 'track_max_fast_jump_px']),
         ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin', 'hunt_timeout',

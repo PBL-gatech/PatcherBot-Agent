@@ -16,6 +16,8 @@ from patcherbot.gui.ParamConfig import ParamConfig
 class ExperimentBookTab(ParamConfig):
     """Experiment detail form with an append-only chat-style timeline."""
 
+    reload_requested = QtCore.pyqtSignal()
+
     THUMBNAIL_SIZE = QtCore.QSize(160, 120)
 
     def __init__(
@@ -57,6 +59,9 @@ class ExperimentBookTab(ParamConfig):
         self.save_details_button = QtWidgets.QPushButton("Save Details")
         self.save_details_button.clicked.connect(self.save_details)
         details_layout.addWidget(self.save_details_button)
+        self.reload_details_button = QtWidgets.QPushButton("Reload Details")
+        self.reload_details_button.clicked.connect(lambda: self.reload_requested.emit())
+        details_layout.addWidget(self.reload_details_button)
 
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
@@ -258,16 +263,17 @@ class ExperimentBookTab(ParamConfig):
         self._set_status("Snapshot added to the experiment timeline.")
         return True
 
-    def add_atlas_entry(self, image_path, image, caption, timestamp):
-        """Record a saved atlas image against the active experiment."""
+    def add_atlas_entry(self, image_path, image, caption, timestamp, persist=True):
+        """Display an atlas image; imported entries are already persisted."""
         if not self.book_active:
             return False
-        try:
-            self.logger.write_atlas(image_path, caption, self.active_details, timestamp)
-        except OSError:
-            logging.getLogger(__name__).exception("Unable to log atlas image")
-            self._set_status("Atlas image could not be added to the experiment log.", error=True)
-            return False
+        if persist:
+            try:
+                self.logger.write_atlas(image_path, caption, self.active_details, timestamp)
+            except OSError:
+                logging.getLogger(__name__).exception("Unable to log atlas image")
+                self._set_status("Atlas image could not be added to the experiment log.", error=True)
+                return False
         card, card_layout = self._new_card("Atlas", timestamp)
         body = QtWidgets.QLabel(f"{caption}\nImage: {image_path}")
         body.setTextFormat(QtCore.Qt.PlainText)

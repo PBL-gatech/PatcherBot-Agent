@@ -397,12 +397,16 @@ class AutoPatchInterface(TaskInterface):
                     continue
                 try:
                     if marker is None:
-                        if not unit.calibrated or getattr(unit, 'must_be_recalibrated', False):
+                        if not unit.calibrated:
+                            continue
+                        needs_offset_refresh = getattr(unit, 'must_be_recalibrated', False)
+                        trusted_anchor = getattr(unit, '_trusted_tip_reference', None)
+                        if needs_offset_refresh and trusted_anchor is None:
                             continue
                         homes = np.asarray([controller.home_position, controller.home_stage_position], dtype=float)
                         if homes.shape != (2, 3) or not np.isfinite(homes).all():
                             continue
-                        anchor = (getattr(unit, '_tip_reference', None)
+                        anchor = trusted_anchor if needs_offset_refresh else (getattr(unit, '_tip_reference', None)
                                   or getattr(unit, '_trusted_tip_reference', None)
                                   or (np.array([unit.camera.width / 2., unit.camera.height / 2.]), homes[0], homes[1][:2]))
                         point = unit.reference_position(anchor=anchor)[:2]
@@ -694,16 +698,24 @@ class AutoPatchInterface(TaskInterface):
     
 
     @command(category='Patch',
-             description='read the calibratoin values from file',
-                success_message='Calibration values read from file')
-    def read_calibration(self) -> None:
-        self.pipette_controller.read_calibration()
-        self.current_autopatcher.home_position = self.pipette_controller.home_position
-        self.current_autopatcher.safe_position = self.pipette_controller.safe_position
-        self.current_autopatcher.home_stage_position = self.pipette_controller.home_stage_position
-        self.current_autopatcher.safe_stage_position = self.pipette_controller.safe_stage_position
+             description='Read calibration and saved positions from file',
+             success_message='Calibration and saved positions loaded')
+    def read_calibration(self, config_filename='calibration.pickle') -> None:
+        self.pipette_controller.read_calibration(config_filename)
+        self.current_autopatcher.home_position = self.pipette_controller.home_position.copy()
+        self.current_autopatcher.safe_position = self.pipette_controller.safe_position.copy()
+        self.current_autopatcher.home_stage_position = self.pipette_controller.home_stage_position.copy()
+        self.current_autopatcher.safe_stage_position = self.pipette_controller.safe_stage_position.copy()
         self.current_autopatcher.cleaning_bath_position = self.pipette_controller.cleaning_bath_position
         self.current_autopatcher.rinsing_bath_position = self.pipette_controller.rinsing_bath_position
+        config = self.pipette_controller.calibration_config
+        config.home_position = tuple(self.current_autopatcher.home_position)
+        config.safe_position = tuple(self.current_autopatcher.safe_position)
+        config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
+        config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
+        config.bath_position = (tuple(self.current_autopatcher.cleaning_bath_position)
+                                if self.current_autopatcher.cleaning_bath_position is not None
+                                else (0.0, 0.0, 0.0))
         self.info(f'Calibration values read from file: {self.current_autopatcher.home_position}, {self.current_autopatcher.safe_position}, {self.current_autopatcher.home_stage_position}, {self.current_autopatcher.safe_stage_position}, {self.current_autopatcher.cleaning_bath_position}, {self.current_autopatcher.rinsing_bath_position}')
 
 

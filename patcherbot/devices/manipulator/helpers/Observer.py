@@ -26,7 +26,9 @@ class Observer:
                 evidence=None, raw_resistance=False):
         fields = tuple(dict.fromkeys(self.default_fields if fields is None else fields))
         if evidence is None:
-            evidence = self.infer_frame(fields, getattr(phase, "frame_context", None))
+            evidence = self.infer_frame(
+                fields, getattr(phase, "frame_context", None),
+                pipette_prefer_anchor=getattr(phase, "pipette_prefer_anchor", False))
         evidence = dict(evidence)
         image = evidence.pop("_source_image", None)
         acquired = evidence.get("frame_retrieval_started_at")
@@ -69,7 +71,8 @@ class Observer:
         self.deck.append(deepcopy({name: value for name, value in observation.items() if name != "camera_image"}))
         return observation
 
-    def infer_frame(self, fields, frame_context=None, *, confirmation=None, pipette_radius_um=None):
+    def infer_frame(self, fields, frame_context=None, *, confirmation=None, pipette_radius_um=None,
+                    pipette_prefer_anchor=False):
         unit, stage = self.unit, self.stage
         if confirmation is not None:
             helper = stage.focusHelper
@@ -81,7 +84,9 @@ class Observer:
             try:
                 for _ in range(helper.CONFIRM_MAX_FRAMES):
                     unit.abort_if_requested()
-                    evidence = self.infer_frame(fields, frame_context, pipette_radius_um=pipette_radius_um)
+                    evidence = self.infer_frame(
+                        fields, frame_context, pipette_radius_um=pipette_radius_um,
+                        pipette_prefer_anchor=pipette_prefer_anchor)
                     if helper.update_confirmation(sweep, evidence):
                         return dict(evidence, confirmed_tip_xy=sweep["confirmation"]["confirmed_tip_xy"])
                     unit.sleep(0.05)
@@ -111,7 +116,8 @@ class Observer:
                     options = dict(expected_tip_xy=evidence["source_positions"]["pipette_expected_xy"],
                         pixels_to_um=stage.pixels_to_um_relative,
                         radius_um=(unit.config.pipette_detection_radius_um if pipette_radius_um is None
-                                   else pipette_radius_um))
+                                   else pipette_radius_um),
+                        prefer_anchor=pipette_prefer_anchor)
                 result = detector.detect_pipette_details(image.copy(), **options)
                 evidence["pipette_position"] = result["tip_xy"]
                 evidence["confidence"]["pipette_detector"] = result["box_confidence"]

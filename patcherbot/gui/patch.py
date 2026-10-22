@@ -85,6 +85,11 @@ class PatchGui(ManipulatorGui):
         classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
         self.classic_patching_tab = classic_patching_tab
         classic_patching_tab.origin_requested.connect(self._request_origin)
+        self.experiment_book_tab.reload_requested.connect(self._reload_book_details)
+        self._last_book_tares = None
+        self.pipette_interface.task_finished.connect(self._tare_task_finished)
+        self.experiment_book_tab.save_details_button.clicked.connect(
+            lambda: self._record_book_tares(self._current_tares()))
         self.add_tab(classic_patching_tab, 'PatcherBot Agent', index = 0)
         self.record_button.clicked.disconnect(self.toggle_recording)
         self.record_button.clicked.connect(classic_patching_tab.toggle_recording)
@@ -138,6 +143,7 @@ class PatchGui(ManipulatorGui):
             return
         self.patch_command_signal.emit(self.patch_interface.accept_origin, record)
         self.experiment_book_tab.add_origin_entry(record, frame)
+        self.classic_patching_tab.set_origin_complete(record["axis"])
         self.classic_patching_tab.set_origin_status(
             record["axis"].upper() + " origin saved to Experiment Book.")
 
@@ -150,6 +156,124 @@ class PatchGui(ManipulatorGui):
         if exit_code:
             self.classic_patching_tab.set_origin_status(
                 "Origin not saved; see the task error for details.", error=True)
+
+    def _setup_reload_busy(self):
+        return (self.running_task is not None or self._origin_busy
+                or self.patch_interface._current_controller is not None
+                or self.pipette_interface._current_controller is not None)
+
+    def _current_tares(self):
+        return {name: [None if value is None else float(value) for value in values]
+                for name, values in (("pipette", self.pipette_interface.tare_pipette),
+                                     ("stage", self.pipette_interface.tare_stage))}
+
+    @QtCore.pyqtSlot(int, object)
+    def _tare_task_finished(self, exit_code, message):
+        if exit_code == 0 and isinstance(message, str) and message == 'Tared position written to file':
+            self._record_book_tares(self._current_tares())
+
+    def _record_book_tares(self, tares):
+        if not self.experiment_book_tab.book_active:
+            return
+        snapshot = (self.experiment_book_tab.logger,
+                    tuple(tares['pipette']), tuple(tares['stage']))
+        # The existing command channel can report a successful command twice.
+        if snapshot == self._last_book_tares:
+            return
+        try:
+            self.experiment_book_tab.logger.write_tares(tares)
+            self._last_book_tares = snapshot
+        except Exception:
+            logging.exception("Unable to record tares in Experiment Book")
+            self.experiment_book_tab._set_status("Tares could not be saved to the book.", error=True)
+
+    def _record_calibration_reload(self):
+        book = self.experiment_book_tab
+        reference = self.pipette_interface.loaded_calibration_reference
+        timestamp = datetime.fromisoformat(reference["reloaded_at"])
+        text = "\n".join([
+            f"Calibration source: {reference['source_file']}",
+            f"Source saved at: {reference['source_saved_at'] or 'not recorded in this older file'}",
+            f"Source session folder: {reference['source_session']}",
+            f"Reloaded at: {reference['reloaded_at']}",
+        ])
+        try:
+            book.logger.write_note(text, timestamp)
+            book._add_text_card("Reloaded Calibration", text, timestamp)
+        except Exception:
+            logging.exception("Calibration loaded but source history could not be recorded")
+            book._set_status("Calibration loaded; source note could not be saved.", error=True)
+
+    def _reload_book_details(self):
+        book = self.experiment_book_tab
+        if self._setup_reload_busy():
+            book._set_status("Wait for the current movement/task to finish.", error=True)
+            return
+        source, _ = QFileDialog.getOpenFileName(
+            self, "Reload Experiment Book Details",
+            "experiments/Data/experiment_book_data", "Experiment Books (*.log)")
+        if not source:
+            return
+        try:
+            payload = book.logger.read_details(source)
+            tares = payload["tares"]
+            if tares is None:
+                tare_path, _ = QFileDialog.getOpenFileName(
+                    self, "Select saved tares (Cancel to keep current tares)",
+                    "experiments/Data/calibration_data", "Saved Tares (*.pickle)")
+                if tare_path:
+                    with open(tare_path, "rb") as stream:
+                        tares = pickle.load(stream)
+            # Decode images before committing any imported runtime state.
+            import cv2
+            frames = {}
+            for axis, record in payload["origins"].items():
+                if record is not None:
+                    frame = cv2.imread(record["image_path"], cv2.IMREAD_UNCHANGED)
+                    if frame is None:
+                        raise ValueError(f"Cannot read {axis.upper()} origin image")
+                    frames[axis] = frame
+            atlas_images = []
+            for atlas in payload.get("atlases", []):
+                image = QtGui.QImage(atlas["image_path"])
+                if image.isNull():
+                    raise ValueError(f"Cannot read saved atlas image: {atlas['image_path']}")
+                atlas_images.append(image)
+            if self._setup_reload_busy():
+                raise ValueError("Wait for the current movement/task to finish.")
+            payload = book.logger.import_details(source, tares=tares)
+            self._last_book_tares = None
+            for name, value in payload["details"].items():
+                setattr(book.config, name, value)
+            book.active_details = dict(payload["details"])
+            book.book_active = True
+            book.send_button.setEnabled(True)
+            book._add_text_card("Reloaded Details", "\n".join(
+                [f"Source: {payload['source_path']}",
+                 f"Source first entry: {payload.get('source_started_at') or 'not recorded'}",
+                 f"Details recorded at: {payload.get('details_saved_at') or 'not recorded'}"] +
+                [f"{name}: {value}" for name, value in payload["details"].items()]),
+                datetime.now().astimezone())
+            for note in payload["notes"]:
+                book._add_text_card("Imported Note", note["text"],
+                                    datetime.fromisoformat(note["saved_at"]))
+            for atlas, image in zip(payload.get("atlases", []), atlas_images):
+                book.add_atlas_entry(atlas["image_path"], image, atlas["caption"],
+                                     datetime.fromisoformat(atlas["saved_at"]), persist=False)
+            self.classic_patching_tab.restore_tares(payload["tares"])
+            for axis, record in payload["origins"].items():
+                if record is None:
+                    continue
+                self.patch_interface.origins[axis] = float(record["origins_um"][axis])
+                book.add_origin_entry(record, frames[axis])
+                self.classic_patching_tab.set_origin_complete(axis)
+            message = "Book details, notes, atlas images, and available origins reloaded."
+            if payload["tares"] is None:
+                message += " No saved tares selected; current tares retained."
+            book._set_status(message)
+        except Exception as error:
+            logging.exception("Unable to reload experiment book details")
+            book._set_status(f"Details reload failed: {error}", error=True)
 
     def register_commands(self):
         super(PatchGui, self).register_commands()
@@ -732,6 +856,9 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
                         change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)",
                         extra_widget=origin_controls)
+        load_button = self.get_section_button('calibration', 'Load Calibration')
+        load_button.clicked.disconnect()
+        load_button.clicked.connect(self.load_calibration)
 
         # Add a box for movement commands 
         buttonList = [
@@ -815,16 +942,75 @@ class ClassicPatchButtons(ButtonTabWidget):
         for button in self.origin_buttons.values():
             button.setToolTip(message)
 
-    def load_calibration(self):
-        self.file_selector.fileSelected.connect(self.load_calibration_file)  # Connect the signal to the slot
-        self.file_selector.open_file_dialog()  # Open the file dialog
+    def set_origin_complete(self, axis):
+        self._set_button_completion_style(
+            self.origin_buttons[axis], self.section_colors['calibration'])
 
+    def restore_tares(self, tares):
+        if tares is None:
+            return
+        pipette, stage = tares['pipette'], tares['stage']
+        interface = self.pipette_interface
+        interface.tare_pipette = np.asarray(interface.tare_pipette, dtype=object).copy()
+        interface.tare_stage = np.asarray(interface.tare_stage, dtype=object).copy()
+        self.tare_pipette_pos = list(self.tare_pipette_pos)
+        for index, value in enumerate(pipette):
+            if value is not None:
+                interface.tare_pipette[index] = value
+                self.tare_pipette_pos[index] = value
+        for index, value in enumerate(stage):
+            if value is not None:
+                interface.tare_stage[index] = value
+        if stage[0] is not None:
+            self.currx_stage_pos = [stage[0], 0, 0]
+        if stage[1] is not None:
+            self.curry_stage_pos = [0, stage[1], 0]
+        if stage[2] is not None:
+            scale = float(interface.calibration_config.microscope_units_per_um)
+            self.currz_stage_pos = [0, 0, stage[2] * scale]
+
+    def load_calibration(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Load Calibration', 'experiments/Data/calibration_data',
+            'Calibration Files (*.pickle);;All Files (*)')
+        if file_path:
+            self.load_calibration_file(file_path)
 
     def load_calibration_file(self, file_path):
-        # call pipette.interface.read_calibration
-            logging.info(f"Loading calibration file: {file_path}")
-            self.pipette_interface.read_calibration(file_path)
-
+        gui = self.window()
+        if (getattr(gui, 'running_task', None) is not None
+                or getattr(gui, '_origin_busy', False)
+                or self.patch_interface._current_controller is not None
+                or self.pipette_interface._current_controller is not None):
+            QMessageBox.warning(self, 'Calibration Reload',
+                                'Wait for the current movement/task to finish.')
+            return
+        button = self.get_section_button('calibration', 'Load Calibration')
+        button.setStyleSheet('')
+        try:
+            self.patch_interface.read_calibration(file_path)
+        except Exception as error:
+            logging.exception('Failed to load calibration: %s', file_path)
+            QMessageBox.critical(self, 'Calibration Load Failed', str(error))
+            return
+        # Blue confirms restored data; the pipette's offset-refresh flag remains active.
+        for name in ('Load Calibration', 'Calibrate Stage', 'Calibrate Pipette'):
+            self._set_button_completion_style(
+                self.get_section_button('calibration', name),
+                self.section_colors['calibration'])
+        pipette_button = self.get_section_button('calibration', 'Calibrate Pipette')
+        if self.pipette_interface.calibrated_unit.must_be_recalibrated:
+            pipette_button.setToolTip('Calibration loaded; pipette offset refresh required.')
+        else:
+            pipette_button.setToolTip('Calibration loaded.')
+        cleaning_button = self.get_section_button('calibration', 'Store Cleaning Position')
+        if self.pipette_interface.cleaning_bath_position is not None:
+            self._set_button_completion_style(cleaning_button, self.section_colors['calibration'])
+        else:
+            cleaning_button.setStyleSheet('')
+        gui._record_calibration_reload()
+        # Refresh only the displayed tip anchor; this command does not move hardware.
+        self.execute_command(self.pipette_interface.detect_pipette)
 
     def test_movement(self):
         # check if recording is enabled

@@ -653,7 +653,7 @@ class PipetteDetector4(PipetteDetector):
         return img
 
     def detect_pipette_details(self, img: np.ndarray, *, expected_tip_xy=None,
-                               pixels_to_um=None, radius_um=50.0) -> dict:
+                               pixels_to_um=None, radius_um=50.0, prefer_anchor=False) -> dict:
         """Return XY, depth in microns, box confidence and optional Z confidence.
 
         Uses one inference pass. Missing/invalid predictions are None; box
@@ -686,6 +686,8 @@ class PipetteDetector4(PipetteDetector):
                     confidence = candidate.get("box_confidence")
                     if tip.shape != (2,) or not np.isfinite(tip).all() or confidence is None or not np.isfinite(confidence):
                         continue
+                    if prefer_anchor and confidence < self.adapter.threshold:
+                        continue
                     offset = np.asarray(pixels_to_um(tip - expected), dtype=float).reshape(-1)[:2]
                     if offset.size != 2 or not np.isfinite(offset).all():
                         continue
@@ -696,7 +698,18 @@ class PipetteDetector4(PipetteDetector):
                 prediction["accepted_candidate_count"] = len(accepted)
                 if not accepted:
                     return prediction
-                result = max(accepted, key=lambda candidate: candidate["box_confidence"])
+                if prefer_anchor:
+                    result = min(
+                        accepted,
+                        key=lambda candidate: (
+                            np.linalg.norm(np.asarray(pixels_to_um(
+                                np.asarray(candidate["tip_xy"], dtype=float) - expected
+                            ), dtype=float).reshape(-1)[:2]),
+                            -candidate["box_confidence"],
+                        ),
+                    )
+                else:
+                    result = max(accepted, key=lambda candidate: candidate["box_confidence"])
             tip = result["tip_xy"]
             if tip is None:
                 return prediction
@@ -818,13 +831,14 @@ class PipetteDetector5(PipetteDetector4):
             return super().detect_pipette(img)
 
     def detect_pipette_details(
-        self, img, *, expected_tip_xy=None, pixels_to_um=None, radius_um=50.0
+        self, img, *, expected_tip_xy=None, pixels_to_um=None, radius_um=50.0,
+        prefer_anchor=False
     ):
         with self._model_lock:
             self._require_model()
             result = super().detect_pipette_details(
                 img, expected_tip_xy=expected_tip_xy,
-                pixels_to_um=pixels_to_um, radius_um=radius_um,
+                pixels_to_um=pixels_to_um, radius_um=radius_um, prefer_anchor=prefer_anchor,
             )
             result["z_confidence_supported"] = (
                 self.adapter.model.z_confidence_head is not None

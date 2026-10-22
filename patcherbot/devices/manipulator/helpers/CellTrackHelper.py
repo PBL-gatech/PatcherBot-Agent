@@ -121,7 +121,9 @@ class CellTrackHelper:
         if detection is not None and image is not None:
             source_xy = np.asarray(observation['deep_learning'].get('source_positions', {}).get(
                 'stage_xy', observation['stage_positions'][:2]))[:2]
-            expected = (stage.M @ source_xy + stage.r0)[:2] - phase.cell[0][:2]
+            anchored = getattr(phase, 'mode', None) == 'Adaptive' and hasattr(phase, 'bounded_cell_target')
+            expected = (phase.expected_cell_xy(source_xy) if anchored else
+                        (stage.M @ source_xy + stage.r0)[:2] - phase.cell[0][:2])
             CellTrackHelper.template_evidence(stage, observation, phase, expected, use_centroid=use_centroid, info=info)
             template = phase.cell_template_evidence
             template_xy = None if template is None else (stage.M @ source_xy + stage.r0)[:2] - template
@@ -145,12 +147,14 @@ class CellTrackHelper:
                 if frame is None or frame == recheck[0] or observation['deep_learning'].get('stale', False) or not stable:
                     fused = expected.copy()
                     warning('Cell SHIFT: recheck lacks fresh stable evidence for the selected cell; retaining calibration estimate')
-            if ambiguous:
+            if ambiguous and not anchored:
                 correction = fused - expected
                 distance = np.linalg.norm(stage.pixels_to_um_relative(correction)[:2])
                 if distance > stage.focusHelper.TIP_STABILITY_UM:
                     fused = expected + correction * (stage.focusHelper.TIP_STABILITY_UM / distance)
                 warning('Cell SHIFT: no agreeing pair; model correction limited to 5 um from calibration estimate')
+            if anchored:
+                fused = phase.bounded_cell_target(fused, source_xy)
             reference = np.array(phase.cell[0], dtype=float, copy=True)
             reference[:2] = (stage.M @ source_xy + stage.r0)[:2] - fused
             reference[2] = phase.cell_focus_z
@@ -166,7 +170,10 @@ class CellTrackHelper:
         else:
             recheck = phase.cell_shift_recheck
             phase.cell_shift_recheck = None
-            if recheck is not None:
+            if getattr(phase, 'mode', None) == 'Adaptive' and hasattr(phase, 'expected_cell_xy'):
+                options['detected_px'] = phase.expected_cell_xy(np.asarray(stage.position())[:2])
+                warning('Cell SHIFT: missing detector or source image; retaining original selected anchor')
+            elif recheck is not None:
                 options['detected_px'] = (stage.M @ np.asarray(stage.position())[:2] + stage.r0)[:2] - phase.cell[0][:2]
                 warning('Cell SHIFT: recheck missing detector or source image; retaining calibration estimate')
             else:

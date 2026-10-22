@@ -38,6 +38,26 @@ class HuntCellPhase(ApproachCellPhase):
         self.last_velocity = None
         self.cell_detected = False
         self.cell = cell
+        self.selected_cell_anchor = None if cell is None else np.array(cell[0], dtype=float, copy=True)
+        if self.selected_cell_anchor is not None:
+            self.selected_cell_anchor.setflags(write=False)
+        self.pipette_anchor = None
+        approach = getattr(self.controller, 'approach_cell_phase', None)
+        if (self.mode == "Adaptive" and cell is not None and getattr(approach, 'completed_successfully', False)
+                and getattr(approach, 'mode', None) == "Adaptive"
+                and getattr(approach, 'original_cell_reference', None) is cell[0]
+                and np.isfinite([getattr(approach, 'cell_focus_z', np.nan),
+                                     getattr(approach, 'pipette_z', np.nan),
+                                     getattr(approach, 'manipulator_position', [np.nan] * 3)[2]]).all()
+                and getattr(approach, 'pipette_anchor', None) is not None
+                and getattr(approach, 'pipette_anchor_homes', (None, None))[0] is self.controller.home_position
+                and getattr(approach, 'pipette_anchor_homes', (None, None))[1] is self.controller.home_stage_position
+                and getattr(approach, 'pipette_anchor_source', None) is getattr(self.controller.calibrated_unit, '_trusted_tip_reference', None)):
+            self.pipette_anchor = tuple(value.copy() for value in approach.pipette_anchor)
+            self.pipette_anchor_source = approach.pipette_anchor_source
+            self.pipette_anchor_homes = (self.controller.home_position, self.controller.home_stage_position)
+            for value in self.pipette_anchor:
+                value.setflags(write=False)
         self.spear_motion = None
         self.confirmed_readings = 0
         self.last_confirmation_id = None
@@ -109,6 +129,7 @@ class HuntCellPhase(ApproachCellPhase):
                          or (self.operation == self.spear and monitor) else ["cell_detections"])
             if kwargs.get("evidence") is None:
                 kwargs["evidence"] = self.controller.observer.infer_frame(detectors, self.frame_context,
+                    pipette_prefer_anchor=getattr(self, "pipette_prefer_anchor", False),
                     pipette_radius_um=(min(self.controller.calibrated_unit.config.pipette_detection_radius_um, 7.0)
                                        if self.operation == self.spear else None))
             kwargs.setdefault("fields", ["manipulator_position", "stage_positions", "deep_learning"]
@@ -154,31 +175,19 @@ class HuntCellPhase(ApproachCellPhase):
         radius_um = self.controller.config.hunt_target_radius
         if self.operation == self.search:
             radius_um = 7.0 if reacquiring else self.controller.config.search_xy_radius_um
-        reference = self.spear_cell_reference if reacquiring else self.cell[0]
-        expected_xy = (self.controller.calibrated_stage.M @ stage_xy
-                       + self.controller.calibrated_stage.r0)[:2] - reference[:2]
-        detections = vision.get("cell_detections")
-        candidates = []
-        for detection in (() if detections is None else detections):
-            if (not np.isfinite(detection[:3]).all()
-                    or detection[2] < self.controller.calibrated_stage.cellDetectHelper.cellDetector.conf_threshold
-                    or not 0 <= detection[0] < self.controller.calibrated_unit.camera.width
-                    or not 0 <= detection[1] < self.controller.calibrated_unit.camera.height):
-                continue
-            offset_px = np.asarray(detection[:2]) - expected_xy
-            if (self.controller.config.hunt_limit_target_radius
-                    and np.linalg.norm(self.controller.calibrated_stage.pixels_to_um_relative(offset_px)[:2])
-                    > radius_um):
-                continue
-            candidates.append(detection)
-        self.cell_detection = min(candidates,
-            key=lambda detection: np.linalg.norm(np.asarray(detection[:2]) - expected_xy), default=None)
+        outer_radius = self.controller.config.search_xy_radius_um
+        if self.controller.config.hunt_limit_target_radius:
+            outer_radius = min(outer_radius, radius_um)
+        self.cell_detection = self.select_cell_detection(vision.get("cell_detections"), stage_xy, outer_radius,
+            local_reference=self.spear_cell_reference if reacquiring else None,
+            local_radius_um=7.0 if reacquiring else None)
         frame = vision.get("source_frame")
         if (self.operation == self.spear and self.cell_detection is not None
                 and frame is not None and frame != self.last_cell_frame):
             reference = np.array(self.cell[0], dtype=float, copy=True)
+            target = self.bounded_cell_target(self.cell_detection[:2], stage_xy)
             reference[:2] = (self.controller.calibrated_stage.M @ stage_xy
-                            + self.controller.calibrated_stage.r0)[:2] - self.cell_detection[:2]
+                            + self.controller.calibrated_stage.r0)[:2] - target
             reference[2] = self.cell_focus_z
             self.cell = (reference, self.cell[1], self.cell[2])
             self.last_cell_frame = frame
@@ -199,7 +208,7 @@ class HuntCellPhase(ApproachCellPhase):
                 if self.scan_confirmed:
                     defocus = self.vision.get("pipette_focus")
                     if (not self.vision_fresh or defocus is None or not np.isfinite(defocus)
-                            or abs(defocus) > self.controller.calibrated_stage.focusHelper.DEPTH_TOLERANCE_UM):
+                            or abs(defocus) > self.controller.config.scan_confirm_defocus_um):
                         self.failure_gate(message=f"Hunt Scan has stable XY but unconfirmed tip focus "
                             f"(defocus_um={defocus}); retrying Scan", recover=True)
                     else:
@@ -343,15 +352,21 @@ class HuntCellPhase(ApproachCellPhase):
     def shift(self):
         """Verify or correct cell alignment, then Scan and correct the pipette before Spear."""
         self.controller.microscope.stop()
+        self.validate_pipette_anchor()
+        if not self.shift_cell and (not self.scan_confirmed or self.confirmed_tip_xy is None):
+            self.failure_gate(message='Pipette SHIFT requires confirmed anchored focus evidence', recover=True)
+            return
         if self.shift_cell:
+            target = self.bounded_cell_target(self.cell_detection[:2], self.source_stage_xy)
             reference = np.array(self.cell[0], dtype=float, copy=True)
             reference[:2] = (self.controller.calibrated_stage.M @ self.source_stage_xy
-                            + self.controller.calibrated_stage.r0)[:2] - self.cell_detection[:2]
+                            + self.controller.calibrated_stage.r0)[:2] - target
             reference[2] = self.cell_focus_z
             self.cell = (reference, self.cell[1], self.cell[2])
             if not self.contact_aligned and self.confirmed_readings < 5:
                 self.controller.calibrated_stage.center_on_cell(
-                    self.cell, detected_px=self.cell_detection[:2],
+                    self.cell, detected_px=target + (self.controller.calibrated_stage.M @ (
+                        np.asarray(self.controller.calibrated_stage.position())[:2] - self.source_stage_xy))[:2],
                     max_error_px=self.controller.config.approach_cell_max_shift)
                 self.confirmed_readings = 0
         else:
@@ -362,7 +377,7 @@ class HuntCellPhase(ApproachCellPhase):
             if not self.contact_aligned and self.confirmed_readings < 5:
                 if self.controller.calibrated_unit.center_pipette(
                         speed=self.controller.config.approach_pipette_speed,
-                        detected_px=self.confirmed_tip_xy,
+                        detected_px=self.projected_confirmed_tip(),
                         expected_px=self.frame_context["pipette_expected_xy"](),
                         max_deviation_um=self.controller.calibrated_unit.config.pipette_detection_radius_um) is False:
                     raise AutopatchError("Hunt pipette centering failed")
@@ -388,6 +403,7 @@ class HuntCellPhase(ApproachCellPhase):
 
     def spear(self):
         """Focus, retain the original target reference, and start one monitored descent."""
+        self.validate_pipette_anchor()
         if not self.at_hover:
             self.controller.calibrated_stage.focusHelper.relocate(self.cell_focus_z)
             return
@@ -434,6 +450,7 @@ class HuntCellPhase(ApproachCellPhase):
     def failure_gate(self, *, message=None, recover=False, validate_cell=False, position=None):
         """Check operator aborts, setup, search bounds, timeout, and measured travel."""
         self.controller.abort_if_requested()
+        self.validate_pipette_anchor()
         if self.controller.config.mode not in ("Training", "Classic", "Manual", "Adaptive"):
             raise AutopatchError(f"Hunt mode is not implemented: {self.controller.config.mode}")
         if self.controller.config.mode != self.mode:

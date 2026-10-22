@@ -968,7 +968,8 @@ class AutoPatcher(TaskController):
             evidence = self.observer.infer_frame(["pipette_image_xy"], frame_context={
                 "pipette_expected_xy": lambda: unit.reference_position(anchor=anchor)[:2],
                 "pipette_xyz": unit.position, "stage_xy": self.calibrated_stage.position},
-                confirmation={"confidence_threshold": lambda: 0.5})
+                confirmation={"confidence_threshold": lambda: 0.5},
+                pipette_prefer_anchor=self.config.mode == "Adaptive")
             if evidence.get("confirmed_tip_xy") is not None:
                 source = evidence["source_positions"]
                 unit.set_tip_reference(evidence["confirmed_tip_xy"], source["pipette_xyz"], source["stage_xy"])

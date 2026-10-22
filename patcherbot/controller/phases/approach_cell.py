@@ -29,6 +29,10 @@ class ApproachCellPhase(PhaseController):
     def prepare(self, cell=None):
         """Establish safe defaults, recording, and ownership for this attempt."""
         self.cell = cell
+        self.selected_cell_anchor = None if cell is None else np.array(cell[0], dtype=float, copy=True)
+        if self.selected_cell_anchor is not None:
+            self.selected_cell_anchor.setflags(write=False)
+        self.pipette_anchor = None
         self.original_cell_reference = None
         self.fields = ()
         self.operation = self._start
@@ -95,6 +99,7 @@ class ApproachCellPhase(PhaseController):
         The raw record remains available for recording and tracking helpers;
         phase decisions use the named attributes unpacked here.
         """
+        self.validate_pipette_anchor()
         kwargs.setdefault("fields", self.fields)
         observation = super().observe(**kwargs)
         self.observation = observation
@@ -127,10 +132,28 @@ class ApproachCellPhase(PhaseController):
         """Configure acquisition-time anchors in microscope/manipulator um."""
         controller = self.controller
         unit, stage = controller.calibrated_unit, controller.calibrated_stage
+        self.pipette_prefer_anchor = self.mode == "Adaptive"
+        self.pipette_anchor_homes = (controller.home_position, controller.home_stage_position)
+        if self.pipette_prefer_anchor and self.pipette_anchor is None:
+            self.pipette_anchor_source = getattr(unit, '_trusted_tip_reference', None)
+            anchor = self.pipette_anchor_source
+            if anchor is None:
+                anchor = (np.array([unit.camera.width / 2., unit.camera.height / 2.]),
+                          controller.home_position, np.asarray(controller.home_stage_position)[:2])
+            self.pipette_anchor = tuple(np.asarray(value, dtype=float).copy() for value in anchor)
+            for value in self.pipette_anchor:
+                value.setflags(write=False)
+        if self.pipette_prefer_anchor:
+            detector = getattr(getattr(unit, 'pipetteCalHelper', None), 'pipetteDetector', None)
+            controller.info(f'Adaptive pipette anchor: anchor_xy={self.pipette_anchor[0]}; '
+                f'radius_um={getattr(unit.config, "pipette_detection_radius_um", None)}; '
+                f'model={getattr(detector, "_active_model", None)}; '
+                f'model_version={getattr(detector, "model_version", None)}')
         self.frame_context = dict(stage_xy=stage.position, pipette_xyz=unit.position,
             focus_z=lambda: controller.microscope.position() / unit.config.microscope_units_per_um,
             pipette_expected_xy=lambda: unit.reference_position(
-                anchor=getattr(unit, '_trusted_tip_reference', None) or
+                anchor=self.pipette_anchor if self.pipette_prefer_anchor else
+                getattr(unit, '_trusted_tip_reference', None) or
                 (np.array([unit.camera.width / 2., unit.camera.height / 2.]),
                  controller.home_position, np.asarray(controller.home_stage_position)[:2]))[:2])
         if tracking:
@@ -147,6 +170,16 @@ class ApproachCellPhase(PhaseController):
                 use_centroid=controller.config.use_centroid, info=controller.info, warning=controller.warning)
             if options is False:
                 return False
+        elif self.mode == "Adaptive":
+            source_xy = np.asarray(self.source_stage_xy)[:2]
+            expected = self.expected_cell_xy(source_xy)
+            stage.cellTrackHelper.template_evidence(stage, self.observation, self, expected,
+                use_centroid=controller.config.use_centroid, info=controller.info)
+            template = self.cell_template_evidence
+            target = self.bounded_cell_target(None if template is None else
+                (stage.M @ source_xy + stage.r0)[:2] - template, source_xy)
+            options['detected_px'] = target + (stage.M @ (np.asarray(stage.position())[:2] - source_xy))[:2]
+            controller.info(f'Cell SHIFT template-only: anchor_xy={expected}; bounded_xy={target}')
         else:
             controller.info('Cell SHIFT consensus disabled; using existing template centering')
         if 'detected_px' in options:
@@ -198,6 +231,63 @@ class ApproachCellPhase(PhaseController):
             snapshot["operation"] = self.operation
             self.alignment_snapshot = snapshot
 
+    def expected_cell_xy(self, stage_xy):
+        stage = self.controller.calibrated_stage
+        return (stage.M @ np.asarray(stage_xy) + stage.r0)[:2] - self.selected_cell_anchor[:2]
+
+    def select_cell_detection(self, detections, stage_xy, radius_um, *, local_reference=None, local_radius_um=None):
+        if stage_xy is None or not np.isfinite(stage_xy).all():
+            return None
+        stage = self.controller.calibrated_stage
+        expected = self.expected_cell_xy(stage_xy)
+        camera = self.controller.calibrated_unit.camera
+        local = None if local_reference is None else (stage.M @ np.asarray(stage_xy) + stage.r0)[:2] - np.asarray(local_reference)[:2]
+        candidates = []
+        for row in (() if detections is None else detections):
+            if len(row) < 3 or not np.isfinite(row[:3]).all() or row[2] < self.cell_confidence_threshold():
+                continue
+            xy = np.asarray(row[:2])
+            if not (0 <= xy[0] < camera.width and 0 <= xy[1] < camera.height):
+                continue
+            distance = np.linalg.norm(stage.pixels_to_um_relative(xy - expected)[:2])
+            if not np.isfinite(distance) or distance > radius_um:
+                continue
+            if local is not None:
+                local_distance = np.linalg.norm(stage.pixels_to_um_relative(xy - local)[:2])
+                if local_radius_um is None or not np.isfinite(local_distance) or local_distance > local_radius_um:
+                    continue
+            candidates.append((distance, -float(row[2]), row))
+        return min(candidates, key=lambda item: item[:2])[2] if candidates else None
+
+    def bounded_cell_target(self, point, stage_xy):
+        expected = self.expected_cell_xy(stage_xy)
+        point = None if point is None else np.asarray(point, dtype=float)
+        if point is None or point.shape != (2,) or not np.isfinite(point).all():
+            return expected.copy()
+        stage = self.controller.calibrated_stage
+        distance = np.linalg.norm(stage.pixels_to_um_relative(point - expected)[:2])
+        limit = min(self.controller.config.search_xy_radius_um, stage.focusHelper.TIP_STABILITY_UM)
+        if not np.isfinite(distance) or distance > limit:
+            self.controller.info(f'Cell refinement rejected: anchor_xy={expected}; measured_xy={point}; distance_um={distance}')
+            return expected.copy()
+        return point.copy()
+
+    def validate_pipette_anchor(self):
+        if self.mode == "Adaptive" and getattr(self, 'pipette_anchor', None) is not None:
+            if (getattr(self.controller.calibrated_unit, '_trusted_tip_reference', None) is not self.pipette_anchor_source
+                    or self.controller.home_position is not self.pipette_anchor_homes[0]
+                    or self.controller.home_stage_position is not self.pipette_anchor_homes[1]):
+                raise AutopatchError('Pipette calibration changed; restart the phase to rebuild its anchor')
+
+    def projected_confirmed_tip(self):
+        sources = self.vision.get('source_positions', {})
+        unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
+        if sources.get('pipette_xyz') is None or sources.get('stage_xy') is None:
+            raise AutopatchError('Confirmed pipette evidence has no motor/stage anchors')
+        return (np.asarray(self.confirmed_tip_xy).copy()
+                + unit.um_to_pixels_relative(np.asarray(unit.position()) - sources['pipette_xyz'])[:2]
+                + stage.um_to_pixels_relative(np.asarray(stage.position())[:2] - np.asarray(sources['stage_xy'])[:2])[:2])
+
     def calculate_search(self):
         """SEARCH: associate the selected cell and confirm settled focus evidence.
 
@@ -211,17 +301,8 @@ class ApproachCellPhase(PhaseController):
             return
         stage = self.controller.calibrated_stage
         if not self.cell_selection_locked:
-            expected_xy = (stage.M @ self.source_stage_xy + stage.r0)[:2] - self.cell[0][:2]
-            threshold = stage.cellDetectHelper.cellDetector.conf_threshold
-            candidates = []
-            for detection in self.cell_detections:
-                if not np.isfinite(detection[:3]).all() or detection[2] < threshold:
-                    continue
-                offset_px = np.asarray(detection[:2]) - expected_xy
-                if np.linalg.norm(stage.pixels_to_um_relative(offset_px)[:2]) <= self.controller.config.search_xy_radius_um:
-                    candidates.append(detection)
-            self.cell_detection = min(candidates,
-                key=lambda detection: np.linalg.norm(np.asarray(detection[:2]) - expected_xy), default=None)
+            self.cell_detection = (self.select_cell_detection(self.cell_detections,
+                self.source_stage_xy, self.controller.config.search_xy_radius_um) if self.vision_fresh else None)
         try:
             self.search_confirmed = stage.focusHelper.confirm_search(self.vision, self.cell_detection)
         except RuntimeError as error:
@@ -372,6 +453,7 @@ class ApproachCellPhase(PhaseController):
             stage.focusHelper.advance_search(actual_z=self.stage_position[2], vision=self.vision,
                 cell=self.cell_detection, center_z=self.pipette_z, speed=controller.config.search_speed,
                 motion=stage.actionHelper,
+                settled_focus_limit_um=(controller.config.scan_confirm_defocus_um if self.mode == "Adaptive" else None),
                 bounds=(self.pipette_z - controller.config.scan_z_radius_um,
                         self.pipette_z + controller.config.scan_z_radius_um), pipette=True,
                 pixels_to_um_relative=stage.pixels_to_um_relative,
@@ -394,10 +476,14 @@ class ApproachCellPhase(PhaseController):
             if centered is False:
                 return
         else:
+            if self.mode == "Adaptive" and (not self.scan_confirmed or self.confirmed_tip_xy is None):
+                self.failure_gate(message='Pipette SHIFT requires confirmed anchored focus evidence', recover=True)
+                return
+            self.validate_pipette_anchor()
             self.pipette_z = self.stage_position[2]
             options = {}
             if self.confirmed_tip_xy is not None:
-                options = dict(detected_px=self.confirmed_tip_xy,
+                options = dict(detected_px=self.projected_confirmed_tip() if self.mode == "Adaptive" else self.confirmed_tip_xy,
                     expected_px=self.frame_context["pipette_expected_xy"](),
                     max_deviation_um=controller.calibrated_unit.config.pipette_detection_radius_um)
                 self.confirmed_tip_xy = None
@@ -432,6 +518,7 @@ class ApproachCellPhase(PhaseController):
 
         Return while the pipette moves so the phase can continue observing.
         Later observations check the motion's progress and completion."""
+        self.validate_pipette_anchor()
         controller = self.controller
         controller.microscope.stop()
         self.operation = self.spear
@@ -544,6 +631,7 @@ class ApproachCellPhase(PhaseController):
     def failure_gate(self, *, message=None, recover=False, validate_cell=False):
         """Check aborts and retry missing focus evidence without ending Approach."""
         self.controller.abort_if_requested()
+        self.validate_pipette_anchor()
         if recover:
             if (self.mode != "Adaptive" or self.controller.config.mode != "Adaptive"
                     or self.operation not in (self.search, self.scan)):
