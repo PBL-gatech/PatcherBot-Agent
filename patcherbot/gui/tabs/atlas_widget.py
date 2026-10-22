@@ -53,6 +53,7 @@ class AtlasWidget(QtWidgets.QGroupBox):
     """Independent reference viewer; coordinates never command rig movement."""
 
     selectionChanged = QtCore.pyqtSignal(object, str)
+    saveRequested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None, provider=None):
         super().__init__("Mouse Brain Atlas", parent)
@@ -76,6 +77,10 @@ class AtlasWidget(QtWidgets.QGroupBox):
             self.view_group.addButton(button)
             self.view_buttons[plane] = button
             buttons.addWidget(button)
+        self.save_button = QtWidgets.QPushButton("Save Image")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(lambda: self.saveRequested.emit())
+        buttons.addWidget(self.save_button)
         layout.addLayout(buttons)
         self.canvas = AtlasCanvas(self)
         layout.addWidget(self.canvas, 1)
@@ -130,6 +135,37 @@ class AtlasWidget(QtWidgets.QGroupBox):
         """Return committed coordinates and selected plane for future consumers."""
         return self.coordinates, self.plane
 
+    def snapshot(self):
+        """Capture the displayed marker with its committed coordinate caption."""
+        if not self.save_button.isEnabled() or self.canvas.image.isNull():
+            raise ValueError("Wait for the selected atlas image to finish loading.")
+        c = self.coordinates
+        axis = "AP" if self.plane == "coronal" else "ML"
+        caption = (f"Selected ML {c.ml:.2f}, AP {c.ap:.2f}, DV {c.dv:.2f} mm. "
+                   f"{self.plane.title()} plate {axis} {self._displayed_plate.depth:.2f} mm.")
+        x, y = self.canvas.marker
+        if not (0 <= x < self.canvas.image.width() and 0 <= y < self.canvas.image.height()):
+            caption += " Selected point is outside this image."
+        canvas_image = self.canvas.grab().toImage()
+        canvas_image.setDevicePixelRatio(1)
+        width = max(640, canvas_image.width())
+        font = QtGui.QFont(self.font())
+        font.setPixelSize(18)
+        bounds = QtGui.QFontMetrics(font).boundingRect(
+            QtCore.QRect(0, 0, width - 24, 1000), QtCore.Qt.TextWordWrap, caption)
+        image = QtGui.QImage(width, canvas_image.height() + bounds.height() + 24,
+                             QtGui.QImage.Format_RGB32)
+        image.fill(QtGui.QColor("white"))
+        painter = QtGui.QPainter(image)
+        painter.drawImage((width - canvas_image.width()) // 2, 0, canvas_image)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("black"))
+        painter.drawText(QtCore.QRect(12, canvas_image.height() + 12,
+                                     width - 24, bounds.height()),
+                         QtCore.Qt.TextWordWrap, caption)
+        painter.end()
+        return image, caption
+
     def _preview(self, axis, value):
         self.readouts[axis].setText(f"{value / 100:.2f} mm")
 
@@ -157,6 +193,7 @@ class AtlasWidget(QtWidgets.QGroupBox):
             self._preview(axis, slider.value())
         if not force and coords == self.coordinates:
             return
+        self.save_button.setEnabled(False)
         self.coordinates = coords
         self._request_id += 1
         self.selectionChanged.emit(coords, self.plane)
@@ -175,6 +212,7 @@ class AtlasWidget(QtWidgets.QGroupBox):
         if request_id != self._request_id:
             return
         self._displayed_plate = plate
+        self.save_button.setEnabled(not image.isNull())
         self.canvas.image = image
         self.canvas.marker = marker_position(plate, self.coordinates)
         x, y = self.canvas.marker
@@ -191,6 +229,7 @@ class AtlasWidget(QtWidgets.QGroupBox):
     def _failed(self, message, request_id):
         if request_id not in (-1, self._request_id):
             return
+        self.save_button.setEnabled(False)
         self.status.setText("Atlas unavailable: " + message)
         self.retry.show()
 

@@ -89,6 +89,18 @@ class ExperimentBookLogger:
         self._write_to_file(entry)
         return cleaned_path
 
+    def write_atlas(self, image_path, caption, details, timestamp=None):
+        """Associate a saved atlas selection with the active experiment."""
+        cleaned_path = Path(image_path).as_posix()
+        entry = "\n".join([
+            self._entry_header("ATLAS", timestamp),
+            f"Experiment name: {details['experiment_name']}",
+            str(caption),
+            f"Saved: {cleaned_path}",
+        ])
+        self._write_to_file(entry)
+        return cleaned_path
+
     def write_state_tally(self, counts, state_labels, timestamp=None):
         """Append one complete, ordered state-press tally snapshot."""
         if not isinstance(counts, Mapping) or not isinstance(state_labels, Mapping):

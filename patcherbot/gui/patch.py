@@ -77,6 +77,7 @@ class PatchGui(ManipulatorGui):
             self.experiment_book_tab.handle_state_press_tally
         )
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
+        self.atlas_window.atlas_widget.saveRequested.connect(self._save_atlas_image)
         self._origin_busy = False
         self.patch_interface.origin_saved.connect(self._origin_saved)
         self.patch_interface.task_finished.connect(self._origin_task_finished)
@@ -166,6 +167,29 @@ class PatchGui(ManipulatorGui):
                                  self.patch_interface.store_rinsing_position)
         self.register_key_action(Qt.Key_F4, None,
                                  self.patch_interface.clean_pipette)
+
+    def _save_atlas_image(self):
+        atlas = self.atlas_window.atlas_widget
+        book = self.experiment_book_tab
+        if not book.book_active:
+            atlas.status.setText("Save experiment details in the Experiment Book first.")
+            return
+        timestamp = datetime.now().astimezone()
+        try:
+            image, caption = atlas.snapshot()
+            folder = self.main_interface.snap_image_recorder.camera_folder_path
+            os.makedirs(folder, exist_ok=True)
+            image_path = os.path.join(folder, f"atlas_{timestamp.strftime('%Y%m%d_%H%M%S_%f')}.png")
+            if not image.save(image_path, "PNG"):
+                raise OSError("Unable to write the atlas PNG.")
+        except (OSError, ValueError) as error:
+            logging.exception("Unable to save atlas image")
+            atlas.status.setText(f"Atlas image could not be saved: {error}")
+            return
+        if book.add_atlas_entry(image_path, image, caption, timestamp):
+            atlas.status.setText(f"Atlas image saved and added to Experiment Book: {image_path}")
+        else:
+            atlas.status.setText(f"Image saved to {image_path}, but could not be added to Experiment Book.")
 
     def toggle_atlas_window(self, checked=None):
         if checked is None:

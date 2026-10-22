@@ -258,6 +258,32 @@ class ExperimentBookTab(ParamConfig):
         self._set_status("Snapshot added to the experiment timeline.")
         return True
 
+    def add_atlas_entry(self, image_path, image, caption, timestamp):
+        """Record a saved atlas image against the active experiment."""
+        if not self.book_active:
+            return False
+        try:
+            self.logger.write_atlas(image_path, caption, self.active_details, timestamp)
+        except OSError:
+            logging.getLogger(__name__).exception("Unable to log atlas image")
+            self._set_status("Atlas image could not be added to the experiment log.", error=True)
+            return False
+        card, card_layout = self._new_card("Atlas", timestamp)
+        body = QtWidgets.QLabel(f"{caption}\nImage: {image_path}")
+        body.setTextFormat(QtCore.Qt.PlainText)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        card_layout.addWidget(body)
+        preview = QtWidgets.QLabel()
+        preview.setObjectName("atlas_thumbnail")
+        preview.setAlignment(QtCore.Qt.AlignCenter)
+        preview.setPixmap(QtGui.QPixmap.fromImage(image).scaled(
+            self.THUMBNAIL_SIZE, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        card_layout.addWidget(preview)
+        self._append_card(card)
+        self._set_status("Atlas image added to the experiment timeline.")
+        return True
+
     def add_origin_entry(self, record, frame):
         """Append one already-persisted origin card without further disk writes."""
         timestamp = datetime.fromisoformat(record["saved_at"])
