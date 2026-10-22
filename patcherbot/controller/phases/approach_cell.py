@@ -36,7 +36,6 @@ class ApproachCellPhase(PhaseController):
         self.mode = self.controller.config.mode
         self.initialized = False
         self.speared = False
-        self.cell_search_radius_um = 25.0
         self.cell_search_bounds = None
         self.cell_focus_z = None
         self.cell_focus_error = None
@@ -217,7 +216,7 @@ class ApproachCellPhase(PhaseController):
                 if not np.isfinite(detection[:3]).all() or detection[2] < threshold:
                     continue
                 offset_px = np.asarray(detection[:2]) - expected_xy
-                if np.linalg.norm(stage.pixels_to_um_relative(offset_px)[:2]) <= self.cell_search_radius_um:
+                if np.linalg.norm(stage.pixels_to_um_relative(offset_px)[:2]) <= self.controller.config.search_xy_radius_um:
                     candidates.append(detection)
             self.cell_detection = min(candidates,
                 key=lambda detection: np.linalg.norm(np.asarray(detection[:2]) - expected_xy), default=None)
@@ -276,9 +275,13 @@ class ApproachCellPhase(PhaseController):
         self.next_action = None
         if self.awaiting_operator or self.finished:
             return
+        if self.mode == "Training":
+            if not self.initialized:
+                self.next_action = self._start
+            return
         self.decision_cell_type = self.controller.config.cell_type
         self.decision_cell_type_toggle = self.controller.config.cell_type_toggle
-        # Classic, Manual, Agent, and Training share the existing cell-type route.
+        # Classic, Manual, and Agent share the existing cell-type route.
         if self.controller.config.mode != "Adaptive" or not self.initialized:
             self.next_action = self._start
         elif self.operation == self.search:
@@ -337,7 +340,9 @@ class ApproachCellPhase(PhaseController):
             helper.advance_search(actual_z=self.stage_position[2], vision=self.vision,
                 cell=self.cell_detection, center_z=self.cell_focus_z,
                 speed=controller.config.search_speed, motion=controller.calibrated_stage.actionHelper,
-                bounds=self.cell_search_bounds, pipette=False,
+                bounds=(self.cell_search_bounds if self.cell_search_bounds is not None else
+                        (self.cell_focus_z - controller.config.search_z_radius_um,
+                         self.cell_focus_z + controller.config.search_z_radius_um)), pipette=False,
                 pixels_to_um_relative=controller.calibrated_stage.pixels_to_um_relative,
                 confidence_threshold=self.cell_confidence_threshold,
                 abort_check=controller.abort_if_requested, info=controller.info, warning=controller.warning)
@@ -358,7 +363,9 @@ class ApproachCellPhase(PhaseController):
         try:
             stage.focusHelper.advance_search(actual_z=self.stage_position[2], vision=self.vision,
                 cell=self.cell_detection, center_z=self.pipette_z, speed=controller.config.search_speed,
-                motion=stage.actionHelper, bounds=None, pipette=True,
+                motion=stage.actionHelper,
+                bounds=(self.pipette_z - controller.config.scan_z_radius_um,
+                        self.pipette_z + controller.config.scan_z_radius_um), pipette=True,
                 pixels_to_um_relative=stage.pixels_to_um_relative,
                 confidence_threshold=self.pipette_confidence_threshold,
                 abort_check=controller.abort_if_requested, info=controller.info, warning=controller.warning)
@@ -446,8 +453,14 @@ class ApproachCellPhase(PhaseController):
             raise AutopatchError(str(error)) from error
 
     def _start(self):
-        """Initialize Adaptive inputs or execute the existing cell-type route."""
+        """Set up manual Training, initialize Adaptive, or execute the cell-type route."""
         controller, config = self.controller, self.controller.config
+        if self.mode == "Training":
+            controller.amplifier.start_patch()
+            self.fields = ["manipulator_position", "resistance"]
+            self.initialized = True
+            controller.info("Training mode: manual movement. Click Success or Abort to finish.")
+            return
         controller.calibrated_stage.set_max_speed(config.max_locate_speed)
         controller.calibrated_unit.set_max_speed(config.max_locate_speed)
         self.mode = config.mode
@@ -497,21 +510,26 @@ class ApproachCellPhase(PhaseController):
         self.failure_gate()
         self.success_gate()
         config = self.controller.config
+        if self.mode == "Training":
+            return self.next_action == self._start and not self.initialized
         adaptive = ((self.mode == "Adaptive" and self.initialized) or config.mode == "Adaptive")
         if adaptive:
             if config.mode != "Adaptive":
                 return False
             if not self.initialized:
                 return True
-            low, high = sorted([self.cell_focus_z, self.pipette_z])
+            low = min(self.cell_focus_z - config.search_z_radius_um,
+                      self.pipette_z - config.scan_z_radius_um)
+            high = max(self.cell_focus_z + config.search_z_radius_um,
+                       self.pipette_z + config.scan_z_radius_um)
             focus = self.controller.calibrated_stage.focusHelper
             tolerance = focus.BOUNDARY_TOLERANCE_UM if focus.active_search else 0.0
             if self.next_action == self.spear:
                 if not (self.spear_speed > 0 and np.isfinite(self.spear_target)
                         and self.spear_target >= self.manipulator_position[2]):
                     return False
-            return (self.vision_fresh and low - focus.RADIUS_UM - tolerance <= self.stage_position[2]
-                    <= high + focus.RADIUS_UM + tolerance)
+            return (self.vision_fresh and low - tolerance <= self.stage_position[2]
+                    <= high + tolerance)
         return (self.decision_cell_type == config.cell_type and
                 (config.cell_type == "Plate" or bool(self.decision_cell_type_toggle) == bool(config.cell_type_toggle)))
 

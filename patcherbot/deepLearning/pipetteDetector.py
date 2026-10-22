@@ -8,12 +8,20 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 import torch
-from patcherbot.deepLearning import _import_module_from_path
+import importlib.util
 
 
 logger = logging.getLogger(__name__)
 
 
+def _import_module_from_path(module_name: str, module_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module {module_name} from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    return module
 
 
 class PipetteDetector(ABC):
@@ -67,42 +75,14 @@ class PipetteDetector1(PipetteDetector):
         cur_file = Path(__file__).parent.absolute()
         default_model = cur_file / "pipetteModel" / "pipetteDetectorNet4.onnx"
         self.model_path = Path(model_path) if model_path is not None else default_model
-        self.yolo_net = cv2.dnn.readNetFromONNX(str(self.model_path))
-        layer_names = self.yolo_net.getLayerNames()
-        self.output_layers = [layer_names[i - 1] for i in self.yolo_net.getUnconnectedOutLayers()]
+        from neuron_detection.models import ModelFactory
+        predictor = ModelFactory.create("onnx_centroid", {"source": self.model_path})
+        self.yolo_net, self.output_layers = predictor.net, predictor.output_layers
         self.pipette_class = 0
 
     def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
-        """Return the (x, y) position of the pipette tip or None if not detected."""
-        img = self._ensure_color(img)
-        blob = cv2.dnn.blobFromImage(img, 1 / 255.0, (640, 640), swapRB=True, crop=False)
-        outs = self._forward(blob)
-
-        confidences = []
-        boxes = []
-        for out in outs:
-            for detection in out:
-                idx = np.argmax(detection[4, :])
-                detection = detection[:, idx]
-                x, y, width, height, objectness = tuple(detection)
-                if objectness < 0.20:
-                    continue
-
-                boxes.append([x, y])
-                confidences.append(float(objectness))
-
-        if len(boxes) == 0:
-            return None
-
-        confidences = np.array(confidences)
-        best_x, best_y = boxes[confidences.argmax()]
-        if np.isnan(best_x) or np.isnan(best_y):
-            return None
-
-        best_x = (best_x / 640) * img.shape[1]
-        best_y = (best_y / 640) * img.shape[0]
-
-        return int(best_x), int(best_y)
+        from neuron_detection.models import OnnxCentroidPredictor
+        return OnnxCentroidPredictor.predict(img, self._forward)
 
     def _forward(self, blob: np.ndarray):
         self.yolo_net.setInput(blob)
@@ -194,31 +174,8 @@ class PipetteDetectorCuda1(PipetteDetector):
             self._ensure_fallback()
             return self._fallback.detect_pipette(img) if self._fallback else None
 
-        confidences = []
-        boxes = []
-        for out in outs:
-            for detection in out:
-                idx = np.argmax(detection[4, :])
-                detection = detection[:, idx]
-                x, y, width, height, objectness = tuple(detection)
-                if objectness < 0.20:
-                    continue
-
-                boxes.append([x, y])
-                confidences.append(float(objectness))
-
-        if len(boxes) == 0:
-            return None
-
-        confidences = np.array(confidences)
-        best_x, best_y = boxes[confidences.argmax()]
-        if np.isnan(best_x) or np.isnan(best_y):
-            return None
-
-        best_x = (best_x / 640) * img.shape[1]
-        best_y = (best_y / 640) * img.shape[0]
-
-        return int(best_x), int(best_y)
+        from neuron_detection.models import OnnxCentroidPredictor
+        return OnnxCentroidPredictor.decode(outs, img.shape)
 
 
 class PipetteDetector2(PipetteDetector):
@@ -295,13 +252,13 @@ class PipetteDetectorYOLO1(PipetteDetector):
                  imgsz: int = 640,
                  conf: float = 0.20) -> None:
         super().__init__()
-        from ultralytics import YOLO
+        from neuron_detection.models import ModelFactory
 
-        cur_file = Path(__file__).parent.absolute()
-        default_model = cur_file / "pipetteModel" / "pipetteDetectorNet7.pt"
+        repository_root = Path(__file__).resolve().parents[1]
+        default_model = repository_root / "training" / "PipetteDetectorNet7.pt"
         self.model_path = Path(model_path) if model_path is not None else default_model
 
-        self.yolo_model = YOLO(str(self.model_path))
+        self.yolo_model = ModelFactory.create("yolo", {"source": str(self.model_path)})
 
         # Match PipetteDetector1 behavior
         self.pipette_class = 0
@@ -390,7 +347,247 @@ class PipetteDetectorYOLO1(PipetteDetector):
         if not (0 <= x_pix < w and 0 <= y_pix < h):
             return None
         return x_pix, y_pix
-    
+
+
+class PipetteDetector3(PipetteDetector):
+    """U-Net/LiteHRNet consumer with optional spatial outputs from one pass.
+
+    By default returns the native-image integer (x, y), or None. With either
+    output flag, returns a dictionary containing tip, diagnostics and the
+    requested maps. Maps are independent float32 NumPy arrays in model space:
+    heatmap is the raw decoder score map (not calibrated confidence), and mask
+    is the 560x560 U-Net foreground probability map. Both span the full input
+    image; array indexing is [y, x]. Map pixel centers map to native coordinates
+    as (coordinate + 0.5) * native_size / map_size - 0.5.
+
+    Invalid input returns None maps; a rejected tip can still have valid maps.
+    Image-only checkpoints return mask=None because no U-Net mask was used.
+    Like the parent, instances retain last_diagnostics and are not thread-safe.
+    """
+
+    def __init__(self, model_path=None, device=None, codec_options=None):
+        super().__init__()
+        import hashlib
+        from neuron_detection.models.unet_memory import create_unet2d
+        from neuron_detection.models import ModelFactory, PipetteHeatmapCodec
+        if model_path is None:
+            raise ValueError('Select a tip heatmap checkpoint in the application config')
+        self.device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu')
+                                   if device is None or device == 'auto' else device)
+        checkpoint = Path(model_path).resolve()
+        payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
+        memory_payload = payload if payload.get('schema') in {'pipette_unet_memory_v1', 'pipette_unet_memory_v2'} else None
+        self.uses_memory = memory_payload is not None
+        if self.uses_memory:
+            head = Path(memory_payload['head_checkpoint'])
+            if not head.is_absolute():
+                head = checkpoint.parent / head
+            if hashlib.sha256(head.read_bytes()).hexdigest() != memory_payload['head_sha256']:
+                raise ValueError('Frozen LiteHRNet checkpoint hash mismatch')
+            payload = torch.load(head, map_location='cpu', weights_only=True)
+            if payload.get('unet_sha256') != memory_payload['base_sha256']:
+                raise ValueError('Memory base does not match the frozen LiteHRNet source UNet')
+        if payload.get('schema') != 'pipette_tip_heatmap_v1':
+            raise ValueError('Expected pipette_tip_heatmap_v1 or versioned pipette_unet_memory checkpoint')
+        options = dict(payload['model_options'])
+        options['initialize_pretrained'] = False
+        self.model = ModelFactory.create('pipette_tip_heatmap', options)
+        self.model.load_state_dict(payload['model'], strict=True)
+        self.model.to(self.device).eval().requires_grad_(False)
+        settings = dict(payload.get('codec_options', {}))
+        settings.update(codec_options or {})
+        self.codec = PipetteHeatmapCodec(**settings)
+        self.input_mode = options.get('input_mode', 'image_mask')
+        self.native_boundary_epsilon = float(payload.get('config', {}).get('native_boundary_epsilon', 1e-4))
+        source = Path(memory_payload['base_checkpoint'] if self.uses_memory else payload['unet_checkpoint'])
+        if not source.is_absolute():
+            source = checkpoint.parent / source
+        if hashlib.sha256(source.read_bytes()).hexdigest() != payload['unet_sha256']:
+            raise ValueError('Original UNet source checkpoint hash mismatch')
+        if self.uses_memory:
+            from neuron_detection.models.unet_memory import PipetteMemoryUNet
+            if self.input_mode != 'image_mask':
+                raise ValueError('Memory checkpoints require an image_mask LiteHRNet head')
+            self.unet = PipetteMemoryUNet.from_checkpoint(memory_payload, training_scope='inference')
+            if memory_payload['schema'] == 'pipette_unet_memory_v2' and memory_payload['lineage']['stage'] == 'B':
+                lineage = memory_payload['lineage']
+                parent_path = Path(lineage['stage_a_checkpoint'])
+                if not parent_path.is_absolute():
+                    parent_path = checkpoint.parent / parent_path
+                if hashlib.sha256(parent_path.read_bytes()).hexdigest() != lineage['stage_a_sha256']:
+                    raise ValueError('Selected stage A checkpoint hash mismatch')
+                parent = torch.load(parent_path, map_location='cpu', weights_only=True)
+                if (parent.get('schema') != 'pipette_unet_memory_v2'
+                        or parent.get('lineage', {}).get('stage') != 'A'
+                        or parent.get('base_sha256') != memory_payload['base_sha256']
+                        or parent.get('head_sha256') != memory_payload['head_sha256']):
+                    raise ValueError('Selected stage A lineage differs from stage B')
+                PipetteMemoryUNet._validate_lineage(parent)
+                child_weights, parent_weights = memory_payload['unet_state_dict'], parent['unet_state_dict']
+                if (child_weights.keys() != parent_weights.keys()
+                        or any(value.shape != parent_weights[key].shape for key, value in child_weights.items())):
+                    raise ValueError('Stage B changed the selected stage A single-image architecture')
+                scope = memory_payload.get('training_scope', 'memory')
+                decoder_prefixes = ('up_blocks.', 'conv_norm_out.', 'conv_out.')
+                frozen_weights = (() if scope == 'all' else
+                    (key for key in child_weights if not key.startswith(decoder_prefixes))
+                    if scope == 'decoder_memory' else child_weights)
+                if any(not torch.equal(child_weights[key], parent_weights[key]) for key in frozen_weights):
+                    raise ValueError('Stage B changed the selected stage A single-image weights outside its declared training scope')
+            if self.unet.config.sample_size not in (560, (560, 560), [560, 560]):
+                raise ValueError('Memory checkpoints require 560-pixel full-frame inference')
+        else:
+            unet_payload = torch.load(source, map_location='cpu', weights_only=True)
+            mask_options = payload.get('unet_options') or unet_payload['config']
+            if mask_options.get('_class_name') == 'PipetteSegFormerB0':
+                if self.codec.native_crop_size != 640 or mask_options != unet_payload['config']:
+                    raise ValueError('SegFormer checkpoint requires matching 640px crop metadata')
+                self.unet = ModelFactory.create('segformer', mask_options, task='amodal_mask', topology='pipette_b0')
+            else:
+                self.unet = create_unet2d(mask_options)
+            self.unet.load_state_dict(unet_payload['model'], strict=True)
+        self.unet.to(self.device).eval().requires_grad_(False)
+        self.input_size = 560
+        self.last_diagnostics = None
+
+    def detect_pipette(self, img: np.ndarray, *, return_heatmap: bool = False,
+                       return_mask: bool = False):
+        if not return_heatmap and not return_mask:
+            return self._detect_pipette(img)
+        outputs = {}
+        if return_heatmap:
+            outputs['heatmap'] = None
+        if return_mask:
+            outputs['mask'] = None
+        tip = self._detect_pipette(img, outputs)
+        return dict(tip=tip, **outputs, diagnostics=dict(self.last_diagnostics))
+
+
+    def detect_pipette_frame(self, img: np.ndarray, state=None, *,
+                            return_heatmap: bool = False, return_mask: bool = False):
+        """Return (ordinary detection result, next state) without retaining history.
+
+        Pass None to start a new stream or reset memory. Keep a separate state
+        for each stream. Invalid input leaves its supplied state unchanged;
+        a rejected tip can still update memory from a valid image. Legacy
+        checkpoints accept only state=None and return next_state=None.
+        """
+        if state is not None and not getattr(self, 'uses_memory', False):
+            raise ValueError('This checkpoint does not support recurrent state')
+        outputs = {}
+        if return_heatmap:
+            outputs['heatmap'] = None
+        if return_mask:
+            outputs['mask'] = None
+        context = dict(state=state)
+        tip = self._detect_pipette(img, outputs or None, state_context=context)
+        result = (dict(tip=tip, **outputs, diagnostics=dict(self.last_diagnostics))
+                  if return_heatmap or return_mask else tip)
+        return result, context['state']
+
+    @torch.inference_mode()
+    def _detect_pipette(self, img: np.ndarray, outputs=None,
+                        state_context=None, stage_timings=None) -> Optional[Tuple[int, int]]:
+        # Used only in a separate diagnostic pass, never the primary latency loop.
+        import time
+        stage_started = None
+        if stage_timings is not None:
+            if self.device.type=='cuda':torch.cuda.synchronize(self.device)
+            stage_started=time.perf_counter()
+        def mark_stage(name):
+            nonlocal stage_started
+            if stage_timings is not None:
+                if self.device.type=='cuda':torch.cuda.synchronize(self.device)
+                now=time.perf_counter();stage_timings[name]=(now-stage_started)*1000;stage_started=now
+        self.last_diagnostics = dict(valid=False, reason='invalid_input', tip_xy=None)
+        if not isinstance(img, np.ndarray) or img.size == 0:
+            return None
+        if img.ndim == 2:
+            gray = img
+        elif img.ndim == 3 and img.shape[2] == 1:
+            gray = img[..., 0]
+        elif img.ndim == 3 and img.shape[2] in (3, 4):
+            if not np.issubdtype(img.dtype, np.number):
+                return None
+            color = img if img.dtype in (np.uint8, np.uint16, np.float32) else img.astype(np.float32)
+            gray = self._ensure_grayscale(color)
+        else:
+            return None
+        if not (np.issubdtype(gray.dtype, np.integer) or np.issubdtype(gray.dtype, np.floating)):
+            return None
+        source = np.array(gray, dtype=np.float32, copy=True, order='C')
+        if not np.isfinite(source).all() or source.min() < 0:
+            return None
+        if np.issubdtype(gray.dtype, np.floating) and source.max() <= 1:
+            source *= 255
+        if source.max() > 255:
+            return None
+        native_height, native_width = source.shape
+        view_size, view_origin = self.codec.view_geometry((native_height,native_width))
+        vx, vy = view_origin; vw, vh = view_size
+        view = source[vy:vy+vh,vx:vx+vw].astype(np.uint8)
+        resized = cv2.resize(view, (560, 560), interpolation=cv2.INTER_AREA)
+        mark_stage('native_cpu_preprocessing')
+        condition = torch.from_numpy(resized).to(self.device, dtype=torch.float32)[None, None] / 127.5 - 1
+        mark_stage('input_transfer_normalization')
+        if self.input_mode == 'image_only':
+            mask = torch.zeros_like(condition)
+        else:
+            network_size = (self.unet.config.get('sample_size') if isinstance(self.unet.config,dict)
+                            else getattr(self.unet.config, 'sample_size', None))
+            network_shape = ((network_size, network_size) if isinstance(network_size, int)
+                             else tuple(network_size) if network_size is not None else condition.shape[-2:])
+            unet_input = (condition if tuple(condition.shape[-2:]) == tuple(network_shape) else
+                          torch.nn.functional.interpolate(condition, size=network_shape, mode='area'))
+            if network_shape==(768,768) or (isinstance(self.unet.config,dict) and self.unet.config.get('_class_name')=='PipetteSegFormerB0'):
+                unet_input=torch.from_numpy(cv2.resize(view,network_shape[::-1],interpolation=cv2.INTER_AREA)).to(
+                    self.device,dtype=torch.float32)[None,None]/127.5-1
+            mark_stage('mask_input_preparation_transfer')
+            if state_context is not None and getattr(self, 'uses_memory', False):
+                logits, next_state = self.unet.forward_frame(unet_input, state_context['state'])
+                state_context['state'] = next_state.detach()
+            else:
+                logits = self.unet(unet_input, torch.zeros(1, device=self.device)).sample
+            mark_stage('mask_model_inference')
+            if tuple(logits.shape[-2:]) != tuple(condition.shape[-2:]):
+                logits = torch.nn.functional.interpolate(logits, size=condition.shape[-2:],
+                                                         mode='bilinear', align_corners=False)
+            probability = logits.sigmoid()
+            mask = probability * 2 - 1
+        pair=torch.cat((condition,mask),dim=1)
+        mark_stage('mask_resize_and_pair')
+        heatmaps = self.model(pair)
+        mark_stage('litehrnet_inference')
+        if outputs is not None:
+            if 'heatmap' in outputs:
+                outputs['heatmap'] = heatmaps[0, 0].detach().float().cpu().numpy().copy()
+            if 'mask' in outputs and self.input_mode != 'image_only':
+                outputs['mask'] = probability[0, 0].detach().float().cpu().numpy().copy()
+        model_xy, diagnostics = self.codec.decode(heatmaps)
+        native_xy = self.codec.model_to_native(model_xy[0],(native_height,native_width)).detach().cpu().numpy()
+        diagnostic = dict(diagnostics[0])
+        diagnostic.update(native_shape=[native_height, native_width],
+                          input_mode=self.input_mode, unet_used=self.input_mode != 'image_only')
+        if not np.isfinite(native_xy).all():
+            diagnostic.update(valid=False, tip_xy=None)
+            self.last_diagnostics = diagnostic
+            mark_stage('heatmap_decode_native_extraction')
+            return None
+        public_xy, valid = self.codec.public_from_model(
+            model_xy, (native_height, native_width), self.native_boundary_epsilon)
+        if not bool(valid[0]):
+            diagnostic.update(valid=False, reason='outside_native_image', tip_xy=None,
+                              native_xy_unrounded=native_xy.tolist())
+            self.last_diagnostics = diagnostic
+            mark_stage('heatmap_decode_native_extraction')
+            return None
+        point = tuple(int(value) for value in public_xy[0].detach().cpu().tolist())
+        diagnostic.update(valid=True, reason='ok', tip_xy=list(point), native_xy_unrounded=native_xy.tolist())
+        self.last_diagnostics = diagnostic
+        mark_stage('heatmap_decode_native_extraction')
+        return point
+
+
 class PipetteDetector4(PipetteDetector):
     """Canonical 384px U-Net + MobileNetV4 boxes pipette detector.
 
@@ -411,9 +608,11 @@ class PipetteDetector4(PipetteDetector):
         super().__init__()
         model_root = Path(__file__).parent.absolute()
         if model_path is None:
-            model_path = str(model_root / "pipetteModel" / "PipetteDetectorNetX.pt")
+            repository_root = Path(__file__).resolve().parents[3]
+            model_path = str(repository_root / "training" / "Pipette_Fresh_384_001_Patience10"
+                             / "Fresh_384_pipettes_Patience10" / "epoch_0030.pt")
         adapter_module = _import_module_from_path(
-            "pipette_detector_model_factory", model_root / "pipetteModel" / "PDModelFactory.py"
+            "pipette_detector_model_factory", model_root / "PDModelFactory.py"
         )
         self.adapter = adapter_module.PDModelFactory.create(
             model_type="unet_mobilenetv4_boxes",
@@ -440,145 +639,70 @@ class PipetteDetector4(PipetteDetector):
             if peak > 1.0:
                 if peak > 255.0:
                     raise ValueError("Image intensity exceeds uint8 range")
+                img = img
             else:
                 img = img * 255.0
             img = np.clip(img, 0, 255).astype(np.uint8)
         return img
 
-    def detect_pipette_tracking(self, img: np.ndarray) -> dict:
-        """Return an independent native-size mask, grayscale frame and subpixel tip."""
-        prediction = dict(tip_xy=None, mask=None, frame=None)
+    def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
         if img is None:
-            return prediction
+            return None
         try:
             gray = self._to_uint8_grayscale(img)
-            if gray.ndim != 2 or gray.size == 0:
-                raise ValueError("Expected a nonempty grayscale image")
-            result = self.adapter.predict(gray, native_mask=True)
-            prediction["frame"] = gray.copy()
-            tip = result.get("tip_xy")
-            if tip is not None:
-                tip = np.asarray(tip, dtype=float)
-                if tip.shape == (2,) and np.isfinite(tip).all():
-                    prediction["tip_xy"] = tuple(float(value) for value in tip)
-                else:
-                    logger.warning("PipetteDetector4 tracking tip has invalid shape or values")
-            mask = result.get("mask")
-            if mask is not None:
-                mask = np.asarray(mask, dtype=np.float32)
-                if mask.shape == gray.shape and np.isfinite(mask).all():
-                    prediction["mask"] = mask.copy()
-                else:
-                    logger.warning("PipetteDetector4 tracking mask has invalid shape or values")
-            return prediction
-        except Exception as exc:
-            logger.warning("PipetteDetector4 tracking inference failed: %s", exc)
-            return dict(tip_xy=None, mask=None, frame=None)
-
-    def detect_pipette_details(self, img: np.ndarray, *, expected_tip_xy=None,
-                               pixels_to_um=None, radius_um=50.0) -> dict:
-        """Return XY, depth in microns, box confidence and optional Z confidence.
-
-        Uses one inference pass. Missing/invalid predictions are None; box
-        confidence is not a substitute for the optional Z-confidence head.
-        """
-        empty_prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
-                                box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
-                                radius_rejected_count=0)
-        if img is None:
-            return empty_prediction
-        prediction = empty_prediction.copy()
-        try:
-            gray = self._to_uint8_grayscale(img)
-            if expected_tip_xy is None:
-                result = self.adapter.predict(gray, native_mask=False)
-                prediction["candidate_count"] = int(result.get("tip_xy") is not None)
-                prediction["accepted_candidate_count"] = prediction["candidate_count"]
-            else:
-                expected = np.asarray(expected_tip_xy, dtype=float)
-                if expected.shape != (2,) or not np.isfinite(expected).all() or not callable(pixels_to_um):
-                    raise ValueError("A finite expected XY and calibrated pixel-to-micron converter are required")
-                if not np.isfinite(radius_um) or radius_um <= 0:
-                    raise ValueError("Pipette candidate radius must be positive and finite")
-                decoded = self.adapter.predict(gray, native_mask=False, max_detections=100)
-                candidates = decoded.get("candidates", [])
-                prediction["candidate_count"] = len(candidates)
-                accepted = []
-                for candidate in candidates:
-                    tip = np.asarray(candidate.get("tip_xy"), dtype=float)
-                    confidence = candidate.get("box_confidence")
-                    if tip.shape != (2,) or not np.isfinite(tip).all() or confidence is None or not np.isfinite(confidence):
-                        continue
-                    offset = np.asarray(pixels_to_um(tip - expected), dtype=float).reshape(-1)[:2]
-                    if offset.size != 2 or not np.isfinite(offset).all():
-                        continue
-                    if np.linalg.norm(offset) > radius_um:
-                        prediction["radius_rejected_count"] += 1
-                        continue
-                    accepted.append(candidate)
-                prediction["accepted_candidate_count"] = len(accepted)
-                if not accepted:
-                    return prediction
-                result = max(accepted, key=lambda candidate: candidate["box_confidence"])
+            result = self.adapter.predict(gray, native_mask=False)
             tip = result["tip_xy"]
             if tip is None:
-                return prediction
-            prediction["tip_xy"] = tuple(int(round(v)) for v in tip)
-            box = result.get("box_xyxy")
-            if box is not None:
-                box = np.asarray(box, dtype=float)
-                if box.shape == (4,) and np.isfinite(box).all():
-                    prediction["box_xyxy"] = tuple(float(value) for value in box)
-            for key in ("z_um", "box_confidence", "z_confidence"):
-                value = result.get(key)
-                if value is not None and np.isfinite(value):
-                    prediction[key] = float(value)
-            if result.get("z_um") is not None and prediction["z_um"] is None:
+                return None
+            z = result["z_um"]
+            if z is not None and not np.isfinite(z):
                 logger.warning("PipetteDetector4 Z prediction is nonfinite; returning tip only")
-            return prediction
+            return tuple(int(round(v)) for v in tip)
         except Exception as exc:
             logger.warning("PipetteDetector4 inference failed: %s", exc)
-            return empty_prediction
-
-    def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
-        """Preserve the existing integer XY-only detection interface."""
-        return self.detect_pipette_details(img)["tip_xy"]
-
-    def get_pipette_z(self, img: np.ndarray) -> Optional[float]:
-        """Infer depth in microns, or None when unavailable."""
-        return self.detect_pipette_details(img)["z_um"]
+            return None
 
 
+class PipetteDetector5(PipetteDetector4):
+    """R12 August detector using the existing point-detection interface."""
+
+    def __init__(
+        self,
+        model_path: str,
+        device: Optional[str] = None,
+        *,
+        threshold: float = 0.001,
+        cuda_graph: bool = True,
+        precision: Optional[str] = None,
+    ) -> None:
+        PipetteDetector.__init__(self)
+        model_root = Path(__file__).parent.absolute()
+        adapter_module = _import_module_from_path(
+            "pipette_detector_model_factory",
+            model_root / "PDModelFactory.py",
+        )
+        self.adapter = adapter_module.PDModelFactory.create(
+            model_type="unet_mobilenetv4_boxes_v5",
+            model_path=model_path,
+            device=device,
+            threshold=threshold,
+            cuda_graph=cuda_graph,
+            precision=precision,
+        )
+
+_DEFAULT_DETECTOR = None
 
 
+def configure_pipette_detector(detector):
+    """Select a loaded detector for the optional module-level point API."""
+    if not callable(getattr(detector, "detect_pipette", None)):
+        raise TypeError("detector must implement detect_pipette(image)")
+    global _DEFAULT_DETECTOR
+    _DEFAULT_DETECTOR = detector
 
 
-
-
-
-
-
-if __name__ == '__main__':
-    detector = PipetteDetector4()
-    # path = r"C:\Users\sa-forest\Documents\GitHub\Neuron_Detection\codex_training\personal_training\combined_net6\test\images\2026_08_26-16_43__2298_1787777086.380385.webp"
-    # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\3333_1787864986.209094.webp"
-    # path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-17_08\camera_frames\8352_1787865160.058934.webp"
-    path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\snap_image_data\2026_08_27-18_41\camera_frames\1864_1787870571.912273.webp"
-    
-    img = cv2.imread(path)
-
-    values = detector._test_detector(img,10)
-    print(f'Test timings (s): {values[0]}, average: {values[1]}')
-
-    start = time.time()
-    result = detector.detect_pipette(img)
-    end = time.time()
-
-    if result is not None:
-        x, y = result
-        print(f'framerate: {1 / (end - start)}')
-        cv2.circle(img, (x, y), 3, (0, 255, 0))
-        cv2.imshow("pipette detection test", img)
-        cv2.waitKey(0)
-    else:
-        print("No pipette detected")
+def detect_pipette(img):
+    """Return a tip or None using the detector selected at application startup."""
+    if _DEFAULT_DETECTOR is None:
+        raise RuntimeError("Call configure_pipette_detector with a loaded detector first")
+    return _DEFAULT_DETECTOR.detect_pipette(img)
