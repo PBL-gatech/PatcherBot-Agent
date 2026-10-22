@@ -12,17 +12,19 @@ class ApproachCellPhase(PhaseController):
 
     def run(self, cell=None):
         """Run one approach attempt; always release its owned motions."""
-        try:
-            self.prepare(cell)
-            while True:
-                self.failure_gate()
-                self.success_gate()
-                self.observe()
-                self.calculate()
-                self.decide()
-                self.act()
-        finally:
-            self.finish()
+        helper = self.controller.calibrated_unit.pipetteCalHelper
+        with helper.brain_slice_detector():
+            try:
+                self.prepare(cell)
+                while True:
+                    self.failure_gate()
+                    self.success_gate()
+                    self.observe()
+                    self.calculate()
+                    self.decide()
+                    self.act()
+            finally:
+                self.finish()
 
     def prepare(self, cell=None):
         """Establish safe defaults, recording, and ownership for this attempt."""
@@ -223,7 +225,9 @@ class ApproachCellPhase(PhaseController):
         try:
             self.search_confirmed = stage.focusHelper.confirm_search(self.vision, self.cell_detection)
         except RuntimeError as error:
-            raise AutopatchError(str(error)) from error
+            if not (str(error).startswith("cell focus confirmation failed:")
+                    and self.failure_gate(message=str(error), recover=True)):
+                raise AutopatchError(str(error)) from error
 
     def calculate_scan(self):
         """SCAN: confirm detector XY and retain separately anchored provisional evidence."""
@@ -234,7 +238,11 @@ class ApproachCellPhase(PhaseController):
         try:
             self.scan_confirmed = focus.confirm_search(self.vision)
         except RuntimeError as error:
-            raise AutopatchError(str(error)) from error
+            if not (str(error).startswith("pipette focus confirmation failed:")
+                    and self.failure_gate(message=str(error), recover=True)):
+                raise AutopatchError(str(error)) from error
+            self.confirmed_tip_xy = None
+            return
         self.confirmed_tip_xy = focus.confirmed_tip_xy
         self.saved_tip_evidence = focus.saved_tip_evidence
 
@@ -534,10 +542,20 @@ class ApproachCellPhase(PhaseController):
                 (config.cell_type == "Plate" or bool(self.decision_cell_type_toggle) == bool(config.cell_type_toggle)))
 
     def failure_gate(self, *, message=None, recover=False, validate_cell=False):
-        """Check aborts; optionally validate the rig/cell before slice clearing."""
-        if recover:
-            return False
+        """Check aborts and retry missing focus evidence without ending Approach."""
         self.controller.abort_if_requested()
+        if recover:
+            if (self.mode != "Adaptive" or self.controller.config.mode != "Adaptive"
+                    or self.operation not in (self.search, self.scan)):
+                return False
+            self.controller.calibrated_stage.focusHelper.reset_search()
+            self.search_confirmed = False
+            self.scan_confirmed = False
+            self.shift_ready = False
+            self.confirmed_tip_xy = None
+            self.saved_tip_evidence = None
+            self.controller.warning(f"{message}; retrying {self.operation.__name__.upper()}")
+            return True
         if validate_cell:
             self.controller.isrigready()
             if self.controller.rig_ready is False:

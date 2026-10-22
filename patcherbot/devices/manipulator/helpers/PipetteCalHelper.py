@@ -6,7 +6,9 @@ from pathlib import Path
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.manipulator import Manipulator
 from patcherbot.devices.camera import Camera
-from patcherbot.deepLearning.pipetteDetector import PipetteDetector, PipetteDetectorYOLO1, PipetteDetector4
+from patcherbot.deepLearning.pipetteDetector import (
+    PipetteDetector, PipetteDetector5, configure_pipette_detector,
+)
 from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser2
 from threading import Thread
 import logging
@@ -73,30 +75,43 @@ class PipetteCalHelper():
         self.camera = camera
         self.config = config
         device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
-        model_name = getattr(self.config, "pipette_detector_model", None) if self.config is not None else None
+        model_name = getattr(self.config, "pipette_detector_model", None)
         model_path = _resolve_model_path(model_name)
+        model_version = getattr(self.config, "pipette_detector_model_version", "R02")
         try:
-            # self.pipetteDetector: PipetteDetector = PipetteDetectorYOLO1(
-            #     model_path=model_path,
-            #     device=device,
-            # )
-            self.pipetteDetector: PipetteDetector = PipetteDetector4(
+            self.pipetteDetector: PipetteDetector = PipetteDetector5(
                 model_path=model_path,
                 device=device,
+                model_version=model_version,
             )
         except Exception as exc:
             logging.warning(
-                "Failed to initialize PipetteDetector4 with model '%s' (%s); using default model path",
+                "Failed to load general pipette model '%s' (%s); using the existing default R02 checkpoint",
                 model_name,
                 exc,
             )
-            self.pipetteDetector = PipetteDetector4(device=device)
+            self.pipetteDetector = PipetteDetector5(
+                model_path=None, device=device, model_version="R02",
+            )
+        configure_pipette_detector(self.pipetteDetector)
         self.calibrated_stage = calibrated_stage
         # Each calibration point will be a tuple:
         #   (image_x, image_y, encoder_x, encoder_y)
         self.cal_points = []
         self.calibration_samples = []
         self._flow_reference = None
+
+    def brain_slice_detector(self):
+        """Temporarily load the configured specialist into the shared detector."""
+        model_path = _resolve_model_path(getattr(
+            self.config, "pipette_brain_slice_model", "PipetteDetectorNetB.pt",
+        ))
+        if model_path is None:
+            raise ValueError("A brain-slice checkpoint path is required")
+        return self.pipetteDetector.use_model(
+            model_path,
+            model_version=getattr(self.config, "pipette_brain_slice_model_version", "R12"),
+        )
 
     def collect_cal_points(self, num_points=10, xy_step=5, max_retries=5):
         """Apply the stage-style calibration speed cap and restore the prior limit."""

@@ -2,7 +2,9 @@ import sys
 import time
 import logging
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Optional, Tuple, List
 
 import cv2
@@ -606,13 +608,12 @@ class PipetteDetector4(PipetteDetector):
                  *, threshold: float = 0.001, cuda_graph: bool = True,
                  precision: Optional[str] = None) -> None:
         super().__init__()
-        model_root = Path(__file__).parent.absolute()
         if model_path is None:
             repository_root = Path(__file__).resolve().parents[3]
             model_path = str(repository_root / "training" / "Pipette_Fresh_384_001_Patience10"
                              / "Fresh_384_pipettes_Patience10" / "epoch_0030.pt")
         adapter_module = _import_module_from_path(
-            "pipette_detector_model_factory", model_root / "PDModelFactory.py"
+            "pipette_detector_model_factory", self._model_factory_path()
         )
         self.adapter = adapter_module.PDModelFactory.create(
             model_type="unet_mobilenetv4_boxes",
@@ -622,6 +623,12 @@ class PipetteDetector4(PipetteDetector):
             cuda_graph=cuda_graph,
             precision=precision,
         )
+
+    @staticmethod
+    def _model_factory_path() -> Path:
+        model_root = Path(__file__).resolve().parent
+        adjacent = model_root / "PDModelFactory.py"
+        return adjacent if adjacent.is_file() else model_root / "pipetteModel" / "PDModelFactory.py"
 
     @staticmethod
     def _to_uint8_grayscale(img: np.ndarray) -> np.ndarray:
@@ -645,6 +652,71 @@ class PipetteDetector4(PipetteDetector):
             img = np.clip(img, 0, 255).astype(np.uint8)
         return img
 
+    def detect_pipette_details(self, img: np.ndarray, *, expected_tip_xy=None,
+                               pixels_to_um=None, radius_um=50.0) -> dict:
+        """Return XY, depth in microns, box confidence and optional Z confidence.
+
+        Uses one inference pass. Missing/invalid predictions are None; box
+        confidence is not a substitute for the optional Z-confidence head.
+        """
+        empty_prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
+                                box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
+                                radius_rejected_count=0)
+        if img is None:
+            return empty_prediction
+        prediction = empty_prediction.copy()
+        try:
+            gray = self._to_uint8_grayscale(img)
+            if expected_tip_xy is None:
+                result = self.adapter.predict(gray, native_mask=False)
+                prediction["candidate_count"] = int(result.get("tip_xy") is not None)
+                prediction["accepted_candidate_count"] = prediction["candidate_count"]
+            else:
+                expected = np.asarray(expected_tip_xy, dtype=float)
+                if expected.shape != (2,) or not np.isfinite(expected).all() or not callable(pixels_to_um):
+                    raise ValueError("A finite expected XY and calibrated pixel-to-micron converter are required")
+                if not np.isfinite(radius_um) or radius_um <= 0:
+                    raise ValueError("Pipette candidate radius must be positive and finite")
+                decoded = self.adapter.predict(gray, native_mask=False, max_detections=100)
+                candidates = decoded.get("candidates", [])
+                prediction["candidate_count"] = len(candidates)
+                accepted = []
+                for candidate in candidates:
+                    tip = np.asarray(candidate.get("tip_xy"), dtype=float)
+                    confidence = candidate.get("box_confidence")
+                    if tip.shape != (2,) or not np.isfinite(tip).all() or confidence is None or not np.isfinite(confidence):
+                        continue
+                    offset = np.asarray(pixels_to_um(tip - expected), dtype=float).reshape(-1)[:2]
+                    if offset.size != 2 or not np.isfinite(offset).all():
+                        continue
+                    if np.linalg.norm(offset) > radius_um:
+                        prediction["radius_rejected_count"] += 1
+                        continue
+                    accepted.append(candidate)
+                prediction["accepted_candidate_count"] = len(accepted)
+                if not accepted:
+                    return prediction
+                result = max(accepted, key=lambda candidate: candidate["box_confidence"])
+            tip = result["tip_xy"]
+            if tip is None:
+                return prediction
+            prediction["tip_xy"] = tuple(int(round(v)) for v in tip)
+            box = result.get("box_xyxy")
+            if box is not None:
+                box = np.asarray(box, dtype=float)
+                if box.shape == (4,) and np.isfinite(box).all():
+                    prediction["box_xyxy"] = tuple(float(value) for value in box)
+            for key in ("z_um", "box_confidence", "z_confidence"):
+                value = result.get(key)
+                if value is not None and np.isfinite(value):
+                    prediction[key] = float(value)
+            if result.get("z_um") is not None and prediction["z_um"] is None:
+                logger.warning("PipetteDetector4 Z prediction is nonfinite; returning tip only")
+            return prediction
+        except Exception as exc:
+            logger.warning("PipetteDetector4 inference failed: %s", exc)
+            return empty_prediction
+
     def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
         if img is None:
             return None
@@ -664,31 +736,103 @@ class PipetteDetector4(PipetteDetector):
 
 
 class PipetteDetector5(PipetteDetector4):
-    """R12 August detector using the existing point-detection interface."""
+    """Configurable R02/R12 detector with shared point and detailed output APIs.
+
+    model_version="R02": full-frame AREA resize to 384, no contrast stretch.
+    model_version="R12" (default): center crop 896, p1/p99 stretch, AREA to 512.
+    Pass the matching checkpoint; resolution/schema mismatches raise on load.
+    """
 
     def __init__(
         self,
         model_path: str,
         device: Optional[str] = None,
         *,
+        model_version: str = "R12",
         threshold: float = 0.001,
         cuda_graph: bool = True,
         precision: Optional[str] = None,
     ) -> None:
         PipetteDetector.__init__(self)
-        model_root = Path(__file__).parent.absolute()
+        self._model_lock = RLock()
+        self._adapter_options = dict(
+            device=device, threshold=threshold,
+            cuda_graph=cuda_graph, precision=precision,
+        )
         adapter_module = _import_module_from_path(
             "pipette_detector_model_factory",
-            model_root / "PDModelFactory.py",
+            self._model_factory_path(),
         )
-        self.adapter = adapter_module.PDModelFactory.create(
-            model_type="unet_mobilenetv4_boxes_v5",
-            model_path=model_path,
-            device=device,
-            threshold=threshold,
-            cuda_graph=cuda_graph,
-            precision=precision,
-        )
+        self._factory = adapter_module.PDModelFactory
+        self.adapter = None
+        self._active_model = None
+        self.reload_model(model_path, model_version=model_version)
+
+    def reload_model(self, model_path, *, model_version):
+        """Load a checkpoint while retaining this detector's shared identity."""
+        version = str(model_version).strip().upper()
+        if version not in self._factory.MODEL_VERSIONS:
+            raise ValueError(f"Unsupported model version: {model_version!r}")
+        if model_path is None:
+            if version != "R02":
+                raise ValueError("An R12 checkpoint path is required")
+            # Preserve Detector4's existing general-model fallback.
+            model_path = (
+                Path(__file__).resolve().parents[3] / "training"
+                / "Pipette_Fresh_384_001_Patience10"
+                / "Fresh_384_pipettes_Patience10" / "epoch_0030.pt"
+            )
+        selection = (Path(model_path).expanduser().resolve(), version)
+        with self._model_lock:
+            if self.adapter is not None and selection == self._active_model:
+                return
+            adapter = self._factory.create(
+                model_type=self._factory.MODEL_VERSIONS[version],
+                model_path=str(selection[0]), **self._adapter_options,
+            )
+            self.adapter = adapter
+            self.model_version = version
+            self._active_model = selection
+            logger.info("Pipette model loaded: %s (%s)", *selection)
+
+    @contextmanager
+    def use_model(self, model_path, *, model_version):
+        """Use a checkpoint until the caller exits, then restore its predecessor."""
+        with self._model_lock:
+            self._require_model()
+            previous = self.adapter, self.model_version, self._active_model
+            self.reload_model(model_path, model_version=model_version)
+        try:
+            yield self
+        finally:
+            with self._model_lock:
+                self.adapter, self.model_version, self._active_model = previous
+
+    def _require_model(self):
+        if self.adapter is None:
+            raise RuntimeError("Pipette detector has no usable model")
+
+    def detect_pipette(self, img):
+        with self._model_lock:
+            self._require_model()
+            return super().detect_pipette(img)
+
+    def detect_pipette_details(
+        self, img, *, expected_tip_xy=None, pixels_to_um=None, radius_um=50.0
+    ):
+        with self._model_lock:
+            self._require_model()
+            result = super().detect_pipette_details(
+                img, expected_tip_xy=expected_tip_xy,
+                pixels_to_um=pixels_to_um, radius_um=radius_um,
+            )
+            result["z_confidence_supported"] = (
+                self.adapter.model.z_confidence_head is not None
+            )
+            return result
+
+    def get_pipette_z(self, img):
+        return self.detect_pipette_details(img)["z_um"]
 
 _DEFAULT_DETECTOR = None
 

@@ -308,12 +308,12 @@ class FocusHelper():
 
     @classmethod
     def _focus_sample_rank(cls, sample):
-        """Prefer confident pipette XY near focus without consulting Z confidence."""
+        """Prefer smallest predicted defocus; use confidence to break ties."""
         score, _, _, depth = sample[:4]
         if depth is None:
             return (0, score, 0)
         error = abs(depth)
-        return (2, score, -error) if error <= cls.DEPTH_TOLERANCE_UM else (1, -error, score)
+        return (2, -error, score) if error <= cls.DEPTH_TOLERANCE_UM else (1, -error, score)
 
     def _record_focus_sample(self, state, *, frame_id, focus_z, xy, score, stale,
                              depth=None, source_positions=None):

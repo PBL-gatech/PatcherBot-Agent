@@ -11,17 +11,19 @@ class HuntCellPhase(ApproachCellPhase):
     phase_name = "Hunt"
 
     def run(self, cell=None):
-        try:
-            self.prepare(cell)
-            while True:
-                self.failure_gate()
-                self.success_gate()
-                self.observe()
-                self.calculate()
-                self.decide()
-                self.act()
-        finally:
-            self.finish()
+        helper = self.controller.calibrated_unit.pipetteCalHelper
+        with helper.brain_slice_detector():
+            try:
+                self.prepare(cell)
+                while True:
+                    self.failure_gate()
+                    self.success_gate()
+                    self.observe()
+                    self.calculate()
+                    self.decide()
+                    self.act()
+            finally:
+                self.finish()
 
     def prepare(self, cell=None):
         """Prepare the selected mode, near pressure, and initial position and resistance."""

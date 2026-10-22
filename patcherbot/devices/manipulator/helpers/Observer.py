@@ -120,7 +120,7 @@ class Observer:
                     evidence["pipette_focus"] = result["z_um"]
                     evidence["confidence"]["pipette_focuser"] = result["z_confidence"]
                     evidence["status"]["pipette_focuser"] = "ok" if result["z_um"] is not None else "no_detection"
-                    evidence["pipette_focus_confidence_supported"] = detector.adapter.model.z_confidence_head is not None
+                    evidence["pipette_focus_confidence_supported"] = result["z_confidence_supported"]
             if visual & {"cell_detections", "deep_learning"}:
                 cells = stage.cellDetectHelper._ensure_detector().detect_cells(image.copy())
                 evidence["cell_detections"] = cells
