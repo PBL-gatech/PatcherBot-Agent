@@ -763,6 +763,13 @@ class AutoPatchInterface(TaskInterface):
     def move_to_home_space(self):
         self.execute(self.current_autopatcher.move_to_home_space)
 
+    @blocking_command(category='Testing',
+                      description='Test Pipette Planar Drift',
+                      task_description='Testing pipette planar drift during Z movement')
+    def test_pipette_planar_drift(self):
+        self.execute(self.current_autopatcher.test_pipette_planar_drift,
+                     argument=self.pipette_controller.folder_path)
+
     @blocking_command(category='Patch',
                         description='Move the group down',
                         task_description='Moving the group down')

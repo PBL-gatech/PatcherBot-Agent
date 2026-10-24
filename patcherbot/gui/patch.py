@@ -559,6 +559,9 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 if exit_code != 0 and self._seq_active_style and self._seq_button:
                     self._seq_button.setStyleSheet("")
                     self._seq_active_style = False
+                if exit_code != 0 and self._seq_cmds == getattr(self, "pipette_calibration", None):
+                    self._seq_index = len(self._seq_cmds)
+                    return
                 # Launch next command after current one finishes
                 self._run_next_seq_command()
             # Connect to the task_finished signal
@@ -823,7 +826,11 @@ class ClassicPatchButtons(ButtonTabWidget):
         )
 
         self.stage_calibration = [self.pipette_interface.set_floor, self.pipette_interface.calibrate_stage, self.pipette_interface.move_microscope]
-        self.pipette_calibration = [self.pipette_interface.calibrate_manipulator, self.patch_interface.store_calibration_positions, self.patch_interface.move_to_safe_space]
+        self.pipette_calibration = [
+            self.pipette_interface.calibrate_manipulator,
+            self.patch_interface.store_calibration_positions,
+            self.patch_interface.move_to_safe_space,
+        ]
         self.pipette_cleaning_calibration = [self.patch_interface.store_cleaning_position,self.patch_interface.move_pipette_up,self.patch_interface.move_to_safe_space]
 
 
@@ -885,11 +892,14 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.pipette_location = [self.pipette_interface.center_pipette,self.pipette_interface.focus_pipette,self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
         # add a box for testing controllability of the pipette and stage
         buttonList = [['Find Pipette','Test Pipette Movement'],
-                      ['Detect Pipette','Detect Cells']]
+                      ['Detect Pipette','Detect Cells'],
+                      ['Test Pipette Planar Drift']]
         cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity],
-                [self.pipette_interface.detect_pipette, self.patch_interface.detect_cells]]
+                [self.pipette_interface.detect_pipette, self.patch_interface.detect_cells],
+                [self.patch_interface.test_pipette_planar_drift]]
         freq = [[1, 3],
-                [1, 1]]
+                [1, 1],
+                [1]]
         self.addButtonList('testing', layout, buttonList, cmds, freq=freq, sequential=True)
 
         # # Add a box for lamp commands

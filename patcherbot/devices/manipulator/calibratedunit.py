@@ -70,6 +70,7 @@ class CalibratedUnit(ManipulatorUnit):
         self.camera = camera
 
         self.calibrated = False
+        self.z_calibration = None
         self.must_be_recalibrated = False
         self.up_direction = [-1 for _ in range(len(unit.axes))] # Default up direction, determined during calibration
         self.abort_requested = False
@@ -785,24 +786,112 @@ class CalibratedUnit(ManipulatorUnit):
         self.relative_move_group(movement_vector)
         self.wait_until_still()
 
+    @staticmethod
+    def _validate_z_calibration(model, matrix):
+        """Validate a legacy model or the complete distance bundle before publishing it."""
+        def header(record, version, kind):
+            if (not isinstance(record, dict) or type(record.get('version')) is not int
+                    or record['version'] != version or record.get('mode') != 'group'
+                    or record.get('model_kind') != kind or record.get('accepted') is not True
+                    or record.get('status') != 'validated'):
+                raise ValueError('Unsupported or unaccepted pipette Z calibration')
+            jxy = np.asarray(record.get('jxy'), dtype=float)
+            if jxy.shape != (2, 2) or not np.isfinite(jxy).all():
+                raise ValueError('Invalid pipette Z calibration jxy')
+            if not np.allclose(jxy, matrix[:2, :2], rtol=1e-9, atol=1e-9):
+                raise ValueError('Pipette Z calibration does not match the XY calibration')
+
+        def single(record):
+            header(record, 2, 'group_z_innovations')
+            arrays = {}
+            for name, shape in (('means_px', (2, 2)), ('gain', (2, 2)),
+                                ('innovation_covariance_px2', (2, 2)),
+                                ('training_end_state', (2,))):
+                value = np.asarray(record.get(name), dtype=float)
+                if value.shape != shape or not np.isfinite(value).all():
+                    raise ValueError('Invalid pipette Z calibration ' + name)
+                arrays[name] = value
+            rho = record.get('rho')
+            if (isinstance(rho, (bool, np.bool_))
+                    or not isinstance(rho, (int, float, np.integer, np.floating))
+                    or not math.isfinite(rho) or abs(rho) >= 1):
+                raise ValueError('Invalid pipette Z calibration rho')
+            gain = arrays['gain']
+            if not np.allclose(gain, np.diag(np.diag(gain)), rtol=0, atol=1e-12):
+                raise ValueError('Pipette Z calibration gain must be diagonal')
+            if np.max(np.abs(np.linalg.eigvals(rho * np.eye(2) - gain))) >= 1:
+                raise ValueError('Unstable pipette Z calibration')
+            covariance = arrays['innovation_covariance_px2']
+            if not np.allclose(covariance, covariance.T, rtol=1e-9, atol=1e-12):
+                raise ValueError('Pipette Z innovation covariance must be symmetric')
+            try:
+                np.linalg.cholesky(covariance)
+            except np.linalg.LinAlgError as error:
+                raise ValueError('Pipette Z innovation covariance must be positive definite') from error
+
+        if isinstance(model, dict) and model.get('version') == 3:
+            header(model, 3, 'group_z_innovations_by_distance')
+            children = model.get('models_by_distance')
+            legacy_steps = {'100', '200', '300'}
+            full_steps = legacy_steps | {'400', '500', '600'}
+            if not isinstance(children, dict) or set(children) not in (legacy_steps, full_steps):
+                raise ValueError('Pipette Z calibration requires a complete three- or six-distance bundle')
+            if 'requested_steps_um' in model:
+                requested = np.asarray(model['requested_steps_um'], dtype=float)
+                if (requested.ndim != 1 or not np.isfinite(requested).all()
+                        or requested.size != len(children) or np.unique(requested).size != requested.size
+                        or set(requested.tolist()) != {float(step) for step in children}):
+                    raise ValueError('Pipette Z calibration distance manifest does not match its models')
+            for step, child in children.items():
+                single(child)
+                if 'requested_step_um' in child:
+                    distance = child['requested_step_um']
+                    if (isinstance(distance, (bool, np.bool_))
+                            or not isinstance(distance, (int, float, np.integer, np.floating))
+                            or not math.isfinite(distance) or distance != float(step)):
+                        raise ValueError('Pipette Z calibration child distance does not match its key')
+        else:
+            single(model)
+
     def save_configuration(self):
         '''
         Outputs configuration in a dictionary.
         '''
+        import copy
+
         config = {'up_direction' : self.up_direction,
                   'M' : self.M,
                   'r0' : self.r0}
-
+        if self.M.shape == (3, 3):
+            model = getattr(self, 'z_calibration', None)
+            compatible = False
+            if model is not None:
+                try:
+                    self._validate_z_calibration(model, self.M)
+                    compatible = True
+                except (TypeError, ValueError, np.linalg.LinAlgError):
+                    pass
+            config['z_calibration'] = copy.deepcopy(model) if compatible else None
         return config
     
 
     def load_configuration(self, config):
         '''
         Loads configuration from dictionary config.
-        Variables not present in the dictionary are untouched.
+        Missing Z metadata clears a previous model; validate before updating state.
         '''
-        self.M = config.get('M', self.M)
-        self.Minv = pinv(self.M)
+        import copy
+
+        matrix = np.asarray(config.get('M', self.M), dtype=float)
+        model = None
+        if matrix.shape == (3, 3):
+            model = copy.deepcopy(config.get('z_calibration'))
+            if model is not None:
+                self._validate_z_calibration(model, matrix)
+        inverse = pinv(matrix)
+        self.M = matrix
+        self.Minv = inverse
+        self.z_calibration = model
         self.r0 = np.zeros(self.M.shape[0])
         self.r0_inv = np.zeros(self.M.shape[0])
         if self.M.shape[0] == 3:

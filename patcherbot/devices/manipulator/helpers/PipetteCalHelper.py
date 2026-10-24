@@ -243,6 +243,440 @@ class PipetteCalHelper():
         log.warning("Pipette calibration sample timed out: %d/%d valid new frames; point rejected",
                     len(detections), CALIBRATION_FRAME_COUNT)
 
+    def observe_z_calibration(self, abort_check):
+        """Collect five fresh detections after the caller's move-completion wait.
+
+        Readback variation is measurement evidence, not a movement interlock.
+        Scientifica positions are cached asynchronously, so use the readbacks
+        accompanying accepted frames rather than a potentially stale entry value.
+        """
+        abort_check()
+        started = time.monotonic()
+        readbacks = []
+
+        def read_position():
+            xyz = np.asarray(self.pipette.position(), dtype=float).copy()
+            stage = np.asarray(self.calibrated_stage.position(), dtype=float)[:2].copy()
+            scope = float(self.microscope.position())
+            if (xyz.shape != (3,) or stage.shape != (2,)
+                    or not np.isfinite(np.r_[xyz, stage, scope]).all()):
+                raise RuntimeError("Z calibration requires finite positions")
+            value = dict(pipette_xyz=xyz.tolist(), stage_xy=stage.tolist(),
+                         microscope_z=scope, read_at=time.monotonic())
+            readbacks.append(value)
+            return value
+
+        read_position()
+
+        seen, points, frames = set(), [], []
+        while time.monotonic() - started < CALIBRATION_TIMEOUT_SECONDS:
+            abort_check()
+            data = self.camera.last_raw_frame_data(include_timing=True)
+            if data is None:
+                time.sleep(0.01)
+                continue
+            frame_id, _, image, timing = data
+            retrieved = timing.get("retrieval_started_at")
+            if (frame_id in seen or image is None or retrieved is None
+                    or not np.isfinite(retrieved) or not started <= retrieved <= time.monotonic()):
+                time.sleep(0.01)
+                continue
+            seen.add(frame_id)
+            tip = self.pipetteDetector.detect_pipette(image.copy())
+            abort_check()
+            position = read_position()
+            if time.monotonic() - started >= CALIBRATION_TIMEOUT_SECONDS:
+                break
+            if tip is None:
+                continue
+            tip = np.asarray(tip, dtype=float)
+            if tip.shape != (2,) or not np.isfinite(tip).all():
+                continue
+            points.append(tip)
+            available = timing.get("available_at")
+            frames.append(dict(frame_no=int(frame_id), retrieval_started_at=float(retrieved),
+                available_at=None if available is None else float(available), tip_xy=tip.tolist(),
+                **position))
+            if len(points) == CALIBRATION_FRAME_COUNT:
+                median = np.median(points, axis=0)
+                xyz = np.median([f["pipette_xyz"] for f in frames], axis=0)
+                stage = np.median([f["stage_xy"] for f in frames], axis=0)
+                scope = float(np.median([f["microscope_z"] for f in frames]))
+                return dict(tip_xy=median.tolist(), pipette_xyz=xyz.tolist(), stage_xy=stage.tolist(),
+                    microscope_z=scope, frames=frames, sampling_started_at=started,
+                    sampling_finished_at=time.monotonic(),
+                    position_readbacks=readbacks,
+                    readback_span=dict(
+                        pipette_xyz_um=np.ptp([r["pipette_xyz"] for r in readbacks], axis=0).tolist(),
+                        stage_xy_um=np.ptp([r["stage_xy"] for r in readbacks], axis=0).tolist(),
+                        microscope_z_native=float(np.ptp([r["microscope_z"] for r in readbacks]))),
+                    spread_px=float(np.max(np.linalg.norm(np.asarray(points) - median, axis=1))))
+        raise RuntimeError("Z calibration timed out before five fresh valid detections")
+
+    @staticmethod
+    def fit_z_calibration(samples, jxy, continuous=False):
+        """Fit group errors; keep centering and autofocus as separate evidence."""
+        jxy = np.asarray(jxy, dtype=float)
+        if (jxy.shape != (2, 2) or not np.isfinite(jxy).all()
+                or np.linalg.cond(jxy) > 1e8):
+            raise ValueError("A nonsingular finite XY calibration is required")
+        if not samples:
+            raise ValueError("No group calibration samples")
+        requested_steps = [sample.get("requested_step_um") for sample in samples]
+        step_values = []
+        if any(step is not None for step in requested_steps):
+            if any(step is None or isinstance(step, (bool, np.bool_)) for step in requested_steps):
+                raise ValueError("Every sample must specify its requested group distance")
+            step_values = [float(step) for step in requested_steps]
+            if not np.isfinite(step_values).all() or any(step <= 0 for step in step_values):
+                raise ValueError("Requested group distances must be finite and positive")
+        distances = list(dict.fromkeys(step_values))
+        if len(distances) > 1 and not continuous:
+            if len({sample["id"] for sample in samples}) != len(samples):
+                raise ValueError("Sample IDs must be unique across distance blocks")
+            models = {}
+            for distance in distances:
+                subset = [sample for sample, step in zip(samples, step_values) if step == distance]
+                models[format(distance, "g")] = PipetteCalHelper.fit_z_calibration(subset, jxy)
+            accepted = all(model["status"] == "validated" for model in models.values())
+            return dict(version=3, mode="group", model_kind="group_z_innovations_by_distance",
+                status="validated" if accepted else "unsupported", accepted=accepted,
+                jxy=jxy.tolist(), requested_steps_um=distances, models_by_distance=models,
+                training_count=sum(model["training_count"] for model in models.values()),
+                validation=dict(by_distance={key: model["validation"] for key, model in models.items()}),
+                reason="; ".join(f"{key} um: {model['reason']}" for key, model in models.items()))
+        reference = np.asarray(samples[0]["before"]["stage_xy"], dtype=float)
+        positions, scopes, observations, directions, splits = [], [], [], [], []
+        pair_keys, ids = [], set()
+
+        def check(observation):
+            tip = np.asarray(observation["tip_xy"], dtype=float)
+            xyz = np.asarray(observation["pipette_xyz"], dtype=float)
+            stage = np.asarray(observation["stage_xy"], dtype=float)
+            scope = float(observation["microscope_z"])
+            if (tip.shape != (2,) or xyz.shape != (3,) or stage.shape != (2,)
+                    or not np.isfinite(np.r_[tip, xyz, stage, scope]).all()
+                    or not np.allclose(stage, reference, atol=0.1, rtol=0)):
+                raise ValueError("Invalid or moving-stage calibration observation")
+            positions.append(float(xyz[2]))
+            scopes.append(scope)
+            return tip, xyz
+
+        for sample in samples:
+            if sample["id"] in ids or sample["direction"] not in ("up", "down"):
+                raise ValueError("Duplicate sample or invalid direction")
+            ids.add(sample["id"])
+            before_tip, before_xyz = check(sample["before"])
+            after_tip, after_xyz = check(sample["after"])
+            check(sample["final"])
+            delta = after_xyz - before_xyz
+            sign = -1 if sample["direction"] == "up" else 1
+            dz = float(sample["dz_um"])
+            if not np.isfinite(dz) or dz * sign <= 0 or not np.isclose(delta[2], dz, atol=1e-6, rtol=0):
+                raise ValueError("Actual Z disagrees with group direction")
+            error = after_tip - before_tip - jxy @ delta[:2]
+            sample["group_error_px"] = error.tolist()
+            for event in sample["correction_events"]:
+                old_tip, old_xyz = check(event["before"])
+                new_tip, new_xyz = check(event["after"])
+                if event["kind"] not in ("center", "focus"):
+                    raise ValueError("Unknown fine-calibration event")
+                event["achieved_xyz_um"] = (new_xyz - old_xyz).tolist()
+                event["image_displacement_px"] = (new_tip - old_tip).tolist()
+                if event["kind"] == "center":
+                    event["centering_response_error_px"] = (new_tip - old_tip - jxy @ (new_xyz - old_xyz)[:2]).tolist()
+            observations.append(error)
+            directions.append(sign)
+            splits.append(sample["split"])
+            pair_keys.append((sample["split"], sample["pair_id"]))
+        if len(samples) % 2:
+            raise ValueError("Complete up/down pairs are required")
+        for index in range(0, len(samples), 2):
+            if (pair_keys[index] != pair_keys[index + 1]
+                    or directions[index:index + 2] != [-1, 1]
+                    or pair_keys[index] in pair_keys[:index]):
+                raise ValueError("Calibration pairs must be complete, ordered and unique")
+        if continuous:
+            return PipetteCalHelper._fit_z_continuous(
+                samples, observations, directions, jxy, positions, scopes)
+        fitted = PipetteCalHelper._fit_z_innovations(observations, directions, splits)
+        metrics, status = PipetteCalHelper._z_validation_metrics(samples, observations, fitted, jxy)
+        reasons = []
+        worse = [direction for direction in ("up", "down")
+                 if metrics[direction]["ssm_rmse_um"] > metrics[direction]["mean_rmse_um"]]
+        if worse:
+            reasons.append("SSM held-out RMSE exceeds the directional-mean baseline for " + ", ".join(worse))
+        interval = metrics["paired_mse_benefit_interval_um2"]
+        if interval[0] <= 0:
+            reasons.append(f"paired MSE-benefit interval [{interval[0]:.6g}, {interval[1]:.6g}] um^2 is not wholly positive")
+        if metrics.get("cross_cycle_dependence", {}).get("significant", False):
+            reasons.append("held-out innovations retain significant cross-cycle dependence")
+        fitted.update(version=2, mode="group", model_kind="group_z_innovations", status=status,
+            accepted=status == "validated", jxy=jxy.tolist(), validation=metrics,
+            reason="; ".join(reasons) if reasons else "Held-out SSM improvement passes the paired and directional checks",
+            fit_sample_ids=[s["id"] for s in samples if s["split"] == "fit"],
+            validation_sample_ids=[s["id"] for s in samples if s["split"] == "validation"],
+            measured_coverage=dict(steps_um=[float(s["dz_um"]) for s in samples],
+                pipette_z_um=[min(positions), max(positions)],
+                microscope_z_native=[min(scopes), max(scopes)]))
+        if distances:
+            fitted["requested_step_um"] = distances[0]
+        return fitted
+
+    @staticmethod
+    def _fit_z_continuous(samples, observations, directions, jxy, positions, scopes):
+        """Report-only continuous predictors; reserved targets never reach a fit or score."""
+        splits = np.asarray([sample["split"] for sample in samples])
+        counts = {name: int(np.sum(splits == name))
+                  for name in ("fit", "validation", "reserved")}
+        expected = [name for name in counts for _ in range(counts[name])]
+        if (not all(counts.values()) or not np.array_equal(splits, expected)
+                or any(count % 2 for count in counts.values())):
+            raise ValueError("Continuous data require chronological fit, validation and reserved pairs")
+        n, stop = counts["fit"], counts["fit"] + counts["validation"]
+        active = samples[:stop]
+        labels = np.asarray(directions[:stop])
+        if any(np.sum(labels[:n] == sign) < 6 for sign in (-1, 1)):
+            raise ValueError("At least six fitting moves per direction are required")
+        # Slice before conversion: reserved target values do not enter any estimator.
+        errors_px = np.asarray(observations[:stop], dtype=float)
+        errors = np.linalg.solve(jxy, errors_px.T).T
+        distance = np.abs([sample["dz_um"] for sample in active]) / 100.0
+        validation_labels = labels[n:]
+
+        def score(predicted):
+            residual = errors[n:] - predicted
+            result = {}
+            for name, sign in (("all", None), ("up", -1), ("down", 1)):
+                mask = np.ones(len(residual), dtype=bool) if sign is None else validation_labels == sign
+                if not mask.any():
+                    raise ValueError("Both validation directions are required")
+                selected = residual[mask]
+                result[name] = dict(count=int(mask.sum()),
+                    rmse_xy_um=np.sqrt(np.mean(selected ** 2, axis=0)).tolist(),
+                    rmse_um=float(np.sqrt(np.mean(np.sum(selected ** 2, axis=1)))),
+                    bias_um=selected.mean(axis=0).tolist())
+            return result, residual.tolist()
+
+        models, predictions = {}, {}
+        bases = {
+            "zero": np.ones((stop, 1)),
+            "directional_mean": np.ones((stop, 1)),
+            "affine": np.column_stack((np.ones(stop), distance)),
+            "quadratic": np.column_stack((np.ones(stop), distance, distance ** 2)),
+            "cubic": np.column_stack((np.ones(stop), distance, distance ** 2, distance ** 3)),
+            "hinge300": np.column_stack((np.ones(stop), distance, np.maximum(0, distance - 3))),
+        }
+        for name, design in bases.items():
+            predicted = np.zeros_like(errors)
+            coefficients = {}
+            for direction, sign in (("up", -1), ("down", 1)):
+                train_mask = labels[:n] == sign
+                if name == "zero":
+                    coef = np.zeros((1, 2))
+                else:
+                    coef, _, rank, _ = np.linalg.lstsq(design[:n][train_mask], errors[:n][train_mask], rcond=None)
+                    if rank < design.shape[1] or not np.isfinite(coef).all():
+                        raise ValueError("Insufficient training distance variation for " + name)
+                coefficients[direction] = coef.tolist()
+                predicted[labels == sign] = design[labels == sign] @ coef
+            metrics, residuals = score(predicted[n:])
+            models[name] = dict(status="fitted", coefficients_um=coefficients,
+                basis=("[1,d,max(0,d-3)]" if name == "hinge300" else
+                       "ascending powers of d; d=abs(actual dz_um)/100"),
+                validation=metrics, validation_predictions_um=predicted[n:].tolist(),
+                validation_residuals_um=residuals)
+            predictions[name] = predicted
+
+        # The existing estimator operates in image pixels. Its mean is a residual
+        # offset, and its state updates only after recording each prediction.
+        affine = predictions["affine"]
+        residual_px = (errors - affine) @ jxy.T
+        try:
+            innovations = PipetteCalHelper._fit_z_innovations(
+                residual_px, labels, splits[:stop])
+            ssm_prediction = affine[n:] + np.linalg.solve(
+                jxy, np.asarray(innovations["validation_predictions_px"]).T).T
+            metrics, residuals = score(ssm_prediction)
+            models["affine_ssm"] = dict(status="fitted", prediction_mode="detector-assisted one-step",
+                innovations=innovations, validation=metrics,
+                validation_predictions_um=ssm_prediction.tolist(),
+                validation_residuals_um=residuals,
+                affine_rmse_um=models["affine"]["validation"]["all"]["rmse_um"],
+                improvement_um=models["affine"]["validation"]["all"]["rmse_um"] - metrics["all"]["rmse_um"])
+        except (RuntimeError, ValueError, FloatingPointError, np.linalg.LinAlgError) as error:
+            models["affine_ssm"] = dict(status="unsupported", reason=str(error))
+
+        for index, sample in enumerate(active):
+            sample["group_error_um"] = errors[index].tolist()
+            sample["predictions_um"] = {name: value[index].tolist() for name, value in predictions.items()}
+            if index >= n and models["affine_ssm"]["status"] == "fitted":
+                sample["predictions_um"]["affine_ssm"] = models["affine_ssm"]["validation_predictions_um"][index - n]
+            sample["proposed_corrections_um"] = {
+                name: (-np.asarray(prediction)).tolist()
+                for name, prediction in sample["predictions_um"].items()}
+        static_names = ("affine", "quadratic", "cubic", "hinge300")
+        best = min(static_names, key=lambda name: models[name]["validation"]["all"]["rmse_um"])
+        ssm_ok = models["affine_ssm"]["status"] == "fitted"
+        return dict(version=4, mode="group", model_kind="group_z_continuous_characterization",
+            report_only=True, accepted=False, status="analyzed" if ssm_ok else "unsupported",
+            reason=("Report-only model comparison; reserved observations remain unevaluated" if ssm_ok else
+                    "Static analysis completed; residual SSM unsupported: " + models["affine_ssm"]["reason"]),
+            jxy=jxy.tolist(), counts=counts, training_count=n, validation_count=counts["validation"],
+            reserved_count=counts["reserved"], models=models, best_static_model=best,
+            distance_scale_um=100.0, hinge_breakpoint_um=300.0,
+            fit_sample_ids=[sample["id"] for sample in samples[:n]],
+            validation_sample_ids=[sample["id"] for sample in samples[n:stop]],
+            reserved_sample_ids=[sample["id"] for sample in samples[stop:]],
+            measured_coverage=dict(steps_um=[float(sample["dz_um"]) for sample in samples],
+                pipette_z_um=[min(positions), max(positions)], microscope_z_native=[min(scopes), max(scopes)]))
+
+    @staticmethod
+    def _fit_z_innovations(errors_xy, directions, splits):
+        from scipy.optimize import minimize
+
+        errors = np.asarray(errors_xy, dtype=float)
+        direction, split = np.asarray(directions), np.asarray(splits)
+        if (errors.ndim != 2 or errors.shape[1] != 2
+                or direction.shape != (len(errors),) or split.shape != (len(errors),)
+                or not np.isfinite(errors).all()
+                or not np.isin(direction, [-1, 1]).all()
+                or not np.isin(split, ["fit", "validation"]).all()):
+            raise ValueError("Finite XY errors, signed directions and valid splits required")
+        n = int(np.sum(split == "fit"))
+        if (n == 0 or n == len(errors) or not np.all(split[:n] == "fit")
+                or not np.all(split[n:] == "validation")):
+            raise ValueError("Training must precede nonempty held-out data")
+        labels = (direction > 0).astype(int)
+        train, train_labels = errors[:n], labels[:n]
+        if any(np.sum(train_labels == i) < 6 for i in (0, 1)):
+            raise ValueError("Too few training movements in either direction")
+        if any(np.sum(labels[n:] == i) == 0 for i in (0, 1)):
+            raise ValueError("Held-out data must contain both directions")
+        baseline = np.asarray([train[train_labels == i].mean(axis=0) for i in (0, 1)])
+        scale = max(1.0, float(np.max(np.abs(train))))
+        floor = (scale * 1e-6) ** 2
+        bounds = [(-10 * scale, 10 * scale)] * 4 + [
+            (-0.98, 0.98), (-1.96, 1.96), (-1.96, 1.96)]
+
+        def replay(p, values, indices, state=None):
+            state = np.zeros(2) if state is None else state.copy()
+            predictions, innovations = [], []
+            for value, label in zip(values, indices):
+                prediction = p[:4].reshape(2, 2)[label] + state
+                predictions.append(prediction.copy())
+                innovation = value - prediction
+                innovations.append(innovation.copy())
+                state = p[4] * state + p[5:7] * innovation
+            return np.asarray(predictions), np.asarray(innovations), state
+
+        def profile(p):
+            _, residuals, _ = replay(p, train, train_labels)
+            covariance = residuals.T @ residuals / n + np.eye(2) * floor
+            sign, logdet = np.linalg.slogdet(covariance)
+            if sign <= 0 or not np.isfinite(covariance).all():
+                return float("inf"), covariance
+            quadratic = np.sum(residuals * np.linalg.solve(covariance, residuals.T).T)
+            return float(0.5 * (n * (2 * np.log(2 * np.pi) + logdet) + quadratic)), covariance
+
+        constraint = {"type": "ineq", "fun": lambda p: 0.98 - np.abs(p[4] - p[5:7])}
+        candidates = []
+        for rho in (0.0, -0.5, 0.5, -0.9, 0.9):
+            result = minimize(lambda p: profile(p)[0],
+                              np.r_[baseline.ravel(), rho, 0.0, 0.0],
+                              method="SLSQP", bounds=bounds, constraints=[constraint],
+                              options={"maxiter": 400, "ftol": 1e-8})
+            if (result.success and np.isfinite(result.x).all()
+                    and np.isfinite(result.fun)
+                    and np.min(constraint["fun"](result.x)) >= -1e-7):
+                candidates.append(result)
+        if not candidates:
+            raise RuntimeError("No converged stable movement-error model")
+        best = min(candidates, key=lambda candidate: candidate.fun)
+        p = best.x
+        _, _, state = replay(p, train, train_labels)
+        predicted, residuals, _ = replay(p, errors[n:], labels[n:], state)
+        return {
+            "means_px": p[:4].reshape(2, 2).tolist(),
+            "direction_order": ["up", "down"], "rho": float(p[4]),
+            "gain": np.diag(p[5:7]).tolist(),
+            "innovation_covariance_px2": profile(p)[1].tolist(),
+            "covariance_floor_px2": floor,
+            "training_end_state": state.tolist(), "training_count": n,
+            "training_negative_log_likelihood": float(best.fun),
+            "optimizer_message": str(best.message),
+            "optimizer_converged": bool(best.success),
+            "optimizer_iterations": int(best.nit),
+            "boundary_parameter_indices": [i for i, (lower, upper) in enumerate(bounds)
+                if min(abs(p[i] - lower), abs(p[i] - upper)) <= 1e-6 * max(1.0, abs(p[i]))],
+            "error_dynamics_radius": float(np.max(np.abs(p[4] - p[5:7]))),
+            "validation_predictions_px": predicted.tolist(),
+            "validation_residuals_px": residuals.tolist(),
+            "baseline_predictions_px": baseline[labels[n:]].tolist(),
+        }
+
+    @staticmethod
+    def _z_validation_metrics(samples, observations, fitted, jxy):
+        start = fitted["training_count"]
+        rows = samples[start:]
+        actual = np.asarray(observations, dtype=float)[start:]
+        predicted = np.asarray(fitted["validation_predictions_px"])
+        baseline = np.asarray(fitted["baseline_predictions_px"])
+        mean_error = np.linalg.solve(jxy, (actual - baseline).T).T
+        ssm_error = np.linalg.solve(jxy, (actual - predicted).T).T
+        result = {}
+        for name in ("all", "up", "down"):
+            mask = np.array([name == "all" or row["direction"] == name for row in rows])
+            if not mask.any():
+                raise ValueError("Missing validation direction")
+            result[name] = {
+                "count": int(mask.sum()),
+                "mean_rmse_um": float(np.sqrt(np.mean(np.sum(mean_error[mask] ** 2, axis=1)))),
+                "ssm_rmse_um": float(np.sqrt(np.mean(np.sum(ssm_error[mask] ** 2, axis=1)))),
+                "ssm_bias_um": ssm_error[mask].mean(axis=0).tolist(),
+            }
+        for row, prediction in zip(rows, predicted):
+            row["predicted_error_px"] = prediction.tolist()
+            row["predicted_correction_um"] = (-np.linalg.solve(jxy, prediction)).tolist()
+        pair_ids = sorted({row["pair_id"] for row in rows})
+        benefits = []
+        for pair_id in pair_ids:
+            mask = np.array([row["pair_id"] == pair_id for row in rows])
+            benefits.append(float(np.mean(np.sum(mean_error[mask] ** 2, axis=1)
+                                         - np.sum(ssm_error[mask] ** 2, axis=1))))
+        rng = np.random.default_rng(0)
+        draws = rng.choice(benefits, size=(2000, len(benefits)), replace=True).mean(axis=1)
+        interval = np.quantile(draws, [0.025, 0.975]).tolist()
+        result["paired_mse_benefit_interval_um2"] = interval
+        no_direction_worse = all(result[d]["ssm_rmse_um"] <= result[d]["mean_rmse_um"]
+                                 for d in ("up", "down"))
+        from scipy.stats import pearsonr
+        pair_residuals = np.asarray([np.concatenate([ssm_error[i] for i, row in enumerate(rows)
+            if row["pair_id"] == pair_id]) for pair_id in pair_ids])
+        correlations, probabilities = [], []
+        for component in pair_residuals.T:
+            if (len(component) < 4 or np.std(component[:-1]) < 1e-12
+                    or np.std(component[1:]) < 1e-12):
+                correlations.append(0.0)
+                probabilities.append(1.0)
+            else:
+                correlation, probability = pearsonr(component[:-1], component[1:])
+                correlations.append(float(correlation))
+                probabilities.append(float(probability))
+        dependent = any(p < 0.05 / len(probabilities) for p in probabilities)
+        result["cross_cycle_dependence"] = dict(lag_pairs=1, correlations=correlations,
+            p_values=probabilities, familywise_alpha=0.05, significant=dependent,
+            method="lag-one Pearson per direction/coordinate; Bonferroni")
+        result["pair_mse_benefits_um2"] = benefits
+        for name in ("all", "up", "down"):
+            mask = np.array([name == "all" or row["direction"] == name for row in rows])
+            result[name].update(
+                mean_rmse_px=float(np.sqrt(np.mean(np.sum((actual[mask] - baseline[mask]) ** 2, axis=1)))),
+                ssm_rmse_px=float(np.sqrt(np.mean(np.sum((actual[mask] - predicted[mask]) ** 2, axis=1)))),
+                ssm_bias_px=(actual[mask] - predicted[mask]).mean(axis=0).tolist())
+        supported = interval[0] > 0 and no_direction_worse and not dependent
+        return result, ("validated" if supported else "unsupported")
+
     def _hybrid_position(self, detected, frame, mask):
         """Use validated foreground motion, with detection anchoring and fallback."""
         log = logging.getLogger("patcherbot.PipetteCalibration")

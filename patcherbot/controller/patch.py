@@ -1,5 +1,7 @@
 import time
 import csv
+import json
+from pathlib import Path
 import numpy as np
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.devices.amplifier.DAQ import DAQ
@@ -16,7 +18,7 @@ from uuid import uuid4
 from patcherbot.configs.PatchConfig import PatchConfig
 from patcherbot.configs.ProtocolConfig import ProtocolConfig
 
-from .base import TaskController, RequestedSuccessException
+from .base import TaskController, RequestedSuccessException, RequestedAbortException
 from .phases.find_pipette import FindPipettePhase
 from .errors import AutopatchError
 from .phases.approach_cell import ApproachCellPhase
@@ -366,29 +368,406 @@ class AutoPatcher(TaskController):
     # endregion
     
     # region Phase helpers
-    def fine_calibrate_pipette(self):
+    def fine_calibrate_pipette(self, record=None):
         '''
         Fine calibrates the pipette using microscope imaging
         '''
         self.info("Fine calibrating pipette using imaging")
-        self.calibrated_unit.center_pipette()
-        self.calibrated_unit.wait_until_still()
-        self.calibrated_unit.autofocus_pipette()
-        self.calibrated_unit.wait_until_still()
-        self.calibrated_unit.center_pipette()
-        self.calibrated_unit.wait_until_still()
-        self.calibrated_unit.autofocus_pipette()
-        self.calibrated_unit.wait_until_still()
-        self.calibrated_unit.center_pipette()
-        self.calibrated_unit.wait_until_still()
-        self.calibrated_unit.autofocus_pipette()
-        self.calibrated_unit.wait_until_still()
+        for _ in range(3):
+            for kind, action in (("center", self.calibrated_unit.center_pipette),
+                                 ("focus", self.calibrated_unit.autofocus_pipette)):
+                before = record("before", kind, None) if record else None
+                result = action()
+                self.calibrated_unit.wait_until_still()
+                if record:
+                    if result is False:
+                        raise RuntimeError("Fine calibration failed during Z collection")
+                    record("after", kind, before)
+
+    def test_pipette_planar_drift(self, output_dir=None):
+        """Collect 360 random-amplitude pairs before report-only continuous analysis."""
+        pair_count = 360
+        fit_pairs, validation_pairs = 252, 72
+        random_seed = uuid4().int & ((1 << 64) - 1)
+        rng = np.random.default_rng(random_seed)
+        pair_distances_um = rng.uniform(10.0, 600.0, size=pair_count).tolist()
+        total_movements = 2 * pair_count
+        locate_speed = float(self.config.max_locate_speed)
+        if not np.isfinite(locate_speed) or locate_speed < 1:
+            raise ValueError("Planar drift test requires a positive locate-cell speed")
+        requested_speed = int(locate_speed)  # Same integer command used by Scientifica.
+        unit = self.calibrated_unit
+        if not unit.calibrated:
+            raise RuntimeError("Complete XY calibration before Z calibration")
+        jxy = np.asarray(unit.M, dtype=float)[:2, :2].copy()
+        if jxy.shape != (2, 2) or not np.isfinite(jxy).all() or np.linalg.cond(jxy) > 1e8:
+            raise ValueError("Z calibration requires a valid XY matrix")
+        origin = np.asarray(unit.position(), dtype=float).copy()
+        stage_origin = np.asarray(self.calibrated_stage.position(), dtype=float)[:2].copy()
+        scope_origin = float(self.microscope.position())
+        scale = float(unit.config.microscope_units_per_um)
+        if (not np.isfinite(np.r_[origin, stage_origin, scope_origin, scale]).all()
+                or scale <= 0):
+            raise ValueError("Z calibration requires finite positions and microscope scale")
+        target = np.array([unit.camera.width / 2., unit.camera.height / 2.])
+        helper = unit.pipetteCalHelper
+        stem = "z_calibration_" + datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
+        output_dir = output_dir or "experiments/Data/calibration_data"
+        report = dict(version=4, run_id=stem, status="collecting", reason=None,
+            model_kind="group_z_continuous_characterization", sampling_mode="continuous_uniform",
+            random_seed=random_seed, random_generator=type(rng.bit_generator).__name__,
+            distribution=dict(kind="uniform", low_um=10.0, high_um=600.0, high_exclusive=True),
+            pair_distances_um=pair_distances_um, pair_count=pair_count, pair_endpoints=[],
+            planned_pair_counts=dict(fit=fit_pairs, validation=validation_pairs,
+                                     reserved=pair_count - fit_pairs - validation_pairs),
+            total_movements=total_movements, speed_profile="locate_cell",
+            configured_locate_speed=locate_speed, test_speed_limits=[],
+            timestamp=datetime.now().astimezone().isoformat(),
+            timestamp_basis="camera_retrieval_not_sensor_exposure", jxy=jxy.tolist(),
+            origin_xyz=origin.tolist(), microscope_origin=scope_origin,
+            stage_origin=stage_origin.tolist(), samples=[], rejected_samples=[],
+            counts={name: {"accepted": 0, "rejected": 0} for name in ("fit", "validation", "reserved")})
+        unit.z_calibration_report = report
+        observation_id = 0
+        active = None
+        speed_devices = (("pipette", unit), ("microscope_controller", self.microscope.dev))
+        previous_speeds = []
+
+        def observe():
+            nonlocal observation_id
+            self.abort_if_requested()
+            value = helper.observe_z_calibration(self.abort_if_requested)
+            if not np.allclose(value["stage_xy"], stage_origin, atol=0.1, rtol=0):
+                raise RuntimeError("Stage moved during pipette Z calibration")
+            value["id"] = observation_id
+            observation_id += 1
+            return value
+
+        def record_into(events):
+            def record(when, kind, before):
+                after = observe()
+                if when == "after":
+                    events.append(dict(kind=kind, before=before, after=after))
+                return after
+            return record
+
+        try:
+            for name, device in speed_devices:
+                previous_speed = float(device.get_max_speed())
+                if not np.isfinite(previous_speed) or previous_speed <= 0:
+                    raise ValueError("Cannot preserve the current device speed for the drift test")
+                previous_speeds.append((device, previous_speed))
+                device.set_max_speed(requested_speed)
+                readback = device.get_max_speed()
+                applied = None if readback is None else float(readback)
+                report['test_speed_limits'].append(dict(device=name, previous=previous_speed,
+                    requested=requested_speed,
+                    applied=applied if applied is not None and np.isfinite(applied) else None))
+                if applied is None or not np.isfinite(applied) or applied != requested_speed:
+                    raise RuntimeError(f"{name} speed readback {applied} does not match "
+                                       f"requested locate-cell speed {requested_speed}")
+                self.info(f"Planar drift test {name} speed limit: previous={previous_speed:g}, "
+                          f"requested={requested_speed}, applied={applied:g} (controller units)")
+            schedule_path = Path(output_dir) / (stem + ".json")
+            schedule_path.parent.mkdir(parents=True, exist_ok=True)
+            schedule_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+            self.info(f"Test Pipette Planar Drift: {pair_count} up/down pairs with independent "
+                      f"uniform magnitudes in [10, 600) um; {total_movements} movements; locate-cell speed "
+                      f"limit {requested_speed}; original fine calibration; fit after all collection")
+            self.fine_calibrate_pipette(record=record_into([]))
+            for pair_id, distance in enumerate(pair_distances_um):
+                split = ("fit" if pair_id < fit_pairs else
+                         "validation" if pair_id < fit_pairs + validation_pairs else "reserved")
+                for direction, move in (("up", self.move_group_up),
+                                        ("down", self.move_group_down)):
+                    active = dict(id=len(report["samples"]), pair_id=pair_id,
+                                  split=split, direction=direction, requested_step_um=distance,
+                                  correction_events=[])
+                    active["before"] = observe()
+                    self.abort_if_requested()
+                    motion_started = time.monotonic()
+                    move(distance)
+                    active["group_motion_elapsed_s"] = float(time.monotonic() - motion_started)
+                    events = active["correction_events"]
+                    self.fine_calibrate_pipette(record=record_into(events))
+                    after, final = events[0]["before"], observe()
+                    delta = np.asarray(after["pipette_xyz"]) - active["before"]["pipette_xyz"]
+                    expected = -distance if direction == "up" else distance
+                    if not np.isclose(delta[2], expected, atol=0.5, rtol=0.02):
+                        raise RuntimeError("Group Z command did not reach its requested displacement")
+                    corrections = [np.asarray(e["after"]["pipette_xyz"])[:2]
+                                   - np.asarray(e["before"]["pipette_xyz"])[:2]
+                                   for e in events if e["kind"] == "center"]
+                    active.update(after=after, final=final, dz_um=float(delta[2]),
+                        actual_correction_um=np.sum(corrections, axis=0).tolist(),
+                        correction_distance_um=float(sum(np.linalg.norm(c) for c in corrections)),
+                        final_error_um=np.linalg.solve(jxy, np.asarray(final["tip_xy"]) - target).tolist())
+                    for event in events:
+                        event["group_id"] = active["id"]
+                    report["samples"].append(active)
+                    report["counts"][split]["accepted"] += 1
+                    active = None
+                report["pair_endpoints"].append(dict(pair_id=pair_id, split=split,
+                    requested_step_um=distance, final_observation_id=final["id"],
+                    pipette_xyz_offset_um=(np.asarray(final["pipette_xyz"]) - origin).tolist(),
+                    microscope_z_offset_um=float((final["microscope_z"] - scope_origin) / scale)))
+                self.info(f"Planar drift test: {distance:g} um pair {pair_id + 1}/{pair_count} "
+                          f"({split}); {len(report['samples'])}/{total_movements} movements")
+            self.info(f"All {total_movements} movements collected; comparing continuous-distance predictors; "
+                      "reserved observations remain unevaluated")
+            try:
+                model = helper.fit_z_calibration(report["samples"], jxy, continuous=True)
+            except RequestedAbortException:
+                raise
+            except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError) as error:
+                model = dict(version=4, model_kind="group_z_continuous_characterization",
+                    report_only=True, status="unsupported", accepted=False, validation={}, models={},
+                    reason=f"Collection completed; continuous analysis failed: {error}")
+            report.update(status=model["status"], model=model,
+                          validation=model.get("validation", {}), reason=model.get("reason"))
+            self.abort_if_requested()
+            self.microscope.absolute_move(scope_origin / scale)
+            self.microscope.wait_until_still()
+            self.abort_if_requested()
+            unit.absolute_move(origin.tolist())
+            unit.wait_until_still()
+            return_events = []
+            self.fine_calibrate_pipette(record=record_into(return_events))
+            report.update(return_events=return_events, final=observe())
+            model["report_path"] = str(Path(output_dir) / (stem + ".json"))
+            self._write_z_calibration_report(report, output_dir, stem)
+        except BaseException as error:
+            report.update(status="aborted" if isinstance(error, RequestedAbortException) else "failed",
+                          reason=str(error) or type(error).__name__)
+            if active is not None:
+                active["rejection_reason"] = report["reason"]
+                report["rejected_samples"].append(active)
+                report["counts"][active["split"]]["rejected"] += 1
+            for device in (unit, self.microscope):
+                try:
+                    device.stop()
+                except Exception:
+                    logging.exception("Could not stop device after Z calibration failure")
+            try:
+                self._write_z_calibration_report(report, output_dir, stem)
+            except Exception:
+                logging.exception("Could not save partial Z calibration report; original failure retained")
+                self.info(self._format_z_calibration_report(report))
+            raise
+        finally:
+            for device, previous_speed in reversed(previous_speeds):
+                try:
+                    device.set_max_speed(previous_speed)
+                except Exception:
+                    logging.exception("Could not restore device speed after planar drift test")
 
 
         
    
 
     # endregion
+
+    @staticmethod
+    def _format_z_calibration_report(report):
+        lines = ["TEST PIPETTE PLANAR DRIFT", f"Status: {report['status']}",
+                 f"Reason: {report.get('reason') or 'not available'}",
+                 "Mode: group Z; model corrections were NOT applied."]
+        if report.get("speed_profile"):
+            lines.append(f"Speed profile: {report['speed_profile']}; controller limits, not measured velocity")
+        for speed in report.get("test_speed_limits", []):
+            lines.append(f"{speed.get('device', 'device')} speed limit: previous={speed['previous']}; "
+                         f"requested={speed['requested']}; applied={speed.get('applied', 'not recorded')}")
+        for split in report["counts"]:
+            counts = report["counts"][split]
+            lines.append(f"{split}: accepted={counts['accepted']}, rejected={counts['rejected']}")
+        model = report.get("model") or {}
+        if (report.get("sampling_mode") == "continuous_uniform"
+                or model.get("model_kind") == "group_z_continuous_characterization"):
+            lines.append(f"Uniform random distances: 10-600 um; pairs={report.get('pair_count')}; "
+                         f"planned movements={report.get('total_movements')}; seed={report.get('random_seed')}")
+            lines.append("Reserved observations are saved but not fitted, scored or assimilated.")
+            lines.append("Coefficient basis uses d=abs(measured dz_um)/100; vector outputs are XY error in um.")
+            samples = report.get("samples", [])
+            for direction in ("up", "down"):
+                steps = [s["dz_um"] for s in samples if s["direction"] == direction]
+                if steps:
+                    lines.append(f"{direction} measured Z steps (um): {min(steps):.3f} to {max(steps):.3f}")
+            elapsed = [s["group_motion_elapsed_s"] for s in samples if "group_motion_elapsed_s" in s]
+            if elapsed:
+                lines.append(f"Group command + wait time (s): mean={np.mean(elapsed):.3f}; "
+                             f"min={min(elapsed):.3f}; max={max(elapsed):.3f}")
+            for name, candidate in model.get("models", {}).items():
+                lines.append(f"{name}: {candidate.get('status')}; {candidate.get('reason', '')}")
+                if candidate.get("coefficients_um") is not None:
+                    lines.append(f"  basis={candidate.get('basis')}; coefficients_um="
+                                 + json.dumps(candidate["coefficients_um"]))
+                for direction, metrics in candidate.get("validation", {}).items():
+                    lines.append(f"  {direction}: n={metrics['count']}; planar RMSE (um)={metrics['rmse_um']}; "
+                                 f"XY RMSE (um)={metrics['rmse_xy_um']}; bias (um)={metrics['bias_um']}")
+                if "innovations" in candidate:
+                    lines.append("  SSM: detector-assisted one-step predictions; frozen fitted parameters.")
+                    for key in ("rho", "gain", "innovation_covariance_px2", "optimizer_message"):
+                        lines.append(f"  {key}={candidate['innovations'].get(key)}")
+                    lines.append(f"  RMSE improvement over affine (um)={candidate.get('improvement_um')}")
+            lines.append(f"Lowest validation RMS distance-dependent model: {model.get('best_static_model', 'not available')}")
+            lines.append("Innovation covariance is predictive uncertainty, not separately identified physical Q/R.")
+            lines.append("Actual detector correction distance (um): "
+                         + str(sum(s.get("correction_distance_um", 0.) for s in samples)))
+            lines.append("Reports: " + json.dumps(report.get("artifacts", {}), sort_keys=True))
+            return "\n".join(lines)
+        for direction in ("up", "down", "all"):
+            metrics = report.get("validation", {}).get(direction, {})
+            lines.append(
+                f"{direction} held-out RMSE (um): mean={metrics.get('mean_rmse_um', 'not available')}; "
+                f"SSM={metrics.get('ssm_rmse_um', 'not available')}")
+        model = report.get("model") or {}
+        samples = report.get("samples", [])
+        for distance in sorted({s['requested_step_um'] for s in samples if 'requested_step_um' in s}):
+            elapsed = [s['group_motion_elapsed_s'] for s in samples
+                       if s.get('requested_step_um') == distance and 'group_motion_elapsed_s' in s]
+            if elapsed:
+                lines.append(f"{distance:g} um group command + wait time (s): "
+                             f"mean={np.mean(elapsed):.3f}; min={min(elapsed):.3f}; max={max(elapsed):.3f}")
+        if "models_by_distance" in model:
+            lines.append("Results by requested group-Z distance:")
+            for distance, child in model["models_by_distance"].items():
+                child_samples = [s for s in report.get("samples", [])
+                                 if float(s["requested_step_um"]) == float(distance)]
+                child_report = dict(report, model=child, validation=child["validation"],
+                    status=child["status"], reason=child.get("reason"), samples=child_samples,
+                    counts={split: dict(accepted=sum(s["split"] == split for s in child_samples),
+                                        rejected=0) for split in ("fit", "validation")})
+                lines.append(f"--- {distance} um ---")
+                lines.append(AutoPatcher._format_z_calibration_report(child_report))
+            return "\n".join(lines)
+        samples = report.get("samples", [])
+        for index, direction in enumerate(("up", "down")):
+            steps = [s["dz_um"] for s in samples if s["direction"] == direction]
+            if steps:
+                lines.append(f"{direction} measured Z steps (um): {min(steps):.3f} to {max(steps):.3f}")
+            if "means_px" in model:
+                proposed = -np.linalg.solve(np.asarray(report["jxy"]), model["means_px"][index])
+                lines.append(f"{direction} mean proposed XY correction (um), unapplied: {proposed.tolist()}")
+        interval = report.get("validation", {}).get("paired_mse_benefit_interval_um2")
+        if interval is not None:
+            lines.append(f"Paired mean-squared prediction benefit interval (um^2): {interval}")
+        for key in ("means_px", "rho", "gain", "innovation_covariance_px2",
+                    "optimizer_message", "training_negative_log_likelihood"):
+            lines.append(f"{key}: {model.get(key, 'not available')}")
+        lines.append("Innovation covariance is predictive uncertainty, not separately identified physical Q/R.")
+        lines.append("Actual detector correction distance (um): " +
+                     str(sum(s["correction_distance_um"] for s in report.get("samples", []))))
+        lines.append("Reports: " + json.dumps(report.get("artifacts", {}), sort_keys=True))
+        return "\n".join(lines)
+
+    def _write_z_calibration_report(self, report, output_dir, stem):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+        folder = Path(output_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        paths = {ext: folder / f"{stem}.{ext}" for ext in ("txt", "json", "csv", "png")}
+        report["artifacts"] = {key: str(path) for key, path in paths.items()}
+        summary = self._format_z_calibration_report(report)
+        temporary = {key: path.with_suffix(path.suffix + ".tmp") for key, path in paths.items()}
+        temporary["txt"].write_text(summary + "\n", encoding="utf-8")
+        columns = ["id", "pair_id", "split", "direction", "requested_step_um", "dz_um", "group_motion_elapsed_s",
+                   "group_error_px", "predicted_error_px", "actual_correction_um",
+                   "predicted_correction_um", "correction_distance_um", "final_error_um"]
+        continuous = (report.get("sampling_mode") == "continuous_uniform"
+                      or (report.get("model") or {}).get("model_kind") == "group_z_continuous_characterization")
+        if continuous:
+            columns += ["group_error_um", "predictions_um", "proposed_corrections_um"]
+        with temporary["csv"].open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+            for row in report.get("samples", []):
+                writer.writerow({key: json.dumps(row.get(key)) if isinstance(row.get(key), (list, dict))
+                                 else row.get(key) for key in columns})
+        figure = Figure(figsize=(11, 10) if continuous else (10, 7))
+        FigureCanvasAgg(figure)
+        axes = figure.subplots(4 if continuous else 3, 1)
+        rows = [s for s in report.get("samples", []) if "predicted_error_px" in s] if report.get("model") else []
+        if continuous:
+            model = report.get("model") or {}
+            validation_ids = model.get("validation_sample_ids", [])
+            samples_by_id = {s["id"]: s for s in report.get("samples", [])}
+            rows = [samples_by_id[i] for i in validation_ids]
+            if rows:
+                actual = np.asarray([s["group_error_um"] for s in rows])
+                steps = np.asarray([s["dz_um"] for s in rows])
+                directions = np.asarray([s["direction"] for s in rows])
+                for coord, axis in enumerate(axes[:2]):
+                    axis.scatter(steps, actual[:, coord], s=12, color="black", alpha=.5, label="validation observations")
+                    for name, candidate in model.get("models", {}).items():
+                        if name in ("zero", "directional_mean") or "validation_predictions_um" not in candidate:
+                            continue
+                        predicted = np.asarray(candidate["validation_predictions_um"])
+                        if name == "affine_ssm":
+                            axis.scatter(steps, predicted[:, coord], s=9, marker="x", label=name)
+                        else:
+                            for direction in ("up", "down"):
+                                order = np.where(directions == direction)[0]
+                                order = order[np.argsort(steps[order])]
+                                axis.plot(steps[order], predicted[order, coord], linewidth=1,
+                                          label=name if direction == "up" else None)
+                    axis.set_ylabel(("X", "Y")[coord] + " error (um)")
+                    axis.set_xlabel("Measured signed Z displacement (um)")
+                    axis.legend(fontsize=7, ncol=3)
+                for name in dict.fromkeys(("affine", model.get("best_static_model"), "affine_ssm")):
+                    candidate = model.get("models", {}).get(name, {})
+                    if "validation_predictions_um" not in candidate:
+                        continue
+                    residual = actual - np.asarray(candidate["validation_predictions_um"])
+                    for coord, axis in enumerate(axes[2:]):
+                        axis.plot(validation_ids, residual[:, coord], linewidth=.8, label=name)
+                        axis.set_ylabel(("X", "Y")[coord] + " residual (um)")
+                        axis.set_xlabel("Acquisition movement index (validation only)")
+                        axis.legend(fontsize=8)
+                axes[0].set_title("Random continuous distances; reserved observations excluded")
+            else:
+                axes[0].text(.05, .5, "Collection report; no validation fits available", transform=axes[0].transAxes)
+        elif rows:
+            actual = np.asarray([s["group_error_px"] for s in rows])
+            predicted = np.asarray([s["predicted_error_px"] for s in rows])
+            for index, axis in enumerate(axes[:2]):
+                axis.plot(actual[:, index], label="measured")
+                axis.plot(predicted[:, index], label="causal prediction")
+                axis.set_ylabel(("X", "Y")[index] + " (px)")
+                axis.legend()
+            residual = np.linalg.solve(np.asarray(report["jxy"]), (actual - predicted).T).T
+            model = report["model"]
+            if "models_by_distance" in model:
+                baseline_by_id = {sample_id: prediction
+                    for child in model["models_by_distance"].values()
+                    for sample_id, prediction in zip(child["validation_sample_ids"],
+                                                     child["baseline_predictions_px"])}
+                baseline = np.asarray([baseline_by_id[s["id"]] for s in rows])
+                for i in range(1, len(rows)):
+                    if rows[i]["requested_step_um"] != rows[i-1]["requested_step_um"]:
+                        for axis in axes:
+                            axis.axvline(i - .5, color="gray", linestyle=":")
+                distances = " / ".join(model["models_by_distance"])
+                axes[0].set_title(f"{distances} um blocks; separate SSMs")
+            else:
+                baseline = np.asarray(model["baseline_predictions_px"])
+            baseline_error = np.linalg.solve(np.asarray(report["jxy"]), (actual - baseline).T).T
+            axes[2].plot(np.linalg.norm(baseline_error, axis=1), label="Mean-only prediction error")
+            axes[2].plot(np.linalg.norm(residual, axis=1), label="SSM prediction error")
+            axes[2].set_ylabel("Planar error (um)")
+            axes[2].legend()
+        else:
+            axes[0].text(0.05, 0.5, "No held-out predictions available", transform=axes[0].transAxes)
+        if not continuous:
+            axes[2].set_xlabel("Held-out movement index")
+        figure.tight_layout()
+        figure.savefig(temporary["png"], format="png")
+        temporary["json"].write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+        for key in ("txt", "csv", "png"):
+            temporary[key].replace(paths[key])
+        temporary["json"].replace(paths["json"])  # Manifest last.
+        self.info(summary)
+        return report["artifacts"]
 
     # region Escape and cleaning
 
