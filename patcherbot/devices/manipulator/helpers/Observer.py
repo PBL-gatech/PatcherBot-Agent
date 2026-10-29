@@ -104,6 +104,7 @@ class Observer:
         evidence = dict(source_frame=frame_id, frame_retrieval_started_at=timing.get("retrieval_started_at"),
             frame_available_at=timing.get("available_at"), _source_image=image, source_positions={},
             pipette_position=None, pipette_focus=None, cell_detections=None,
+            pipette_focus_score=None, pipette_focus_score_supported=False,
             confidence={}, status={}, errors={}, pipette_focus_confidence_supported=None)
         if image is not None and visual:
             image = image.copy()
@@ -120,12 +121,15 @@ class Observer:
                         prefer_anchor=pipette_prefer_anchor)
                 result = detector.detect_pipette_details(image.copy(), **options)
                 evidence["pipette_position"] = result["tip_xy"]
+                evidence["pipette_focus_score"] = result.get("focus_score")
+                evidence["pipette_focus_score_supported"] = result.get("focus_score_supported", False)
                 evidence["confidence"]["pipette_detector"] = result["box_confidence"]
                 evidence["status"]["pipette_detector"] = "ok" if result["tip_xy"] is not None else "no_detection"
                 if visual & {"pipette_defocus_um", "deep_learning"}:
                     evidence["pipette_focus"] = result["z_um"]
                     evidence["confidence"]["pipette_focuser"] = result["z_confidence"]
-                    evidence["status"]["pipette_focuser"] = "ok" if result["z_um"] is not None else "no_detection"
+                    evidence["status"]["pipette_focuser"] = ("unsupported" if result.get("focus_score_supported")
+                        else "ok" if result["z_um"] is not None else "no_detection")
                     evidence["pipette_focus_confidence_supported"] = result["z_confidence_supported"]
             if visual & {"cell_detections", "deep_learning"}:
                 cells = stage.cellDetectHelper._ensure_detector().detect_cells(image.copy())

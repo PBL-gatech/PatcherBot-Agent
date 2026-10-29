@@ -200,9 +200,15 @@ class AutoPatchInterface(TaskInterface):
             return
         self.execute(self.pipette_controller.move_stage, argument=position)
 
+    def _invalidate_cell_reference(self, cell):
+        for phase in (self.current_autopatcher.approach_cell_phase,
+                      self.current_autopatcher.hunt_cell_phase):
+            phase.invalidate_cell_reference(cell)
+
     def remove_last_cell(self):
         if self.cells_to_patch:
             last_cell = self.cells_to_patch[-1]
+            self._invalidate_cell_reference(last_cell[0])
             self.info(
                 f"removing last cell {last_cell}... {self.is_selecting_cells}, at {self.cells_to_patch}"
             )
@@ -216,6 +222,7 @@ class AutoPatchInterface(TaskInterface):
         """Remove the first queued cell after escape or automatic cleanup."""
         if self.cells_to_patch:
             first_cell = self.cells_to_patch[0]
+            self._invalidate_cell_reference(first_cell[0])
             self.info(f"Removing first queued cell {first_cell}")
             self.cells_to_patch = self.cells_to_patch[1:]
             self.update_camera_cell_list()

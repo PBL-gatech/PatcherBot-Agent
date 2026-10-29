@@ -3,8 +3,8 @@ import time
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from pathlib import Path
 from threading import RLock
+from pathlib import Path
 from typing import Optional, Tuple, List
 
 import cv2
@@ -654,14 +654,15 @@ class PipetteDetector4(PipetteDetector):
 
     def detect_pipette_details(self, img: np.ndarray, *, expected_tip_xy=None,
                                pixels_to_um=None, radius_um=50.0, prefer_anchor=False) -> dict:
-        """Return XY, depth in microns, box confidence and optional Z confidence.
+        """Return XY, optional depth, box confidence and optional Z/focus scores.
 
         Uses one inference pass. Missing/invalid predictions are None; box
         confidence is not a substitute for the optional Z-confidence head.
         """
         empty_prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
                                 box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
-                                radius_rejected_count=0)
+                                radius_rejected_count=0, focus_score=None,
+                                focus_score_supported=getattr(self, "model_version", None) == "X1")
         if img is None:
             return empty_prediction
         prediction = empty_prediction.copy()
@@ -723,6 +724,9 @@ class PipetteDetector4(PipetteDetector):
                 value = result.get(key)
                 if value is not None and np.isfinite(value):
                     prediction[key] = float(value)
+            if "focus_score" in result:
+                value = result["focus_score"]
+                prediction["focus_score"] = float(value) if value is not None and np.isfinite(value) else None
             if result.get("z_um") is not None and prediction["z_um"] is None:
                 logger.warning("PipetteDetector4 Z prediction is nonfinite; returning tip only")
             return prediction
@@ -739,7 +743,7 @@ class PipetteDetector4(PipetteDetector):
             tip = result["tip_xy"]
             if tip is None:
                 return None
-            z = result["z_um"]
+            z = result.get("z_um")
             if z is not None and not np.isfinite(z):
                 logger.warning("PipetteDetector4 Z prediction is nonfinite; returning tip only")
             return tuple(int(round(v)) for v in tip)
@@ -749,10 +753,12 @@ class PipetteDetector4(PipetteDetector):
 
 
 class PipetteDetector5(PipetteDetector4):
-    """Configurable R02/R12 detector with shared point and detailed output APIs.
+    """Configurable R02/R12/X1 detector with shared point and detailed output APIs.
 
     model_version="R02": full-frame AREA resize to 384, no contrast stretch.
     model_version="R12" (default): center crop 896, p1/p99 stretch, AREA to 512.
+    model_version="X1": same preprocessing, no Z; details include focus_score.
+    Focus is the native focal-map score at the predicted tip, without gating.
     Pass the matching checkpoint; resolution/schema mismatches raise on load.
     """
 
@@ -788,7 +794,7 @@ class PipetteDetector5(PipetteDetector4):
             raise ValueError(f"Unsupported model version: {model_version!r}")
         if model_path is None:
             if version != "R02":
-                raise ValueError("An R12 checkpoint path is required")
+                raise ValueError(f"An {version} checkpoint path is required")
             # Preserve Detector4's existing general-model fallback.
             model_path = (
                 Path(__file__).resolve().parents[3] / "training"
@@ -841,12 +847,15 @@ class PipetteDetector5(PipetteDetector4):
                 pixels_to_um=pixels_to_um, radius_um=radius_um, prefer_anchor=prefer_anchor,
             )
             result["z_confidence_supported"] = (
-                self.adapter.model.z_confidence_head is not None
+                getattr(getattr(self.adapter, "model", None), "z_confidence_head", None) is not None
             )
             return result
 
     def get_pipette_z(self, img):
-        return self.detect_pipette_details(img)["z_um"]
+        with self._model_lock:
+            if self.model_version == "X1":
+                raise RuntimeError("X1 does not support signed pipette depth; use focus-score scanning")
+            return self.detect_pipette_details(img)["z_um"]
 
 _DEFAULT_DETECTOR = None
 

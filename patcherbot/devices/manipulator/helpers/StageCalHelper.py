@@ -51,6 +51,21 @@ class FocusHelper():
         return self._search['confirmation']['confirmed_tip_xy']
 
     @property
+    def reference_focus_scores(self):
+        return tuple(self._search['confirmation'].get('focus_scores', ())) if self.confirmed else ()
+
+    @staticmethod
+    def focus_accepted(vision, threshold):
+        if threshold is None:
+            return True
+        try:
+            score = float(vision.get('pipette_focus_score'))
+            return bool(vision.get('pipette_focus_score_supported') and math.isfinite(score)
+                        and 0.0 <= score <= 1.0 and score >= threshold)
+        except (TypeError, ValueError):
+            return False
+
+    @property
     def saved_tip_evidence(self):
         """Return copied provisional Scan evidence with its original frame anchors."""
         if self._search is None or not self._search['pipette']:
@@ -74,7 +89,7 @@ class FocusHelper():
     def advance_search(
         self, *, actual_z, vision, cell, center_z, speed, motion, bounds,
         pipette, pixels_to_um_relative, confidence_threshold,
-        abort_check, info, warning, settled_focus_limit_um=None,
+        abort_check, info, warning, settled_focus_limit_um=None, focus_score_threshold=None,
     ):
         """Advance Search or Scan while retaining ownership until explicit reset.
 
@@ -96,7 +111,7 @@ class FocusHelper():
             pipette=pipette,
             pixels_to_um_relative=pixels_to_um_relative,
             confidence_threshold=confidence_threshold,
-            settled_focus_limit_um=settled_focus_limit_um,
+            settled_focus_limit_um=settled_focus_limit_um, focus_score_threshold=focus_score_threshold,
             abort_check=abort_check,
             info=info,
             warning=warning,
@@ -211,10 +226,13 @@ class FocusHelper():
             if state['pipette']:
                 result = detector.detect_pipette_details(image.copy(), expected_tip_xy=expected_xy,
                     pixels_to_um=stage.pixels_to_um_relative, radius_um=radius_um)
-                vision.update(pipette_position=result['tip_xy'], pipette_focus=result['z_um'])
+                vision.update(pipette_position=result['tip_xy'], pipette_focus=result['z_um'],
+                    pipette_focus_score=result.get('focus_score'),
+                    pipette_focus_score_supported=result.get('focus_score_supported', False))
                 vision['confidence'] = dict(pipette_detector=result['box_confidence'],
                                             pipette_focuser=result['z_confidence'])
-                vision['status']['pipette_focuser'] = 'ok' if result['z_um'] is not None else 'no_detection'
+                vision['status']['pipette_focuser'] = ('unsupported' if result.get('focus_score_supported')
+                    else 'ok' if result['z_um'] is not None else 'no_detection')
             else:
                 cells = detector.detect_cells(image.copy())
                 vision['cell_detections'] = cells
@@ -257,7 +275,7 @@ class FocusHelper():
 
     def start_sweep(self, center_z, speed, *, motion, pixels_to_um_relative,
                     abort_check, info, warning, confidence_threshold, bounds=None, label='SEARCH', pipette=False,
-                    settled_focus_limit_um=None):
+                    settled_focus_limit_um=None, focus_score_threshold=None):
         """Return per-attempt focus state; the caller owns confidence and retry policy."""
         abort_check()
         center_z, speed = float(center_z), float(speed)
@@ -267,12 +285,15 @@ class FocusHelper():
             settled_focus_limit_um = float(settled_focus_limit_um)
             if not math.isfinite(settled_focus_limit_um) or settled_focus_limit_um <= 0:
                 raise ValueError('Settled focus limit must be finite and positive')
+        if focus_score_threshold is not None and (not math.isfinite(focus_score_threshold) or not 0 <= focus_score_threshold <= 1):
+            raise ValueError('Focus score threshold must be finite and within [0, 1]')
         low, high = bounds if bounds is not None else (center_z-self.RADIUS_UM, center_z+self.RADIUS_UM)
         state = dict(center_z=center_z, low=low, high=high, label=label, pipette=pipette,
             stage='idle', target=None, best_z=None, best_score=-math.inf, best_rank=None,
             samples=0, seen_frames=set(), tip_samples=[], empty=False,
             best_xy=None, best_depth=None, best_tip_evidence=None,
             settled_focus_limit_um=settled_focus_limit_um if pipette else None,
+            focus_score_threshold=focus_score_threshold if pipette else None,
             deadline=time.monotonic()+max(60.0, 4.0*20.0/speed*20.0), speed=speed,
             endpoint_correction=False, motion=None, motion_device=motion,
             pixels_to_um_relative=pixels_to_um_relative, confidence_threshold=confidence_threshold,
@@ -323,7 +344,7 @@ class FocusHelper():
         return (2, -error, score) if error <= cls.DEPTH_TOLERANCE_UM else (1, -error, score)
 
     def _record_focus_sample(self, state, *, frame_id, focus_z, xy, score, stale,
-                             depth=None, source_positions=None):
+                             depth=None, source_positions=None, focus_score=None):
         """Select an actually sampled plane supported by three stable XY detections."""
         seen, samples = state['seen_frames'], state['tip_samples']
         if score is None or focus_z is None or stale or frame_id is None or frame_id in seen:
@@ -352,11 +373,13 @@ class FocusHelper():
         evidence = deepcopy(dict(xy=xy, source_frame=frame_id,
             stage_xy=sources.get('stage_xy'), pipette_xyz=sources.get('pipette_xyz'),
             expected_tip_xy=sources.get('pipette_expected_xy')))
-        samples.append((score, focus_z, xy, depth, evidence))
+        samples.append((score, focus_z, xy, depth, evidence,
+                        float(focus_score) if focus_score is not None else None))
         del samples[:-self.MIN_STABLE_SAMPLES]
         if len(samples) < self.MIN_STABLE_SAMPLES:
             return
-        rank_sample = self._focus_sample_rank if state['pipette'] else lambda sample: (sample[0],)
+        rank_sample = (lambda sample: (sample[5], sample[0])) if state.get('focus_score_threshold') is not None else (
+            self._focus_sample_rank if state['pipette'] else lambda sample: (sample[0],))
         candidate = sorted(samples, key=rank_sample)[len(samples)//2]
         rank = rank_sample(candidate)
         if state['best_rank'] is None or rank > state['best_rank']:
@@ -387,6 +410,9 @@ class FocusHelper():
             return self.start_sweep(**start_options)
         frame_id, focus_z = vision.get('source_frame'), vision.get('source_positions', {}).get('focus_z')
         xy, score = self._focus_evidence(state, vision, cell)
+        score_threshold = state.get('focus_score_threshold')
+        if not self.focus_accepted(vision, score_threshold):
+            score = None
         stale, depth = vision.get('stale', True), vision.get('pipette_focus')
         state['abort_check']()
         stage, label = state['stage'], state['label']
@@ -404,7 +430,8 @@ class FocusHelper():
         if stage in ('down', 'up') and not state['endpoint_correction']:
             self._record_focus_sample(state, frame_id=frame_id, focus_z=focus_z, xy=xy,
                                       score=score, stale=stale, depth=depth,
-                                      source_positions=vision.get('source_positions'))
+                                      source_positions=vision.get('source_positions'),
+                                      focus_score=vision.get('pipette_focus_score') if score_threshold is not None else None)
         z = float(actual_z)
         if not math.isfinite(z):
             raise RuntimeError(f'{label} focus sweep has no valid objective position')
@@ -432,7 +459,7 @@ class FocusHelper():
                 state['best_z'] = state['center_z']
                 state['warning'](f'{label} FOCUS SWEEP: no stable pipette XY samples; '
                     f'returning to saved pipette plane z={state["center_z"]}; fresh XY detection still required')
-            elif state['pipette'] and (state['best_depth'] is None
+            elif state['pipette'] and state.get('focus_score_threshold') is None and (state['best_depth'] is None
                     or abs(state['best_depth']) > self.DEPTH_TOLERANCE_UM):
                 state['warning'](f'{label} FOCUS SWEEP: no stable near-focus XY candidate; '
                     f'using best available XY fallback; predicted_defocus_um={state["best_depth"]}; '
@@ -470,6 +497,7 @@ class FocusHelper():
             pixels_to_um_relative=sweep['pixels_to_um_relative'], info=sweep['info'], warning=sweep['warning'],
             started_at=time.monotonic(), valid_samples=0, depths=[], depth_advisory=sweep.get('depth_advisory', True),
             settled_focus_limit_um=sweep.get('settled_focus_limit_um') if pipette else None,
+            focus_score_threshold=sweep.get('focus_score_threshold') if pipette else None, focus_scores=[],
             depth_warnings=set(), seen_frames=set(), last_frame=None, last_vision={}, confirmed=False,
             xy_samples=[], confirmed_tip_xy=None)
 
@@ -504,7 +532,8 @@ class FocusHelper():
         sample_valid = (bool(valid) and xy is not None and len(xy) >= 2
                         and all(math.isfinite(float(value)) for value in xy[:2]))
         expected, samples = state['selected_xy'], state['xy_samples']
-        focus_limit = state.get('settled_focus_limit_um')
+        score_threshold = state.get('focus_score_threshold')
+        focus_limit = state.get('settled_focus_limit_um') if score_threshold is None else None
         reason = 'qualifying' if sample_valid else 'invalid detector evidence'
         try:
             numeric_depth = float(depth)
@@ -513,6 +542,9 @@ class FocusHelper():
         if focus_limit is not None and (not math.isfinite(numeric_depth) or abs(numeric_depth) > focus_limit):
             sample_valid = False
             reason = 'missing/nonfinite/out-of-band predicted defocus'
+        if not self.focus_accepted(vision, score_threshold):
+            sample_valid = False
+            reason = 'missing/invalid/below-threshold focus score'
         if sample_valid:
             xy = tuple(float(value) for value in xy[:2])
             if expected is not None:
@@ -525,23 +557,27 @@ class FocusHelper():
         if sample_valid:
             if any(not np.linalg.norm(state['pixels_to_um_relative'](np.r_[np.subtract(xy, previous), 0.])[:2]) <= self.TIP_STABILITY_UM for previous in samples):
                 samples.clear()
+                state['focus_scores'].clear()
                 if focus_limit is not None:
                     state['depths'].clear()
                 reason = 'XY window restarted after instability'
             samples.append(xy)
         else:
             samples.clear()
+            state['focus_scores'].clear()
             if focus_limit is not None:
                 state['depths'].clear()
+        if sample_valid and score_threshold is not None:
+            state['focus_scores'].append(float(vision['pipette_focus_score']))
         state['valid_samples'] = len(samples)
-        if state['pipette'] and sample_valid and (state['depth_advisory'] or focus_limit is not None):
+        if state['pipette'] and score_threshold is None and sample_valid and (state['depth_advisory'] or focus_limit is not None):
             if math.isfinite(numeric_depth):
                 state['depths'].append(abs(numeric_depth))
             else:
                 state['depth_warnings'].add('missing or non-finite Z estimate')
             if focus_status != 'ok':
                 state['depth_warnings'].add(f'Z model status={focus_status}')
-        if focus_limit is not None:
+        if focus_limit is not None or score_threshold is not None:
             anchor_xy = vision.get('source_positions', {}).get('pipette_expected_xy')
             anchor_error = (np.linalg.norm(state['pixels_to_um_relative'](
                 np.r_[np.subtract(xy, anchor_xy), 0.])[:2])
@@ -552,6 +588,7 @@ class FocusHelper():
                 f'anchor_xy={anchor_xy}; anchor_error_um={anchor_error}; '
                 f'box_confidence={score}; confidence_threshold={sweep["confidence_threshold"]()}; '
                 f'focus_limit_um={focus_limit}; xy_stability_um={self.TIP_STABILITY_UM}; '
+                f'focus_score={vision.get("pipette_focus_score")}; focus_score_threshold={score_threshold}; '
                 f'qualifying_count={state["valid_samples"]}; reason={reason}')
         aggregate = median(state['depths']) if state['depths'] else None
         state['confirmed'] = state['valid_samples'] >= (self.MIN_PIPETTE_SAMPLES if state['pipette'] else self.MIN_CELL_SAMPLES)
@@ -562,6 +599,7 @@ class FocusHelper():
                 state['confirmed'] = False
                 state['valid_samples'] = 0
                 samples.clear()
+                state['focus_scores'].clear()
                 if focus_limit is not None:
                     state['depths'].clear()
                 state['info'](f'{state["label"]} FOCUS CONFIRM: median XY rejected; selected_tip_error_um={distance}')

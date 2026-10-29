@@ -24,8 +24,8 @@ reader_offset: 516.72
 reader_scale: 0.3923
 pipette_detector_model: PipetteDetectorNetX.pt
 pipette_detector_model_version: R02
-pipette_brain_slice_model: PipetteDetectorNetB.pt
-pipette_brain_slice_model_version: R12
+pipette_brain_slice_model: PipetteDetectorNetX1.pt
+pipette_brain_slice_model_version: X1
 pipette_detection_radius_um: 3.0
 pipette_focuser_model: PipetteFocuserNet.pt
 pipette_focus_crop_feature: false

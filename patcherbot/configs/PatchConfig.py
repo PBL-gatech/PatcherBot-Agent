@@ -30,6 +30,10 @@ class PatchConfig(Config):
         doc='Scan distance above and below the estimated pipette plane in Adaptive Approach and Hunt')
     scan_confirm_defocus_um = NumberWithUnit(0.5, bounds=(0.01, 100), unit='\u03bcm',
         doc='Maximum absolute predicted defocus on each settled Adaptive pipette Scan confirmation frame')
+    x1_focus_mode = Selector(default='Anchor', objects=['Anchor', 'Fixed'],
+        doc='X1 focus policy for new Adaptive Approach/Hunt runs: reference-derived or fixed cutoff')
+    x1_focus_score_threshold = Number(0.5, bounds=(0, 1),
+        doc='Minimum X1 focus score in Fixed mode; independent of box confidence and predicted defocus')
     approach_cell_max_shift = NumberWithUnit(256, bounds=(1, 10000), doc='Maximum cell-centering shift per axis during approach', unit='px')
     approach_pipette_speed = NumberWithUnit(20, bounds=(1, 10000), doc='Pipette-centering speed during approach', unit='μm/s')
     slice_start_distance = NumberWithUnit(75, bounds=(0, 100), doc='Initial distance above target cell in slice', unit='μm') # 20 um default
@@ -92,6 +96,7 @@ class PatchConfig(Config):
         ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin', 'hunt_timeout',
                   'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
                   'hunt_target_radius', 'hunt_contact_distance', 'hunt_contact_plane_tolerance_um']),
+        ('X1 focus', ['x1_focus_mode', 'x1_focus_score_threshold']),
         ('Sealing', ['pressure_sealing', 'gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch', 'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate', 'measurement_speed', 'Vramp_amplitude', 'seal_min_time', 'seal_deadline']),
         ('Break-in', ['zap', 'pressure_ramp_increment', 'pressure_ramp_max', 'pressure_ramp_duration','pulse_pressure_break_in','pulse_pressure_duration', 'max_cell_R','max_access_R','min_cell_C']),
         ('AutoPatching', ['cell_type_toggle','cell_type', 'mode','auto_clean_pipette']),

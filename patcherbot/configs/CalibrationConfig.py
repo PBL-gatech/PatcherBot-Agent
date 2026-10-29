@@ -77,13 +77,13 @@ class CalibrationConfig(Config):
     pipette_detector_model = param.String(default="",
                                           doc="Pipette detector model path")
     pipette_detector_model_version = param.Selector(
-        default="R02", objects=["R02", "R12"],
+        default="R02", objects=["R02", "R12", "X1"],
         doc="Version of the general pipette detector model")
     pipette_brain_slice_model = param.String(
         default="PipetteDetectorNetB.pt",
         doc="Pipette detector checkpoint used during approach and hunt")
     pipette_brain_slice_model_version = param.Selector(
-        default="R12", objects=["R02", "R12"],
+        default="R12", objects=["R02", "R12", "X1"],
         doc="Version of the brain-slice pipette detector model")
     pipette_detection_radius_um = NumberWithUnit(50, bounds=(1, 1000), unit="um",
         doc="Maximum pipette detection distance from its calibrated expected position")

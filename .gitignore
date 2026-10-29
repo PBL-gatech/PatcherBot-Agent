@@ -32,7 +32,8 @@ experiments/Datasets
 /patcherbot/deepLearning/cellModel
 /patcherbot/deepLearning/patchModel/models
 /patcherbot/deepLearning/patchModel/test_data
-/patcherbot/deepLearning/pipetteModel
+/patcherbot/deepLearning/pipetteModel/*
+!/patcherbot/deepLearning/pipetteModel/PDModelFactory.py
 /experiments/Analysis/Results
 /patcherbot/deepLearning/patchModel/PipetteFinder/models
 /patcherbot/deepLearning/patchModel/PipetteFinder/models

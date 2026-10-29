@@ -776,6 +776,11 @@ class AutoPatcher(TaskController):
             self.amplifier.stop_patch()
             self.calibrated_unit.stop()
             self.microscope.stop()
+            for phase in (getattr(self, 'approach_cell_phase', None),
+                          getattr(self, 'hunt_cell_phase', None)):
+                if phase is not None:
+                    phase.focus_reference = phase.focus_threshold = None
+            self.calibrated_unit.set_max_speed(100000)
             self.pressure.set_pressure(50)
             self.pressure.set_ATM(atm=False)
             self.daq.setCellMode(False)
