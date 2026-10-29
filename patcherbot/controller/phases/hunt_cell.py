@@ -42,6 +42,8 @@ class HuntCellPhase(ApproachCellPhase):
         self.started = False
         self.last_velocity = None
         self.cell_detected = False
+        self.contact_checking = False
+        self.contact_check_observation_id = None
         self.alignment_snapshot = self.confirmed_tip_xy = self.saved_tip_evidence = None
         self.detected_tip_xy = self.calibrated_tip_xy = self.tracked_tip_xy = None
         self.cell_detection = None
@@ -162,7 +164,7 @@ class HuntCellPhase(ApproachCellPhase):
             self.controller.alignment_phase = self
 
     def observe(self, **kwargs):
-        """Acquire cell evidence throughout Spear; add tip and resistance in its final 5 um."""
+        """Track vision throughout Spear; monitor resistance within 5 um in Z."""
         self.failure_gate()
         self.success_gate()
         if not self.started and self.mode != "Adaptive":
@@ -170,9 +172,8 @@ class HuntCellPhase(ApproachCellPhase):
         position = self.controller.calibrated_unit.position()
         self.failure_gate(position=position)
         if self.mode == "Adaptive":
-            monitor = (self.spear_start_z is not None and self.spear_target - position[2] <= 5.0
-                       if self.operation == self.spear
-                       else abs(self.cell_focus_z - self.pipette_z) <= 5.0)
+            _, z_um = self.calibrated_contact_separation(position)
+            monitor = self.contact_checking or z_um <= 5.0
             detectors = (["deep_learning"] if self.operation == self.scan
                          or (self.operation == self.spear and monitor) else ["cell_detections"])
             if kwargs.get("evidence") is None:
@@ -232,7 +233,7 @@ class HuntCellPhase(ApproachCellPhase):
             local_reference=self.spear_cell_reference if reacquiring else None,
             local_radius_um=7.0 if reacquiring else None)
         frame = vision.get("source_frame")
-        if (self.operation == self.spear and self.cell_detection is not None
+        if (not self.contact_checking and self.operation == self.spear and self.cell_detection is not None
                 and frame is not None and frame != self.last_cell_frame):
             reference = np.array(self.cell[0], dtype=float, copy=True)
             target = self.bounded_cell_target(self.cell_detection[:2], stage_xy)
@@ -244,10 +245,14 @@ class HuntCellPhase(ApproachCellPhase):
         return observation
 
     def calculate(self):
-        """Calculate the active operation, then sustained contact and verification alignment."""
+        """Give resistance confirmation priority over focus searches and steering."""
         if self.mode != "Adaptive":
             return
-        self.cell_detected = False
+        self.cell_detected = self.calculate_contact()
+        if (getattr(self, 'contact_checking', False) or self.cell_detected
+                or getattr(self, 'confirmed_readings', 0) > 0):
+            self.publish_alignment_snapshot()
+            return
         try:
             if self.operation == self.search:
                 self.calculate_search()
@@ -287,54 +292,66 @@ class HuntCellPhase(ApproachCellPhase):
         if self.spear_start_z is None:
             self.pipette_plane = self.pipette_z
 
+    def calibrated_contact_separation(self, position):
+        """Project both anchors in the same frame using the supplied motor position."""
+        self.validate_pipette_anchor()
+        unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
+        anchor_xy, anchor_position, anchor_stage = self.pipette_anchor
+        position = np.asarray(position, dtype=float)
+        tip_xy = anchor_xy + unit.um_to_pixels_relative(position - anchor_position)[:2]
+        xy_um = float(np.linalg.norm(stage.pixels_to_um_relative(
+            tip_xy - self.expected_cell_xy(anchor_stage))[:2]))
+        tip_z = self.pipette_z
+        if self.operation == self.spear and self.spear_start_z is not None:
+            tip_z += position[2] - self.spear_start_z
+        z_um = abs(self.cell_focus_z - tip_z)
+        if not np.isfinite([xy_um, z_um]).all():
+            raise AutopatchError("Invalid calibrated contact separation")
+        return xy_um, z_um
+
     def calculate_contact(self):
-        """Count eligible readings and confirm contact after Search and Scan."""
+        """Use visual alignment for steering and calibrated proximity for resistance success."""
         self.contact_aligned = False
-        cell_z = self.cell_focus_z
-        tip_z = self.pipette_plane if self.operation == self.spear else self.pipette_z
-        eligible = (self.spear_start_z is not None and self.spear_remaining <= 5.0
-                    if self.operation == self.spear else abs(cell_z - tip_z) <= 5.0)
-        if not eligible:
+        xy_um, z_um = self.calibrated_contact_separation(self.observation["manipulator_position"])
+        config = self.controller.config
+        calibrated_aligned = (xy_um <= config.hunt_contact_distance
+                              and z_um <= config.hunt_contact_plane_tolerance_um)
+        self.contact_aligned = bool(self.operation == self.scan
+            and getattr(self, 'position_fallback', None) == 'scan' and calibrated_aligned)
+        if self.vision_fresh and self.cell_detection is not None:
+            cell_xy = np.asarray(self.cell_detection)[:2]
+            tip = self.vision.get("pipette_position") if self.observation.get("pipette_visible", False) else None
+            if tip is None and self.last_tip_anchor is not None:
+                sources = self.vision.get("source_positions", {})
+                if (sources.get("pipette_xyz") is not None and sources.get("stage_xy") is not None
+                        and np.isfinite(sources["pipette_xyz"]).all()
+                        and np.isfinite(sources["stage_xy"]).all()):
+                    previous_tip, previous_position, previous_stage = self.last_tip_anchor
+                    tip = (previous_tip
+                        + self.controller.calibrated_unit.um_to_pixels_relative(
+                            np.asarray(sources["pipette_xyz"]) - previous_position)[:2]
+                        + self.controller.calibrated_stage.um_to_pixels_relative(
+                            np.asarray(sources["stage_xy"]) - previous_stage)[:2])
+            if (tip is not None and np.isfinite(tip[:2]).all() and np.isfinite(cell_xy).all()
+                    and 0 <= tip[0] < self.controller.calibrated_unit.camera.width
+                    and 0 <= tip[1] < self.controller.calibrated_unit.camera.height):
+                separation = self.controller.calibrated_stage.pixels_to_um_relative(
+                    np.asarray(tip[:2]) - cell_xy)[:2]
+                self.contact_aligned = bool(np.linalg.norm(separation) <= config.hunt_contact_distance
+                    and z_um <= config.hunt_contact_plane_tolerance_um)
+        observation_id = self.observation["observation_id"]
+        if not calibrated_aligned:
             self.confirmed_readings = 0
-        if self.observation["observation_id"] != self.last_confirmation_id:
-            self.last_confirmation_id = self.observation["observation_id"]
-            if eligible and "resistance" in self.observation:
-                resistance = self.observation["resistance"]
-                self.confirmed_readings = (self.confirmed_readings + 1
-                    if resistance is not None and np.isfinite(resistance)
-                    and resistance - self.controller.first_res >= self.controller.config.cell_R_increase
-                    else 0)
-        fallback = self.operation == self.scan and getattr(self, 'position_fallback', None) == 'scan'
-        if self.operation == self.spear or (not fallback and (not self.vision_fresh or self.cell_detection is None)):
-            return False
-        cell_xy = self.cell_detection
-        tip = self.vision.get("pipette_position") if self.observation.get("pipette_visible", False) else None
-        if fallback:
-            self.validate_pipette_anchor()
-            cell_xy, tip = self._position_target_xy('search'), self._position_target_xy('scan')
-        if tip is None and self.last_tip_anchor is not None:
-            sources = self.vision.get("source_positions", {})
-            if sources.get("pipette_xyz") is not None and sources.get("stage_xy") is not None:
-                previous_tip, previous_position, previous_stage = self.last_tip_anchor
-                tip = (previous_tip
-                    + self.controller.calibrated_unit.um_to_pixels_relative(
-                        np.asarray(sources["pipette_xyz"]) - previous_position)[:2]
-                    + self.controller.calibrated_stage.um_to_pixels_relative(
-                        np.asarray(sources["stage_xy"]) - previous_stage)[:2])
-        if (tip is None or not np.isfinite(tip[:2]).all()
-                or not 0 <= tip[0] < self.controller.calibrated_unit.camera.width
-                or not 0 <= tip[1] < self.controller.calibrated_unit.camera.height):
-            return False
-        separation = self.controller.calibrated_stage.pixels_to_um_relative(
-            np.asarray(tip[:2]) - cell_xy[:2])[:2]
-        self.contact_aligned = bool(
-            np.linalg.norm(separation) <= self.controller.config.hunt_contact_distance
-            and abs(cell_z - tip_z) <= self.controller.config.hunt_contact_plane_tolerance_um)
-        detected = bool(self.operation == self.scan and (self.scan_confirmed or fallback)
-                        and self.contact_aligned and self.confirmed_readings >= 5)
-        if detected and fallback:
+        elif observation_id != self.last_confirmation_id:
+            resistance = self.observation.get("resistance")
+            self.confirmed_readings = (self.confirmed_readings + 1
+                if resistance is not None and np.isfinite(resistance)
+                and resistance - self.controller.first_res >= config.cell_R_increase else 0)
+        self.last_confirmation_id = observation_id
+        detected = bool(self.contact_checking and calibrated_aligned and self.confirmed_readings >= 5)
+        if detected:
             self.controller.info(f'Hunt contact accepted with calibrated alignment: '
-                f'xy_distance_um={np.linalg.norm(separation):.3f}; plane_gap_um={abs(cell_z - tip_z):.3f}; '
+                f'xy_distance_um={xy_um:.3f}; plane_gap_um={z_um:.3f}; '
                 f'qualifying_resistance_readings={self.confirmed_readings}')
         return detected
 
@@ -342,6 +359,19 @@ class HuntCellPhase(ApproachCellPhase):
         """Select an action from the active operation's result."""
         self.next_action = None
         if self.controller.config.mode == "Adaptive":
+            if self.cell_detected:
+                return
+            if self.contact_checking:
+                if (self.confirmed_readings == 0
+                        and self.observation["observation_id"] != self.contact_check_observation_id):
+                    self.next_action = self.search
+                return
+            xy_um, z_um = self.calibrated_contact_separation(self.observation["manipulator_position"])
+            if (xy_um <= self.controller.config.hunt_contact_distance
+                    and z_um <= self.controller.config.hunt_contact_plane_tolerance_um
+                    and self.confirmed_readings > 0):
+                self.next_action = self.check_contact
+                return
             if (self.search_settings is None or "deep_learning" not in self.observation
                     or (not self.vision_fresh and getattr(self, 'position_fallback', None) is None)):
                 return
@@ -353,12 +383,6 @@ class HuntCellPhase(ApproachCellPhase):
                     self.next_action = self.search
             elif self.operation == self.scan:
                 if self._position_ready('scan'):
-                    if getattr(self, 'position_fallback', None) == 'scan' and self.contact_aligned:
-                        return
-                    if self.scan_confirmed and (self.confirmed_readings >= 5 or (self.contact_aligned and (
-                            self.confirmed_readings > 0
-                            or self.cell_focus_z - self.pipette_z <= 1.0))):
-                        return
                     self.shift_cell = False
                     self.next_action = self.shift
                 else:
@@ -392,8 +416,30 @@ class HuntCellPhase(ApproachCellPhase):
                 self.last_velocity = self.velocity
         self.started = True
 
+    def check_contact(self):
+        """Pause on a resistance rise; confirm contact or resume the normal loop."""
+        if self.contact_checking:
+            return
+        self.stop_motions(all_devices=True)
+        self.controller.calibrated_stage.focusHelper.reset_search()
+        self.contact_checking = True
+        self.contact_check_observation_id = self.observation["observation_id"]
+        self.confirmed_readings = 0
+        self.next_action = None
+        self.controller.info('Hunt contact check: motion stopped; waiting for five qualifying resistance observations; '
+                             'resuming Search/Scan if resistance confirmation fails')
+
     def search(self):
         """Search the cell; after Spear, use actual travel plus the configured margin."""
+        if self.contact_checking:
+            self.contact_checking = False
+            self.search_confirmed = self.scan_confirmed = False
+            self._clear_position_cycle('search')
+            self._clear_position_cycle('scan')
+            self.controller.calibrated_stage.focusHelper.reset_search()
+            if self.operation != self.spear:
+                self.operation = self.search
+            self.controller.info('Hunt contact not confirmed; resuming Search/Scan')
         if self.operation == self.spear:
             self.cell_detected = False
             self.stop_motions(all_devices=True)
@@ -438,7 +484,6 @@ class HuntCellPhase(ApproachCellPhase):
                     self.cell, detected_px=target + (self.controller.calibrated_stage.M @ (
                         np.asarray(self.controller.calibrated_stage.position())[:2] - source_stage_xy))[:2],
                     max_error_px=self.controller.config.approach_cell_max_shift)
-                self.confirmed_readings = 0
         else:
             if not fallback:
                 if getattr(self, 'focus_reference_unavailable', False) and not self._capture_focus_reference():
@@ -455,7 +500,6 @@ class HuntCellPhase(ApproachCellPhase):
                         max_deviation_um=self.controller.calibrated_unit.config.pipette_detection_radius_um) is False:
                     raise AutopatchError("Hunt pipette centering failed")
                 self.start_position = self.controller.calibrated_unit.position()
-                self.confirmed_readings = 0
         self.failure_gate()
         self.controller.calibrated_stage.focusHelper.reset_search()
         self.search_confirmed = False
@@ -483,7 +527,6 @@ class HuntCellPhase(ApproachCellPhase):
             self.controller.calibrated_stage.focusHelper.relocate(self.cell_focus_z)
             return
         self.spear_cell_reference = np.array(self.cell[0], dtype=float, copy=True)
-        self.confirmed_readings = 0
         super().spear()
 
     def action_gate(self):
@@ -492,6 +535,10 @@ class HuntCellPhase(ApproachCellPhase):
         self.success_gate()
         if self.controller.config.mode != "Adaptive":
             return self.velocity is None or self.controller.config.mode == "Classic"
+        if self.contact_checking:
+            return self.next_action == self.search
+        if self.next_action == self.check_contact:
+            return True
         if "deep_learning" not in self.observation:
             return False
         if self.next_action is None:
@@ -547,7 +594,8 @@ class HuntCellPhase(ApproachCellPhase):
                 raise AutopatchError("No cell given to patch!")
         if self.controller.config.mode == "Adaptive":
             if time.monotonic() - self.started_at >= self.controller.config.hunt_timeout:
-                raise AutopatchError("Adaptive Hunt exceeded hunt_timeout")
+                raise AutopatchError("Adaptive Hunt contact not confirmed before hunt_timeout"
+                    if self.contact_checking else "Adaptive Hunt exceeded hunt_timeout")
             if self.search_settings is not None and self.stage_position is not None:
                 lower = min(self.cell_focus_z - self.controller.config.search_z_radius_um,
                             self.pipette_z - self.controller.config.scan_z_radius_um)
@@ -573,8 +621,7 @@ class HuntCellPhase(ApproachCellPhase):
         self.controller.success_if_requested()
         if self.controller.config.mode == "Adaptive":
             self.cell_detected = bool(
-                self.search_settings is not None and self.operation == self.scan
-                and self.cell_detected)
+                self.search_settings is not None and self.cell_detected)
         elif self.search_settings is not None:
             return False
         elif goal is None:

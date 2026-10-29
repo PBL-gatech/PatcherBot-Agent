@@ -1,7 +1,7 @@
 pressure_near: 45
 pressure_sealing: -20
 pressure_ramp_increment: -5
-pressure_ramp_max: -30
+pressure_ramp_max: -45.0
 pressure_ramp_duration: 1.15
 pulse_pressure_break_in: -345
 pulse_pressure_duration: 1
@@ -13,6 +13,12 @@ min_cell_C: 5.0e-12
 cell_distance: 20
 max_locate_speed: 5000.0
 search_speed: 100
+search_z_radius_um: 5
+search_xy_radius_um: 25
+scan_z_radius_um: 10.0
+scan_confirm_defocus_um: 0.5
+x1_focus_mode: Fixed
+x1_focus_score_threshold: 0.35
 approach_cell_max_shift: 256
 approach_pipette_speed: 20
 slice_start_distance: 75
@@ -36,7 +42,7 @@ max_R_increase: 1000000.0
 cell_R_increase: 0.3
 gigaseal_R: 1000
 gigaseal_min_delta_R: 15
-hold_switch: 12
+hold_switch: 20.0
 increase_slope_gate: 3000
 constant_slope_gate: 10
 decrease_slope_gate: 5

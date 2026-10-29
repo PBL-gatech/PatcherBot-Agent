@@ -26,27 +26,27 @@ pipette_detector_model: PipetteDetectorNetX.pt
 pipette_detector_model_version: R02
 pipette_brain_slice_model: PipetteDetectorNetX1.pt
 pipette_brain_slice_model_version: X1
-pipette_detection_radius_um: 3.0
+pipette_detection_radius_um: 4.0
 pipette_focuser_model: PipetteFocuserNet.pt
 pipette_focus_crop_feature: false
 use_ai_features: true
 home_position:
-- 106702.9
-- -14363.5
-- 53377.5
+- 106079.2
+- -15439.7
+- 53428.2
 home_position_stage:
-- 25762.1
-- -44891.2
-- 25867.2
+- 26341.7
+- -43928.5
+- 25842.9
 safe_position:
-- 90389.35983334029
-- -14363.5
-- 45770.37128866741
+- 89765.6598333403
+- -15439.7
+- 45821.07128866741
 safe_position_stage:
-- 25762.1
-- -44891.2
-- 25867.2
+- 26341.7
+- -43928.5
+- 25842.9
 bath_position:
-- 92487.3
-- -6370.4
-- 51515.4
+- 92489.7
+- -6538.4
+- 51800.1
