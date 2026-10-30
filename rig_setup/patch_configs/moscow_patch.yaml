@@ -28,6 +28,7 @@ hunt_timeout: 200
 hunt_target_radius: 50
 hunt_contact_distance: 5
 hunt_contact_plane_tolerance_um: 2
+hunt_resistance_band_percent: 8
 hunt_search_margin: 5
 hunt_progress_cycles: 4
 hunt_min_progress_percent: 25

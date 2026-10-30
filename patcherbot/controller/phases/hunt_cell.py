@@ -43,6 +43,8 @@ class HuntCellPhase(ApproachCellPhase):
         self.last_velocity = None
         self.cell_detected = False
         self.contact_checking = False
+        self.contact_advancing = False
+        self.contact_resistances = []
         self.contact_check_observation_id = None
         self.alignment_snapshot = self.confirmed_tip_xy = self.saved_tip_evidence = None
         self.detected_tip_xy = self.calibrated_tip_xy = self.tracked_tip_xy = None
@@ -248,6 +250,10 @@ class HuntCellPhase(ApproachCellPhase):
         """Give resistance confirmation priority over focus searches and steering."""
         if self.mode != "Adaptive":
             return
+        if getattr(self, 'contact_advancing', False):
+            self.cell_detected = False
+            self.publish_alignment_snapshot()
+            return
         self.cell_detected = self.calculate_contact()
         if (getattr(self, 'contact_checking', False) or self.cell_detected
                 or getattr(self, 'confirmed_readings', 0) > 0):
@@ -342,18 +348,32 @@ class HuntCellPhase(ApproachCellPhase):
         observation_id = self.observation["observation_id"]
         if not calibrated_aligned:
             self.confirmed_readings = 0
+            self.contact_resistances.clear()
         elif observation_id != self.last_confirmation_id:
             resistance = self.observation.get("resistance")
-            self.confirmed_readings = (self.confirmed_readings + 1
-                if resistance is not None and np.isfinite(resistance)
-                and resistance - self.controller.first_res >= config.cell_R_increase else 0)
+            if resistance is None or not np.isfinite(resistance):
+                self.contact_resistances.clear()
+            elif self.contact_checking:
+                self.contact_resistances.append(float(resistance))
+                del self.contact_resistances[:-5]
+            else:
+                self.contact_resistances = ([float(resistance)]
+                    if resistance - self.controller.first_res >= self.contact_band_floor() else [])
+            self.confirmed_readings = len(self.contact_resistances)
         self.last_confirmation_id = observation_id
-        detected = bool(self.contact_checking and calibrated_aligned and self.confirmed_readings >= 5)
+        detected = bool(self.contact_checking and calibrated_aligned and self.confirmed_readings >= 5
+            and np.mean(self.contact_resistances) - self.controller.first_res
+                >= config.cell_R_increase - 1e-12)
         if detected:
             self.controller.info(f'Hunt contact accepted with calibrated alignment: '
                 f'xy_distance_um={xy_um:.3f}; plane_gap_um={z_um:.3f}; '
-                f'qualifying_resistance_readings={self.confirmed_readings}')
+                f'resistance_readings={self.confirmed_readings}; '
+                f'mean_resistance_increase={np.mean(self.contact_resistances) - self.controller.first_res:.6f}')
         return detected
+
+    def contact_band_floor(self):
+        config = self.controller.config
+        return config.cell_R_increase * (1.0 - config.hunt_resistance_band_percent / 100.0)
 
     def decide(self):
         """Select an action from the active operation's result."""
@@ -361,10 +381,25 @@ class HuntCellPhase(ApproachCellPhase):
         if self.controller.config.mode == "Adaptive":
             if self.cell_detected:
                 return
+            if self.contact_advancing:
+                resistance = self.observation.get('resistance')
+                xy_um, z_um = self.calibrated_contact_separation(self.observation['manipulator_position'])
+                threshold_met = (self.observation['observation_id'] != self.contact_check_observation_id
+                    and resistance is not None and np.isfinite(resistance)
+                    and resistance - self.controller.first_res >= self.controller.config.cell_R_increase
+                    and xy_um <= self.controller.config.hunt_contact_distance
+                    and z_um <= self.controller.config.hunt_contact_plane_tolerance_um)
+                if self.spear_done or threshold_met:
+                    self.next_action = self.check_contact
+                return
             if self.contact_checking:
                 if (self.confirmed_readings == 0
                         and self.observation["observation_id"] != self.contact_check_observation_id):
                     self.next_action = self.search
+                elif self.confirmed_readings >= 5:
+                    mean_increase = np.mean(self.contact_resistances) - self.controller.first_res
+                    self.next_action = (self.advance_contact if mean_increase >= self.contact_band_floor()
+                                        else self.search)
                 return
             xy_um, z_um = self.calibrated_contact_separation(self.observation["manipulator_position"])
             if (xy_um <= self.controller.config.hunt_contact_distance
@@ -418,21 +453,58 @@ class HuntCellPhase(ApproachCellPhase):
 
     def check_contact(self):
         """Pause on a resistance rise; confirm contact or resume the normal loop."""
-        if self.contact_checking:
+        if self.contact_checking and not self.contact_advancing:
             return
         self.stop_motions(all_devices=True)
         self.controller.calibrated_stage.focusHelper.reset_search()
         self.contact_checking = True
+        self.contact_advancing = False
         self.contact_check_observation_id = self.observation["observation_id"]
+        self.last_confirmation_id = self.contact_check_observation_id
         self.confirmed_readings = 0
+        self.contact_resistances.clear()
         self.next_action = None
-        self.controller.info('Hunt contact check: motion stopped; waiting for five qualifying resistance observations; '
-                             'resuming Search/Scan if resistance confirmation fails')
+        self.controller.info('Hunt contact check: motion stopped; averaging five resistance observations')
+
+    def advance_contact(self):
+        """Advance half the positive remaining contact gap using the existing Spear monitor."""
+        self.stop_motions(all_devices=True)
+        position = np.asarray(self.controller.calibrated_unit.position(), dtype=float)
+        self.failure_gate(position=position)
+        xy_um, z_um = self.calibrated_contact_separation(position)
+        config = self.controller.config
+        if xy_um > config.hunt_contact_distance or z_um > config.hunt_contact_plane_tolerance_um:
+            return self.search()
+        if self.operation == self.spear and self.spear_start_z is not None:
+            self.pipette_z += position[2] - self.spear_start_z
+        self.pipette_plane = self.pipette_z
+        # The old descent has been accounted for, even if no further step is possible.
+        self.spear_start_z = None
+        step = (self.cell_focus_z - self.pipette_z) / 2.0
+        actions = self.controller.calibrated_unit.actionHelper
+        if step <= actions.MOTION_ENDPOINT_TOLERANCE_UM:
+            return self.search()
+        target = position[2] + step
+        if not np.isfinite(target) or abs(target - self.start_position[2]) >= config.max_distance:
+            raise AutopatchError('Contact advance exceeds Hunt travel bounds')
+        self.manipulator_position = position
+        self.spear_target, self.spear_speed = target, abs(config.max_descent_speed)
+        self.spear_done = None
+        self.spear_cell_reference = np.array(self.cell[0], dtype=float, copy=True)
+        self.contact_advancing = True
+        self.contact_check_observation_id = self.observation['observation_id']
+        self.confirmed_readings = 0
+        self.contact_resistances.clear()
+        self.controller.info(f'Hunt contact advance: remaining_z_um={2 * step:.3f}; step_um={step:.3f}')
+        super().spear()
 
     def search(self):
         """Search the cell; after Spear, use actual travel plus the configured margin."""
         if self.contact_checking:
             self.contact_checking = False
+            self.contact_advancing = False
+            self.confirmed_readings = 0
+            self.contact_resistances.clear()
             self.search_confirmed = self.scan_confirmed = False
             self._clear_position_cycle('search')
             self._clear_position_cycle('scan')
@@ -536,7 +608,7 @@ class HuntCellPhase(ApproachCellPhase):
         if self.controller.config.mode != "Adaptive":
             return self.velocity is None or self.controller.config.mode == "Classic"
         if self.contact_checking:
-            return self.next_action == self.search
+            return self.next_action in (self.search, self.advance_contact, self.check_contact)
         if self.next_action == self.check_contact:
             return True
         if "deep_learning" not in self.observation:
@@ -606,7 +678,8 @@ class HuntCellPhase(ApproachCellPhase):
                     upper = max(upper, self.cell_search_bounds[1])
                 tolerance = (self.controller.calibrated_stage.focusHelper.BOUNDARY_TOLERANCE_UM
                              if self.controller.calibrated_stage.focusHelper.active_search
-                             or self.operation in (self.search, self.scan) else 0.0)
+                             or self.operation in (self.search, self.scan)
+                             or getattr(self, 'contact_checking', False) else 0.0)
                 if not lower - tolerance <= self.stage_position[2] <= upper + tolerance:
                     raise AutopatchError("Adaptive Hunt exceeded microscope search bounds")
         if position is None or not self.started or self.controller.config.mode == "Training":

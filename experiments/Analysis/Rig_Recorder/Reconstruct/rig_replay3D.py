@@ -368,6 +368,263 @@ class GLViewWidgetWithGrid(gl.GLViewWidget):
 
 # ------------------- Data Manager -------------------
 
+class RecordedGeometry:
+    """Replay recorded geometry causally; missing evidence stays explicitly unavailable."""
+
+    def __init__(self, directory, movement_data, scaling_factor=1 / 1000):
+        import bisect
+        import csv
+        from pathlib import Path
+        import numpy as np
+
+        self.directory = Path(directory)
+        self.scale = float(scaling_factor)
+        self.times, self.states, self.motor_times, self.motors = [], [], [], []
+        self._np, self._bisect = np, bisect
+        self.status = 'Recorded calibration/anchors unavailable'
+        movement_file = self.directory / 'movement_recording.csv'
+        if movement_file.exists():
+            with movement_file.open(encoding='utf-8-sig', newline='') as stream:
+                for row in csv.DictReader(stream, delimiter=';'):
+                    try:
+                        values = np.array([float(row[key]) for key in
+                            ('st_x', 'st_y', 'st_z', 'pi_x', 'pi_y', 'pi_z')])
+                        timestamp = float(row['timestamp'])
+                        if np.isfinite(values).all() and np.isfinite(timestamp):
+                            self.motor_times.append(timestamp)
+                            self.motors.append(values)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        if not self.motors:
+            for row in movement_data:
+                if 'raw_stage' in row and 'raw_pipette' in row:
+                    self.motor_times.append(float(row['time']))
+                    self.motors.append(np.r_[row['raw_stage'], row['raw_pipette']])
+        if self.motor_times:
+            order = np.argsort(self.motor_times)
+            self.motor_times = [self.motor_times[i] for i in order]
+            self.motors = [self.motors[i] for i in order]
+        day = self.directory.name[:10]
+        candidates = [self.directory.parent.parent / 'log_data' / ('logs_' + day + '.csv')]
+        for parent in self.directory.parents:
+            candidates.append(parent / 'experiments/Data/log_data' / ('logs_' + day + '.csv'))
+        log_path = next((path for path in candidates if path.is_file()), None)
+        if log_path is not None:
+            self._read_events(log_path)
+
+    def _motor(self, timestamp):
+        index = self._bisect.bisect_right(self.motor_times, timestamp) - 1
+        if index < 0:
+            return None
+        # Pair events with the closest recorded encoder sample, never extrapolate before recording.
+        if index + 1 < len(self.motor_times) and (
+                self.motor_times[index + 1] - timestamp < timestamp - self.motor_times[index]):
+            index += 1
+        if abs(self.motor_times[index] - timestamp) > 1.0:
+            return None
+        return self.motors[index]
+
+    def _load_calibration(self, filename, timestamp):
+        import pickle
+        from pathlib import Path, PureWindowsPath
+        import numpy as np
+
+        class ArrayUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                allowed = {'numpy': {'ndarray', 'dtype'},
+                    'numpy.core.multiarray': {'_reconstruct', 'scalar'},
+                    'numpy._core.multiarray': {'_reconstruct', 'scalar'},
+                    'numpy.core.numeric': {'_frombuffer'},
+                    'numpy._core.numeric': {'_frombuffer'}}
+                if name not in allowed.get(module, set()):
+                    raise pickle.UnpicklingError('Unsupported calibration object: ' + module + '.' + name)
+                return super().find_class(module, name)
+
+        source = Path(filename.strip())
+        if not source.is_file():
+            parts = PureWindowsPath(filename.strip()).parts
+            source = self.directory.parent.parent / 'calibration_data' / parts[-2] / parts[-1]
+        if not source.is_file() or source.stat().st_mtime > timestamp + 1.0:
+            raise ValueError('Historical calibration absent or overwritten after this event')
+        with source.open('rb') as stream:
+            payload = ArrayUnpickler(stream).load()
+        stage = np.asarray(payload['stage']['M'], dtype=float)
+        manip = np.asarray(payload['manip']['M'], dtype=float)
+        if stage.shape != (2, 2) or manip.shape != (3, 3) or not (
+                np.isfinite(stage).all() and np.isfinite(manip).all()):
+            raise ValueError('Invalid recorded calibration matrices')
+        # Live load_configuration resets r0; saved offsets must not be reintroduced here.
+        return dict(stage_M=stage, manip_M=manip, source=str(source),
+                    home=np.asarray(payload.get('home', []), dtype=float))
+
+    def _read_events(self, path):
+        import ast
+        import csv
+        import re
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        np = self._np
+        state = dict(calibration=None, calibrated=None, accepted=None, cell=None, selected_cell=None,
+                     cell_z=None, focus=None, detected=None, status=self.status)
+
+        def vector(message, label, length=2):
+            match = re.search(re.escape(label) + r'\s*[\[(]([^\])]+)[\])]', message)
+            if match is None:
+                return None
+            values = np.fromstring(match.group(1).replace(',', ' '), sep=' ')
+            return values[:length] if len(values) >= length and np.isfinite(values).all() else None
+
+        def number(message, label):
+            match = re.search(re.escape(label) + r'([-+\d.eE]+)', message)
+            return float(match.group(1)) if match else None
+
+        events = []
+        with path.open(encoding='utf-8-sig', errors='replace', newline='') as stream:
+            for row in csv.reader(stream):
+                if len(row) < 4:
+                    continue
+                # Older log format leaves commas inside messages unquoted.
+                message = ','.join(row[3:-2]) if len(row) > 6 else row[3]
+                if not any(text in message for text in ('Calibration reloaded from ',
+                        'Pipette calibration selected matrix:', 'Moving to Cell position:',
+                        'FOCUS CONFIRM:', 'FOCUS SWEEP: finished', 'calibrated fallback after',
+                        'Pipette XY correction:', 'Centering on cell at approx.')):
+                    continue
+                try:
+                    timestamp = datetime.strptime(row[0] + ',' + row[1], '%Y-%m-%d %H:%M:%S,%f').replace(
+                        tzinfo=ZoneInfo('America/New_York')).timestamp()
+                except ValueError:
+                    continue
+                events.append((timestamp, message))
+        for timestamp, message in sorted(events, key=lambda item: item[0]):
+            motor = self._motor(timestamp)
+            changed = False
+            if 'Calibration reloaded from ' in message:
+                filename = message.split('Calibration reloaded from ', 1)[1].split('; file saved at:', 1)[0]
+                state.update(calibration=None, calibrated=None, accepted=None, focus=None,
+                             cell=None, cell_z=None, detected=None)
+                try:
+                    calibration = self._load_calibration(filename, timestamp)
+                    state['calibration'] = calibration
+                    home = calibration['home']
+                    if home.shape == (6,) and np.isfinite(home).all():
+                        state['focus'] = (float(home[5]), float(home[2]))
+                    state['status'] = 'Recorded calibration: ' + calibration['source']
+                except Exception as error:
+                    state['status'] = str(error)
+                changed = True
+            elif 'Pipette calibration selected matrix:' in message:
+                try:
+                    matrix = np.asarray(ast.literal_eval(message.split('matrix:', 1)[1].strip()), dtype=float)
+                    if state['calibration'] is not None and matrix.shape == (3, 4) and np.isfinite(matrix).all():
+                        state['calibration'] = dict(state['calibration'], manip_M=matrix[:, :3])
+                        state.update(calibrated=None, accepted=None, focus=None, detected=None)
+                        state['status'] += '; pipette matrix updated from log at epoch ' + str(timestamp)
+                        changed = True
+                except (ValueError, SyntaxError):
+                    pass
+            elif 'Moving to Cell position:' in message:
+                cell = vector(message, 'Moving to Cell position:', 3)
+                if cell is not None:
+                    state.update(cell=cell[:2], selected_cell=cell[:2], cell_z=float(cell[2]), accepted=None, detected=None)
+                    changed = True
+            if motor is not None:
+                anchor = vector(message, 'anchor_xy=')
+                if 'pipette FOCUS CONFIRM:' in message and anchor is not None:
+                    state['calibrated'] = (anchor, motor[3:].copy(), motor[:2].copy())
+                    changed = True
+                if 'pipette FOCUS CONFIRM:' in message:
+                    tip = vector(message, '; xy=')
+                    if tip is not None:
+                        state['detected'] = (timestamp, tip)
+                        changed = True
+                    count = number(message, 'qualifying_count=')
+                    plane = number(message, 'microscope_z_um=')
+                    if tip is not None and plane is not None and count is not None and count >= 3:
+                        state['accepted'] = (tip, motor[3:].copy(), motor[:2].copy())
+                        state['focus'] = (plane, float(motor[5]))
+                        changed = True
+                if 'SCAN calibrated fallback after' in message:
+                    anchor, plane = vector(message, 'xy='), number(message, 'focus_z=')
+                    if anchor is not None:
+                        state['calibrated'] = (anchor, motor[3:].copy(), motor[:2].copy())
+                        changed = True
+                    if plane is not None:
+                        state['focus'] = (plane, float(motor[5]))
+                        changed = True
+                if 'Pipette XY correction:' in message:
+                    tip = vector(message, 'detected=')
+                    if tip is not None:
+                        state['accepted'] = (tip, motor[3:].copy(), motor[:2].copy())
+                        changed = True
+                if 'Centering on cell at approx.' in message and state['calibration'] is not None:
+                    cell_xy = vector(message, 'Centering on cell at approx.')
+                    if cell_xy is not None:
+                        state['cell'] = state['calibration']['stage_M'] @ motor[:2] - cell_xy
+                        state['cell_z'] = float(motor[2] / 5.0)
+                        changed = True
+                if 'SEARCH FOCUS SWEEP: finished' in message or 'SEARCH calibrated fallback after' in message:
+                    plane = number(message, 'microscope_z_um=')
+                    if plane is None:
+                        plane = number(message, 'focus_z=')
+                    if plane is not None and state['cell'] is not None:
+                        state['cell_z'] = plane
+                        changed = True
+                if 'cell FOCUS CONFIRM:' in message:
+                    count = number(message, 'qualifying_count=')
+                    plane = number(message, 'microscope_z_um=')
+                    if count is not None and count >= 3 and plane is not None:
+                        state['cell_z'] = plane
+                        changed = True
+            if changed:
+                self.times.append(timestamp)
+                self.states.append(dict(state))
+        if self.states:
+            self.status = self.states[-1]['status']
+
+    def at(self, timestamp):
+        np = self._np
+        result = dict(calibrated_tip_xy=None, accepted_tip_xy=None, cell_xy=None, accepted_cell_xy=None,
+                      detected_tip_xy=None, positions=None, status='No recorded geometry at this time')
+        index = self._bisect.bisect_right(self.times, float(timestamp)) - 1
+        if index < 0:
+            return result
+        state, motor = self.states[index], self._motor(float(timestamp))
+        result['status'] = state['status']
+        detected = state['detected']
+        if detected is not None and 0 <= timestamp - detected[0] <= .5:
+            result['detected_tip_xy'] = detected[1].copy()
+        calibration = state['calibration']
+        if calibration is None or motor is None:
+            result['status'] += '; missing calibration or synchronized motor sample'
+            return result
+        stage_M, manip_M = calibration['stage_M'], calibration['manip_M']
+        for key, anchor_key in (('calibrated_tip_xy', 'calibrated'), ('accepted_tip_xy', 'accepted')):
+            anchor = state[anchor_key]
+            if anchor is not None:
+                xy, unit, stage = anchor
+                result[key] = xy + (manip_M @ (motor[3:] - unit))[:2] + stage_M @ (motor[:2] - stage)
+        if state['cell'] is not None:
+            result['accepted_cell_xy'] = stage_M @ motor[:2] - state['cell']
+        if state['selected_cell'] is not None:
+            result['cell_xy'] = stage_M @ motor[:2] - state['selected_cell']
+        tip = result['accepted_tip_xy']
+        if tip is None:
+            tip = result['calibrated_tip_xy']
+        if tip is None or result['cell_xy'] is None or state['focus'] is None or state['cell_z'] is None:
+            result['status'] += '; incomplete recorded tip/cell/focus anchors'
+            return result
+        separation = np.linalg.pinv(stage_M) @ (tip - result['cell_xy'])
+        plane, unit_z = state['focus']
+        tip_z = plane + motor[5] - unit_z
+        result['positions'] = dict(
+            pipette=np.r_[separation, state['cell_z'] - tip_z] * self.scale,
+            cell_position=np.zeros(3),
+            microscope_z=(state['cell_z'] - motor[2] / 5.0) * self.scale,
+            stage=(np.linalg.pinv(stage_M) @ result['cell_xy']) * self.scale)
+        return result
+
+
 class DataManager:
     def __init__(self, scaling_factor=1/1000):
         self.image_paths = []
@@ -383,6 +640,7 @@ class DataManager:
         self.init_image_time = 0.0
         self.state_windows = []
         self._state_window_starts = []
+        self.recorded_geometry = None
 
     def load_directory(self, directory):
         self.directory = directory
@@ -410,6 +668,7 @@ class DataManager:
         valid_start, valid_end = self._get_valid_recording_window()
         folder_name = os.path.basename(os.path.normpath(directory))
         self.load_state_attempts(folder_name, valid_start, valid_end)
+        self.recorded_geometry = RecordedGeometry(directory, self.movement_data, self.scaling_factor)
 
     def _get_valid_recording_window(self):
         if self.graph_data:
@@ -1288,7 +1547,12 @@ class IntegratedTimeline(QMainWindow):
             return
         try:
             from recorder_export import export_recording
-            outputs = export_recording(self, self.recorder_settings, directory)
+            settings = dict(self.recorder_settings)
+            history = self.data_manager.recorded_geometry
+            if history is not None and history.states:
+                # Replay the recorded decisions without requiring a second model run.
+                settings['export_inference'] = False
+            outputs = export_recording(self, settings, directory)
             message = f"Exported {len(outputs)} video(s) to:\n{directory}"
             if getattr(self, "_export_cancelled", False):
                 message += "\nExport cancelled; completed videos were retained."
@@ -1552,6 +1816,7 @@ class IntegratedTimeline(QMainWindow):
             self.current_view_key = 'graphs'
             self.graph_stack.setCurrentWidget(self.view_widgets[self.current_view_key])
             self._reset_inference_state()
+            self._geometry_camera_initialized = False
             self.refresh_view_order()
 
             self._set_loading_popup_message("Preparing timeline chapters...")
@@ -1850,21 +2115,40 @@ class IntegratedTimeline(QMainWindow):
     def _apply_frame_overlays(self, pixmap, image_path):
         if pixmap is None or pixmap.isNull():
             return pixmap
-        if not self._frame_overlay_results:
-            return pixmap
-        if self._frame_overlay_results.get("image_path") != image_path:
-            return pixmap
+        overlay = self._frame_overlay_results or {}
+        if overlay.get('image_path') != image_path:
+            overlay = {}
 
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
+        history = self.data_manager.recorded_geometry
+        timestamp = self.data_manager.extract_image_data(image_path)[1]
+        recorded = history.at(timestamp) if history is not None else {}
+        legend = []
+        for key, label, color in (
+                ('detected_tip_xy', 'Logged detection', QtGui.QColor(255, 140, 40)),
+                ('calibrated_tip_xy', 'Calibrated tip', QtGui.QColor(0, 220, 255)),
+                ('accepted_tip_xy', 'Accepted tip', QtGui.QColor(80, 255, 100)),
+                ('cell_xy', 'Calibrated cell', QtGui.QColor(80, 140, 255)),
+                ('accepted_cell_xy', 'Accepted cell', QtGui.QColor(255, 220, 0))):
+            point = self._normalize_point(recorded.get(key), pixmap.width(), pixmap.height())
+            if point is not None:
+                self._draw_overlay_point(painter, point, color)
+                legend.append((label, color))
+        for index, (label, color) in enumerate(legend):
+            painter.setPen(color)
+            painter.drawText(10, 22 + 20 * index, label)
+        painter.setPen(QtGui.QColor(255, 255, 255))
+        painter.drawText(10, 22 + 20 * len(legend), recorded.get('status', 'Recorded geometry unavailable'))
+
         self._draw_overlay_point(
             painter,
-            self._frame_overlay_results.get("pipette_point"),
+            overlay.get("pipette_point"),
             QtGui.QColor(255, 0, 0),
         )
-        pipette_parameters = self._frame_overlay_results.get("pipette_parameters") or {}
-        if self._frame_overlay_results.get("pipette_point") is not None:
+        pipette_parameters = overlay.get("pipette_parameters") or {}
+        if overlay.get("pipette_point") is not None:
             details = []
             for key, label in (("z_um", "Z (um)"), ("box_confidence", "XY confidence"), ("z_confidence", "Z confidence")):
                 value = pipette_parameters.get(key)
@@ -1873,14 +2157,14 @@ class IntegratedTimeline(QMainWindow):
             if details:
                 painter.setPen(QtGui.QPen(QtGui.QColor(255, 160, 150)))
                 painter.drawText(pixmap.rect().adjusted(10, 10, -10, -10), Qt.AlignBottom | Qt.AlignLeft, "  ".join(details))
-        for cell_point in self._frame_overlay_results.get("cell_points", []):
+        for cell_point in overlay.get("cell_points", []):
             self._draw_overlay_point(painter, cell_point, QtGui.QColor(70, 150, 255))
-        target = self._frame_overlay_results.get("target_cell")
+        target = overlay.get("target_cell")
         if target is not None:
             painter.setPen(QtGui.QPen(QtGui.QColor(255, 220, 60), 2))
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(QtCore.QPointF(float(target[0]), float(target[1])), 12.0, 12.0)
-            parameters = self._frame_overlay_results.get("cell_parameters") or {}
+            parameters = overlay.get("cell_parameters") or {}
             confidence = parameters.get("confidence")
             label = f"Target cell ({int(target[0])}, {int(target[1])})"
             if confidence is not None:
@@ -1888,7 +2172,7 @@ class IntegratedTimeline(QMainWindow):
             if parameters.get("tip_distance_um") is not None:
                 label += f"  tip distance {parameters['tip_distance_um']:.1f} um (XY)"
             painter.drawText(QtCore.QPointF(float(target[0]) + 16, max(20.0, float(target[1]) - 16)), label)
-        focus_value = self._frame_overlay_results.get("focus_value")
+        focus_value = overlay.get("focus_value")
         if focus_value is not None:
             text_rect = pixmap.rect().adjusted(
                 self.overlay_text_margin,
@@ -2043,6 +2327,8 @@ class IntegratedTimeline(QMainWindow):
         """Update image, 2D graphs, and 3D plot based on current index."""
         image_path = self.data_manager.image_paths[self.current_index]
         current_timestamp = self.data_manager.timestamps[self.current_index]
+        history = self.data_manager.recorded_geometry
+        self._recorded_geometry = history.at(current_timestamp) if history is not None else {}
         active_state, outcome_code = self.data_manager.get_active_state_for_timestamp(current_timestamp)
         if not self.recorder_settings["tracking_states"]:
             active_state, outcome_code = None, None
@@ -2186,17 +2472,17 @@ class IntegratedTimeline(QMainWindow):
             settings = self.recorder_settings
             overlay = self._frame_overlay_results or {}
             image_size = QtGui.QImage(self.data_manager.image_paths[self.current_index]).size()
-            positions = reconstruction_positions(
-                movement_entry, reference,
-                microscope_offset_enabled=settings["apply_microscope_offset"],
-                microscope_offset_um=settings["microscope_offset_um"],
-                centered_pipette_enabled=settings["apply_cell_distance"],
-                pipette_cell_distance_um=settings["cell_distance_um"],
-                approach_cell_distance_um=settings["approach_cell_distance_um"],
-                active_state=phase,
-                cell_point=overlay.get("target_cell"),
-                image_size=(image_size.width(), image_size.height()),
-            )
+            history = self.data_manager.recorded_geometry
+            recorded = history.at(current_timestamp) if history is not None else {}
+            positions = recorded.get('positions')
+            for item in (self.three_d_view.pipette_mesh, self.three_d_view.stage_mesh,
+                         self.three_d_view.microscope_mesh):
+                item.setVisible(positions is not None)
+            if positions is None:
+                if hasattr(self, '_cell_3d_marker'):
+                    self._cell_3d_marker.setData(pos=np.empty((0, 3)))
+                self._reconstruction_positions = None
+                return
             self.three_d_view.update_objects(
                 microscope_z=positions["microscope_z"],
                 stage_pos=positions["stage"],
@@ -2208,8 +2494,8 @@ class IntegratedTimeline(QMainWindow):
             cell_position = positions.get("cell_position")
             self._cell_3d_marker.setData(pos=np.array([cell_position]) if cell_position is not None else np.empty((0, 3)))
             self._reconstruction_positions = positions
-            if (settings["apply_microscope_offset"] or settings["apply_cell_distance"]) and not getattr(self, "_geometry_camera_initialized", False):
-                self.three_d_view.opts['distance'] = max(8.0, settings["microscope_offset_um"] / 1000 * 4)
+            if not getattr(self, "_geometry_camera_initialized", False):
+                self.three_d_view.opts['distance'] = 1.0
                 self._geometry_camera_initialized = True
         else:
             # Optionally, handle cases where no movement data is available

@@ -47,6 +47,8 @@ class PatchConfig(Config):
                                           doc='Maximum image-plane tip-to-cell distance for Adaptive contact success')
     hunt_contact_plane_tolerance_um = NumberWithUnit(2, bounds=(0.1, 100), unit='\u03bcm',
         doc='Maximum pipette-to-cell Z-plane difference for Adaptive contact confirmation')
+    hunt_resistance_band_percent = NumberWithUnit(8, bounds=(0, 99), unit='%',
+        doc='Band around the resistance-rise threshold for a half-gap contact advance; success still requires the threshold')
     hunt_search_margin = NumberWithUnit(5, bounds=(0, 100),
                                        doc='Extra microscope Search travel after preceding Spear descent', unit='\u03bcm')
     hunt_progress_cycles = Number(4, bounds=(1, 100),
@@ -95,7 +97,8 @@ class PatchConfig(Config):
                       'tracking_mode', 'track_max_fast_jump_px']),
         ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin', 'hunt_timeout',
                   'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
-                  'hunt_target_radius', 'hunt_contact_distance', 'hunt_contact_plane_tolerance_um']),
+                  'hunt_target_radius', 'hunt_contact_distance', 'hunt_contact_plane_tolerance_um',
+                  'hunt_resistance_band_percent']),
         ('X1 focus', ['x1_focus_mode', 'x1_focus_score_threshold']),
         ('Sealing', ['pressure_sealing', 'gigaseal_R', 'gigaseal_min_delta_R', 'hold_switch', 'increase_slope_gate', 'constant_slope_gate', 'decrease_slope_gate', 'measurement_speed', 'Vramp_amplitude', 'seal_min_time', 'seal_deadline']),
         ('Break-in', ['zap', 'pressure_ramp_increment', 'pressure_ramp_max', 'pressure_ramp_duration','pulse_pressure_break_in','pulse_pressure_duration', 'max_cell_R','max_access_R','min_cell_C']),
