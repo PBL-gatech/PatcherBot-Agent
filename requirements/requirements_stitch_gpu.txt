@@ -1,0 +1,6 @@
+# Install only in the separate patcherbot-stitch-gpu clone (Python 3.10).
+# Preserve the rig's NumPy/OpenCV versions; no headless OpenCV replacement.
+numpy==1.26.4
+cupy-cuda12x==13.6.0
+tifffile==2025.5.10
+pytest==8.4.2

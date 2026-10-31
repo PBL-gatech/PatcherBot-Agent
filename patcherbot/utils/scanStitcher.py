@@ -1196,6 +1196,14 @@ class ScanStitcher:
         print("[ScanStitcher] Streaming stitch complete.")
         return output_path
 
+    def stitch_fast(self, output_path=None, metadata_path=None, config=None, frame_limit=None):
+        """Opt-in spatial selection and GPU fusion; existing stitch modes are unchanged."""
+        if __package__:
+            from .scanStitcherFast import stitch_fast
+        else:
+            from scanStitcherFast import stitch_fast
+        return stitch_fast(self, output_path, metadata_path, config, frame_limit)
+
     def stitch(self):
         print("[ScanStitcher] Starting stitch pipeline...")
         frame_timestamps, coords, frame_paths = self._align_all_frames_to_movement()
