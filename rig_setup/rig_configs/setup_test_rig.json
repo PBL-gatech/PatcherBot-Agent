@@ -1,81 +1,124 @@
 {
-  "name": "setup_test_rig",
-  "schema_version": 2,
-  "devices": {
-    "stage_controller": {
-      "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
-      "params": {
-        "serial": {
-          "baudrate": 9600,
-          "port": "COM6",
-          "timeout": 1.0
-        }
-      }
-    },
-    "pipette_controller": {
-      "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
-      "params": {
-        "serial": {
-          "baudrate": 9600,
-          "port": "COM3",
-          "timeout": 1.0
-        }
-      }
-    },
-    "camera": {
-      "class": "patcherbot.devices.camera.pcocamera.PcoCamera",
-      "params": {}
-    },
-    "pipette_camera": {
-      "class": "patcherbot.devices.camera.PipetteCamera.PipetteCamera",
-      "params": {}
-    },
-    "cell_sorter_controller": {
-      "class": "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterController",
-      "params": {}
-    },
-    "cell_sorter_manipulator": {
-      "class": "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterManip",
-      "params": {}
-    },
-    "daq": {
-      "class": "patcherbot.devices.amplifier.DAQ.NiDAQ",
-      "params": {
-        "cmdChannel": "ao0",
-        "cmdDev": "cDaq1Mod4",
-        "readChannel": "ai0",
-        "readDev": "cDAQ1Mod1",
-        "respChannel": "ai3",
-        "respDev": "cDaq1Mod1"
-      }
-    },
-    "amplifier": {
-      "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
-      "params": {
-        "channel": 1
-      }
-    },
-    "pressure": {
-      "class": "patcherbot.devices.pressurecontroller.MoscowPressureController.MoscowPressureController",
-      "params": {
-        "channel": 4,
-        "controllerSerial": {
-          "baudrate": 9600,
-          "port": "COM5",
-          "timeout": 0
-        },
-        "readerSerial": {
-          "baudrate": 9600,
-          "port": "COM9",
-          "timeout": 0
-        }
-      }
-    },
-    "lamp": {
-      "class": "patcherbot.devices.lamp.olympus.OlympusLamp",
-      "params": {
-        "port": "COM21"
-      }
-    }
-  }
+    "name":  "setup_test_rig",
+    "schema_version":  2,
+    "calibration_file":  "setup_test_cal.yaml",
+    "patch_file":  "setup_test_patch.yaml",
+    "protocol_file":  "setup_test_protocol.yaml",
+    "calibration":  {
+                        "pipette_detector_model":  null,
+                        "pipette_focuser_model":  null
+                    },
+    "ai_features":  {
+                        "enabled":  true
+                    },
+    "devices":  {
+                    "stage_controller":  {
+                                             "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
+                                             "params":  {
+                                                            "serial":  {
+                                                                           "baudrate":  9600,
+                                                                           "port":  "COM6",
+                                                                           "timeout":  1.0
+                                                                       },
+                                                            "max_speed":  100000,
+                                                            "max_accel":  1000,
+                                                            "polling_freq":  100
+                                                        }
+                                         },
+                    "pipette_controller":  {
+                                               "class":  "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
+                                               "params":  {
+                                                              "serial":  {
+                                                                             "baudrate":  9600,
+                                                                             "port":  "COM3",
+                                                                             "timeout":  1.0
+                                                                         },
+                                                              "max_speed":  100000,
+                                                              "max_accel":  1000,
+                                                              "polling_freq":  100
+                                                          }
+                                           },
+                    "camera":  {
+                                   "class":  "patcherbot.devices.camera.pcocamera.PcoCamera",
+                                   "params":  {
+                                                  "width":  1280,
+                                                  "height":  1280
+                                              }
+                               },
+                    "pipette_camera":  {
+                                           "class":  "patcherbot.devices.camera.PipetteCamera.PipetteCamera",
+                                           "params":  {
+                                                          "device_index":  0,
+                                                          "width":  480,
+                                                          "height":  480
+                                                      }
+                                       },
+                    "cell_sorter_controller":  {
+                                                   "class":  "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterController",
+                                                   "params":  {
+
+                                                              }
+                                               },
+                    "cell_sorter_manipulator":  {
+                                                    "class":  "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterManip",
+                                                    "params":  {
+
+                                                               }
+                                                },
+                    "daq":  {
+                                "class":  "patcherbot.devices.amplifier.DAQ.NiDAQ",
+                                "params":  {
+                                               "cmdChannel":  "ao0",
+                                               "cmdDev":  "cDaq1Mod4",
+                                               "readChannel":  "ai0",
+                                               "readDev":  "cDAQ1Mod1",
+                                               "respChannel":  "ai3",
+                                               "respDev":  "cDaq1Mod1"
+                                           }
+                            },
+                    "amplifier":  {
+                                      "class":  "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
+                                      "params":  {
+                                                     "channel":  1
+                                                 }
+                                  },
+                    "pressure":  {
+                                     "class":  "patcherbot.devices.pressurecontroller.MoscowPressureController.MoscowPressureController",
+                                     "params":  {
+                                                    "channel":  4,
+                                                    "controllerSerial":  {
+                                                                             "baudrate":  9600,
+                                                                             "port":  "COM5",
+                                                                             "timeout":  0
+                                                                         },
+                                                    "readerSerial":  {
+                                                                         "baudrate":  9600,
+                                                                         "port":  "COM9",
+                                                                         "timeout":  0
+                                                                     },
+                                                    "validProducts":  [
+                                                                          "USB Serial"
+                                                                      ],
+                                                    "validVIDs":  [
+                                                                      6790,
+                                                                      1027
+                                                                  ],
+                                                    "serialCmdTimeout":  1.0
+                                                }
+                                 },
+                    "lamp":  {
+                                 "class":  "patcherbot.devices.lamp.olympus.OlympusLamp",
+                                 "params":  {
+                                                "port":  "COM21",
+                                                "baud":  19200,
+                                                "cube_slots":  6
+                                            }
+                             },
+                    "laser":  {
+                                  "class":  "patcherbot.devices.laser.laser.FakeLaser",
+                                  "params":  {
+
+                                             }
+                              }
+                }
 }

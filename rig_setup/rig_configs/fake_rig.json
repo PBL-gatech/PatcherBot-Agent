@@ -1,34 +1,47 @@
 {
   "name": "Fake Rig",
   "schema_version": 2,
+  "pipette_count": 3,
+  "calibration_file": "fake_cal.yaml",
+  "patch_file": "fake_patch.yaml",
+  "protocol_file": "fake_protocol.yaml",
+  "calibration": {
+    "pipette_detector_model": "pipetteDetectorNet.pt",
+    "pipette_focuser_model": "WaynesBoroPipetteFocuserNet.onnx"
+  },
+  "ai_features": {
+    "enabled": true
+  },
   "devices": {
     "stage_controller": {
       "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
       "params": {
-        "min": [-240000, 50000, 280000],
-        "max": [-230000, 60000, 290000],
-        "x": [-235000, 55000, 285000]
-      }
-    },
-    "pipette_controller": {
-      "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
-      "params": {
-        "min": [0, 0, 0],
-        "max": [4000, 20000, 20000],
-        "x": [200, 300, 400]
+        "min": [
+          -240000,
+          50000,
+          280000
+        ],
+        "max": [
+          -230000,
+          60000,
+          290000
+        ],
+        "x": [
+          -235000,
+          55000,
+          285000
+        ]
       }
     },
     "camera": {
       "class": "patcherbot.devices.camera.FakeCalCamera.FakeCalCamera",
       "params": {
         "image_z": 100,
+        "targetFramerate": 40,
         "stageManip": "$ref:stage_controller",
-        "pipetteManip": "$ref:pipette_controller"
+        "pipetteManip": "$ref:pipette_controller",
+        "background_image": "image.png"
       }
-    },
-    "pipette_camera": {
-      "class": "patcherbot.devices.camera.camera.FakeCamera",
-      "params": {}
     },
     "cell_sorter_controller": {
       "class": "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterController",
@@ -38,18 +51,6 @@
       "class": "patcherbot.devices.cellsorter.CellSorter.FakeCellSorterManip",
       "params": {}
     },
-    "daq": {
-      "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
-      "params": {}
-    },
-    "amplifier": {
-      "class": "patcherbot.devices.amplifier.amplifier.FakeAmplifier",
-      "params": {}
-    },
-    "pressure": {
-      "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
-      "params": {}
-    },
     "lamp": {
       "class": "patcherbot.devices.lamp.lamp.FakeLamp",
       "params": {}
@@ -57,8 +58,118 @@
     "laser": {
       "class": "patcherbot.devices.laser.laser.FakeLaser",
       "params": {}
-    }
-
-
+    },
+    "pipette_controller": [
+      {
+        "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
+        "params": {
+          "min": [
+            0,
+            0,
+            0
+          ],
+          "max": [
+            4000,
+            20000,
+            20000
+          ],
+          "x": [560, 320, 100]
+        }
+      },
+      {
+        "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
+        "params": {
+          "max": [
+            4000,
+            20000,
+            20000
+          ],
+          "min": [
+            0,
+            0,
+            0
+          ],
+          "x": [260, 320, 100]
+        }
+      },
+      {
+        "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
+        "params": {
+          "max": [
+            4000,
+            20000,
+            20000
+          ],
+          "min": [
+            0,
+            0,
+            0
+          ],
+          "x": [260, 500, 100]
+        }
+      }
+    ],
+    "pipette_camera": [
+      {
+        "class": "patcherbot.devices.camera.camera.FakeCamera",
+        "params": {}
+      },
+      {
+        "class": "patcherbot.devices.camera.camera.FakeCamera",
+        "params": {}
+      },
+      {
+        "class": "patcherbot.devices.camera.camera.FakeCamera",
+        "params": {}
+      }
+    ],
+    "pressure": [
+      {
+        "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
+        "params": {}
+      },
+      {
+        "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
+        "params": {}
+      },
+      {
+        "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
+        "params": {}
+      }
+    ],
+    "daq": [
+      {
+        "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
+        "params": {
+          "pressureController": "$ref:pressure[0]"
+        }
+      },
+      {
+        "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
+        "params": {
+          "pressureController": "$ref:pressure[1]"
+        }
+      },
+      {
+        "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
+        "params": {
+          "pressureController": "$ref:pressure[2]"
+        }
+      }
+    ],
+    "amplifier": [
+      {
+        "class": "patcherbot.devices.amplifier.amplifier.FakeAmplifier",
+        "params": {}
+      },
+      {
+        "class": "patcherbot.devices.amplifier.amplifier.FakeAmplifier",
+        "params": {}
+      },
+      {
+        "class": "patcherbot.devices.amplifier.amplifier.FakeAmplifier",
+        "params": {}
+      }
+    ]
   }
 }

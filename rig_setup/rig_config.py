@@ -5,6 +5,9 @@ Schema (schema_version=2):
 {
   "name": "<friendly name>",
   "schema_version": 2,
+  "calibration_file": "<calibration config file>",
+  "patch_file": "<patch config file>",
+  "protocol_file": "<protocol config file>",
   "devices": {
     "<slot>": {
       "class": "module.ClassName",
@@ -39,18 +42,26 @@ PROTOCOL_CONFIG_DIR = Path(__file__).parent / "protocol_configs"
 DEFAULT_CONFIG_NAME = "fake_rig.json"
 
 # Core device slots only; derived pieces (stage, pipette_unit, microscope) are built automatically.
-DEVICE_SLOTS: List[str] = [
+SHARED_DEVICE_SLOTS: List[str] = [
     "stage_controller",
-    "pipette_controller",
     "camera",
-    "pipette_camera",
     "cell_sorter_controller",
     "cell_sorter_manipulator",
-    "daq",
-    "amplifier",
-    "pressure",
     "lamp",
     "laser",
+]
+
+PIPETTE_DEVICE_SLOTS: List[str] = [
+    "pipette_controller",
+    "pipette_camera",
+    "pressure",
+    "daq",
+    "amplifier",
+]
+
+DEVICE_SLOTS: List[str] = [
+    *PIPETTE_DEVICE_SLOTS,
+    *SHARED_DEVICE_SLOTS,
 ]
 
 
@@ -59,12 +70,26 @@ class RigConfigError(Exception):
 
 
 def _slugify(text: str) -> str:
+    """
+    Convert text into a filesystem-safe slug.
+
+    Args:
+        text (str): Input string.
+
+    Returns:
+        str: Slugified string.
+    """
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", text).strip("_")
     return slug or "rig_config"
 
 
 def _default_devices() -> Dict[str, Dict[str, Any]]:
-    """Default fake rig mirrors rig_setup/setup_fake_rig.py."""
+    """
+    Default fake rig mirrors rig_setup/setup_fake_rig.py.
+    
+    Returns:
+        Dict[str, Dict[str, Any]]: Default device configuration mapping.
+    """
     return {
         "stage_controller": {
             "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
@@ -112,10 +137,27 @@ def _default_devices() -> Dict[str, Dict[str, Any]]:
 
 
 def _empty_calibration() -> Dict[str, Any]:
+    """
+    Create an empty calibration configuration.
+
+    Returns:
+        Dict[str, Any]: Empty calibration dictionary.
+    """
     return {
         "pipette_detector_model": None,
         "pipette_focuser_model": None,
         "use_ai_features": False,
+    }
+
+def _default_ai_features() -> Dict[str, Any]:
+    """
+    Create an empty calibration configuration.
+
+    Returns:
+        Dict[str, Any]: Empty calibration dictionary.
+    """
+    return {
+        "enabled": True,
     }
 
 
@@ -131,11 +173,19 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
         {
             "label": "ScientificaSerialNoEncoder",
             "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
-            "params": {"serial": {"port": "COM6", "baudrate": 9600}},
+            "params": {
+                "serial": {"port": "COM6", "baudrate": 9600},
+                "max_speed": 100000,
+                "max_accel": 1000,
+                "polling_freq": 100,
+            },
             "fields": [
                 {"key": "serial.port", "label": "Port", "type": "str"},
                 {"key": "serial.baudrate", "label": "Baudrate", "type": "int"},
                 {"key": "serial.timeout", "label": "Timeout", "type": "float", "optional": True},
+                {"key": "max_speed", "label": "Max Speed", "type": "int", "optional": True},
+                {"key": "max_accel", "label": "Max Accel", "type": "int", "optional": True},
+                {"key": "polling_freq", "label": "Polling Hz", "type": "int", "optional": True},
             ],
         },
     ],
@@ -149,18 +199,31 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
         {
             "label": "ScientificaSerialNoEncoder",
             "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
-            "params": {"serial": {"port": "COM3", "baudrate": 9600}},
+            "params": {
+                "serial": {"port": "COM3", "baudrate": 9600},
+                "max_speed": 100000,
+                "max_accel": 1000,
+                "polling_freq": 100,
+            },
             "fields": [
                 {"key": "serial.port", "label": "Port", "type": "str"},
                 {"key": "serial.baudrate", "label": "Baudrate", "type": "int"},
                 {"key": "serial.timeout", "label": "Timeout", "type": "float", "optional": True},
+                {"key": "max_speed", "label": "Max Speed", "type": "int", "optional": True},
+                {"key": "max_accel", "label": "Max Accel", "type": "int", "optional": True},
+                {"key": "polling_freq", "label": "Polling Hz", "type": "int", "optional": True},
             ],
         },
         {
             "label": "SensapexManip",
             "class": "patcherbot.devices.manipulator.sensapexWrapper.SensapexManip",
-            "params": {},
-            "fields": [],
+            "params": {"deviceID": None, "max_speed": 5000, "max_acceleration": 1, "tilt_angle_deg": 25.0},
+            "fields": [
+                {"key": "deviceID", "label": "Device ID", "type": "int", "optional": True},
+                {"key": "max_speed", "label": "Max Speed", "type": "int", "optional": True},
+                {"key": "max_acceleration", "label": "Max Accel", "type": "float", "optional": True},
+                {"key": "tilt_angle_deg", "label": "Tilt Angle (deg)", "type": "float", "optional": True},
+            ],
         },
     ],
     "cell_sorter_controller": [
@@ -304,6 +367,7 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
                 "channel": 4,
                 "controllerSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0},
                 "readerSerial": {"port": "COM9", "baudrate": 9600, "timeout": 0},
+                "serial_cmd_timeout": 1,
             },
             "fields": [
                 {"key": "channel", "label": "Channel", "type": "int"},
@@ -313,17 +377,45 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
                 {"key": "readerSerial.port", "label": "Reader Port", "type": "str"},
                 {"key": "readerSerial.baudrate", "label": "Reader Baud", "type": "int"},
                 {"key": "readerSerial.timeout", "label": "Reader Timeout", "type": "float", "optional": True},
+                {"key": "serial_cmd_timeout", "label": "Command Timeout", "type": "float", "optional": True},
+            ],
+        },
+        {
+            "label": "WaynesBoroPressureController",
+            "class": "patcherbot.devices.pressurecontroller.WaynesboroPressureController.WaynesBoroPressureController",
+            "params": {
+                "channel": 1,
+                "controllerSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0},
+                "readerSerial": {"port": "COM4", "baudrate": 9600, "timeout": 0},
+                "serial_cmd_timeout": 1,
+            },
+            "fields": [
+                {"key": "channel", "label": "Channel", "type": "int"},
+                {"key": "controllerSerial.port", "label": "Controller Port", "type": "str"},
+                {"key": "controllerSerial.baudrate", "label": "Controller Baud", "type": "int"},
+                {"key": "controllerSerial.timeout", "label": "Controller Timeout", "type": "float", "optional": True},
+                {"key": "readerSerial.port", "label": "Reader Port", "type": "str"},
+                {"key": "readerSerial.baudrate", "label": "Reader Baud", "type": "int"},
+                {"key": "readerSerial.timeout", "label": "Reader Timeout", "type": "float", "optional": True},
+                {"key": "serial_cmd_timeout", "label": "Command Timeout", "type": "float", "optional": True},
             ],
         },
         {
             "label": "IBBPressureController",
             "class": "patcherbot.devices.pressurecontroller.IBBPressureController.IBBPressureController",
-            "params": {"channel": 1, "arduinoSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0}},
+            "params": {
+                "channel": 1,
+                "arduinoSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0},
+                "serial_cmd_timeout": 1,
+                "startup_pressure": 20,
+            },
             "fields": [
                 {"key": "channel", "label": "Channel", "type": "int"},
                 {"key": "arduinoSerial.port", "label": "Arduino Port", "type": "str"},
                 {"key": "arduinoSerial.baudrate", "label": "Arduino Baud", "type": "int"},
                 {"key": "arduinoSerial.timeout", "label": "Arduino Timeout", "type": "float", "optional": True},
+                {"key": "serial_cmd_timeout", "label": "Command Timeout", "type": "float", "optional": True},
+                {"key": "startup_pressure", "label": "Startup Pressure", "type": "float", "optional": True},
             ],
         },
     ],
@@ -375,13 +467,20 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
 
 
 class RigConfigManager:
-    def __init__(
-        self,
-        config_dir: Path | None = None,
-        cal_config_dir: Path | None = None,
-        patch_config_dir: Path | None = None,
-        protocol_config_dir: Path | None = None,
-    ):
+    """Manager for loading, validating, and instantiating rig configurations."""
+    def __init__(self, config_dir: Path | None = None,
+                 cal_config_dir: Path | None = None,
+                 patch_config_dir: Path | None = None,
+                 protocol_config_dir: Path | None = None):
+        """
+        Initialize RigConfigManager with directory paths.
+
+        Args:
+            config_dir (Path, optional): Directory for rig configs.
+            cal_config_dir (Path, optional): Directory for calibration configs.
+            patch_config_dir (Path, optional): Directory for patch configs.
+            protocol_config_dir (Path, optional): Directory for protocol configs.
+        """
         self.config_dir = config_dir or CONFIG_DIR
         self.cal_config_dir = cal_config_dir or CAL_CONFIG_DIR
         self.patch_config_dir = patch_config_dir or PATCH_CONFIG_DIR
@@ -392,18 +491,56 @@ class RigConfigManager:
         self.protocol_config_dir.mkdir(parents=True, exist_ok=True)
 
     def default_config_path(self) -> Path:
+        """
+        Get default configuration file path.
+
+        Returns:
+            Path: Path to default config file.
+        """
         return self.config_dir / DEFAULT_CONFIG_NAME
 
     def ensure_default_config(self) -> Path:
+        """
+        Get default configuration file path.
+
+        Returns:
+            Path: Path to default config file.
+        """
         path = self.default_config_path()
         if not path.exists():
-            self.save_config(path, {"name": "Fake Rig", "schema_version": SCHEMA_VERSION, "devices": _default_devices()})
+            self.save_config(
+                path,
+                {
+                    "name": "Fake Rig",
+                    "schema_version": SCHEMA_VERSION,
+                    "pipette_count": 1,
+                    "calibration_file": "fake_cal.yaml",
+                    "patch_file": "fake_patch.yaml",
+                    "protocol_file": "fake_protocol.yaml",
+                    "calibration": _empty_calibration(),
+                    "ai_features": _default_ai_features(),
+                    "devices": _default_devices(),
+                },
+            )
         return path
 
     def list_configs(self) -> List[Path]:
+        """
+        List all available configuration files.
+
+        Returns:
+            List[Path]: Sorted list of config file paths.
+        """
         return sorted(self.config_dir.glob("*.json"))
 
     def save_config(self, path: Path, data: Dict[str, Any]) -> None:
+        """
+        Save configuration data to a file.
+
+        Args:
+            path (Path): File path to save config.
+            data (Dict[str, Any]): Configuration data.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         sanitized = {
             key: value for key, value in data.items()
@@ -412,41 +549,138 @@ class RigConfigManager:
         with path.open("w", encoding="utf-8") as f:
             json.dump(sanitized, f, indent=2)
 
-    def load_config(self, path: Path) -> Dict[str, Any]:
+    def load_config(self, path: Path, load_overlays: bool = True) -> Dict[str, Any]:
+        """
+        Load and validate a configuration file.
+
+        Args:
+            path (Path): Path to configuration file.
+
+        Returns:
+            Dict[str, Any]: Loaded configuration.
+
+        Raises:
+            RigConfigError: If file does not exist or validation fails.
+        """
         if not path.exists():
             raise RigConfigError(f"Configuration file not found: {path}")
         with path.open("r", encoding="utf-8") as f:
             config = json.load(f)
         self._validate_config(config)
-        self._load_overlay_configs(config)
+
+        if load_overlays:
+            self._load_overlay_configs(config)
+
         return config
 
-    def build_devices_from_file(self, path: Path) -> Dict[str, Any]:
-        config = self.load_config(path)
-        return self.build_devices(config)
+    def build_devices_from_file(self, path: Path, active_pipette_count: int | None = None) -> Dict[str, Any]:
+        """
+        Load config and instantiate devices.
 
-    def build_devices(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        Args:
+            path (Path): Path to configuration file.
+
+        Returns:
+            Dict[str, Any]: Instantiated devices.
+        """
+        config = self.load_config(path)
+        return self.build_devices(config, active_pipette_count=active_pipette_count)
+
+    def build_devices(self, config: Dict[str, Any], active_pipette_count: int | None = None) -> Dict[str, Any]:
+        """
+        Instantiate all devices from configuration.
+
+        Args:
+            config (Dict[str, Any]): Configuration dictionary.
+
+        Returns:
+            Dict[str, Any]: All instantiated devices.
+        """
+        max_pipette_count = int(
+            config.get("pipette_count", 1)
+        )
+
+        if active_pipette_count is None:
+            active_pipette_count = max_pipette_count
+
+        if not 1 <= active_pipette_count <= max_pipette_count:
+            raise RigConfigError(
+                f"Requested {active_pipette_count} pipettes, "
+                f"but this rig supports {max_pipette_count}."
+            )
         devices_cfg = config.get("devices", {})
         self._apply_pressure_calibration(config, devices_cfg)
         base_instances: Dict[str, Any] = {}
         for slot in DEVICE_SLOTS:
             if slot not in devices_cfg:
                 raise RigConfigError(f"Missing device slot '{slot}' in configuration.")
-            base_instances[slot] = self._instantiate_slot(slot, devices_cfg[slot], base_instances)
+            curr_device = devices_cfg[slot]
+            
+            if isinstance(curr_device, list):
+                if slot not in PIPETTE_DEVICE_SLOTS:
+                    raise RigConfigError(f"Shared device slot '{slot}' cannot contain multiple devices.")
+                if not curr_device:
+                    raise RigConfigError(f"Device slot '{slot}' contains an empty device list.")
+                devices_to_initialize = curr_device[:active_pipette_count]
+                instance_dict: Dict[str, Any] = {}
+                for i, dev_cfg in enumerate(devices_to_initialize):
+
+                    if not isinstance(dev_cfg, dict):
+                        raise RigConfigError(
+                            f"Invalid configuration for '{slot}[{i}]'. "
+                            "Expected a device mapping."
+                        )
+
+                    instance_key = f"{slot}_{i}"
+
+                    instance = self._instantiate_slot(
+                        instance_key,
+                        dev_cfg,
+                        base_instances,
+                    )
+
+                    instance_dict[instance_key] = instance
+
+                base_instances[slot] = instance_dict
+
+            # Single-instance device slot.
+            elif isinstance(curr_device, dict):
+                base_instances[slot] = self._instantiate_slot(
+                    slot,
+                    curr_device,
+                    base_instances,
+                )
+            else:
+                raise RigConfigError(
+                f"Invalid configuration for device slot '{slot}'. "
+                "Expected a device mapping or list of device mappings."
+            )
 
         # Auto-wire derived components
         from patcherbot.devices.manipulator.manipulatorunit import ManipulatorUnit
         from patcherbot.devices.manipulator.microscope import Microscope
 
         stage_controller = base_instances["stage_controller"]
-        pipette_controller = base_instances["pipette_controller"]
+        pipette_controllers = base_instances["pipette_controller"]
+
+        pipette_units = {}
+        if isinstance(pipette_controllers, dict):
+            for key, controller in pipette_controllers.items():
+                pipette_units[key] = ManipulatorUnit(controller, [1, 2, 3])
+        else:
+            pipette_units = ManipulatorUnit(pipette_controllers, [1, 2, 3])
 
         derived = {
             "stage": ManipulatorUnit(stage_controller, [1, 2]),
-            "pipette_unit": ManipulatorUnit(pipette_controller, [1, 2, 3]),
+            "pipette_unit": pipette_units,
             "microscope": Microscope(stage_controller, 3),
         }
         derived["microscope"].up_direction = 1.0
+        calibration = config.get("calibration")
+        if isinstance(calibration, dict):
+            units = calibration.get("microscope_units_per_um")
+            if units is not None:
+                derived["microscope"].set_units_per_um(units)
 
         # Inject refs into cameras if they declare matching kwargs
         camera = base_instances.get("camera")
@@ -454,7 +688,7 @@ class RigConfigManager:
             if hasattr(camera, "stageManip"):
                 camera.stageManip = stage_controller
             if hasattr(camera, "pipetteManip"):
-                camera.pipetteManip = pipette_controller
+                camera.pipetteManip = pipette_controllers
             if hasattr(camera, "cellSorterManip") and "cell_sorter_manipulator" in base_instances:
                 camera.cellSorterManip = base_instances["cell_sorter_manipulator"]
             calibration_cfg = config.get("_resolved_calibration")
@@ -470,6 +704,20 @@ class RigConfigManager:
         return all_devices
 
     def _instantiate_slot(self, slot: str, cfg: Dict[str, Any], instances: Dict[str, Any]) -> Any:
+        """
+        Instantiate a device for a given slot.
+
+        Args:
+            slot (str): Device slot name.
+            cfg (Dict[str, Any]): Slot configuration.
+            instances (Dict[str, Any]): Existing instances for reference resolution.
+
+        Returns:
+            Any: Instantiated device.
+
+        Raises:
+            RigConfigError: If import or instantiation fails.
+        """
         class_path = cfg.get("class") or cfg.get("class_path")
         if not class_path or "." not in class_path:
             raise RigConfigError(f"Invalid class for slot '{slot}'.")
@@ -497,6 +745,17 @@ class RigConfigManager:
         return instance
 
     def _split_ctor_params(self, cls: Any, params_cfg: Dict[str, Any], instances: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Split parameters into constructor args and post-init attributes.
+
+        Args:
+            cls (Any): Target class.
+            params_cfg (Dict[str, Any]): Parameter configuration.
+            instances (Dict[str, Any]): Existing instances.
+
+        Returns:
+            Tuple[Dict[str, Any], Dict[str, Any]]: Constructor kwargs and post-init attributes.
+        """
         resolved = {k: self._resolve_value(v, instances) for k, v in (params_cfg or {}).items()}
         sig = inspect.signature(cls.__init__)
         has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
@@ -515,12 +774,69 @@ class RigConfigManager:
         return ctor_kwargs, post_attrs
 
     def _resolve_value(self, value: Any, instances: Dict[str, Any]) -> Any:
+        """
+        Resolve special configuration values.
+
+        Args:
+            value (Any): Input value.
+            instances (Dict[str, Any]): Existing instances.
+
+        Returns:
+            Any: Resolved value.
+
+        Raises:
+            RigConfigError: If reference resolution fails or serial creation fails.
+        """
         if isinstance(value, str):
             if value.startswith("$ref:"):
                 ref = value.split(":", 1)[1]
+
+                # ============================================================
+                # NEW: Handle indexed references such as "$ref:pressure[0]"
+                # ============================================================
+                match = re.fullmatch(
+                    r"([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]",
+                    ref
+                )
+
+                if match:
+                    slot, index = match.groups()
+                    index = int(index)
+
+                    # Make sure the slot exists
+                    if slot not in instances:
+                        raise RigConfigError(
+                            f"Reference '{slot}' not available yet."
+                        )
+
+                    # Multi-device slots are stored as dictionaries
+                    device_group = instances[slot]
+
+                    if not isinstance(device_group, dict):
+                        raise RigConfigError(
+                            f"Reference '{slot}[{index}]' is not a multi-device slot."
+                        )
+
+                    devices = list(device_group.values())
+
+                    if index >= len(devices):
+                        raise RigConfigError(
+                            f"Reference '{slot}[{index}]' does not exist. "
+                            f"Available devices: {len(devices)}"
+                        )
+
+                    return devices[index]
+
+                # ============================================================
+                # EXISTING: Handle normal references such as "$ref:pressure"
+                # ============================================================
                 if ref not in instances:
-                    raise RigConfigError(f"Reference '{ref}' not available yet.")
+                    raise RigConfigError(
+                        f"Reference '{ref}' not available yet."
+                    )
+
                 return instances[ref]
+
             return value
         if isinstance(value, list):
             # Auto-convert flat numeric lists to numpy arrays (keeps JSON simple).
@@ -549,29 +865,86 @@ class RigConfigManager:
         return value
 
     def _validate_config(self, config: Dict[str, Any]) -> None:
+        """
+        Validate configuration structure.
+
+        Args:
+            config (Dict[str, Any]): Configuration dictionary.
+            
+        Raises:
+            RigConfigError: If configuration is invalid.
+        """
         if config.get("schema_version") not in (None, SCHEMA_VERSION):
             raise RigConfigError("Unsupported schema_version in rig configuration.")
         devices = config.get("devices")
         if not isinstance(devices, dict):
             raise RigConfigError("Configuration must contain a 'devices' mapping.")
+        try:
+            pipette_count = max(
+                1,
+                int(config.get("pipette_count", 1)),
+            )
+        except (TypeError, ValueError):
+            raise RigConfigError(
+                "Invalid pipette_count in rig configuration."
+            )
         for slot in DEVICE_SLOTS:
             if slot not in devices:
-                raise RigConfigError(f"Configuration missing required slot '{slot}'.")
+                raise RigConfigError(
+                    f"Configuration missing required slot '{slot}'."
+                )
+            if slot in PIPETTE_DEVICE_SLOTS:
+                spec = devices[slot]
+                if pipette_count > 1:
+                    if not isinstance(spec, list):
+                        raise RigConfigError(
+                            f"'{slot}' must contain {pipette_count} "
+                            "device configurations."
+                        )
+
+                    if len(spec) != pipette_count:
+                        raise RigConfigError(
+                            f"'{slot}' contains {len(spec)} devices, "
+                            f"but this rig declares {pipette_count} pipettes."
+                        )
 
     def make_config_path(self, name: str) -> Path:
+        """
+        Generate a file path for a configuration name.
+
+        Args:
+            name (str): Configuration name.
+
+        Returns:
+            Path: Generated file path.
+        """
         return self.config_dir / f"{_slugify(name)}.json"
 
     def get_device_options(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get available device options.
+
+        Returns:
+            Dict[str, List[Dict[str, Any]]]: Device options mapping.
+        """
         return DEVICE_OPTIONS
 
     def build_empty_template(self) -> Dict[str, Any]:
+        """
+        Get available device options.
+
+        Returns:
+            Dict[str, List[Dict[str, Any]]]: Device options mapping.
+        """
         return {
             "name": "New Rig",
             "schema_version": SCHEMA_VERSION,
+            "pipette_count": 1,
             "calibration_file": None,
             "patch_file": None,
             "protocol_file": None,
             "calibration": _empty_calibration(),
+            "ai_features": _default_ai_features(),
             "devices": {slot: {} for slot in DEVICE_SLOTS},
         }
 
