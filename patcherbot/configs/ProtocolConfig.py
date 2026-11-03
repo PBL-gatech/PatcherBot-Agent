@@ -44,8 +44,6 @@ class ProtocolConfig(Config):
     )
 
     categories = [
-        ('Protocols', ['voltage_protocol', 'current_protocol', 'holding_protocol', 'voltage_sweep_protocol',
-                       'opto_random_wavelength_protocol', 'opto_random_power_protocol']),
         ('Compensation', ['enable_neutralization_capacitance', 'enable_bridge_balance']),
         ('Current Clamp', ['custom_cclamp_protocol', 'cclamp_step', 'cclamp_start', 'cclamp_end', 'cclamp_hold',
                            'cclamp_recording_time_ms', 'cclamp_duty_cycle']),

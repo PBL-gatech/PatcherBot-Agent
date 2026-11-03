@@ -18,6 +18,24 @@ from .pipette_flow import track_pipette_displacement
 CALIBRATION_FRAME_COUNT = 5
 CALIBRATION_TIMEOUT_SECONDS = 3.0
 
+
+class FakePipetteDetector:
+    """Detector adapter for synthetic cameras that know their rendered tip."""
+
+    def __init__(self, camera, pipette=None):
+        self.camera = camera
+        self.pipette = pipette
+
+    def detect_pipette(self, img):
+        try:
+            return self.camera.get_fake_pipette_tip_xy(self.pipette)
+        except TypeError:
+            return self.camera.get_fake_pipette_tip_xy()
+
+    def get_pipette_z(self, img):
+        return 0.0
+
+
 def _resolve_model_path(model_name):
     if model_name is None:
         return None
@@ -78,21 +96,24 @@ class PipetteCalHelper():
         model_name = getattr(self.config, "pipette_detector_model", None)
         model_path = _resolve_model_path(model_name)
         model_version = getattr(self.config, "pipette_detector_model_version", "R02")
-        try:
-            self.pipetteDetector: PipetteDetector = PipetteDetector5(
-                model_path=model_path,
-                device=device,
-                model_version=model_version,
-            )
-        except Exception as exc:
-            logging.warning(
-                "Failed to load general pipette model '%s' (%s); using the existing default R02 checkpoint",
-                model_name,
-                exc,
-            )
-            self.pipetteDetector = PipetteDetector5(
-                model_path=None, device=device, model_version="R02",
-            )
+        if callable(getattr(camera, "get_fake_pipette_tip_xy", None)):
+            self.pipetteDetector = FakePipetteDetector(camera, pipette)
+        else:
+            try:
+                self.pipetteDetector: PipetteDetector = PipetteDetector5(
+                    model_path=model_path,
+                    device=device,
+                    model_version=model_version,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "Failed to load general pipette model '%s' (%s); using the existing default R02 checkpoint",
+                    model_name,
+                    exc,
+                )
+                self.pipetteDetector = PipetteDetector5(
+                    model_path=None, device=device, model_version="R02",
+                )
         configure_pipette_detector(self.pipetteDetector)
         self.calibrated_stage = calibrated_stage
         # Each calibration point will be a tuple:

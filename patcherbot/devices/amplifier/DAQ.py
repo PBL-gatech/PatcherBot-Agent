@@ -195,6 +195,12 @@ class DAQ(TaskController):
         self._pause_evt = threading.Event(); self._pause_evt.set()   # allow run
         self._idle_evt  = threading.Event(); self._idle_evt.set()    # initially idle
         self.sweep_clip = None
+        # Latest samples keyed by physical/logical analog input port. A
+        # channel-to-pipette map can be supplied as a DAQ config attribute.
+        self.analog_io_data = {}
+        self.analog_io_to_pipette = {}
+        self._analog_data_lock = threading.Lock()
+        self._protocol_lock = threading.RLock()
 
 
     def setCellMode(self, mode: bool) -> None:
@@ -259,8 +265,81 @@ class DAQ(TaskController):
         or None if no data is available.
         """
         if hasattr(self, "_daq_acq_thread") and self._daq_acq_thread:
-            return self._daq_acq_thread.get_last_data()
+            data = self._daq_acq_thread.get_last_data()
+            if data is not None:
+                data["analog_io_data"] = self.get_analog_io_data()
+            return data
         return None
+
+    def configure_analog_io_to_pipette(self, mapping):
+        """Configure analog input port -> 1-based pipette number routing.
+
+        Example config value: {"cDAQ1Mod3/ai0": 1, "cDAQ1Mod3/ai1": 2}.
+        Unmapped channels remain available to pipette 1 for backwards
+        compatibility with single-pipette rigs.
+        """
+        if not isinstance(mapping, dict):
+            raise TypeError("analog_io_to_pipette must be a mapping of port names to pipette numbers")
+        routes = {}
+        for port, pipette_number in mapping.items():
+            if not isinstance(port, str) or not port.strip():
+                raise ValueError("Analog I/O port names must be non-empty strings")
+            if isinstance(pipette_number, bool):
+                raise ValueError("Pipette numbers must be positive integers")
+            try:
+                pipette_number = int(pipette_number)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid pipette number for {port!r}") from exc
+            if pipette_number < 1:
+                raise ValueError("Pipette numbers are 1-based and must be positive")
+            routes[port.strip()] = pipette_number
+        self.analog_io_to_pipette = routes
+
+    def _record_analog_io_data(self, raw_data):
+        """Store raw AI rows under the corresponding port names."""
+        samples = np.asarray(raw_data, dtype=float)
+        if samples.ndim == 1:
+            samples = samples.reshape(1, -1)
+        ports = getattr(self, "analog_input_ports", None)
+        if not ports:
+            ports = ("ai0", "ai1")
+        with self._analog_data_lock:
+            self.analog_io_data = {
+                str(port): samples[index].copy()
+                for index, port in enumerate(ports)
+                if index < samples.shape[0]
+            }
+
+    def get_analog_io_data(self):
+        """Return the latest data as ``{analog_port_name: samples}``."""
+        with self._analog_data_lock:
+            return {port: values.copy() for port, values in self.analog_io_data.items()}
+
+    def get_data_for_pipette(self, pipette_number):
+        """Return latest analog-input arrays assigned to a selected pipette."""
+        if isinstance(pipette_number, bool):
+            raise ValueError("Pipette numbers are 1-based positive integers")
+        try:
+            pipette_number = int(pipette_number)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Pipette number must be a positive integer") from exc
+        if pipette_number < 1:
+            raise ValueError("Pipette numbers are 1-based positive integers")
+        active_count = getattr(self, "active_pipette_count", None)
+        if active_count is not None and pipette_number > active_count:
+            raise ValueError(
+                f"Pipette {pipette_number} was not selected at startup; "
+                f"{active_count} pipette(s) are active"
+            )
+        data = self.get_analog_io_data()
+        return {
+            port: values
+            for port, values in data.items()
+            if self.analog_io_to_pipette.get(
+                port,
+                self.analog_io_to_pipette.get(port.rsplit("/", 1)[-1], 1),
+            ) == pipette_number
+        }
 
     def compute_noise_metrics(self, timeData=None, respData=None,
                               window_start=0.004, window_end=0.010,
@@ -379,6 +458,7 @@ class DAQ(TaskController):
             # Device-specific wrappers (implemented in NiDAQ)
             self._sendSquareWave(wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
             raw = self._readAnalogInput(samplesPerSec, recordingTime)
+            self._record_analog_io_data(raw)
 
         # Process raw 2×N array -> six-tuple
         return self._squareWaveProcessor(raw, samplesPerSec, amplitude,sweep_clip=None)
@@ -846,6 +926,60 @@ class DAQ(TaskController):
 # ========================================================
 #  NI-DAQ Subclass
 # ========================================================
+class DAQProtocolSession:
+    """Per-pipette protocol state backed by one shared physical DAQ."""
+
+    _SERIALIZED_METHODS = {
+        "getDataFromSquareWave",
+        "getDataFromCurrentProtocol",
+        "getDataFromHoldingProtocol",
+        "getDataFromOptogeneticProtocol",
+        "getDataFromVoltageProtocol",
+        "getLeakSubtraction",
+        "getVoltageClampSweep",
+    }
+
+    def __init__(self, daq, pipette_number):
+        import copy
+
+        object.__setattr__(self, "_base_daq", daq)
+        state = copy.copy(daq)
+        state._deviceLock = daq._deviceLock
+        state._protocol_lock = daq._protocol_lock
+        state._analog_data_lock = daq._analog_data_lock
+        state._optogenetic_queue_lock = threading.Lock()
+        state.optogenetic_protocol_queue = collections.deque()
+        state.active_pipette_count = getattr(daq, "active_pipette_count", 1)
+        state.pipette_number = int(pipette_number)
+        if getattr(daq, "parallel_protocol_sessions", False):
+            state._deviceLock = threading.RLock()
+            state._protocol_lock = threading.RLock()
+            state._pause_evt = threading.Event()
+            state._pause_evt.set()
+            state._idle_evt = threading.Event()
+            state._idle_evt.set()
+            state._daq_acq_thread = None
+            state._recorded_trace_index = 0
+        object.__setattr__(self, "_state", state)
+
+    def __getattr__(self, name):
+        value = getattr(self._state, name)
+        if name not in self._SERIALIZED_METHODS or not callable(value):
+            return value
+
+        def run_serialized(*args, **kwargs):
+            with self._state._protocol_lock:
+                return value(*args, **kwargs)
+
+        return run_serialized
+
+    def __setattr__(self, name, value):
+        if name in {"_base_daq", "_state"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._state, name, value)
+
+
 class NiDAQ(DAQ):
     C_CLAMP_AMP_PER_VOLT = 400 * 1e-12  # 400 pA per V (DAQ output)
     C_CLAMP_VOLT_PER_VOLT = (10 * 1e-3) / (1e-3)  # 10 mV per V (DAQ input)
@@ -860,6 +994,10 @@ class NiDAQ(DAQ):
         self.readChannel = readChannel
         self.cmdChannel = cmdChannel
         self.respChannel = respChannel
+        self.analog_input_ports = (
+            f"{self.readDev}/{self.readChannel}",
+            f"{self.respDev}/{self.respChannel}",
+        )
         self.latestAccessResistance = None
         self.totalResistance = None
         self.latestMembraneResistance = None
@@ -1141,7 +1279,9 @@ class NiDAQ(DAQ):
             number_of_samples_per_channel=numSamples,
             timeout=10.0
         )
-        return np.array(data, dtype=float)
+        data = np.array(data, dtype=float)
+        self._record_analog_io_data(data)
+        return data
 
     def _sendSquareWave(self, wave_freq, samplesPerSec,
                         dutyCycle, amplitude, recordingTime):
@@ -2141,6 +2281,8 @@ class ArduinoDAQ(DAQ):
 class FakeDAQ(DAQ):
     """DAQ implementation using recorded traces for development or testing without hardware."""
 
+    parallel_protocol_sessions = True
+
     default_recorded_data = 'FakDAQ_graph_recording.csv'
 
     # Use unity conversions so that the base class computations work out of the
@@ -2152,6 +2294,8 @@ class FakeDAQ(DAQ):
 
     def __init__(self):
         super().__init__()
+        self.analog_input_ports = ("ai0", "ai1")
+        self.configure_analog_io_to_pipette({"ai0": 1, "ai1": 1})
         self.totalResistance = 6 * 10 ** 6  # baseline fake resistance
         self._last_wave_params = None
         self._last_command = None
@@ -2312,6 +2456,7 @@ class FakeDAQ(DAQ):
     def _next_recorded_trace(self):
         command, response = self._recorded_traces[self._recorded_trace_index]
         self._recorded_trace_index = (self._recorded_trace_index + 1) % len(self._recorded_traces)
+        self._record_analog_io_data(np.asarray([command, response], dtype=float))
         return command.copy(), response.copy()
 
     @staticmethod

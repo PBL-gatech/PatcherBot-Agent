@@ -38,7 +38,10 @@ def main():
 
     try:
         config_data = manager.load_config(config_path)
-        rig_devices = manager.build_devices(config_data)
+        rig_devices = manager.build_devices(
+            config_data,
+            active_pipette_count=selector.selected_pipette_count,
+        )
     except RigConfigError as exc:
         QMessageBox.critical(None, "Rig configuration error", str(exc))
         return
@@ -49,18 +52,27 @@ def main():
     stage = rig_devices["stage"]
     microscope = rig_devices["microscope"]
     camera = rig_devices["camera"]
+
+    def primary_device(device_or_devices):
+        """Return the first selected device for legacy single-device GUI APIs."""
+        if isinstance(device_or_devices, dict):
+            return next(iter(device_or_devices.values()))
+        return device_or_devices
+
     # Ensure camera has refs if it needs them
     if isinstance(camera, FakeCalCamera):
         camera.stageManip = rig_devices["stage_controller"]
-        camera.pipetteManip = rig_devices["pipette_controller"]
+        camera.set_pipette_manipulators(rig_devices["pipette_controller"])
         camera.cellSorterManip = rig_devices["cell_sorter_manipulator"]
-    pipette_camera = rig_devices["pipette_camera"]
+    pipette_camera = primary_device(rig_devices["pipette_camera"])
     unit = rig_devices["pipette_unit"]
     cellSorterManip = rig_devices["cell_sorter_manipulator"]
     cellSorterController = rig_devices["cell_sorter_controller"]
-    amplifier = rig_devices["amplifier"]
+    amplifiers = rig_devices["amplifier"]
+    amplifier = primary_device(amplifiers)
     daq = rig_devices["daq"]
-    pressure = rig_devices["pressure"]
+    pressures = rig_devices["pressure"]
+    pressure = primary_device(pressures)
     lamp = rig_devices["lamp"]
     laser = rig_devices["laser"]
 
@@ -83,9 +95,9 @@ def main():
         calibration_data=calibration_data,
     )
     patch_controller = AutoPatchInterface(
-        amplifier,
+        amplifiers,
         daq,
-        pressure,
+        pressures,
         pipette_controller,
         recording_state_manager,
         lamp,
@@ -99,12 +111,40 @@ def main():
     # graphs.location_on_the_screen()
     graphs.show()
 
-    currentProtocolGraph = CurrentProtocolGraph(graph_interface, recording_state_manager)
-    voltageProtocolGraph = VoltageProtocolGraph(graph_interface, recording_state_manager)
-    leakSubtractionGraph = LeakSubtractionGraph(graph_interface, recording_state_manager)
-    holdingProtocolGraph = HoldingProtocolGraph(graph_interface, recording_state_manager)
-    optogeneticStimProtocolGraph = OptogeneticStimProtocolGraph(graph_interface, recording_state_manager)
-    optogeneticWavelengthProtocolGraph = OptogeneticWavelengthProtocolGraph(graph_interface, recording_state_manager)
+    protocol_graphs = []
+    protocol_graph_types = (
+        CurrentProtocolGraph,
+        VoltageProtocolGraph,
+        LeakSubtractionGraph,
+        HoldingProtocolGraph,
+        OptogeneticStimProtocolGraph,
+        OptogeneticWavelengthProtocolGraph,
+    )
+    for pipette_index, (pipette_key, protocol_daq) in enumerate(
+            patch_controller.protocol_daQs.items(), start=1):
+        suffix = pipette_key.rsplit("_", 1)[-1]
+        protocol_amplifier = amplifiers.get(f"amplifier_{suffix}", amplifier) if isinstance(
+            amplifiers, dict
+        ) else amplifier
+        protocol_pressure = pressures.get(f"pressure_{suffix}", pressure) if isinstance(
+            pressures, dict
+        ) else pressure
+        protocol_graph_interface = GraphInterface(
+            protocol_amplifier,
+            protocol_daq,
+            protocol_pressure,
+            recording_state_manager,
+            laser=laser,
+        )
+        pipette_name = f"Pipette {pipette_index}"
+        protocol_graphs.extend(
+            graph_type(
+                protocol_graph_interface,
+                recording_state_manager,
+                pipette_name=pipette_name,
+            )
+            for graph_type in protocol_graph_types
+        )
 
 
     gui.initialize()

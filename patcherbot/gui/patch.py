@@ -17,6 +17,7 @@ from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.patch import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
+from patcherbot.gui.ParamConfig import ParamConfig
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
 from patcherbot.interface.base import command
 
@@ -65,7 +66,7 @@ class PatchGui(ManipulatorGui):
         self.interface_signals[self.patch_interface] = (self.patch_command_signal,
                                                         self.patch_reset_signal)
         self.add_config_gui(self.patch_interface.config)
-        self.add_config_gui(self.patch_interface.protocol_config)
+        self._add_protocol_config_gui()
         self.experiment_book_tab = self.add_config_gui(
             self.patch_interface.experiment_book_config,
             gui_class=ExperimentBookTab,
@@ -99,6 +100,48 @@ class PatchGui(ManipulatorGui):
             lambda: self.record_button.setChecked(self.recording_state_manager.is_recording_enabled())
         )
         self._recording_indicator_timer.start(100)
+
+    def _add_protocol_config_gui(self):
+        protocol_config = self.patch_interface.protocol_config
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        selection_group = QtWidgets.QGroupBox("Run Protocols", widget)
+        grid = QtWidgets.QGridLayout(selection_group)
+        pipette_keys = list(self.patch_interface.protocol_selections)
+        protocol_rows = (
+            ("voltage_protocol", "Voltage"),
+            ("current_protocol", "Current"),
+            ("voltage_sweep_protocol", "Voltage Sweep"),
+            ("holding_protocol", "Holding"),
+            ("opto_random_wavelength_protocol", "Optogenetic Wavelength"),
+            ("opto_random_power_protocol", "Optogenetic Power"),
+        )
+
+        grid.addWidget(QtWidgets.QLabel("Protocol"), 0, 0)
+        for column, pipette_key in enumerate(pipette_keys, start=1):
+            grid.addWidget(QtWidgets.QLabel(f"Pipette {column}"), 0, column, alignment=Qt.AlignCenter)
+
+        self.protocol_checkboxes = {}
+        for row, (protocol_name, label) in enumerate(protocol_rows, start=1):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            for column, pipette_key in enumerate(pipette_keys, start=1):
+                checkbox = QtWidgets.QCheckBox()
+                checkbox.setChecked(
+                    self.patch_interface.protocol_selections[pipette_key][protocol_name]
+                )
+                checkbox.stateChanged.connect(
+                    lambda state, key=pipette_key, name=protocol_name:
+                    self.patch_interface.set_protocol_selection(
+                        key, name, state == Qt.Checked
+                    )
+                )
+                grid.addWidget(checkbox, row, column, alignment=Qt.AlignCenter)
+                self.protocol_checkboxes[(pipette_key, protocol_name)] = checkbox
+
+        layout.addWidget(selection_group)
+        layout.addWidget(ParamConfig(protocol_config))
+        layout.addStretch(1)
+        self.add_tab(widget, protocol_config.name)
 
     def close(self):
         self._display_position_timer.stop()

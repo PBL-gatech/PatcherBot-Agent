@@ -35,6 +35,13 @@ class PipetteInterface(TaskInterface):
         self.microscope = microscope
         self.camera = camera
         self.display_positions = None
+        self.pipette_units = dict(unit) if isinstance(unit, dict) else {"pipette_0": unit}
+        if not self.pipette_units:
+            raise ValueError("At least one pipette unit must be selected")
+        # This interface currently drives one patch workflow at a time, but
+        # retain every selected unit so position queries and camera rendering
+        # can address all selected pipettes.
+        unit = next(iter(self.pipette_units.values()))
         # Create a common calibration configuration for all stages/manipulators
         self.calibration_config = CalibrationConfig(name='Calibration')
         if calibration_data:
@@ -52,6 +59,19 @@ class PipetteInterface(TaskInterface):
                                                 microscope,
                                                 camera,
                                                 config=self.calibration_config)
+        unit_items = self.pipette_units.items()
+        primary_key = next(iter(self.pipette_units))
+        self.calibrated_units = {primary_key: self.calibrated_unit}
+        for pipette_key, pipette_unit in unit_items:
+            if pipette_key == primary_key:
+                continue
+            self.calibrated_units[pipette_key] = CalibratedUnit(
+                pipette_unit,
+                self.calibrated_stage,
+                microscope,
+                camera,
+                config=self.calibration_config,
+            )
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
         self.observer = Observer(self)
         self.time_truth = datetime.now()
@@ -89,6 +109,13 @@ class PipetteInterface(TaskInterface):
         self.safe_stage_position = None
         self.tare_pipette = np.array([None, None, None])
         self.tare_stage = np.array([None, None, None])
+
+    def get_pipette_positions(self):
+        """Return current XYZ positions for every selected pipette."""
+        return {
+            name: np.asarray(pipette_unit.position(), dtype=float).copy()
+            for name, pipette_unit in self.pipette_units.items()
+        }
 
     def connect(self, main_gui):
         pass #TODO: unused?

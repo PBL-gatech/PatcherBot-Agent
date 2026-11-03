@@ -3,6 +3,7 @@
 Control of automatic patch clamp algorithm
 '''
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.controller import AutoPatcher
@@ -10,7 +11,7 @@ from patcherbot.utils import EPhysLogger, RecordingStateManager
 from patcherbot.devices.pressurecontroller.BasePressureController import PressureController
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
-from patcherbot.devices.amplifier.DAQ import DAQ
+from patcherbot.devices.amplifier.DAQ import DAQ, DAQProtocolSession
 from patcherbot.devices.lamp import Lamp
 from patcherbot.configs.PatchConfig import PatchConfig
 from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
@@ -49,28 +50,135 @@ class AutoPatchInterface(TaskInterface):
             cleaned = {k: v for k, v in protocol_data.items() if v is not None}
             self.protocol_config.from_dict(cleaned)
         self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
-        self.amplifier = amplifier
+        self.amplifiers = amplifier if isinstance(amplifier, dict) else {"amplifier_0": amplifier}
+        self.amplifier = next(iter(self.amplifiers.values()))
         self.daq = daq
-        self.pressure = pressure
+        self.pressures = pressure if isinstance(pressure, dict) else {"pressure_0": pressure}
+        self.pressure = next(iter(self.pressures.values()))
         self.pipette_controller = pipette_interface
         self.recording_state_manager = recording_state_manager
         self.lamp = lamp
         self.laser = laser
         self.ephys_logger = EPhysLogger(recording_state_manager=self.recording_state_manager, ephys_filename="CellMetadata")
-        autopatcher = AutoPatcher(amplifier, daq, pressure, self.pipette_controller.calibrated_unit,
-                                    self.pipette_controller.calibrated_unit.microscope,
-                                    calibrated_stage=self.pipette_controller.calibrated_stage,
-                                    lamp=self.lamp,
-                                    laser=self.laser,
-                                    config=self.config,
-                                    protocol_config=self.protocol_config)
-        self.current_autopatcher = autopatcher
+        self.protocol_daQs = {}
+        self.autopatchers = {}
+        for pipette_number, (pipette_key, calibrated_unit) in enumerate(
+                self.pipette_controller.calibrated_units.items(), start=1):
+            pipette_amplifier = self._device_for_pipette(self.amplifiers, "amplifier", pipette_number)
+            pipette_pressure = self._device_for_pipette(self.pressures, "pressure", pipette_number)
+            protocol_daq = DAQProtocolSession(daq, pipette_number)
+            self.protocol_daQs[pipette_key] = protocol_daq
+            self.autopatchers[pipette_key] = AutoPatcher(
+                pipette_amplifier,
+                protocol_daq,
+                pipette_pressure,
+                calibrated_unit,
+                calibrated_unit.microscope,
+                calibrated_stage=self.pipette_controller.calibrated_stage,
+                lamp=self.lamp,
+                laser=self.laser,
+                config=self.config,
+                protocol_config=self.protocol_config,
+            )
+        self.current_autopatcher = next(iter(self.autopatchers.values()))
+        self.protocol_selections = {
+            pipette_key: {
+                protocol_name: bool(getattr(self.protocol_config, protocol_name))
+                for protocol_name in self._PROTOCOL_SELECTION_NAMES
+            }
+            for pipette_key in self.autopatchers
+        }
 
         self.is_selecting_cells = False
         self.is_selecting_corners = False
         self.cells_to_patch = []
         self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
+
+    _PROTOCOL_SELECTION_NAMES = (
+        "voltage_protocol",
+        "current_protocol",
+        "voltage_sweep_protocol",
+        "holding_protocol",
+        "opto_random_wavelength_protocol",
+        "opto_random_power_protocol",
+    )
+
+    @staticmethod
+    def _device_for_pipette(devices, slot, pipette_number):
+        if len(devices) == 1:
+            return next(iter(devices.values()))
+        return devices.get(f"{slot}_{pipette_number - 1}", next(iter(devices.values())))
+
+    def set_protocol_selection(self, pipette_key, protocol_name, selected):
+        self.protocol_selections[pipette_key][protocol_name] = bool(selected)
+
+    def _run_protocol_step(self, pipette_key, protocol_name):
+        autopatcher = self.autopatchers[pipette_key]
+        daq = autopatcher.daq
+        if protocol_name == "voltage_protocol":
+            daq.setCellMode(True)
+            autopatcher.run_voltage_protocol()
+        elif protocol_name == "current_protocol":
+            daq.setCellMode(False)
+            autopatcher.iholding = autopatcher.getHolding()
+            autopatcher.run_current_protocol()
+            daq.setCellMode(True)
+        elif protocol_name == "voltage_sweep_protocol":
+            daq.setCellMode(True)
+            autopatcher.run_voltage_sweep_protocol()
+        elif protocol_name == "holding_protocol":
+            daq.setCellMode(True)
+            autopatcher.run_holding_protocol()
+        elif protocol_name in {
+                "opto_random_wavelength_protocol", "opto_random_power_protocol"}:
+            config = autopatcher.protocol_config
+            if protocol_name == "opto_random_wavelength_protocol":
+                opto_params = {
+                    "randomize_target": "wavelength",
+                    "wavelengths": ["red", "green", "cyan", "uv", "blue", "infrared"],
+                    "powers": [float(config.opto_wavelength_power)],
+                }
+            else:
+                opto_params = {
+                    "randomize_target": "power",
+                    "wavelengths": [config.opto_power_wavelength],
+                    "powers": list(range(0, 101, 20)),
+                }
+            opto_params.update({
+                "stabilize_time": float(config.opto_stabilize_time),
+                "off_time": float(config.opto_off_time),
+                "on_time": float(config.opto_on_time),
+                "replicates": int(config.opto_replicates),
+                "randomize": True,
+            })
+            autopatcher.run_optogenetic_protocol(opto_params)
+
+    def _run_protocol_matrix(self, task_controller):
+        protocol_order = (
+            "voltage_protocol",
+            "current_protocol",
+            "voltage_sweep_protocol",
+            "holding_protocol",
+            "opto_random_wavelength_protocol",
+            "opto_random_power_protocol",
+        )
+        for protocol_name in protocol_order:
+            task_controller.abort_if_requested()
+            task_controller.success_if_requested()
+            selected = [
+                pipette_key for pipette_key, selections in self.protocol_selections.items()
+                if selections.get(protocol_name, False)
+            ]
+            if not selected:
+                continue
+            with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+                futures = [
+                    executor.submit(self._run_protocol_step, pipette_key, protocol_name)
+                    for pipette_key in selected
+                ]
+                for future in futures:
+                    future.result()
 
 
     @blocking_command(category='Calibration', description='Save X origin',
@@ -108,13 +216,22 @@ class AutoPatchInterface(TaskInterface):
         voltage_hold = float("nan")
         current_hold = float("nan")
 
-        if getattr(protocol_config, "voltage_protocol", False):
+        voltage_selected = any(
+            selection.get("voltage_protocol", False)
+            for selection in self.protocol_selections.values()
+        )
+        current_selected = any(
+            selection.get("current_protocol", False)
+            for selection in self.protocol_selections.values()
+        )
+
+        if voltage_selected:
             try:
                 voltage_hold = float(protocol_config.vclamp_hold) * 1e3
             except (TypeError, ValueError):
                 voltage_hold = float("nan")
 
-        if getattr(protocol_config, "current_protocol", False):
+        if current_selected:
             try:
                 current_hold = float(protocol_config.cclamp_hold)
             except (TypeError, ValueError):
@@ -268,7 +385,10 @@ class AutoPatchInterface(TaskInterface):
                 voltage_hold=voltage_hold,
                 current_hold=current_hold,
             )
-        self.execute(self.current_autopatcher.run_protocols)
+        self.execute(
+            self.current_autopatcher.run_protocol_matrix,
+            argument=self._run_protocol_matrix,
+        )
 
     @blocking_command(category='DAQ',
             description='Run Optogenetic Protocol',

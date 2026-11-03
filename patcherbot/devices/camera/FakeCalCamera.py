@@ -15,11 +15,11 @@ class FakeCalCamera(Camera):
         self.height : int = 1024
         self.exposure_time : int = 30
         self.stageManip : Manipulator = stageManip
-        self.pipetteManip : Manipulator = pipetteManip
+        self.pipetteManip = pipetteManip
         self.image_z : float = image_z
         self.pixels_per_micron : float = 1.25  # pixels / micrometers
         self.frameno : int = 0
-        self.pipette = FakePipette(self.pipetteManip, self.pixels_per_micron)
+        self.set_pipette_manipulators(pipetteManip)
         self.targetFramerate = targetFramerate
         self.cellSorterManip = cellSorterManip
         self.cellSorterHandler = FakeCellSorterHandler(self.stageManip, self.cellSorterManip, [400, 200, 0], self.pixels_per_micron)
@@ -29,11 +29,7 @@ class FakeCalCamera(Camera):
         #setup frame image (numpy because of easy rolling)
         self.frame = cv2.imread(curFile + "/FakeMicroscopeImgs/background.tif", cv2.IMREAD_GRAYSCALE)
         # self.frame = cv2.imread(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\devices\camera\FakeMicroscopeImgs\213125_1733864762.600275.webp",cv2.IMREAD_GRAYSCALE)
-        # self.frame = cv2.imread(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\devices\camera\FakeMicroscopeImgs\8ae5dd1d-c8de-4e00-8ba8-bc724275ee2f.webp",cv2.IMREAD_GRAYSCALE)
         # self.frame = cv2.imread(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\deepLearning\cellModel\example pictures\before.tiff", cv2.IMREAD_GRAYSCALE)
-        # self.frame = cv2.imread(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\devices\camera\FakeMicroscopeImgs\cellsegtest.png", cv2.IMREAD_GRAYSCALE)
-        # self.frame = cv2.imread(r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\patcherbot\deepLearning\cellModel\sam2\notebooks\images\cars.jpg", cv2.IMREAD_GRAYSCALE)
-  
         self.frame = cv2.resize(self.frame, dsize=(self.width * 2, self.height * 2), interpolation=cv2.INTER_NEAREST)
 
         self.last_img = None
@@ -46,6 +42,25 @@ class FakeCalCamera(Camera):
 
         #start image recording thread
         self.start_acquisition()
+
+    def set_pipette_manipulators(self, pipetteManip):
+        """Set one or more manipulators while preserving each pipette key."""
+        self.pipetteManip = pipetteManip
+        if isinstance(pipetteManip, dict):
+            self.pipette_manipulators = dict(pipetteManip)
+        elif isinstance(pipetteManip, (list, tuple)):
+            self.pipette_manipulators = {
+                f"pipette_{index}": manipulator
+                for index, manipulator in enumerate(pipetteManip)
+            }
+        else:
+            self.pipette_manipulators = {"pipette_0": pipetteManip} if pipetteManip is not None else {}
+        self.pipettes = {
+            name: FakePipette(manipulator, self.pixels_per_micron)
+            for name, manipulator in self.pipette_manipulators.items()
+        }
+        # Keep the legacy singular property pointing at the first pipette.
+        self.pipette = next(iter(self.pipettes.values()), None)
 
     def normalize(self):
         print('normalize not implemented for FakeCalCamera')
@@ -78,25 +93,37 @@ class FakeCalCamera(Camera):
         #Note: use float 32 rather than int16 for opencv sobel filter compatability (focus score)
         return (self.raw_snap().astype(np.float32) / 255) * 65535 
 
+    def get_fake_pipette_tip_xy(self, pipette_id=None):
+        """Return the rendered tip coordinate for a selected fake pipette."""
+        if not self.pipettes:
+            return None
+        if pipette_id is None:
+            pipette = next(iter(self.pipettes.values()))
+        elif isinstance(pipette_id, int):
+            pipette = list(self.pipettes.values())[pipette_id]
+        elif not isinstance(pipette_id, str):
+            manipulator = getattr(pipette_id, "dev", pipette_id)
+            pipette = next(
+                fake_pipette for fake_pipette in self.pipettes.values()
+                if fake_pipette.manipulator is manipulator
+            )
+        else:
+            pipette = self.pipettes[pipette_id]
+        return pipette.last_tip_xy
+
     def get_frame_no(self):
         return self.frameno
 
     def raw_snap(self):
-        '''
-        Returns the current image.
-        This is a blocking call (wait until next frame is available)
-        '''
+        """Return a synthetic microscope frame with all selected pipettes."""
         start = time.time()
-        # Use the part of the image under the microscope
         stage_x, stage_y, stage_z = self.stageManip.position_group([1, 2, 3])
 
-        startPos = [-235000, 55000, 285000]
-        # startPos = [0,0,0]
-        stage_x = stage_x - startPos[0]
-        stage_y = stage_y - startPos[1]
-        stage_z = stage_z - startPos[2]
+        start_pos = [-235000, 55000, 285000]
+        stage_x -= start_pos[0]
+        stage_y -= start_pos[1]
+        stage_z -= start_pos[2]
 
-        #get background at current stage position
         img_x = -stage_x * self.pixels_per_micron
         img_y = -stage_y * self.pixels_per_micron
         frame = self.get_microscope_image(img_x, img_y)
@@ -109,8 +136,12 @@ class FakeCalCamera(Camera):
         frame = cv2.GaussianBlur(np.array(frame), (63,63), focusFactor)
         frame = Image.fromarray(frame)
 
-        #add pipette to image
-        frame = self.pipette.add_pipette_to_img(frame, [stage_x, stage_y, stage_z])
+        # Draw every selected fake pipette; controller mappings must not be
+        # collapsed to a single position just to satisfy the renderer.
+        for pipette in self.pipettes.values():
+            frame = Image.fromarray(
+                pipette.add_pipette_to_img(frame, [stage_x, stage_y, stage_z])
+            )
 
         #add cellsorter to image
         # frame = self.cellSorterHandler.add_cellsorter_to_img(frame, [stage_x, stage_y, stage_z])
@@ -126,7 +157,6 @@ class FakeCalCamera(Camera):
         dt = time.time() - start
         if dt < (1/self.targetFramerate):
             time.sleep((1/self.targetFramerate) - dt)
-        
         return frame
     
 class FakeCellSorterHandler():
@@ -296,6 +326,7 @@ class FakePipette():
         self.pipetteImg = self.pipetteImg.resize((self.pipetteImg.size[0] * 4, self.pipetteImg.size[1] * 2), Image.Resampling.BILINEAR)
         filter = ImageEnhance.Brightness(self.pipetteImg)
         self.pipetteImg = filter.enhance(1.2)
+        self.last_tip_xy = None
 
         #create an alpha mask for the pipette (to make pipette see through)
         filter = ImageEnhance.Brightness(self.pipetteImg)
@@ -328,8 +359,11 @@ class FakePipette():
         pipette_pos_img_coords = pipette_pos_stage_coords * self.pixels_per_micron
 
         #get x,y - convert to int, make relative to frame
-        pipette_img_x = int(pipette_pos_img_coords[0] - stage_img_x) - self.pipetteImg.size[0] #pipette_pos should correspond to tip of pipette (upper right) 
-        pipette_img_y = int(pipette_pos_img_coords[1] - stage_img_y)
+        tip_x = int(pipette_pos_img_coords[0] - stage_img_x)
+        tip_y = int(pipette_pos_img_coords[1] - stage_img_y)
+        self.last_tip_xy = (tip_x, tip_y)
+        pipette_img_x = tip_x - self.pipetteImg.size[0] #pipette_pos should correspond to tip of pipette (upper right)
+        pipette_img_y = tip_y
 
         #blur pipette proportionally to distance between stage_z and pipette_z
         focusFactor = abs(stage_z - pipette_pos_stage_coords[2]) / 10

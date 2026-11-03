@@ -621,7 +621,12 @@ class RigConfigManager:
                     raise RigConfigError(f"Shared device slot '{slot}' cannot contain multiple devices.")
                 if not curr_device:
                     raise RigConfigError(f"Device slot '{slot}' contains an empty device list.")
-                devices_to_initialize = curr_device[:active_pipette_count]
+                # A DAQ is a rig-level resource. In particular, constructing
+                # one FakeDAQ per pipette starts competing replay/acquisition
+                # threads over the same replay source. Keep accepting legacy
+                # per-pipette config lists, but instantiate only one DAQ.
+                device_count = 1 if slot == "daq" else active_pipette_count
+                devices_to_initialize = curr_device[:device_count]
                 instance_dict: Dict[str, Any] = {}
                 for i, dev_cfg in enumerate(devices_to_initialize):
 
@@ -641,7 +646,32 @@ class RigConfigManager:
 
                     instance_dict[instance_key] = instance
 
-                base_instances[slot] = instance_dict
+                if slot == "daq":
+                    daq = next(iter(instance_dict.values()))
+                    daq.active_pipette_count = active_pipette_count
+                    # Preserve explicit routing declarations from config for
+                    # future single-DAQ / multi-pipette rig configurations.
+                    route_map: Dict[str, Any] = {}
+                    for dev_cfg in curr_device:
+                        params = dev_cfg.get("params", {}) if isinstance(dev_cfg, dict) else {}
+                        routes = params.get("analog_io_to_pipette", {}) if isinstance(params, dict) else {}
+                        if isinstance(routes, dict):
+                            route_map.update(routes)
+                    if route_map:
+                        configure_routes = getattr(daq, "configure_analog_io_to_pipette", None)
+                        if callable(configure_routes):
+                            configure_routes(route_map)
+                        else:
+                            daq.analog_io_to_pipette = dict(route_map)
+                    base_instances[slot] = daq
+                    if len(curr_device) > 1:
+                        LOGGER.warning(
+                            "DAQ slot contains %d legacy entries; instantiated one rig-level DAQ. "
+                            "Use params.analog_io_to_pipette to route analog inputs to pipettes.",
+                            len(curr_device),
+                        )
+                else:
+                    base_instances[slot] = instance_dict
 
             # Single-instance device slot.
             elif isinstance(curr_device, dict):
@@ -650,6 +680,17 @@ class RigConfigManager:
                     curr_device,
                     base_instances,
                 )
+                if slot == "daq":
+                    daq = base_instances[slot]
+                    daq.active_pipette_count = active_pipette_count
+                    params = curr_device.get("params", {})
+                    routes = params.get("analog_io_to_pipette", {}) if isinstance(params, dict) else {}
+                    if routes:
+                        configure_routes = getattr(daq, "configure_analog_io_to_pipette", None)
+                        if callable(configure_routes):
+                            configure_routes(routes)
+                        else:
+                            daq.analog_io_to_pipette = dict(routes)
             else:
                 raise RigConfigError(
                 f"Invalid configuration for device slot '{slot}'. "
@@ -896,12 +937,15 @@ class RigConfigManager:
             if slot in PIPETTE_DEVICE_SLOTS:
                 spec = devices[slot]
                 if pipette_count > 1:
+                    # A DAQ can be configured once for a multi-pipette rig;
+                    # the other slots still require one device per pipette.
+                    if slot == "daq" and isinstance(spec, dict):
+                        continue
                     if not isinstance(spec, list):
                         raise RigConfigError(
                             f"'{slot}' must contain {pipette_count} "
                             "device configurations."
                         )
-
                     if len(spec) != pipette_count:
                         raise RigConfigError(
                             f"'{slot}' contains {len(spec)} devices, "

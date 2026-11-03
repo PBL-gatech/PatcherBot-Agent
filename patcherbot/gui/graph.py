@@ -41,14 +41,21 @@ __all__ = [
 class ProtocolGraph(QWidget):
     def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
                  window_title: str, y_label: str, y_unit: str,
-                 x_label: str, x_unit: str, ephys_filename: str):
+                 x_label: str, x_unit: str, ephys_filename: str,
+                 pipette_name: str | None = None):
         super().__init__()
         self.recording_state_manager = recording_state_manager
         self.graph_interface= graph_interface
-     
+        self.pipette_name = pipette_name
+        self.pipette_slug = (
+            "" if pipette_name is None else
+            "_" + "_".join(pipette_name.strip().lower().split())
+        )
+        self.file_prefix = self.pipette_slug.lstrip("_") + "_" if self.pipette_slug else ""
 
         # Set window title and layout
-        self.setWindowTitle(window_title)
+        display_title = f"{window_title} - {pipette_name}" if pipette_name else window_title
+        self.setWindowTitle(display_title)
         layout = QVBoxLayout()
 
         # Create and configure the PlotWidget
@@ -79,19 +86,20 @@ class ProtocolGraph(QWidget):
             logging.info(f"{window_title} Timer not active")
 
         # Initialize the ephys logger with a protocol-specific filename
-        self.ephys_logger = EPhysLogger(ephys_filename=ephys_filename,
+        self.ephys_logger = EPhysLogger(ephys_filename=f"{ephys_filename}{self.pipette_slug}",
                                         recording_state_manager=self.recording_state_manager)
 
     def update_plot(self):
         """This method should be overridden by subclasses."""
         raise NotImplementedError("Subclasses must implement update_plot()")
 class CurrentProtocolGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+                 *, pipette_name: str | None = None):
         super().__init__(graph_interface, recording_state_manager,
                          window_title="Current Protocol",
                          y_label="Voltage", y_unit="V",
                          x_label="Time", x_unit="s",
-                         ephys_filename="CurrentProtocol")
+                         ephys_filename="CurrentProtocol", pipette_name=pipette_name)
 
     def update_plot(self):
         # Check if new data exists and if it’s different from what was last displayed
@@ -138,12 +146,13 @@ class CurrentProtocolGraph(ProtocolGraph):
         self.latestDisplayedData = (self.graph_interface.daq.current_protocol_data.copy() 
                                     if self.graph_interface.daq.current_protocol_data is not None else None)
 class VoltageProtocolGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+                 *, pipette_name: str | None = None):
         super().__init__(graph_interface, recording_state_manager,
                          window_title="Voltage Protocol (Membrane Test)",
                          y_label="PicoAmps", y_unit="A",
                          x_label="Time", x_unit="s",
-                         ephys_filename="VoltageProtocol")
+                         ephys_filename="VoltageProtocol", pipette_name=pipette_name)
 
     def update_plot(self):
         daq = self.graph_interface.daq
@@ -211,7 +220,7 @@ class VoltageProtocolGraph(ProtocolGraph):
             step_label = f"{int(round(step_mV))}mV" if step_mV is not None else "step"
             hold_label = f"{int(round(sweep_hold_mV))}mV" if sweep_hold_mV is not None else "hold"
 
-            filename_override = f"MembraneTest_{index}_{mem_color}_{hold_label}_{step_label}"
+            filename_override = f"{self.file_prefix}MembraneTest_{index}_{mem_color}_{hold_label}_{step_label}"
             if timeData is not None and respData is not None:
                 self.ephys_logger.write_ephys_data(
                     index,
@@ -224,7 +233,7 @@ class VoltageProtocolGraph(ProtocolGraph):
                 self.ephys_logger.save_ephys_plot(
                     index,
                     self.plotWidget,
-                    filename_override=f"MembraneTest_{index}"
+                    filename_override=f"{self.file_prefix}MembraneTest_{index}"
                 )
 
         # Reset DAQ buffers after plotting
@@ -234,7 +243,8 @@ class VoltageProtocolGraph(ProtocolGraph):
         daq.vclamp_steps = None
         daq.vclamp_hold_value = None
 class LeakSubtractionGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+                 *, pipette_name: str | None = None):
         super().__init__(
             graph_interface,
             recording_state_manager,
@@ -244,6 +254,7 @@ class LeakSubtractionGraph(ProtocolGraph):
             x_label="Time",
             x_unit="s",
             ephys_filename="LeakSubtraction",
+            pipette_name=pipette_name,
         )
 
     def update_plot(self):
@@ -291,19 +302,20 @@ class LeakSubtractionGraph(ProtocolGraph):
         self.ephys_logger.save_ephys_plot(
             index,
             self.plotWidget,
-            filename_override=f"LeakSubtraction_{index}"
+            filename_override=f"{self.file_prefix}LeakSubtraction_{index}"
         )
 
         self.latestDisplayedData = sweep_count
         daq.leak_subtraction_data = None
         daq.leak_subtraction_meta = None
 class HoldingProtocolGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+                 *, pipette_name: str | None = None):
         super().__init__(graph_interface, recording_state_manager,
                          window_title="Holding Protocol (E/I PSC Test)",
                          y_label="PicoAmps", y_unit="A",
                          x_label="Time", x_unit="s",
-                         ephys_filename="HoldingProtocol")
+                         ephys_filename="HoldingProtocol", pipette_name=pipette_name)
 
     def update_plot(self):
         if self.graph_interface.daq.holding_protocol_data is None:
@@ -337,6 +349,7 @@ class OptogeneticBaseGraph(ProtocolGraph):
         *,
         window_title: str,
         protocol_key: str,
+        pipette_name: str | None = None,
     ):
         super().__init__(
             graph_interface,
@@ -347,6 +360,7 @@ class OptogeneticBaseGraph(ProtocolGraph):
             x_label="Time",
             x_unit="s",
             ephys_filename="OptogeneticProtocol",
+            pipette_name=pipette_name,
         )
         self.protocol_key = protocol_key
 
@@ -491,22 +505,26 @@ class OptogeneticBaseGraph(ProtocolGraph):
 
 
 class OptogeneticStimProtocolGraph(OptogeneticBaseGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+                 *, pipette_name: str | None = None):
         super().__init__(
             graph_interface,
             recording_state_manager,
             window_title="Optogenetic Stim Protocol",
             protocol_key="power",
+            pipette_name=pipette_name,
         )
 
 
 class OptogeneticWavelengthProtocolGraph(OptogeneticBaseGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+                 *, pipette_name: str | None = None):
         super().__init__(
             graph_interface,
             recording_state_manager,
             window_title="Optogenetic Wavelength Protocol",
             protocol_key="wavelength",
+            pipette_name=pipette_name,
         )
 
 class NoiseGraph(QWidget):

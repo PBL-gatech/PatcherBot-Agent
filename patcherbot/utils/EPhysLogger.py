@@ -17,6 +17,7 @@ class EPhysLogger(threading.Thread):
         if testMode:
             folder_path = folder_path.replace("Data/", "Data/TEST_")
         self.folder_path = folder_path + self.time_truth.strftime("%Y_%m_%d-%H_%M") + "/" + f"{ephys_filename}" + "/"
+        self.ephys_filename = ephys_filename
         self.filename = self.folder_path + f"{ephys_filename}"
         self.file = None
 
@@ -101,7 +102,7 @@ class EPhysLogger(threading.Thread):
 
     def _optogenetic_basename(self, index, protocol_type):
         protocol_type = self._normalize_protocol_type(protocol_type)
-        return f"OptogeneticProtocol_{index}_{protocol_type}"
+        return f"{self.ephys_filename}_{index}_{protocol_type}"
 
     def write_optogenetic_data(self, index, timeData, readData, respData, protocol_type):
         basename = self._optogenetic_basename(index, protocol_type)

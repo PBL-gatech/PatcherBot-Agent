@@ -887,6 +887,12 @@ class AutoPatcher(TaskController):
     # endregion
 
     # region Recording protocols
+    def run_protocol_matrix(self, protocol_runner):
+        """Run the interface's per-pipette protocol matrix as a controller task."""
+        self.abort_if_requested()
+        protocol_runner(self)
+        self.success_if_requested()
+
     @record_state("run_protocols")
     def run_protocols(self):
         self.daq.setCellMode(True)
