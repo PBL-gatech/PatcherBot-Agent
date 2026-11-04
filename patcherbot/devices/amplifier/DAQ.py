@@ -19,6 +19,7 @@ __all__ = ['NiDAQ', 'ArduinoDAQ', 'FakeDAQ', 'PipetteChannels', 'PipetteDAQView'
 
 import collections
 import contextlib
+import functools
 import logging
 from dataclasses import dataclass
 
@@ -121,6 +122,46 @@ def _new_pipette_state():
         name: (default() if callable(default) else default)
         for name, default in _PER_PIPETTE_FIELDS.items()
     }
+
+
+def multi_pipette_protocol(method):
+    """Protocol that acquires every requested pipette in the same reads.
+
+    The decorated method is written as ``method(self, keys, **kwargs)`` and
+    returns ``{pipette_key: result}``. Callers pass ``pipettes=[...]``
+    (default: the active pipette only). Protocols use the shared hardware one
+    at a time.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, pipettes=None, **kwargs):
+        keys = self._protocol_pipettes(pipettes)
+        with self._protocol_lock:
+            return method(self, keys, *args, **kwargs)
+    return wrapper
+
+
+def per_pipette_protocol(method):
+    """Adapter for a protocol body still written for ONE pipette.
+
+    Gives it the same ``pipettes=[...]`` -> ``{pipette_key: result}`` interface
+    as multi_pipette_protocol, but runs the body once per pipette, one after
+    another (not synchronous). Replace with multi_pipette_protocol once the
+    body reads every pipette's channels together.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, pipettes=None, **kwargs):
+        keys = self._protocol_pipettes(pipettes)
+        with self._protocol_lock:
+            if len(keys) > 1 and not getattr(self, "_warned_sequential_protocols", False):
+                self._warned_sequential_protocols = True
+                self.warning(f"{type(self).__name__} runs protocols one pipette at a time "
+                             "(not synchronous across pipettes)")
+            results = {}
+            for key in keys:
+                with self.for_pipette(key):
+                    results[key] = method(self, *args, **kwargs)
+            return results
+    return wrapper
 
 
 class _PerPipetteAttribute:
@@ -401,6 +442,13 @@ class DAQ(TaskController):
         for key in keys:
             self.channels_for(key)
         return keys
+
+    def _protocol_pipettes(self, pipettes=None):
+        """Pipettes a protocol call covers: the given ones (duplicates dropped,
+        order kept), or just the active pipette when None."""
+        if pipettes is None:
+            return [self.active_pipette_key]
+        return list(dict.fromkeys(self._resolve_pipettes(pipettes)))
 
     @staticmethod
     def _rows_to_channel_dict(raw, channel_names):
@@ -1102,18 +1150,10 @@ class PipetteDAQView:
     Holds a reference (never a copy). Every call made through the view runs
     with this pipette active, so ``view.resistance()``,
     ``view.current_protocol_data``, ``view.setCellMode(...)`` and protocol
-    calls all use this pipette's channels and state. Protocols run one at a
-    time on the shared hardware.
+    calls all use this pipette's channels and state. A protocol called through
+    a view covers only this pipette; call the DAQ itself with
+    ``pipettes=[...]`` to acquire several pipettes together.
     """
-
-    _PROTOCOL_METHODS = frozenset({
-        "getDataFromCurrentProtocol",
-        "getDataFromHoldingProtocol",
-        "getDataFromOptogeneticProtocol",
-        "getDataFromVoltageProtocol",
-        "getLeakSubtraction",
-        "getVoltageClampSweep",
-    })
 
     def __init__(self, daq, pipette_key):
         daq.channels_for(pipette_key)       # validate
@@ -1132,13 +1172,9 @@ class PipetteDAQView:
         if not callable(value):
             return value
         key = self.pipette_key
-        serialize = name in self._PROTOCOL_METHODS
 
         def call_for_pipette(*args, **kwargs):
             with daq.for_pipette(key):
-                if serialize:
-                    with daq._protocol_lock:
-                        return value(*args, **kwargs)
                 return value(*args, **kwargs)
 
         call_for_pipette.__name__ = name
@@ -1620,6 +1656,7 @@ class NiDAQ(DAQ):
         ai_task.close()
         return np.asarray(raw, dtype=float)
 
+    @per_pipette_protocol
     def getLeakSubtraction(
             self,
             *,
@@ -1831,6 +1868,7 @@ class NiDAQ(DAQ):
 
         return self.leak_subtraction_data
 
+    @per_pipette_protocol
     def getVoltageClampSweep(
             self,
             *,
@@ -1957,6 +1995,7 @@ class NiDAQ(DAQ):
 
         return self.voltage_protocol_data
 
+    @per_pipette_protocol
     def getDataFromCurrentProtocol(self,
                                    custom: bool = False,
                                    factor: float | None = None,
@@ -2069,6 +2108,7 @@ class NiDAQ(DAQ):
 
         return self.current_protocol_data, self.pulses, self.pulseRange
 
+    @per_pipette_protocol
     def getDataFromHoldingProtocol(self, *, rate_hz: int = 50_000, duration_s: float = 60.0):
         """
         OLD-STYLE baseline read-out (no command output).
@@ -2128,6 +2168,7 @@ class NiDAQ(DAQ):
             # ---------------------------------------------- 3. resume stream
             self.resume_acquisition()
 
+    @per_pipette_protocol
     def getDataFromOptogeneticProtocol(
         self,
         *,
@@ -2291,6 +2332,7 @@ class NiDAQ(DAQ):
                 pass
             self.resume_acquisition()
 
+    @per_pipette_protocol
     def getDataFromVoltageProtocol(
             self,
             *,                       # keyword-only
@@ -2683,11 +2725,15 @@ class FakeDAQ(DAQ):
             raise ValueError(f"No paired current/voltage traces found in {graph_file}")
         return traces
 
-    def _next_recorded_trace(self):
-        """Return (command, response) for the active pipette from one tick."""
-        spec = self.channels_for()
-        data = self._read_recorded([spec.read, spec.resp])
-        return data[spec.read], data[spec.resp]
+    def _read_pipettes(self, keys):
+        """ONE read covering every listed pipette -> ``{key: (read, resp)}``.
+
+        All pipettes come from the same tick, as they would from one
+        hardware task containing all their channels.
+        """
+        specs = [self.channels_for(key) for key in keys]
+        data = self._read_recorded([name for spec in specs for name in (spec.read, spec.resp)])
+        return {key: (data[spec.read], data[spec.resp]) for key, spec in zip(keys, specs)}
 
     @staticmethod
     def _recorded_time(sample_count, rate_hz):
@@ -2708,8 +2754,14 @@ class FakeDAQ(DAQ):
             targets = np.append(targets, end)
         return targets
 
+    # --------------------------------------------------------------
+    # Protocols: each step is one read covering every requested pipette.
+    # Called as daq.<protocol>(pipettes=[...], ...) -> {pipette_key: result}.
+    # --------------------------------------------------------------
+    @multi_pipette_protocol
     def getLeakSubtraction(
             self,
+            keys,
             *,
             start_voltage: float,
             end_voltage: float,
@@ -2727,42 +2779,51 @@ class FakeDAQ(DAQ):
         if repeats <= 0:
             raise ValueError("repeats must be positive")
         targets = self._trace_targets(start_voltage, end_voltage, step_voltage)
-        self.leak_subtraction_data = []
+        data_by_key = {key: [] for key in keys}
         leak_steps = []
         leak_targets = []
 
         for target in targets:
             leak_step = -(target - holding_voltage) / 4.0
             leak_target = holding_voltage + leak_step
-            traces = [self._next_recorded_trace() for _ in range(repeats)]
-            sample_count = min(min(command.size, response.size) for command, response in traces)
-            commands = np.vstack([command[:sample_count] for command, _ in traces])
-            responses = np.vstack([response[:sample_count] for _, response in traces])
-            self.leak_subtraction_data.append({
-                "time": self._recorded_time(sample_count, samplesPerSec),
-                "response": responses.mean(axis=0),
-                "command": commands.mean(axis=0),
-                "target_voltage": target,
-                "leak_target_voltage": leak_target,
-                "leak_step_voltage": leak_step,
-                "repeat_count": repeats,
-            })
+            repeat_reads = [self._read_pipettes(keys) for _ in range(repeats)]
+            for key in keys:
+                traces = [read[key] for read in repeat_reads]
+                sample_count = min(min(command.size, response.size) for command, response in traces)
+                commands = np.vstack([command[:sample_count] for command, _ in traces])
+                responses = np.vstack([response[:sample_count] for _, response in traces])
+                data_by_key[key].append({
+                    "time": self._recorded_time(sample_count, samplesPerSec),
+                    "response": responses.mean(axis=0),
+                    "command": commands.mean(axis=0),
+                    "target_voltage": target,
+                    "leak_target_voltage": leak_target,
+                    "leak_step_voltage": leak_step,
+                    "repeat_count": repeats,
+                })
             leak_steps.append(leak_step)
             leak_targets.append(leak_target)
 
-        self.leak_subtraction_meta = {
-            "holding_voltage": holding_voltage,
-            "targets": targets,
-            "leak_target_voltages": np.asarray(leak_targets, dtype=float),
-            "leak_step_values": np.asarray(leak_steps, dtype=float),
-            "repeats": repeats,
-            "wave_freq": wave_freq,
-            "pulse_recording_time": pulse_recording_time,
-        }
-        return self.leak_subtraction_data
+        results = {}
+        for key in keys:
+            with self.for_pipette(key):
+                self.leak_subtraction_data = data_by_key[key]
+                self.leak_subtraction_meta = {
+                    "holding_voltage": holding_voltage,
+                    "targets": targets,
+                    "leak_target_voltages": np.asarray(leak_targets, dtype=float),
+                    "leak_step_values": np.asarray(leak_steps, dtype=float),
+                    "repeats": repeats,
+                    "wave_freq": wave_freq,
+                    "pulse_recording_time": pulse_recording_time,
+                }
+            results[key] = data_by_key[key]
+        return results
 
+    @multi_pipette_protocol
     def getVoltageClampSweep(
             self,
+            keys,
             *,
             start_voltage: float,
             end_voltage: float,
@@ -2774,33 +2835,30 @@ class FakeDAQ(DAQ):
             recordingTime: float = 0.750
     ):
         targets = self._trace_targets(start_voltage, end_voltage, step_voltage)
-        self.vclamp_steps = targets
-        self.vclamp_hold_value = holding_voltage
-        self.voltage_protocol_data = []
+        sweeps = {key: [] for key in keys}
         for _ in targets:
-            command, response = self._next_recorded_trace()
-            sample_count = min(command.size, response.size)
-            time_data = self._recorded_time(sample_count, samplesPerSec)
-            self.voltage_protocol_data.append([
-                time_data,
-                response[:sample_count],
-                command[:sample_count],
-            ])
-        if targets.size and self.voltage_membrane_test is not None:
-            self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
-        return self.voltage_protocol_data
+            for key, (command, response) in self._read_pipettes(keys).items():
+                sample_count = min(command.size, response.size)
+                sweeps[key].append([
+                    self._recorded_time(sample_count, samplesPerSec),
+                    response[:sample_count],
+                    command[:sample_count],
+                ])
 
-    def getDataFromCurrentProtocol(self,
-                                   custom: bool = False,
-                                   factor: float | None = None,
-                                   startCurrentPicoAmp: float | None = None,
-                                   endCurrentPicoAmp: float | None = None,
-                                   stepCurrentPicoAmp: float = 10,
-                                   recordingTimeMs: float = 500,
-                                   dutyCycle: float = 0.5):
-        recording_time = float(recordingTimeMs) * 1e-3
-        if recording_time <= 0:
-            raise ValueError("recordingTimeMs must be positive")
+        results = {}
+        for key in keys:
+            with self.for_pipette(key):
+                self.vclamp_steps = targets
+                self.vclamp_hold_value = holding_voltage
+                self.voltage_protocol_data = sweeps[key]
+                if targets.size and self.voltage_membrane_test is not None:
+                    self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
+            results[key] = sweeps[key]
+        return results
+
+    def _current_pulses(self, custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp):
+        """Current steps (pA) for the active pipette. The default range scales
+        with that pipette's own membrane capacitance."""
         if not custom:
             capacitance = self.latestMembraneCapacitance
             if capacitance is None or not np.isfinite(capacitance) or capacitance <= 0:
@@ -2825,44 +2883,86 @@ class FakeDAQ(DAQ):
         )
         if 0.0 not in pulses:
             pulses = np.sort(np.append(pulses, 0.0))
+        return pulses
 
-        self.pulses = pulses
-        self.pulseRange = len(pulses)
-        self.current_protocol_data = []
-        for _ in pulses:
-            command_voltage, response_current = self._next_recorded_trace()
-            sample_count = min(command_voltage.size, response_current.size)
-            command_current = response_current[:sample_count]
-            response_voltage = command_voltage[:sample_count]
-            if self.C_CLAMP_AMP_PER_VOLT not in (None, 0):
-                command_current = command_current / self.C_CLAMP_AMP_PER_VOLT
-            if self.C_CLAMP_VOLT_PER_VOLT not in (None, 0):
-                response_voltage = response_voltage / self.C_CLAMP_VOLT_PER_VOLT
-            self.current_protocol_data.append([
-                self._recorded_time(sample_count, 100_000),
-                response_voltage,
-                command_current,
-            ])
-        return self.current_protocol_data, self.pulses, self.pulseRange
+    @multi_pipette_protocol
+    def getDataFromCurrentProtocol(self,
+                                   keys,
+                                   custom: bool = False,
+                                   factor: float | None = None,
+                                   startCurrentPicoAmp: float | None = None,
+                                   endCurrentPicoAmp: float | None = None,
+                                   stepCurrentPicoAmp: float = 10,
+                                   recordingTimeMs: float = 500,
+                                   dutyCycle: float = 0.5):
+        """Current-step protocol for several pipettes; sweep i is one read.
 
-    def getDataFromHoldingProtocol(self, *, rate_hz: int = 50_000, duration_s: float = 60.0):
-        command, response = self._next_recorded_trace()
-        sample_count = min(command.size, response.size)
-        command = command[:sample_count]
-        response = response[:sample_count]
-        hold_voltage = self.holding_voltage
-        if hold_voltage is None:
-            hold_voltage = float(np.mean(command)) if sample_count else 0.0
-        command = np.full(sample_count, hold_voltage, dtype=float)
-        self.holding_protocol_data = np.array([
-            self._recorded_time(sample_count, rate_hz),
-            response,
-            command,
-        ])
-        return self.holding_protocol_data
+        Pipettes can have different numbers of pulses (the default range
+        depends on each pipette's capacitance). Sweep i reads only pipettes
+        that still have a pulse i; on hardware the others would get a 0 command.
+        Returns ``{key: (sweeps, pulses, pulseRange)}``.
+        """
+        recording_time = float(recordingTimeMs) * 1e-3
+        if recording_time <= 0:
+            raise ValueError("recordingTimeMs must be positive")
+        pulses_by_key = {}
+        for key in keys:
+            with self.for_pipette(key):
+                pulses_by_key[key] = self._current_pulses(
+                    custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
 
+        sweeps = {key: [] for key in keys}
+        sweep_count = max(len(pulses) for pulses in pulses_by_key.values())
+        for sweep_index in range(sweep_count):
+            stepping = [key for key in keys if sweep_index < len(pulses_by_key[key])]
+            for key, (command_voltage, response_current) in self._read_pipettes(stepping).items():
+                sample_count = min(command_voltage.size, response_current.size)
+                command_current = response_current[:sample_count]
+                response_voltage = command_voltage[:sample_count]
+                if self.C_CLAMP_AMP_PER_VOLT not in (None, 0):
+                    command_current = command_current / self.C_CLAMP_AMP_PER_VOLT
+                if self.C_CLAMP_VOLT_PER_VOLT not in (None, 0):
+                    response_voltage = response_voltage / self.C_CLAMP_VOLT_PER_VOLT
+                sweeps[key].append([
+                    self._recorded_time(sample_count, 100_000),
+                    response_voltage,
+                    command_current,
+                ])
+
+        results = {}
+        for key in keys:
+            pulses = pulses_by_key[key]
+            with self.for_pipette(key):
+                self.pulses = pulses
+                self.pulseRange = len(pulses)
+                self.current_protocol_data = sweeps[key]
+            results[key] = (sweeps[key], pulses, len(pulses))
+        return results
+
+    @multi_pipette_protocol
+    def getDataFromHoldingProtocol(self, keys, *, rate_hz: int = 50_000, duration_s: float = 60.0):
+        results = {}
+        for key, (command, response) in self._read_pipettes(keys).items():
+            sample_count = min(command.size, response.size)
+            command = command[:sample_count]
+            response = response[:sample_count]
+            with self.for_pipette(key):
+                hold_voltage = self.holding_voltage
+                if hold_voltage is None:
+                    hold_voltage = float(np.mean(command)) if sample_count else 0.0
+                command = np.full(sample_count, hold_voltage, dtype=float)
+                self.holding_protocol_data = np.array([
+                    self._recorded_time(sample_count, rate_hz),
+                    response,
+                    command,
+                ])
+                results[key] = self.holding_protocol_data
+        return results
+
+    @multi_pipette_protocol
     def getDataFromVoltageProtocol(
             self,
+            keys,
             *,                       # keyword-only
             wave_freq: int = 40,
             samplesPerSec: int = 50_000,   # 50 kS/s
@@ -2872,29 +2972,44 @@ class FakeDAQ(DAQ):
             max_attempts: int = 15,
             membrane_hold: float | None = None
     ):
-        self.voltage_membrane_test = None
-        capacitances = []
-        first_result = None
+        """Membrane test: square-wave cycles until each pipette has 5 good
+        capacitance fits (or max_attempts). Each cycle is one read covering
+        every pipette still collecting. Returns ``{key: mean capacitance or None}``."""
+        for key in keys:
+            self._pipette_state(key)["voltage_membrane_test"] = None
+        capacitances = {key: [] for key in keys}
+        first_results = {}
         attempts = 0
-        self._pause_evt.clear()
+        self._pause_evt.clear()          # one pause of the live thread for all pipettes
         try:
-            while attempts < max_attempts and len(capacitances) < 5:
+            while attempts < max_attempts:
+                collecting = [key for key in keys if len(capacitances[key]) < 5]
+                if not collecting:
+                    break
                 attempts += 1
-                key = self.active_pipette_key
-                result = self.getDataFromSquareWave(
+                cycle = self.getDataFromSquareWave(
                     wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime,
-                    pipettes=[key]
-                )[key]
-                if first_result is None:
-                    first_result = result
-                membrane_capacitance = result[5]
-                if (membrane_capacitance is not None
-                        and np.isfinite(membrane_capacitance)
-                        and 0 < membrane_capacitance < 250):
-                    capacitances.append(membrane_capacitance)
+                    pipettes=collecting,
+                )
+                for key, result in cycle.items():
+                    first_results.setdefault(key, result)
+                    membrane_capacitance = result[5]
+                    if (membrane_capacitance is not None
+                            and np.isfinite(membrane_capacitance)
+                            and 0 < membrane_capacitance < 250):
+                        capacitances[key].append(membrane_capacitance)
         finally:
             self._pause_evt.set()
 
+        results = {}
+        for key in keys:
+            with self.for_pipette(key):
+                results[key] = self._store_membrane_test(
+                    first_results.get(key), capacitances[key], membrane_hold)
+        return results
+
+    def _store_membrane_test(self, first_result, capacitances, membrane_hold):
+        """Store one pipette's membrane-test results (active pipette)."""
         if first_result is None:
             self.voltageMembraneCapacitance = None
             return None

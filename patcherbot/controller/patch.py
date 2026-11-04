@@ -962,7 +962,38 @@ class AutoPatcher(TaskController):
             #         holding_current = -50
             return holding_current
 
+    # Each protocol is split into three parts so several pipettes can share
+    # one synchronous DAQ acquisition:
+    #   prepare_<name>()  amplifier setup; returns the DAQ steps as a list of
+    #                     (daq_method_name, kwargs)
+    #   DAQ steps         run once for every selected pipette by the interface
+    #                     (or for this pipette alone by run_<name>)
+    #   finish_<name>()   amplifier cleanup
+    # run_<name>() runs all three for this pipette alone.
+
+    def _run_daq_steps(self, steps):
+        """Run DAQ steps for this pipette only; returns this pipette's results."""
+        pipette_key = getattr(self.daq, "pipette_key", None) or self.daq.active_pipette_key
+        results = []
+        for index, (method_name, kwargs) in enumerate(steps):
+            if index:
+                self.sleep(0.25)
+            result = getattr(self.daq, method_name)(**kwargs)
+            results.append(result.get(pipette_key) if isinstance(result, dict) else result)
+        return results
+
+    def _run_split_protocol(self, prepare, finish, *args):
+        steps = prepare(*args)
+        try:
+            return self._run_daq_steps(steps)
+        finally:
+            finish()
+
     def run_voltage_protocol(self):
+        self._run_split_protocol(self.prepare_voltage_protocol, self.finish_voltage_protocol)
+
+    def prepare_voltage_protocol(self):
+        self.daq.setCellMode(True)
         self.info('Running voltage protocol (membrane test)')
         self.amplifier.voltage_clamp()
         self.sleep(0.25)
@@ -970,7 +1001,7 @@ class AutoPatcher(TaskController):
         self.sleep(0.25)
         self.amplifier.auto_slow_compensation()
         self.sleep(0.25)
-        self.info('auto capacitance compensation')  
+        self.info('auto capacitance compensation')
         holding = self.amplifier.get_holding()
         if holding is None:
             holding = -0.070
@@ -983,20 +1014,23 @@ class AutoPatcher(TaskController):
         self.amplifier.switch_holding(True)
         self.info('enabled holding')
         self.sleep(0.25)
+        self.info("Getting data from voltage membrane test")
+        return [("getDataFromVoltageProtocol", {"membrane_hold": membrane_hold})]
 
-        try:
-            self.info("Getting data from voltage membrane test")
-            self.daq.getDataFromVoltageProtocol(membrane_hold=membrane_hold)
-            self.sleep(0.25)
-
-        finally:
-            self.amplifier.set_holding(membrane_hold)
-            self.amplifier.switch_holding(True)
-            self.sleep(0.25)
-            self.info(f'holding reset to {membrane_hold * 1e3:.1f} mV after voltage protocol')
-            self.info('finished running voltage membrane test')
+    def finish_voltage_protocol(self):
+        self.sleep(0.25)
+        membrane_hold = float(self.protocol_config.vclamp_hold)
+        self.amplifier.set_holding(membrane_hold)
+        self.amplifier.switch_holding(True)
+        self.sleep(0.25)
+        self.info(f'holding reset to {membrane_hold * 1e3:.1f} mV after voltage protocol')
+        self.info('finished running voltage membrane test')
 
     def run_voltage_sweep_protocol(self):
+        self._run_split_protocol(self.prepare_voltage_sweep_protocol, self.finish_voltage_sweep_protocol)
+
+    def prepare_voltage_sweep_protocol(self):
+        self.daq.setCellMode(True)
         self.info('Running voltage sweep protocol')
         self.amplifier.voltage_clamp()
         self.sleep(0.25)
@@ -1010,26 +1044,25 @@ class AutoPatcher(TaskController):
         self.amplifier.switch_holding(True)
         self.info('holding enabled for voltage sweep')
         self.sleep(0.25)
-        self.info("Executing P/4 leak subtraction series")
-        self.daq.getLeakSubtraction(
-            start_voltage=sweep_start,
-            step_voltage=sweep_step,
-            end_voltage=sweep_end,
-            holding_voltage=sweep_hold
-        )
-        self.sleep(0.25)
-        self.info("Getting data from voltage clamp sweep")
-        self.daq.getVoltageClampSweep(
-            start_voltage=sweep_start,
-            step_voltage=sweep_step,
-            end_voltage=sweep_end,
-            holding_voltage=sweep_hold
-        )
+        self.info("Executing P/4 leak subtraction series, then voltage clamp sweep")
+        sweep = {
+            "start_voltage": sweep_start,
+            "step_voltage": sweep_step,
+            "end_voltage": sweep_end,
+            "holding_voltage": sweep_hold,
+        }
+        return [("getLeakSubtraction", dict(sweep)), ("getVoltageClampSweep", dict(sweep))]
+
+    def finish_voltage_sweep_protocol(self):
         self.sleep(0.25)
         self.amplifier.set_holding(self.protocol_config.vclamp_hold)
         self.info('finished running voltage sweep protocol')
 
     def run_current_protocol(self):
+        self._run_split_protocol(self.prepare_current_protocol, self.finish_current_protocol)
+
+    def prepare_current_protocol(self):
+        self.daq.setCellMode(False)
         self.info('Running current protocol (current clamp)')
         self.amplifier.voltage_clamp()
         self.sleep(0.1)
@@ -1037,7 +1070,7 @@ class AutoPatcher(TaskController):
         self.sleep(0.25)
         self.amplifier.auto_slow_compensation()
         self.sleep(0.25)
-        self.info('auto capacitance compensation')  
+        self.info('auto capacitance compensation')
         cap_c_double = self.amplifier.get_fast_compensation_capacitance()
         cap = float(cap_c_double.value) * 1e12 - 0.5
         cap = cap*1e-12
@@ -1075,34 +1108,42 @@ class AutoPatcher(TaskController):
         self.sleep(0.1)
         if self.protocol_config.custom_cclamp_protocol:
             self.debug('running custom current protocol')
-            self.daq.getDataFromCurrentProtocol(
-                custom=self.protocol_config.custom_cclamp_protocol,
-                factor=1,
-                startCurrentPicoAmp=self.protocol_config.cclamp_start,
-                endCurrentPicoAmp=self.protocol_config.cclamp_end,
-                stepCurrentPicoAmp=self.protocol_config.cclamp_step,
-                recordingTimeMs=self.protocol_config.cclamp_recording_time_ms,
-                dutyCycle=self.protocol_config.cclamp_duty_cycle,
-            )
+            kwargs = {
+                "custom": self.protocol_config.custom_cclamp_protocol,
+                "factor": 1,
+                "startCurrentPicoAmp": self.protocol_config.cclamp_start,
+                "endCurrentPicoAmp": self.protocol_config.cclamp_end,
+                "stepCurrentPicoAmp": self.protocol_config.cclamp_step,
+                "recordingTimeMs": self.protocol_config.cclamp_recording_time_ms,
+                "dutyCycle": self.protocol_config.cclamp_duty_cycle,
+            }
         else:
             self.debug('running default current protocol')
-            self.daq.getDataFromCurrentProtocol(
-                custom=self.protocol_config.custom_cclamp_protocol,
-                factor=1,
-                startCurrentPicoAmp=None,
-                endCurrentPicoAmp=None,
-                stepCurrentPicoAmp=10,
-                recordingTimeMs=self.protocol_config.cclamp_recording_time_ms,
-                dutyCycle=self.protocol_config.cclamp_duty_cycle,
-            )
+            kwargs = {
+                "custom": self.protocol_config.custom_cclamp_protocol,
+                "factor": 1,
+                "startCurrentPicoAmp": None,
+                "endCurrentPicoAmp": None,
+                "stepCurrentPicoAmp": 10,
+                "recordingTimeMs": self.protocol_config.cclamp_recording_time_ms,
+                "dutyCycle": self.protocol_config.cclamp_duty_cycle,
+            }
+        return [("getDataFromCurrentProtocol", kwargs)]
+
+    def finish_current_protocol(self):
         self.sleep(0.1)
         self.amplifier.switch_holding(False)
         self.info('disabled holding')
         self.sleep(0.1)
         self.amplifier.voltage_clamp()
         self.info('finished running current protocol(current clamp)')
+        self.daq.setCellMode(True)
 
     def run_holding_protocol(self):
+        self._run_split_protocol(self.prepare_holding_protocol, self.finish_holding_protocol)
+
+    def prepare_holding_protocol(self):
+        self.daq.setCellMode(True)
         self.info('Running holding protocol (E/I PSC test)')
         self.amplifier.voltage_clamp()
         self.sleep(0.25)
@@ -1110,13 +1151,15 @@ class AutoPatcher(TaskController):
         self.amplifier.set_holding(holding)
         self.info(f'holding at {holding} mV')
         self.sleep(0.25)
-        self.daq.getDataFromHoldingProtocol(duration_s=self.protocol_config.hclamp_duration)
+        return [("getDataFromHoldingProtocol", {"duration_s": self.protocol_config.hclamp_duration})]
+
+    def finish_holding_protocol(self):
         self.sleep(0.25)
         # self.amplifier.set_holding(0)
         self.sleep(0.25)
         self.amplifier.voltage_clamp()
         self.info('finished running holding protocol (E/I PSC test)')
-    
+
     def run_optogenetic_protocol(self, protocol_params: dict | None = None):
         """
         Run optogenetic protocols based on configuration or explicit parameters.
@@ -1124,9 +1167,25 @@ class AutoPatcher(TaskController):
         if self.laser is None:
             self.warning("No laser configured; skipping optogenetic protocol.")
             return None
+        results = self._run_split_protocol(
+            self.prepare_optogenetic_protocol, self.finish_optogenetic_protocol, protocol_params)
+        if len(results) == 1:
+            return results[0]
+        return results
+
+    def prepare_optogenetic_protocol(self, protocol_params: dict | None = None):
+        """Amplifier setup plus the laser sequence(s) to run.
+
+        The laser is shared, so when several pipettes run together the
+        interface uses the first pipette's sequence for all of them: one
+        stimulus run, recorded on every pipette.
+        """
+        if self.laser is None:
+            self.warning("No laser configured; skipping optogenetic protocol.")
+            return []
         if not hasattr(self.daq, "getDataFromOptogeneticProtocol"):
             self.warning("DAQ does not support optogenetic protocol capture.")
-            return None
+            return []
 
         self.info("Running optogenetic protocol")
         self.amplifier.voltage_clamp()
@@ -1136,7 +1195,7 @@ class AutoPatcher(TaskController):
         self.info(f'holding at {holding} mV')
         self.sleep(0.25)
 
-        results = []
+        steps = []
 
         color_cycle = ["red", "green", "cyan", "uv", "blue", "infrared"]
 
@@ -1153,20 +1212,18 @@ class AutoPatcher(TaskController):
                 idx = 1
             return color_cycle[(idx - 1) % len(color_cycle)]
 
-        def _run_steps(steps, rate_hz):
-            result = self.daq.getDataFromOptogeneticProtocol(
-                laser=self.laser,
-                protocol_steps=steps,
-                rate_hz=rate_hz,
-            )
-            results.append(result)
-            self.sleep(0.25)
+        def _add_run(laser_steps, rate_hz):
+            steps.append(("getDataFromOptogeneticProtocol", {
+                "laser": self.laser,
+                "protocol_steps": laser_steps,
+                "rate_hz": rate_hz,
+            }))
 
         if protocol_params is not None:
             randomize_target = protocol_params.get("randomize_target", protocol_params.get("mode", "wavelength"))
             raw_wavelengths = list(protocol_params.get("wavelengths", ["green"]))
             wavelengths = [_coerce_wavelength(value) for value in raw_wavelengths]
-            steps = self.laser.build_optogenetic_protocol(
+            laser_steps = self.laser.build_optogenetic_protocol(
                 wavelengths=wavelengths,
                 powers=list(protocol_params.get("powers", [50])),
                 randomize_target=randomize_target,
@@ -1177,7 +1234,7 @@ class AutoPatcher(TaskController):
                 randomize=bool(protocol_params.get("randomize", True)),
                 power_divisor=float(protocol_params.get("power_divisor", 1.0)),
             )
-            _run_steps(steps, int(protocol_params.get("rate_hz", 50_000)))
+            _add_run(laser_steps, int(protocol_params.get("rate_hz", 50_000)))
         else:
             cfg = self.protocol_config
             stabilize_time = float(cfg.opto_stabilize_time)
@@ -1189,7 +1246,7 @@ class AutoPatcher(TaskController):
             if cfg.opto_random_wavelength_protocol:
                 wavelengths = ["red", "green", "cyan", "uv", "blue", "infrared"]
                 powers = [float(cfg.opto_wavelength_power)]
-                steps = self.laser.build_optogenetic_protocol(
+                laser_steps = self.laser.build_optogenetic_protocol(
                     wavelengths=wavelengths,
                     powers=powers,
                     randomize_target="wavelength",
@@ -1199,12 +1256,12 @@ class AutoPatcher(TaskController):
                     replicates=replicates,
                     randomize=True,
                 )
-                _run_steps(steps, rate_hz)
+                _add_run(laser_steps, rate_hz)
 
             if cfg.opto_random_power_protocol:
                 wavelengths = [_coerce_wavelength(cfg.opto_power_wavelength)]
                 powers = list(range(0, 101, 20))
-                steps = self.laser.build_optogenetic_protocol(
+                laser_steps = self.laser.build_optogenetic_protocol(
                     wavelengths=wavelengths,
                     powers=powers,
                     randomize_target="power",
@@ -1214,16 +1271,16 @@ class AutoPatcher(TaskController):
                     replicates=replicates,
                     randomize=True,
                 )
-                _run_steps(steps, rate_hz)
+                _add_run(laser_steps, rate_hz)
 
-        if not results:
+        if not steps:
             self.warning("No optogenetic protocol flags enabled")
+        return steps
 
+    def finish_optogenetic_protocol(self):
+        self.sleep(0.25)
         self.amplifier.voltage_clamp()
         self.info("finished running optogenetic protocol")
-        if len(results) == 1:
-            return results[0]
-        return results
     # endregion
 
     # region Observations and measurements

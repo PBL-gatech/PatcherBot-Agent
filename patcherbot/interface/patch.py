@@ -129,48 +129,78 @@ class AutoPatchInterface(TaskInterface):
     def set_protocol_selection(self, pipette_key, protocol_name, selected):
         self.protocol_selections[pipette_key][protocol_name] = bool(selected)
 
-    def _run_protocol_step(self, pipette_key, protocol_name):
+    # Selection name -> AutoPatcher prepare_/finish_ suffix
+    _PROTOCOL_RUNNERS = {
+        "voltage_protocol": "voltage_protocol",
+        "current_protocol": "current_protocol",
+        "voltage_sweep_protocol": "voltage_sweep_protocol",
+        "holding_protocol": "holding_protocol",
+        "opto_random_wavelength_protocol": "optogenetic_protocol",
+        "opto_random_power_protocol": "optogenetic_protocol",
+    }
+
+    @staticmethod
+    def _opto_params(protocol_name, config):
+        if protocol_name == "opto_random_wavelength_protocol":
+            opto_params = {
+                "randomize_target": "wavelength",
+                "wavelengths": ["red", "green", "cyan", "uv", "blue", "infrared"],
+                "powers": [float(config.opto_wavelength_power)],
+            }
+        else:
+            opto_params = {
+                "randomize_target": "power",
+                "wavelengths": [config.opto_power_wavelength],
+                "powers": list(range(0, 101, 20)),
+            }
+        opto_params.update({
+            "stabilize_time": float(config.opto_stabilize_time),
+            "off_time": float(config.opto_off_time),
+            "on_time": float(config.opto_on_time),
+            "replicates": int(config.opto_replicates),
+            "randomize": True,
+        })
+        return opto_params
+
+    def _prepare_protocol(self, pipette_key, protocol_name):
+        """Amplifier setup for one pipette; returns its DAQ steps."""
         autopatcher = self.autopatchers[pipette_key]
-        daq = autopatcher.daq
-        if protocol_name == "voltage_protocol":
-            daq.setCellMode(True)
-            autopatcher.run_voltage_protocol()
-        elif protocol_name == "current_protocol":
-            daq.setCellMode(False)
+        runner = self._PROTOCOL_RUNNERS[protocol_name]
+        if protocol_name == "current_protocol":
             autopatcher.iholding = autopatcher.getHolding()
-            autopatcher.run_current_protocol()
-            daq.setCellMode(True)
-        elif protocol_name == "voltage_sweep_protocol":
-            daq.setCellMode(True)
-            autopatcher.run_voltage_sweep_protocol()
-        elif protocol_name == "holding_protocol":
-            daq.setCellMode(True)
-            autopatcher.run_holding_protocol()
-        elif protocol_name in {
-                "opto_random_wavelength_protocol", "opto_random_power_protocol"}:
-            config = autopatcher.protocol_config
-            if protocol_name == "opto_random_wavelength_protocol":
-                opto_params = {
-                    "randomize_target": "wavelength",
-                    "wavelengths": ["red", "green", "cyan", "uv", "blue", "infrared"],
-                    "powers": [float(config.opto_wavelength_power)],
-                }
-            else:
-                opto_params = {
-                    "randomize_target": "power",
-                    "wavelengths": [config.opto_power_wavelength],
-                    "powers": list(range(0, 101, 20)),
-                }
-            opto_params.update({
-                "stabilize_time": float(config.opto_stabilize_time),
-                "off_time": float(config.opto_off_time),
-                "on_time": float(config.opto_on_time),
-                "replicates": int(config.opto_replicates),
-                "randomize": True,
-            })
-            autopatcher.run_optogenetic_protocol(opto_params)
+        if runner == "optogenetic_protocol":
+            return autopatcher.prepare_optogenetic_protocol(
+                self._opto_params(protocol_name, autopatcher.protocol_config))
+        return getattr(autopatcher, f"prepare_{runner}")()
+
+    def _finish_protocol(self, pipette_key, protocol_name):
+        runner = self._PROTOCOL_RUNNERS[protocol_name]
+        getattr(self.autopatchers[pipette_key], f"finish_{runner}")()
+
+    def _merge_protocol_steps(self, protocol_name, steps_by_pipette):
+        """One list of DAQ steps for all pipettes.
+
+        Settings come from the shared protocol config, so the pipettes should
+        agree; if not, the first pipette's settings are used. Opto sequences
+        are randomized per pipette, but the laser is shared, so the first
+        pipette's sequence drives one stimulus run recorded on every pipette.
+        """
+        reference_key, reference = next(iter(steps_by_pipette.items()))
+        methods = [method for method, _ in reference]
+        for pipette_key, steps in steps_by_pipette.items():
+            if [method for method, _ in steps] != methods:
+                raise ValueError(
+                    f"{protocol_name}: {pipette_key} needs different DAQ steps than {reference_key}"
+                )
+            if self._PROTOCOL_RUNNERS[protocol_name] != "optogenetic_protocol" and steps != reference:
+                self.warning(f"{protocol_name}: {pipette_key} settings differ from {reference_key}; "
+                             f"using {reference_key}'s for the shared acquisition")
+        return reference
 
     def _run_protocol_matrix(self, task_controller):
+        """Run each selected protocol for all its pipettes at once:
+        prepare every pipette in parallel, ONE DAQ acquisition per step
+        covering all of them, then finish every pipette in parallel."""
         protocol_order = (
             "voltage_protocol",
             "current_protocol",
@@ -188,13 +218,22 @@ class AutoPatchInterface(TaskInterface):
             ]
             if not selected:
                 continue
+
             with ThreadPoolExecutor(max_workers=len(selected)) as executor:
-                futures = [
-                    executor.submit(self._run_protocol_step, pipette_key, protocol_name)
-                    for pipette_key in selected
-                ]
-                for future in futures:
-                    future.result()
+                prepared = list(executor.map(
+                    lambda key: self._prepare_protocol(key, protocol_name), selected))
+            try:
+                steps = self._merge_protocol_steps(protocol_name, dict(zip(selected, prepared)))
+                daq_keys = list(dict.fromkeys(
+                    self.protocol_daQs[key].pipette_key for key in selected))
+                for index, (method_name, kwargs) in enumerate(steps):
+                    if index:
+                        time.sleep(0.25)
+                    getattr(self.daq, method_name)(pipettes=daq_keys, **kwargs)
+            finally:
+                with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+                    list(executor.map(
+                        lambda key: self._finish_protocol(key, protocol_name), selected))
 
 
     @blocking_command(category='Calibration', description='Save X origin',
