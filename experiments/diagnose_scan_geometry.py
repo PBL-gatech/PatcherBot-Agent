@@ -1,11 +1,16 @@
 """CPU-only stage/image motion diagnostics; edit constants, no CLI required."""
 from pathlib import Path
 import json
-import runpy
+import sys
 import numpy as np
 import cv2
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "patcherbot" / "utils"))
+from scanStitcher import ScanStitcher
+
+SESSION = "2026_09_23-18_05"
+DATA_ROOT = ROOT / "experiments" / "Data" / "rig_recorder_data"
 OUTPUT = ROOT / "experiments/Data/stitch_benchmarks/2026_10_30-13_39_05_815409/geometry_diagnostic"
 PAIRS = [(i, i + 20) for i in range(60, 741, 80)] + [(770, 790), (785, 815), (800, 840), (810, 850), (830, 870), (860, 900), (940, 980), (1100, 1140)]
 DOWNSAMPLE = 4
@@ -31,9 +36,10 @@ def predicted_overlap(a, b, delta):
 
 def main():
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    setup = runpy.run_path(str(ROOT / "experiments/benchmark_scan_stitcher.py"), run_name="geometry_setup")
-    legacy = setup["load_module"]("geometry_legacy", "scanStitcher.py")
-    source = setup["new_stitcher"](legacy.ScanStitcher)
+    source = ScanStitcher(
+        date_time_folder=SESSION, date_time_root=str(DATA_ROOT),
+        use_calibration=True, flip_x=True, flip_y=True, downsample=1,
+    )
     timestamps, raw, paths = source._align_all_frames_to_movement()
     xy = source._aligned_coords_from_raw(raw)
     cache = {}

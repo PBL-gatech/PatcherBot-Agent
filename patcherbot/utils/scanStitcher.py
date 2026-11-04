@@ -30,6 +30,8 @@ class ScanStitcher:
         downsample=10,
         max_canvas_gb=1.0,
         use_pixel_drift_stitch=True,
+        calibration_path=None,
+        scan_time_window=None,
     ):
         print("[ScanStitcher] Initializing...")
         if date_time_folder is None:
@@ -42,6 +44,8 @@ class ScanStitcher:
             date_time_folder=date_time_folder,
             date_time_root=date_time_root,
         )
+        if calibration_path is not None:
+            self.calibration_file = os.path.abspath(os.fspath(calibration_path))
         self.prefer_exts = prefer_exts
         self.use_calibration = use_calibration
         self.coord_cols = coord_cols
@@ -60,7 +64,10 @@ class ScanStitcher:
         self.scan_area_source_session = None
         self.scan_area_source_attempt = None
         self.scan_area_source_json = None
-        self.scan_area_window = self._resolve_scan_area_window()
+        self.scan_area_window = (
+            self._resolve_scan_area_window() if scan_time_window is None
+            else self._validate_scan_time_window(scan_time_window)
+        )
         self.canvas = None
         self._streaming_canvas_path = None
         self._streaming_canvas_shape = None
@@ -69,6 +76,17 @@ class ScanStitcher:
         print(f"[ScanStitcher] Stitch mode: {'pixel_drift' if self.use_pixel_drift_stitch else 'projection'}")
         print(f"[ScanStitcher] Stitch downsample: 1/{self.downsample} (frame decimation and final-tile decimation)")
         print(f"[ScanStitcher] Source file: {os.path.abspath(__file__)}")
+
+    @staticmethod
+    def _validate_scan_time_window(window):
+        try:
+            endpoints = np.asarray(window, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scan_time_window must contain finite ordered (start, end) epochs.") from exc
+        if (endpoints.shape != (2,) or not np.all(np.isfinite(endpoints))
+                or endpoints[1] <= endpoints[0]):
+            raise ValueError("scan_time_window must contain finite ordered (start, end) epochs.")
+        return float(endpoints[0]), float(endpoints[1])
 
     @staticmethod
     def _validate_downsample(downsample):

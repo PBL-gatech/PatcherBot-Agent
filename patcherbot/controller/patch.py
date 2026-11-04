@@ -1,4 +1,5 @@
 import time
+from copy import copy
 import csv
 import json
 from pathlib import Path
@@ -12,6 +13,8 @@ from patcherbot.devices.lamp import Lamp
 from patcherbot.devices.manipulator.helpers.AgentHelper import AgentHelper
 from patcherbot.devices.manipulator.helpers.Observer import Observer
 from patcherbot.utils.StateMachineLogger import StateMachineLogger, record_state
+from patcherbot.devices.manipulator.helpers.ScanStitchHelper import ScanStitchHelper
+from patcherbot.devices.manipulator.helpers.StageScanHelper import StageScanHelper
 import logging
 from datetime import datetime
 from uuid import uuid4
@@ -54,6 +57,19 @@ class AutoPatcher(TaskController):
         self.pressure = pressure
         self.calibrated_unit = calibrated_unit
         self.calibrated_stage = calibrated_stage
+        # Share hardware and measurement helpers, but retain separate objective state.
+        self.calibrated_stage_4x = copy(calibrated_stage)
+        for name in ('debug', 'info', 'warning'):
+            self.calibrated_stage_4x.__dict__.pop(name, None)
+        TaskController.__init__(self.calibrated_stage_4x)
+        self.calibrated_stage_4x.saved_state_question = calibrated_stage.saved_state_question
+        for name in ('M', 'Minv', 'r0', 'r0_inv'):
+            setattr(self.calibrated_stage_4x, name, getattr(calibrated_stage, name).copy())
+        self.calibrated_stage_4x.calibrated = False
+        self.calibrated_stage_4x.stageScanHelper = StageScanHelper(calibrated_stage.camera, calibrated_stage.config)
+        self.scan_stage = calibrated_stage
+        self.scan_stitch_helper = ScanStitchHelper(calibrated_stage)
+        self.last_stitched_scan = None
         self.microscope = microscope
         self.lamp = lamp
         self.laser = laser
@@ -1361,14 +1377,33 @@ class AutoPatcher(TaskController):
         self.success_requested = True
         self.success_if_requested()
 
+    def calibrate_stage_4x(self):
+        self.abort_if_requested()
+        self.calibrated_stage_4x.calibrate()
+        self.abort_if_requested()
+        self.calibrated_stage_4x.reset_scan_corners()
+        self.scan_stage = self.calibrated_stage_4x
+        self.scan_stitch_helper.stage = self.scan_stage
+
     @record_state("scan_area")
     def scan_area(self, speed=None):
         '''
         Scan the currently selected plate area using stored corners.
         '''
-        self.calibrated_stage.scan_area(speed=speed)
+        self.scan_stitch_helper.begin()
+        try:
+            self.scan_stage.scan_area(speed=(self.scan_stage.config.scan_speed if speed is None else speed))
+            self.abort_if_requested()
+            self.scan_stitch_helper.complete()
+        except BaseException:
+            self.scan_stitch_helper.cancel()
+            raise
         self.success_requested = True
         self.success_if_requested()
+
+    def stitch_scan(self, recording_folder=None):
+        self.last_stitched_scan = self.scan_stitch_helper.stitch(recording_folder)
+        return self.last_stitched_scan
 
     def move_stage_to_cell(self, cell):
         '''

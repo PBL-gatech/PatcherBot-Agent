@@ -51,7 +51,7 @@ def make_session(tmp_path, positions, colors, shape=(4, 4)):
 
 def run_image(stitcher, backend, **options):
     config = FastStitchConfig(backend=backend, select_frames=False, **options)
-    output = stitch_fast(stitcher, output_path="result.tif", config=config)
+    output = stitch_fast(stitcher, output_path=Path(stitcher.dataset_dir) / "result.tif", config=config)
     assert isinstance(output, str)
     assert Path(output).is_file()
     return tifffile.imread(output)
@@ -168,7 +168,7 @@ def test_explicit_all_frame_processing_keeps_pauses_and_feathers_overlap(tmp_pat
     # A stationary revisit must remain eligible: spatial selection would drop it.
     stitcher = make_session(tmp_path, [(0, 0), (0, 0)],
                             [[20, 60, 100], [100, 140, 180]])
-    output = stitcher.stitch_fast(output_path="defaults.tif",
+    output = stitcher.stitch_fast(output_path=tmp_path / "defaults.tif",
                                  config=FastStitchConfig(backend="numpy", select_frames=False))
     expected = np.empty((4, 4, 3), dtype=np.uint8)
     expected[:] = [60, 100, 140]
@@ -180,7 +180,7 @@ def test_default_selection_preserves_exact_source_footprints_in_written_image(tm
     positions = np.repeat(np.array([(i - 10, i + 20) for i in range(13)]), 2, axis=0)
     color = [50, 90, 130]
     stitcher = make_session(tmp_path, positions, [color] * len(positions), shape=(8, 8))
-    output = stitcher.stitch_fast(output_path="coverage.tif",
+    output = stitcher.stitch_fast(output_path=tmp_path / "coverage.tif",
                                  config=FastStitchConfig(backend="numpy"))
     actual = tifffile.imread(output)
     source_mask = coverage_mask(positions, (8, 8))
@@ -202,12 +202,12 @@ def test_coverage_repair_preserves_every_original_feather_pixel(tmp_path, backen
     assert np.any(source_mask & ~base_mask)
     options = dict(backend=backend, select_frames=True, blend="feather")
     baseline_path = stitcher.stitch_fast(
-        output_path="base_feather.tif",
+        output_path=tmp_path / "base_feather.tif",
         config=FastStitchConfig(**options, preserve_coverage=False),
     )
     baseline = tifffile.imread(baseline_path)
     repaired_path = stitcher.stitch_fast(
-        output_path="repaired_feather.tif",
+        output_path=tmp_path / "repaired_feather.tif",
         config=FastStitchConfig(**options, preserve_coverage=True),
     )
     repaired = tifffile.imread(repaired_path)
@@ -241,7 +241,7 @@ def test_output_memory_limit_rejects_geometry_without_writing(tmp_path):
     original = stitcher.coord_data.copy()
     config = FastStitchConfig(backend="numpy", select_frames=False, max_output_gb=0.000001)
     with pytest.raises(MemoryError):
-        stitch_fast(stitcher, output_path="must_not_exist.tif", config=config)
+        stitch_fast(stitcher, output_path=tmp_path / "must_not_exist.tif", config=config)
     assert not (tmp_path / "must_not_exist.tif").exists()
     np.testing.assert_array_equal(stitcher.coord_data, original)
 
@@ -250,7 +250,7 @@ def test_frame_limit_excludes_later_frames_before_spatial_selection(tmp_path):
     stitcher = make_session(tmp_path, [(0, 0), (2, 0), (20, 0)],
                             [[20, 60, 100], [100, 140, 180], [200, 220, 240]])
     config = FastStitchConfig(backend="numpy", select_frames=True, blend="overwrite")
-    output = stitch_fast(stitcher, output_path="limited.tif", config=config, frame_limit=2)
+    output = stitch_fast(stitcher, output_path=tmp_path / "limited.tif", config=config, frame_limit=2)
     expected = np.empty((4, 6, 3), dtype=np.uint8)
     expected[:, :2] = [20, 60, 100]
     expected[:, 2:] = [100, 140, 180]
@@ -269,5 +269,5 @@ def test_invalid_configuration_rejected_before_output(tmp_path, options):
     stitcher = make_session(tmp_path, [(0, 0)], [[1, 2, 3]])
     with pytest.raises((ValueError, TypeError)):
         config = FastStitchConfig(**dict({"backend": "numpy"}, **options))
-        stitch_fast(stitcher, output_path="invalid.tif", config=config)
+        stitch_fast(stitcher, output_path=tmp_path / "invalid.tif", config=config)
     assert not (tmp_path / "invalid.tif").exists()

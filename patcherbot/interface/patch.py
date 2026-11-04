@@ -3,6 +3,7 @@
 Control of automatic patch clamp algorithm
 '''
 import numpy as np
+import json
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.controller import AutoPatcher
@@ -26,6 +27,7 @@ class AutoPatchInterface(TaskInterface):
     '''
     state_press_tally_changed = QtCore.pyqtSignal(object)
     origin_saved = QtCore.pyqtSignal(object, object)
+    scan_stitched = QtCore.pyqtSignal(str)
 
     def __init__(
         self,
@@ -167,9 +169,27 @@ class AutoPatchInterface(TaskInterface):
     def detect_cells(self):
         self.execute(self.pipette_controller.calibrated_stage.detect_cells)
 
+    @blocking_command(category='Stage', description='Calibrate the 4x objective',
+                      task_description='Calibrating 4x stage')
+    def calibrate_stage_4x(self):
+        self.is_selecting_corners = False
+        self.execute(self.current_autopatcher.calibrate_stage_4x)
+
+    @blocking_command(category='Stage', description='Calibrate the 40x objective',
+                      task_description='Calibrating 40x stage')
+    def calibrate_stage_40x(self):
+        self.is_selecting_corners = False
+        controller = self.current_autopatcher
+        controller.scan_stage = controller.calibrated_stage
+        controller.scan_stitch_helper.stage = controller.scan_stage
+        self.execute(controller.calibrated_stage.calibrate)
+
     def start_selecting_corners(self):
+        stage = self.current_autopatcher.scan_stage
+        if not stage.calibrated:
+            raise ValueError('Calibrate or load the selected objective before storing scan corners')
+        stage.start_selecting_scan_corners()
         self.is_selecting_corners = True
-        self.pipette_controller.calibrated_stage.start_selecting_scan_corners()
 
     @blocking_command(category='Stage',
                       description='Scan the stored corner coordinates',
@@ -178,10 +198,21 @@ class AutoPatchInterface(TaskInterface):
         self.execute(self.current_autopatcher.scan_area)
 
     @blocking_command(category='Stage',
+                      description='Stitch the recorded scan',
+                      task_description='Stitching scan')
+    def stitch_scan(self, recording):
+        recording_folder, recorders = recording
+        for recorder in recorders:
+            if recorder is not None:
+                recorder.handle_recording_stopped()
+        if self.execute(self.current_autopatcher.stitch_scan, argument=recording_folder):
+            self.scan_stitched.emit(str(self.current_autopatcher.last_stitched_scan))
+
+    @blocking_command(category='Stage',
                       description='Move stage to the stored scan start coordinate',
                       task_description='Moving to scan start')
     def move_to_scan_start(self):
-        self.execute(self.pipette_controller.calibrated_stage.move_to_scan_start)
+        self.execute(self.current_autopatcher.scan_stage.move_to_scan_start)
 
 
     @blocking_command(category='Microscope',
@@ -194,11 +225,11 @@ class AutoPatchInterface(TaskInterface):
              description='Select a corner on right-click while Store Corners is active')
     def handle_corner_right_click(self, position):
         if self.is_selecting_corners:
-            corners_complete = self.pipette_controller.calibrated_stage.store_scan_corner(position)
+            corners_complete = self.current_autopatcher.scan_stage.store_scan_corner(position)
             if corners_complete:
                 self.is_selecting_corners = False
             return
-        self.execute(self.pipette_controller.move_stage, argument=position)
+        self.execute(self.current_autopatcher.scan_stage.safe_move, argument=np.r_[position, 0.0])
 
     def _invalidate_cell_reference(self, cell):
         for phase in (self.current_autopatcher.approach_cell_phase,
@@ -702,13 +733,46 @@ class AutoPatchInterface(TaskInterface):
         self.pipette_controller.safe_stage_position = self.current_autopatcher.safe_stage_position
         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position
         self.pipette_controller.write_calibration()
+
     
 
     @command(category='Patch',
              description='Read calibration and saved positions from file',
              success_message='Calibration and saved positions loaded')
     def read_calibration(self, config_filename='calibration.pickle') -> None:
+        if str(config_filename).endswith('.json'):
+            with open(config_filename, encoding='utf-8') as f:
+                saved = json.load(f)
+            if not any(key in saved for key in ('stage', 'manip')):
+                raise ValueError(f'No stage or pipette calibration in {config_filename}')
+            configurations = []
+            stage = (self.current_autopatcher.calibrated_stage_4x
+                     if saved.get('objective') == '4x' else self.pipette_controller.calibrated_stage)
+            for key, device, shape in (
+                    ('stage', stage, (2, 2)),
+                    ('manip', self.pipette_controller.calibrated_unit, (3, 3))):
+                if key not in saved:
+                    continue
+                configuration = saved[key]
+                matrix = np.asarray(configuration['M'], dtype=float)
+                if (matrix.shape != shape or not np.isfinite(matrix).all()
+                        or np.linalg.matrix_rank(matrix) != shape[0]):
+                    raise ValueError(f'Invalid {key} calibration matrix in {config_filename}')
+                configuration['M'] = matrix
+                configurations.append((key, device, configuration))
+            for key, device, configuration in configurations:
+                device.load_configuration(configuration)
+                if key == 'stage':
+                    self.is_selecting_corners = False
+                    self.current_autopatcher.scan_stage = device
+                    self.current_autopatcher.scan_stitch_helper.stage = device
+                if key == 'manip':
+                    device._tip_reference = None
+                    device._trusted_tip_reference = None
+            return
         self.pipette_controller.read_calibration(config_filename)
+        self.current_autopatcher.scan_stage = self.pipette_controller.calibrated_stage
+        self.current_autopatcher.scan_stitch_helper.stage = self.current_autopatcher.scan_stage
         self.current_autopatcher.home_position = self.pipette_controller.home_position.copy()
         self.current_autopatcher.safe_position = self.pipette_controller.safe_position.copy()
         self.current_autopatcher.home_stage_position = self.pipette_controller.home_stage_position.copy()

@@ -5,7 +5,7 @@ class StageScanHelper:
     """Helper for selecting stage scan corners and executing serpentine scans."""
 
     CORNER_LABELS = ("Top Left", "Bottom Right")
-    SCAN_MAX_SPEED = 2000
+    SCAN_MAX_SPEED = 10000
     NORMAL_MAX_SPEED = 10000
 
     def __init__(self, camera, config=None):

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "profile_id": "recorded-2026-11-03-16-23-07-4x-candidate",
+  "objective": "4x",
+  "status": "candidate",
+  "saved_at": "2026-11-03T16:23:07-05:00",
+  "stage": {
+    "M": [[-0.6025983065727311, 0.024937064503554977], [-0.024937064503554977, -0.6025983065727311]],
+    "r0": [0.0, 0.0],
+    "up_direction": [-1.0, -1.0]
+  },
+  "stage_sha256": "a4d3b33eb46fecbd17fd7fb66e044928ec5a66388fcb7634374052676d45283c",
+  "fingerprint": null,
+  "source": {
+    "kind": "recorded_scan_candidate",
+    "path": "experiments/Data/rig_recorder_data/2026_11_03-16_16/calibration.json",
+    "sha256": "2a6d782a0edd97ceb1907294f29fd8e7fba3b13319c4a7e9c025d7b721d316cd",
+    "note": "Recorded matrix retained exactly. Objective identity, camera fingerprint and current registration were not recorded; explicit objective calibration is required before motion."
+  },
+  "global_anchor": null
+}

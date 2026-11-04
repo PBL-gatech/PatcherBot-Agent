@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 from patcherbot.controller import TaskController
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
+from patcherbot.gui.tabs.scan_viewer import ScanViewerTab
 from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.patch import AutoPatchInterface
@@ -52,6 +53,26 @@ class PatchGui(ManipulatorGui):
         self.show_atlas_button.setCheckable(True)
         self.show_atlas_button.clicked.connect(self.toggle_atlas_window)
         self.status_bar.insertPermanentWidget(1, self.show_atlas_button)
+        self.scan_window = QtWidgets.QDialog(self)
+        self.scan_window.setWindowTitle('Scan')
+        self.scan_window.setWindowFlag(QtCore.Qt.WindowMaximizeButtonHint, True)
+        self.scan_window.setSizeGripEnabled(True)
+        self.scan_window.resize(1000, 800)
+        self.scan_viewer = ScanViewerTab(parent=self.scan_window)
+        scan_layout = QtWidgets.QVBoxLayout(self.scan_window)
+        scan_layout.addWidget(self.scan_viewer)
+        self.show_scan_button = QtWidgets.QPushButton('Show Scan')
+        self.show_scan_button.setCheckable(True)
+        self.show_scan_button.toggled.connect(self.scan_window.setVisible)
+        self.show_scan_button.toggled.connect(
+            lambda checked: self.show_scan_button.setText('Hide Scan' if checked else 'Show Scan'))
+        self.show_scan_button.clicked.connect(
+            lambda checked: self.scan_window.raise_() if checked else None)
+        self.show_scan_button.clicked.connect(
+            lambda checked: self.scan_window.activateWindow() if checked else None)
+        self.scan_window.finished.connect(lambda _: self.show_scan_button.setChecked(False))
+        self.status_bar.insertPermanentWidget(2, self.show_scan_button)
+        self.patch_interface.scan_stitched.connect(self.scan_viewer.load_image)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
         self._cell_list_timer.timeout.connect(self._refresh_cell_list_window)
@@ -82,7 +103,10 @@ class PatchGui(ManipulatorGui):
         self.patch_interface.origin_saved.connect(self._origin_saved)
         self.patch_interface.task_finished.connect(self._origin_task_finished)
         logging.debug("Added config GUI.")
-        classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
+        classic_patching_tab = ClassicPatchButtons(
+            self.patch_interface, pipette_interface, self.start_task, self.interface_signals,
+            self.recording_state_manager,
+            camera_recorder=self.main_video.recorder if self.main_video is not None else None)
         self.classic_patching_tab = classic_patching_tab
         classic_patching_tab.origin_requested.connect(self._request_origin)
         self.experiment_book_tab.reload_requested.connect(self._reload_book_details)
@@ -101,6 +125,7 @@ class PatchGui(ManipulatorGui):
         self._recording_indicator_timer.start(100)
 
     def close(self):
+        self.scan_viewer.shutdown()
         self._display_position_timer.stop()
         self.pipette_interface.display_positions = None
         return super(PatchGui, self).close()
@@ -546,6 +571,9 @@ class ButtonTabWidget(QtWidgets.QWidget):
         # Rest of the method implementation unchanged
         cmd = self._seq_cmds[self._seq_index]
         self._seq_index += 1
+        argument = None
+        if isinstance(cmd, tuple):
+            cmd, argument = cmd
 
         # Check if the command is asynchronous (has task_description)
         if hasattr(cmd, 'task_description'):
@@ -559,7 +587,9 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 if exit_code != 0 and self._seq_active_style and self._seq_button:
                     self._seq_button.setStyleSheet("")
                     self._seq_active_style = False
-                if exit_code != 0 and self._seq_cmds == getattr(self, "pipette_calibration", None):
+                if exit_code != 0 and self._seq_cmds in (
+                        getattr(self, 'pipette_calibration', None),
+                        getattr(self, 'pipette_anchor', None)):
                     self._seq_index = len(self._seq_cmds)
                     return
                 # Launch next command after current one finishes
@@ -570,12 +600,15 @@ class ButtonTabWidget(QtWidgets.QWidget):
             self.start_task(cmd.task_description, interface)
             if interface in self.interface_signals:
                 command_signal, _ = self.interface_signals[interface]
-                command_signal.emit(cmd, None)
+                command_signal.emit(cmd, argument)
             else:
-                cmd(None)
+                cmd(argument)
         else:
             # Synchronous command: run it immediately
-            cmd()
+            if argument is None:
+                cmd()
+            else:
+                cmd(argument)
             self._run_next_seq_command()
 
 
@@ -784,7 +817,7 @@ class FileSelector(QWidget):
 class ClassicPatchButtons(ButtonTabWidget):
     origin_requested = QtCore.pyqtSignal(str)
 
-    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager):
+    def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager, camera_recorder=None):
         super().__init__()
         self.patch_interface = patch_interface
         self.pipette_interface = pipette_interface
@@ -825,9 +858,17 @@ class ClassicPatchButtons(ButtonTabWidget):
             tare_func=self.tare_pipette
         )
 
-        self.stage_calibration = [self.pipette_interface.set_floor, self.pipette_interface.calibrate_stage, self.pipette_interface.move_microscope]
+        self.stage_calibration = [self.pipette_interface.set_floor, self.patch_interface.calibrate_stage_40x, self.pipette_interface.move_microscope]
         self.pipette_calibration = [
             self.pipette_interface.calibrate_manipulator,
+            self.patch_interface.store_calibration_positions,
+            self.patch_interface.move_to_safe_space,
+        ]
+        calibration_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'utils')
+        self.pipette_anchor = [
+            lambda: self.patch_interface.read_calibration(os.path.join(calibration_dir, 'stage_calibration_40x.json')),
+            lambda: self.patch_interface.read_calibration(os.path.join(calibration_dir, 'pipette_calibration.json')),
+            self.pipette_interface.center_pipette,
             self.patch_interface.store_calibration_positions,
             self.patch_interface.move_to_safe_space,
         ]
@@ -854,8 +895,13 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         # Add a box for calibration setup
         # buttonList = [['Calibrate Stage','Calibrate Pipette'],['set home space','set safe space'],['Store Cleaning Position'],['Clear Calibration']]
-        buttonList = [['Calibrate Stage','Calibrate Pipette'],['Store Cleaning Position'],['Load Calibration','Clear Calibration']]
-        cmds = [[self.stage_calibration, self.pipette_calibration],
+        buttonList = [['Anchor Pipette', 'Anchor Cell Plane'], ['Calibrate Stage','Calibrate Pipette'],
+                      ['Calibrate 4x Objective'], ['Store Cleaning Position'], ['Load Calibration','Clear Calibration']]
+        cmds = [[self.pipette_anchor,
+                 [lambda: self.patch_interface.read_calibration(os.path.join(calibration_dir, 'stage_calibration_40x.json')),
+                  self.pipette_interface.set_floor, self.pipette_interface.move_microscope]],
+                [self.stage_calibration, self.pipette_calibration],
+                [self.patch_interface.calibrate_stage_4x],
                 # [self.patch_interface.store_home_position, self.patch_interface.store_safe_position],
                 [self.pipette_cleaning_calibration],
                 [self.load_calibration, self.patch_interface.clear_positions]
@@ -863,6 +909,8 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
                         change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)",
                         extra_widget=origin_controls)
+        self.get_section_button('calibration', 'Calibrate 4x Objective').setToolTip(
+            'Select and focus the 4x objective, then calibrate the XY stage only.')
         load_button = self.get_section_button('calibration', 'Load Calibration')
         load_button.clicked.disconnect()
         load_button.clicked.connect(self.load_calibration)
@@ -881,7 +929,10 @@ class ClassicPatchButtons(ButtonTabWidget):
             [self.pipette_interface.go_to_floor,self.pipette_interface.focus_stage],
             [
                 self.patch_interface.start_selecting_corners,
-                [[self.patch_interface.move_to_scan_start, self.start_recording, self.patch_interface.start_scan, self.stop_recording]],
+                [[self.patch_interface.move_to_scan_start, self.start_recording, self.patch_interface.start_scan,
+                  (self.stop_recording, False),
+                  (self.patch_interface.stitch_scan,
+                   (self.recorder.folder_path, (self.recorder, camera_recorder)))]],
             ],
             [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
             [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
@@ -1052,9 +1103,10 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.record_button.setStyleSheet("background-color: red; color: white;border-radius: 5px; padding: 5px;")
         logging.info("Recording started")
 
-    def stop_recording(self):
+    def stop_recording(self, flush=True):
         self.recording_state_manager.set_recording(False)
-        self.recorder.handle_recording_stopped()
+        if flush:
+            self.recorder.handle_recording_stopped()
         self.record_button.setText("Start Recording")
         self.record_button.setStyleSheet("")
         logging.info("Recording stopped")

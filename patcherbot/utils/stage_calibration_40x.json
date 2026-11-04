@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "objective": "40x",
+  "status": "recorded",
+  "saved_at": "2026-10-29T18:02:08-04:00",
+  "stage": {
+    "M": [
+      [
+        -5.865571421260045,
+        0.3753672142893693
+      ],
+      [
+        -0.3753672142893693,
+        -5.865571421260045
+      ]
+    ],
+    "r0": [
+      0.0,
+      0.0
+    ],
+    "up_direction": [
+      -1,
+      -1
+    ]
+  },
+  "fingerprint": null,
+  "source": {
+    "path": "experiments/Data/calibration_data/2026_10_29-17_44/calibration.pickle",
+    "sha256": "3380b78e8d36cb95ce6d7a7d609c51e447fcc9e4555b318bf295b7b83fd444a3",
+    "objective_basis": "User identified October recordings before October 30 as the 40x source; the original file has no objective label."
+  }
+}

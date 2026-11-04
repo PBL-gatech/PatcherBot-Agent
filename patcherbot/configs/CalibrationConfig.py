@@ -33,6 +33,10 @@ class CalibrationConfig(Config):
     pipette_diag_move = NumberWithUnit(200, unit="um",
                                      doc="x, y dist to move for pipette cal.",
                                      bounds=(50, 10000))
+    scan_speed = NumberWithUnit(10000, unit="um/s",
+                                doc="stage speed used while scanning",
+                                bounds=(1, 100000))
+
     stage_x_axis_flip = Boolean(False,
                                 doc="Flip the x axis of the stage")
     stage_y_axis_flip = Boolean(True,
@@ -106,6 +110,7 @@ class CalibrationConfig(Config):
             "stage_diag_move",
             "frame_lag",
             "y_delta_scan",
+            "scan_speed",
             "stage_x_axis_flip",
             "stage_y_axis_flip",
             "microscope_units_per_um",

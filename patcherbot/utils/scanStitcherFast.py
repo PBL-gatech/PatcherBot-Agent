@@ -1,7 +1,6 @@
 """Optional spatial-selection stitcher using the existing ScanStitcher geometry.
 
-This backend places tiles using recorded stage coordinates; it does not register
-images. CuPy and tifffile are imported only when the fast path is called.
+Tiles use stage coordinates with optional validated image-overlap refinement. CuPy and tifffile are imported only when the fast path is called.
 """
 from __future__ import annotations
 
@@ -19,6 +18,53 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class PreprocessConfig:
+    noise_sigma: float = 3
+    background_sigma: float = 45
+    local_sigma: float = 50
+    epsilon: float = 0.1
+    gain: float = 45
+    midpoint: float = 128
+
+    def validate(self):
+        for name in ('noise_sigma', 'background_sigma', 'local_sigma', 'epsilon'):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be positive and finite')
+        if not np.isfinite(self.gain) or self.gain < 0:
+            raise ValueError('gain must be nonnegative and finite')
+        if not np.isfinite(self.midpoint) or not 0 <= self.midpoint <= 255:
+            raise ValueError('midpoint must be between 0 and 255')
+        return self
+
+
+def preprocessing_metadata(config):
+    return None if config is None else asdict(config)
+
+
+def preprocess_bgr(frame, config):
+    """Apply the supplied float32 Gaussian/RMS recipe before resizing or blending."""
+    if config is None:
+        return frame
+    config.validate()
+    from PIL import Image
+    from scipy.ndimage import gaussian_filter
+
+    if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError('Preprocessing requires uint8 three-channel BGR frames')
+    # Use Pillow's grayscale conversion to match the reference calculation.
+    image = Image.fromarray(frame[:, :, ::-1]).convert('L')
+    pixels = np.asarray(image, dtype=np.float32)
+    detail = (gaussian_filter(pixels, sigma=config.noise_sigma)
+              - gaussian_filter(pixels, sigma=config.background_sigma))
+    local_scale = np.sqrt(
+        gaussian_filter(detail * detail, sigma=config.local_sigma) + config.epsilon)
+    normalized = detail / local_scale
+    enhanced = np.clip(config.midpoint + config.gain * normalized, 0, 255).astype(np.uint8)
+    return np.repeat(enhanced[:, :, None], 3, axis=2)
+
+
+@dataclass(frozen=True)
 class FastStitchConfig:
     overlap: float = 0.4
     workers: int = 8
@@ -32,8 +78,14 @@ class FastStitchConfig:
     max_gpu_gb: float = 12.0
     max_output_gb: float = 4.0
     overwrite: bool = False
+    preprocessing: PreprocessConfig | None = None
+    refine_images: bool = False
 
     def validate(self):
+        if self.preprocessing is not None:
+            if not isinstance(self.preprocessing, PreprocessConfig):
+                raise TypeError("preprocessing must be a PreprocessConfig or None (OFF).")
+            self.preprocessing.validate()
         if self.backend not in ("numpy", "cupy"):
             raise ValueError("backend must be 'numpy' or 'cupy'.")
         if self.blend not in ("feather", "overwrite"):
@@ -51,8 +103,8 @@ class FastStitchConfig:
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite.")
         if any(not isinstance(value, bool) for value in
-               (self.select_frames, self.preserve_coverage, self.overwrite)):
-            raise ValueError("select_frames, preserve_coverage and overwrite must be booleans.")
+               (self.select_frames, self.preserve_coverage, self.overwrite, self.refine_images)):
+            raise ValueError("select_frames, preserve_coverage, overwrite and refine_images must be booleans.")
         return self
 
 
@@ -341,11 +393,27 @@ def preserve_source_coverage(offsets, tile_shape, base_indices, max_pixels=100_0
         "coverage_grid_bytes": int(grid.nbytes + missing.nbytes),
     }
 
-def _output_path(stitcher, requested, default):
-    result = Path(default if requested is None else requested)
-    if not result.is_absolute():
-        result = Path(stitcher._dataset_output_dir()) / result
-    return result.resolve()
+def _output_paths(requested, metadata_path):
+    """Require a caller-selected directory and contain all derived files in it."""
+    if requested is None or not Path(requested).is_absolute():
+        raise ValueError("Fast output_path must be an explicit absolute TIFF path.")
+    requested = Path(requested)
+    directory = requested.parent.resolve()
+    output = requested.resolve()
+    if output.suffix.lower() not in (".tif", ".tiff"):
+        raise ValueError("Fast output must use .tif or .tiff.")
+    companion = output.with_name(output.stem + "_downsampled_2x" + output.suffix).resolve()
+    metadata = (output.with_name(output.stem + "_meta.json") if metadata_path is None
+                else Path(metadata_path))
+    if not metadata.is_absolute():
+        metadata = directory / metadata
+    metadata = metadata.resolve()
+    destinations = (output, companion, metadata)
+    if any(path.parent != directory for path in destinations):
+        raise ValueError("All fast output files must stay in the selected output directory.")
+    if len(set(destinations)) != len(destinations):
+        raise ValueError("Image, companion and metadata paths must differ.")
+    return destinations
 
 
 def _read_bgr(path):
@@ -354,6 +422,135 @@ def _read_bgr(path):
     if frame is None:
         raise ValueError(f"Could not decode camera frame: {path}")
     return frame
+
+
+# Registration calculation recovered from f203c110bb:experiments/restitch_image_refined.py.
+def _registration_overlap(a, b, delta):
+    dx, dy = np.asarray(delta, dtype=int)
+    h, w = a.shape
+    return (a[max(0, dy):min(h, h + dy), max(0, dx):min(w, w + dx)],
+            b[max(0, -dy):min(h, h - dy), max(0, -dx):min(w, w - dx)])
+
+
+def _registration_shift(a, b, factor):
+    size = (a.shape[1] // factor, a.shape[0] // factor)
+    aa = cv2.resize(a, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    bb = cv2.resize(b, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    shift, response = cv2.phaseCorrelate(aa, bb, cv2.createHanningWindow(size, cv2.CV_32F))
+    return np.asarray(shift) * np.array([a.shape[1] / size[0], a.shape[0] / size[1]]), response
+
+
+def _register_pair(item, images, offsets):
+    i, j = item
+    a, b = _registration_overlap(images[i], images[j], offsets[j] - offsets[i])
+    if min(a.shape) < 192:
+        return None
+    split = a.shape[1] // 2
+    shift, response = _registration_shift(a[:, :split], b[:, :split], 4)
+    check, check_response = _registration_shift(a[:, :split], b[:, :split], 8)
+    if (min(response, check_response) < 0.25 or np.linalg.norm(shift) > 64.0
+            or np.linalg.norm(check - shift) > 6):
+        return None
+    # Validate the unchanged shift on the other half of the _registration_overlap.
+    size = (a.shape[1] // 4, a.shape[0] // 4)
+    aa = cv2.resize(a, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    bb = cv2.resize(b, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    aa = cv2.GaussianBlur(aa, (0, 0), 0.75) - cv2.GaussianBlur(aa, (0, 0), 7.5)
+    bb = cv2.GaussianBlur(bb, (0, 0), 0.75) - cv2.GaussianBlur(bb, (0, 0), 7.5)
+    small_shift = shift / np.array([a.shape[1] / size[0], a.shape[0] / size[1]])
+    matrix = np.array([[1, 0, -small_shift[0]], [0, 1, -small_shift[1]]], np.float32)
+    moved = cv2.warpAffine(bb, matrix, size)
+    margin = int(np.ceil(np.max(np.abs(small_shift)))) + 5
+    roi = (slice(margin, size[1] - margin), slice(size[0] // 2 + margin, size[0] - margin))
+    if aa[roi].size < 300 or min(aa[roi].std(), bb[roi].std()) < 0.1:
+        return None
+    before = float(np.corrcoef(aa[roi].ravel(), bb[roi].ravel())[0, 1])
+    after = float(np.corrcoef(aa[roi].ravel(), moved[roi].ravel())[0, 1])
+    if not np.isfinite([before, after]).all() or after < 0.35 or after < before - 0.01:
+        return None
+    return {"i": i, "j": j, "shift": shift.tolist(), "response": float(min(response, check_response)),
+            "heldout_patch_before": before, "heldout_patch_after": after}
+
+
+def _solve_scan_positions(edges, count):
+    from scipy.sparse import coo_matrix, eye, vstack
+    from scipy.sparse.linalg import lsqr
+
+    rows = np.repeat(np.arange(len(edges)), 2)
+    columns = np.array([[e["i"], e["j"]] for e in edges]).ravel()
+    incidence = coo_matrix((np.tile([-1., 1.], len(edges)), (rows, columns)),
+                           shape=(len(edges), count)).tocsr()
+    target = -np.array([e["shift"] for e in edges])
+    confidence = np.sqrt(np.clip([e["response"] for e in edges], 0.1, 1))
+    correction = np.zeros((count, 2))
+    prior = eye(count, format="csr") * 0.08
+    anchor = coo_matrix(([10.], ([0], [0])), shape=(1, count)).tocsr()
+    for _ in range(6):
+        errors = np.linalg.norm(incidence @ correction - target, axis=1)
+        weights = confidence * np.sqrt(np.minimum(1., 5. / np.maximum(errors, 1e-6)))
+        design = vstack([incidence.multiply(weights[:, None]), prior, anchor]).tocsr()
+        for axis in range(2):
+            rhs = np.r_[target[:, axis] * weights, np.zeros(count + 1)]
+            correction[:, axis] = lsqr(design, rhs, atol=1e-8, btol=1e-8)[0]
+    return correction
+
+
+def _refine_scan_positions(timestamps, coords, paths, selected):
+    """Port of the accepted Nov 3 reference's validated overlap/stage-prior fit."""
+    from scipy.spatial import cKDTree
+
+    started = time.perf_counter()
+    frame_ids = np.unique(np.r_[selected, 0, len(paths) - 1]).astype(int)
+    if len(frame_ids) < 2:
+        raise ValueError("Image refinement requires overlapping frames.")
+    offsets = np.rint(coords[frame_ids] - coords[0]).astype(int)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        images = list(pool.map(lambda i: cv2.imread(str(paths[i]), cv2.IMREAD_GRAYSCALE), frame_ids))
+    if any(image is None for image in images):
+        raise ValueError("Could not decode a registration frame.")
+    h, w = images[0].shape
+    if any(image.shape != (h, w) for image in images):
+        raise ValueError("Registration frames must have matching dimensions.")
+    neighbors = cKDTree(offsets).query(offsets, k=min(10, len(frame_ids)))[1]
+    pairs = set()
+    for i, near in enumerate(neighbors):
+        for j in near:
+            if i < j:
+                dx, dy = np.abs(offsets[j] - offsets[i])
+                if dx < w - 192 and dy < h - 192:
+                    pairs.add((i, int(j)))
+    pairs = sorted(pairs)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        edges = [edge for edge in pool.map(
+            lambda pair: _register_pair(pair, images, offsets), pairs) if edge is not None]
+    if len(edges) < 20:
+        raise RuntimeError(f"Only {len(edges)} reliable overlaps; image refinement stopped.")
+    holdout = edges[::5]
+    training = [edge for k, edge in enumerate(edges) if k % 5]
+    probe = _solve_scan_positions(training, len(frame_ids))
+    before = np.array([np.linalg.norm(edge["shift"]) for edge in holdout])
+    after = np.array([np.linalg.norm(probe[edge["j"]] - probe[edge["i"]] + edge["shift"])
+                      for edge in holdout])
+    validation = {"heldout_pair_count": len(holdout),
+                  "median_error_before": float(np.median(before)),
+                  "median_error_after": float(np.median(after)),
+                  "fraction_improved": float(np.mean(after < before))}
+    if np.median(after) >= np.median(before):
+        raise RuntimeError(f"Held-out overlaps did not improve; image refinement stopped: {validation}")
+    corrections = _solve_scan_positions(edges, len(frame_ids))
+    if not np.isfinite(corrections).all() or np.max(np.linalg.norm(corrections, axis=1)) > 128:
+        raise RuntimeError("Global registration corrections exceed conservative bounds.")
+    all_corrections = np.column_stack([
+        np.interp(timestamps, timestamps[frame_ids], corrections[:, axis]) for axis in range(2)])
+    return coords + all_corrections, {
+        "method": "Confidence-filtered overlap translations, robust graph solve with stage prior",
+        "registration_keyframe_indices": frame_ids.tolist(), "attempted_pairs": len(pairs),
+        "accepted_pairs": len(edges), "validation": validation, "edges": edges,
+        "all_frame_corrections": all_corrections.tolist(),
+        "max_correction_pixels": float(np.max(np.linalg.norm(corrections, axis=1))),
+        "unregistered_frame_policy": "Timestamp interpolation between registered keyframes",
+        "elapsed_seconds": time.perf_counter() - started,
+    }
 
 
 def _feather_weights(shape):
@@ -370,6 +567,8 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
     legacy ``downsample`` is deliberately unused; ``output_downsample`` resizes
     both tiles and coordinates. ``blend='overwrite', select_frames=False`` keeps
     the legacy draw order for comparisons at matching output resolution.
+    ``output_path`` must be an explicit absolute TIFF path. Metadata and the
+    2x area-downsampled companion are restricted to that same directory.
     """
     start = time.perf_counter()
     config = FastStitchConfig() if config is None else config
@@ -381,13 +580,8 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
     if frame_limit is not None and (isinstance(frame_limit, bool) or
             not isinstance(frame_limit, (int, np.integer)) or frame_limit < 1):
         raise ValueError("frame_limit must be a positive integer or None.")
-    output = _output_path(stitcher, output_path, "stitched_fast.tif")
-    if output.suffix.lower() not in (".tif", ".tiff"):
-        raise ValueError("Fast output must use .tif or .tiff.")
-    metadata = _output_path(stitcher, metadata_path, str(output.with_name(output.stem + "_meta.json")))
-    if output == metadata:
-        raise ValueError("Image and metadata paths must differ.")
-    if not config.overwrite and (output.exists() or metadata.exists()):
+    output, downsampled_output, metadata = _output_paths(output_path, metadata_path)
+    if not config.overwrite and any(path.exists() for path in (output, downsampled_output, metadata)):
         raise FileExistsError("Fast output already exists; choose a new path or set overwrite=True.")
     try:
         import tifffile
@@ -424,6 +618,11 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
     source_h, source_w = sample.shape[:2]
     selected = (select_keyframes(coords, (source_h, source_w), config.overlap)
                 if config.select_frames else np.arange(len(paths), dtype=np.int64))
+    registration = None
+    if config.refine_images:
+        coords, registration = _refine_scan_positions(timestamps, coords, paths, selected)
+        selected = (select_keyframes(coords, (source_h, source_w), config.overlap)
+                    if config.select_frames else np.arange(len(paths), dtype=np.int64))
     base_selected = selected.copy()
     base_selected_set = set(base_selected.tolist())
     tile_h = math.ceil(source_h / config.output_downsample)
@@ -481,6 +680,7 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
         frame = sample if index == 0 else _read_bgr(paths[index])
         if frame.shape != sample.shape or frame.dtype != np.uint8:
             raise ValueError(f"Inconsistent frame shape or dtype: {paths[index]}")
+        frame = preprocess_bgr(frame, config.preprocessing)
         if (tile_h, tile_w) != (source_h, source_w):
             frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
         return frame
@@ -508,9 +708,11 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
     timing["decode_fuse_seconds"] = time.perf_counter() - blend_start
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    metadata.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
     temporary = output.with_name(f".{output.stem}.{token}.partial{output.suffix}")
+    temporary_downsampled = downsampled_output.with_name(
+        f".{downsampled_output.stem}.{token}.partial{output.suffix}")
+    temporary_pixels = output.with_name(f".{output.stem}.{token}.pixels.partial")
     temporary_metadata = metadata.with_name(f".{metadata.name}.{token}.partial")
     write_start = time.perf_counter()
 
@@ -527,22 +729,43 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
                 padded[:host.shape[0], :host.shape[1]] = host[:, :, ::-1]
                 yield padded
 
+    # Classic TIFF is more widely viewable; leave room for headers and metadata.
+    classic_tiff_limit = 2**32 - 32 * 1024**2
+    tile_count = math.ceil(height / config.tile_size) * math.ceil(width / config.tile_size)
+    tiled_tiff_bytes = tile_count * (config.tile_size**2 * 3 + 8)
     try:
-        with tifffile.TiffWriter(temporary, bigtiff=True) as writer:
+        with tifffile.TiffWriter(temporary, bigtiff=tiled_tiff_bytes >= classic_tiff_limit) as writer:
             writer.write(output_tiles(), shape=(height, width, 3), dtype=np.uint8,
                          photometric="rgb", tile=(config.tile_size, config.tile_size),
                          compression=None, metadata={"axes": "YXS"})
+        # Decode to disk-backed storage instead of allocating a full host canvas.
+        rgb = np.memmap(temporary_pixels, mode="w+", dtype=np.uint8,
+                        shape=(height, width, 3))
+        try:
+            tifffile.imread(temporary, out=rgb)
+            downsampled_rgb = cv2.resize(
+                rgb, ((width + 1) // 2, (height + 1) // 2), interpolation=cv2.INTER_AREA)
+        finally:
+            rgb._mmap.close()
+        tifffile.imwrite(temporary_downsampled, downsampled_rgb,
+                         bigtiff=downsampled_rgb.nbytes >= classic_tiff_limit,
+                         photometric="rgb", compression="deflate", metadata={"axes": "YXS"})
         timing["write_seconds"] = time.perf_counter() - write_start
         timing["total_seconds"] = time.perf_counter() - start
         report = {
             "coord_file": stitcher.coord_file, "photo_dir": stitcher.photo_dir,
             "use_calibration": stitcher.use_calibration,
+            "calibration_file": stitcher.calibration_file,
+            "calibration": stitcher.calibration,
+            "scan_time_window": stitcher.scan_area_window,
             "flip_x": stitcher.flip_x, "flip_y": stitcher.flip_y,
             "use_pixel_drift_stitch": stitcher.use_pixel_drift_stitch,
             "stitch_fraction": stitcher.stitch_fraction,
             "downsample": config.output_downsample,
             "legacy_downsample_unused": stitcher.downsample,
-            "stitch_mode": "pixel_drift_fast", "registration_mode": "stage_only",
+            "stitch_mode": "pixel_drift_fast",
+            "registration_mode": "image_refined_stage_prior" if registration is not None else "stage_only",
+            "registration": registration,
             "canvas_shape": [height, width, 3], "num_frames": len(selected),
             "source_frame_count": source_count, "eligible_frame_count": len(paths),
             "selected_frame_count": len(selected), "decoded_frame_count": len(selected),
@@ -551,9 +774,13 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
             "coverage_repair_mode": "missing_pixels_only" if has_boundary_repairs else "none",
             "backend": config.backend, "device": device, "config": asdict(config),
             "decoder": "opencv_direct",
+            "preprocessing": preprocessing_metadata(config.preprocessing),
             "timing": timing, "coverage": coverage,
             "selection_coverage": selection_coverage,
             "output": str(output), "metadata_path": str(metadata),
+            "downsampled_output": str(downsampled_output),
+            "downsampled_canvas_shape": list(downsampled_rgb.shape),
+            "downsampled_factor": 2,
             "output_origin_xy_pixels": (coords[0] + origin * scale_xy).tolist(),
             "pixel_scale_xy": scale_xy.tolist(),
             "estimated_output_bytes": output_bytes,
@@ -562,9 +789,12 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
         }
         temporary_metadata.write_text(json.dumps(report, indent=2), encoding="utf-8")
         os.replace(temporary, output)
+        os.replace(temporary_downsampled, downsampled_output)
         os.replace(temporary_metadata, metadata)
     finally:
         temporary.unlink(missing_ok=True)
+        temporary_downsampled.unlink(missing_ok=True)
+        temporary_pixels.unlink(missing_ok=True)
         temporary_metadata.unlink(missing_ok=True)
     stitcher.canvas = None
     stitcher._streaming_canvas_path = None
