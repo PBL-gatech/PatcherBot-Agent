@@ -59,13 +59,10 @@ class GraphInterface(TaskInterface):
         
     @command(category='DAQ',
                 description='get last Data from DAQ')
-    def get_last_data(self, pipette_number=None):
-        data = self.daq.get_last_acquisition()
-        if data is None:
-            return None
-        if pipette_number is not None and hasattr(self.daq, "get_data_for_pipette"):
-            data["analog_io_data"] = self.daq.get_data_for_pipette(pipette_number)
-        return data
+    def get_last_data(self, pipette_key=None):
+        # With a PipetteDAQView this is that pipette's packet; with the DAQ
+        # itself it defaults to the first pipette.
+        return self.daq.get_last_acquisition(pipette_key)
 
     @command(category='DAQ',
                 description='compute noise metrics from DAQ response')

@@ -570,6 +570,11 @@ class RigBuilderDialog(QDialog):
         for slot in SHARED_DEVICE_SLOTS:
             spec = devices.get(slot)
 
+            # Older configs listed one DAQ per pipette; a shared slot keeps
+            # only the first, and saving writes it back as a single device.
+            if isinstance(spec, list) and spec:
+                spec = spec[0]
+
             if isinstance(spec, dict):
                 self._set_row_spec(
                     slot,

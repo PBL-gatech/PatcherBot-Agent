@@ -11,7 +11,7 @@ from patcherbot.utils import EPhysLogger, RecordingStateManager
 from patcherbot.devices.pressurecontroller.BasePressureController import PressureController
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
-from patcherbot.devices.amplifier.DAQ import DAQ, DAQProtocolSession
+from patcherbot.devices.amplifier.DAQ import DAQ, PipetteDAQView
 from patcherbot.devices.lamp import Lamp
 from patcherbot.configs.PatchConfig import PatchConfig
 from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
@@ -60,13 +60,14 @@ class AutoPatchInterface(TaskInterface):
         self.lamp = lamp
         self.laser = laser
         self.ephys_logger = EPhysLogger(recording_state_manager=self.recording_state_manager, ephys_filename="CellMetadata")
+        # One DAQ for the whole rig; each pipette gets a view onto it (no copies).
         self.protocol_daQs = {}
         self.autopatchers = {}
         for pipette_number, (pipette_key, calibrated_unit) in enumerate(
                 self.pipette_controller.calibrated_units.items(), start=1):
             pipette_amplifier = self._device_for_pipette(self.amplifiers, "amplifier", pipette_number)
             pipette_pressure = self._device_for_pipette(self.pressures, "pressure", pipette_number)
-            protocol_daq = DAQProtocolSession(daq, pipette_number)
+            protocol_daq = PipetteDAQView(daq, self._daq_key_for_pipette(daq, pipette_key, pipette_number))
             self.protocol_daQs[pipette_key] = protocol_daq
             self.autopatchers[pipette_key] = AutoPatcher(
                 pipette_amplifier,
@@ -103,6 +104,21 @@ class AutoPatchInterface(TaskInterface):
         "opto_random_wavelength_protocol",
         "opto_random_power_protocol",
     )
+
+    def _daq_key_for_pipette(self, daq, pipette_key, pipette_number):
+        """Match a pipette to its DAQ channel set.
+
+        The rig builder gives the DAQ the same pipette keys, so normally this
+        is ``pipette_key``. Otherwise fall back to position, then to the first
+        channel set (a DAQ wired for fewer pipettes than were selected).
+        """
+        daq_keys = list(daq.channel_map)
+        if pipette_key in daq.channel_map:
+            return pipette_key
+        if pipette_number - 1 < len(daq_keys):
+            return daq_keys[pipette_number - 1]
+        self.warning(f"DAQ has no channels for {pipette_key}; it will share {daq_keys[0]}'s channels")
+        return daq_keys[0]
 
     @staticmethod
     def _device_for_pipette(devices, slot, pipette_number):

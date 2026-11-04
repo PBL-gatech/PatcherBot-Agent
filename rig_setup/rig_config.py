@@ -49,13 +49,15 @@ SHARED_DEVICE_SLOTS: List[str] = [
     "cell_sorter_manipulator",
     "lamp",
     "laser",
+    # One DAQ serves every pipette; pipettes map to its channels. It is built
+    # after the pipette slots so it can be given the selected pipette keys.
+    "daq",
 ]
 
 PIPETTE_DEVICE_SLOTS: List[str] = [
     "pipette_controller",
     "pipette_camera",
     "pressure",
-    "daq",
     "amplifier",
 ]
 
@@ -618,15 +620,16 @@ class RigConfigManager:
             
             if isinstance(curr_device, list):
                 if slot not in PIPETTE_DEVICE_SLOTS:
-                    raise RigConfigError(f"Shared device slot '{slot}' cannot contain multiple devices.")
+                    hint = (
+                        " Configure one DAQ for the rig; each pipette maps to its channels."
+                        if slot == "daq" else ""
+                    )
+                    raise RigConfigError(
+                        f"Shared device slot '{slot}' cannot contain multiple devices.{hint}"
+                    )
                 if not curr_device:
                     raise RigConfigError(f"Device slot '{slot}' contains an empty device list.")
-                # A DAQ is a rig-level resource. In particular, constructing
-                # one FakeDAQ per pipette starts competing replay/acquisition
-                # threads over the same replay source. Keep accepting legacy
-                # per-pipette config lists, but instantiate only one DAQ.
-                device_count = 1 if slot == "daq" else active_pipette_count
-                devices_to_initialize = curr_device[:device_count]
+                devices_to_initialize = curr_device[:active_pipette_count]
                 instance_dict: Dict[str, Any] = {}
                 for i, dev_cfg in enumerate(devices_to_initialize):
 
@@ -646,51 +649,21 @@ class RigConfigManager:
 
                     instance_dict[instance_key] = instance
 
-                if slot == "daq":
-                    daq = next(iter(instance_dict.values()))
-                    daq.active_pipette_count = active_pipette_count
-                    # Preserve explicit routing declarations from config for
-                    # future single-DAQ / multi-pipette rig configurations.
-                    route_map: Dict[str, Any] = {}
-                    for dev_cfg in curr_device:
-                        params = dev_cfg.get("params", {}) if isinstance(dev_cfg, dict) else {}
-                        routes = params.get("analog_io_to_pipette", {}) if isinstance(params, dict) else {}
-                        if isinstance(routes, dict):
-                            route_map.update(routes)
-                    if route_map:
-                        configure_routes = getattr(daq, "configure_analog_io_to_pipette", None)
-                        if callable(configure_routes):
-                            configure_routes(route_map)
-                        else:
-                            daq.analog_io_to_pipette = dict(route_map)
-                    base_instances[slot] = daq
-                    if len(curr_device) > 1:
-                        LOGGER.warning(
-                            "DAQ slot contains %d legacy entries; instantiated one rig-level DAQ. "
-                            "Use params.analog_io_to_pipette to route analog inputs to pipettes.",
-                            len(curr_device),
-                        )
-                else:
-                    base_instances[slot] = instance_dict
+                base_instances[slot] = instance_dict
 
             # Single-instance device slot.
             elif isinstance(curr_device, dict):
+                default_kwargs = None
+                if slot == "daq":
+                    # The single DAQ needs to know which pipettes it serves so
+                    # it can key channels/data by the same pipette names.
+                    default_kwargs = {"pipette_keys": self._selected_pipette_keys(base_instances)}
                 base_instances[slot] = self._instantiate_slot(
                     slot,
                     curr_device,
                     base_instances,
+                    default_kwargs=default_kwargs,
                 )
-                if slot == "daq":
-                    daq = base_instances[slot]
-                    daq.active_pipette_count = active_pipette_count
-                    params = curr_device.get("params", {})
-                    routes = params.get("analog_io_to_pipette", {}) if isinstance(params, dict) else {}
-                    if routes:
-                        configure_routes = getattr(daq, "configure_analog_io_to_pipette", None)
-                        if callable(configure_routes):
-                            configure_routes(routes)
-                        else:
-                            daq.analog_io_to_pipette = dict(routes)
             else:
                 raise RigConfigError(
                 f"Invalid configuration for device slot '{slot}'. "
@@ -744,7 +717,16 @@ class RigConfigManager:
         LOGGER.info("Initialized devices: %s", ", ".join(sorted(all_devices.keys())))
         return all_devices
 
-    def _instantiate_slot(self, slot: str, cfg: Dict[str, Any], instances: Dict[str, Any]) -> Any:
+    @staticmethod
+    def _selected_pipette_keys(instances: Dict[str, Any]) -> List[str]:
+        """Pipette keys in rig order, matching the keys used for pipette units."""
+        controllers = instances.get("pipette_controller")
+        if isinstance(controllers, dict):
+            return list(controllers)
+        return ["pipette_0"]   # single-device config; PipetteInterface uses this key
+
+    def _instantiate_slot(self, slot: str, cfg: Dict[str, Any], instances: Dict[str, Any],
+                          default_kwargs: Dict[str, Any] | None = None) -> Any:
         """
         Instantiate a device for a given slot.
 
@@ -752,6 +734,9 @@ class RigConfigManager:
             slot (str): Device slot name.
             cfg (Dict[str, Any]): Slot configuration.
             instances (Dict[str, Any]): Existing instances for reference resolution.
+            default_kwargs (Dict[str, Any] | None): Constructor arguments supplied by
+                the builder. Each is passed only if the constructor names it
+                explicitly and the config doesn't set it.
 
         Returns:
             Any: Instantiated device.
@@ -771,6 +756,11 @@ class RigConfigManager:
 
         params_cfg = cfg.get("params", {}) or {}
         ctor_kwargs, post_attrs = self._split_ctor_params(cls, params_cfg, instances)
+        if default_kwargs:
+            ctor_params = inspect.signature(cls.__init__).parameters
+            for key, value in default_kwargs.items():
+                if key in ctor_params and key not in ctor_kwargs:
+                    ctor_kwargs[key] = value
         try:
             instance = cls(**ctor_kwargs)
         except Exception as exc:
@@ -937,10 +927,6 @@ class RigConfigManager:
             if slot in PIPETTE_DEVICE_SLOTS:
                 spec = devices[slot]
                 if pipette_count > 1:
-                    # A DAQ can be configured once for a multi-pipette rig;
-                    # the other slots still require one device per pipette.
-                    if slot == "daq" and isinstance(spec, dict):
-                        continue
                     if not isinstance(spec, list):
                         raise RigConfigError(
                             f"'{slot}' must contain {pipette_count} "
@@ -951,6 +937,12 @@ class RigConfigManager:
                             f"'{slot}' contains {len(spec)} devices, "
                             f"but this rig declares {pipette_count} pipettes."
                         )
+            elif isinstance(devices[slot], list):
+                hint = (
+                    " Configure one DAQ for the rig; each pipette maps to its channels."
+                    if slot == "daq" else ""
+                )
+                raise RigConfigError(f"'{slot}' is shared by all pipettes and must be a single device.{hint}")
 
     def make_config_path(self, name: str) -> Path:
         """

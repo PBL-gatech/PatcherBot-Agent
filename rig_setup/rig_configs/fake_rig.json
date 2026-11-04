@@ -137,26 +137,10 @@
         "params": {}
       }
     ],
-    "daq": [
-      {
-        "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
-        "params": {
-          "pressureController": "$ref:pressure[0]"
-        }
-      },
-      {
-        "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
-        "params": {
-          "pressureController": "$ref:pressure[1]"
-        }
-      },
-      {
-        "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
-        "params": {
-          "pressureController": "$ref:pressure[2]"
-        }
-      }
-    ],
+    "daq": {
+      "class": "patcherbot.devices.amplifier.DAQ.FakeDAQ",
+      "params": {}
+    },
     "amplifier": [
       {
         "class": "patcherbot.devices.amplifier.amplifier.FakeAmplifier",
