@@ -29,7 +29,7 @@ def resolve_scan_image(path):
     return image_path.resolve()
 
 
-def read_scan_image(path, native=False):
+def read_scan_image(path, native=False, enhance=False):
     """Read one bounded display level; TIFF dimensions always use native pixels."""
     import cv2
     import tifffile
@@ -79,21 +79,42 @@ def read_scan_image(path, native=False):
         pixels = cv2.resize(pixels, (max(1, round(pixels.shape[1] * ratio)),
                                      max(1, round(pixels.shape[0] * ratio))),
                             interpolation=cv2.INTER_AREA)
+    if enhance:
+        # Viewing only: preserve the source file and its native coordinate system.
+        gray = cv2.cvtColor(np.ascontiguousarray(pixels), cv2.COLOR_RGB2GRAY)
+        valid = np.any(pixels != 0, axis=2)
+        values = gray.astype(np.float32)
+        sigma = max(0.1, 30.0 * pixels.shape[1] / width)
+        mask = valid.astype(np.float32)
+        weight = cv2.GaussianBlur(mask, (0, 0), sigma)
+        background = cv2.GaussianBlur(values * mask, (0, 0), sigma)
+        values -= background / np.maximum(weight, 1e-6)
+        values += 127.5
+        if valid.any():
+            low, high = np.percentile(values[valid], (1, 99))
+            if high > low:
+                values = (values - low) * (255.0 / (high - low))
+        gray = np.ascontiguousarray(np.clip(values, 0, 255).astype(np.uint8))
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        gray[~valid] = 0
+        pixels = np.repeat(gray[:, :, None], 3, axis=2)
     return {"path": str(path), "width": width, "height": height,
-            "pixels": np.ascontiguousarray(pixels), "native": native}
+            "pixels": np.ascontiguousarray(pixels), "native": native,
+            "enhanced": enhance}
 
 
 class _ImageReader(QtCore.QThread):
     loaded = QtCore.pyqtSignal(int, object)
     failed = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, token, path, native, parent):
+    def __init__(self, token, path, native, enhance, parent):
         super().__init__(parent)
         self.token, self.path, self.native = token, path, native
+        self.enhance = enhance
 
     def run(self):
         try:
-            self.loaded.emit(self.token, read_scan_image(self.path, self.native))
+            self.loaded.emit(self.token, read_scan_image(self.path, self.native, self.enhance))
         except Exception as error:
             self.failed.emit(self.token, str(error))
 
@@ -140,6 +161,7 @@ class ScanViewerTab(ParamConfig):
         self._native_requested = False
         self._overview_ratio = 1.0
         self._item = None
+        self._fit_pending = False
         layout = QtWidgets.QVBoxLayout(self)
         toolbar = QtWidgets.QHBoxLayout()
         for label, action in (("Open scan…", self.open_image),
@@ -149,6 +171,11 @@ class ScanViewerTab(ParamConfig):
             button = QtWidgets.QPushButton(label)
             button.clicked.connect(action)
             toolbar.addWidget(button)
+        self.enhance_detail = QtWidgets.QCheckBox("Enhance detail")
+        self.enhance_detail.setToolTip(
+            "Viewing only: subtract background, stretch levels, and enhance local contrast")
+        self.enhance_detail.toggled.connect(self._enhancement_changed)
+        toolbar.addWidget(self.enhance_detail)
         toolbar.addStretch()
         self.coordinates = QtWidgets.QLabel("Image pixels")
         toolbar.addWidget(self.coordinates)
@@ -172,17 +199,25 @@ class ScanViewerTab(ParamConfig):
 
     def load_image(self, path):
         self._token += 1
+        self._fit_pending = True
         self._native = self._native_requested = False
         self.image_path = str(path)
         self.status.setText(f"Loading overview: {Path(path).name}")
         self._request_read(False)
 
     def _request_read(self, native):
-        request = (self._token, self.image_path, native)
+        request = (self._token, self.image_path, native, self.enhance_detail.isChecked())
         if self._reader is not None:
             self._pending = request
             return
         self._start_reader(request)
+
+    def _enhancement_changed(self, enabled):
+        if self.image_path:
+            self._token += 1
+            native = self._native or self._native_requested
+            self.status.setText("Updating saved-image detail…")
+            self._request_read(native)
 
     def _start_reader(self, request):
         self._reader = _ImageReader(*request, self)
@@ -219,8 +254,12 @@ class ScanViewerTab(ParamConfig):
         self._native = result["native"]
         if not self._native:
             self._overview_ratio = width / result["width"]
+        if self._fit_pending:
             self.fit_image()
+            self._fit_pending = False
         level = "Native pixels" if self._native else "Downsampled overview; zoom for native detail"
+        if result["enhanced"]:
+            level += "; enhanced display"
         self.status.setText(f"{Path(self.image_path).name} — {result['width']} × "
                             f"{result['height']} — {level}")
 

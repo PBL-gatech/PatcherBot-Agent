@@ -194,8 +194,17 @@ class AutoPatchInterface(TaskInterface):
     @blocking_command(category='Stage',
                       description='Scan the stored corner coordinates',
                       task_description='Scanning plate area')
-    def start_scan(self):
-        self.execute(self.current_autopatcher.scan_area)
+    def start_scan(self, camera_recorder=None):
+        previous_options = None
+        if camera_recorder is not None:
+            previous_options = camera_recorder.image_save_options
+            camera_recorder.image_save_options = {
+                **previous_options, 'lossless': True, 'method': 0}
+        try:
+            self.execute(self.current_autopatcher.scan_area)
+        finally:
+            if camera_recorder is not None:
+                camera_recorder.image_save_options = previous_options
 
     @blocking_command(category='Stage',
                       description='Stitch the recorded scan',

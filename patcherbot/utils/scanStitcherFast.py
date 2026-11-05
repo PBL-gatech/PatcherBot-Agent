@@ -289,12 +289,41 @@ def coverage_report(xy, tile_shape):
 
 
 
+def _rectangle_union_area(rectangles):
+    """Exact integer area using an edge sweep, without a pixel-sized canvas."""
+    events = {}
+    for index, (x0, y0, x1, y1) in enumerate(rectangles):
+        events.setdefault(int(x0), []).append((index, (int(y0), int(y1))))
+        events.setdefault(int(x1), []).append((index, None))
+    active = {}
+    previous_x = covered_y = area = 0
+    for x in sorted(events):
+        area += (x - previous_x) * covered_y
+        for index, interval in events[x]:
+            if interval is None:
+                active.pop(index, None)
+            else:
+                active[index] = interval
+        covered_y = 0
+        end = None
+        for start, stop in sorted(active.values()):
+            if end is None or start > end:
+                covered_y += stop - start
+                end = stop
+            elif stop > end:
+                covered_y += stop - end
+                end = stop
+        previous_x = x
+    return area
+
+
 def preserve_source_coverage(offsets, tile_shape, base_indices, max_pixels=100_000_000):
     """Add source frames until their exact integer pixel union is preserved.
 
     ``offsets`` must be the same rounded source-pixel placements used to render.
     Only input rectangles are added: holes already present in the source remain
-    holes. A bounded difference grid and integral image avoid decoding any images.
+    holes. A bounded difference grid and integral image avoid decoding any images;
+    larger canvases use exact rectangle sweeps instead of allocating that grid.
     """
     started = time.perf_counter()
     points = np.asarray(offsets)
@@ -331,7 +360,37 @@ def preserve_source_coverage(offsets, tile_shape, base_indices, max_pixels=100_0
     height = int(points[:, 1].max()) + tile_h
     grid_pixels = (height + 1) * (width + 1)
     if grid_pixels > max_pixels:
-        raise MemoryError("Coverage grid exceeds max_pixels; reduce resolution or explicitly increase the limit.")
+        rectangles = np.column_stack((points, points + [tile_w, tile_h]))
+        source_pixels = _rectangle_union_area(rectangles)
+        base_pixels = _rectangle_union_area(rectangles[base])
+        selected_mask = np.zeros(count, dtype=bool)
+        selected_mask[base] = True
+        # Check each remaining rectangle against the current selected union.
+        # Source order is deterministic; every added frame contributes coverage.
+        for index in np.flatnonzero(~selected_mask):
+            x0, y0, x1, y1 = rectangles[index]
+            intersects = (selected_mask & (rectangles[:, 0] < x1) &
+                          (rectangles[:, 2] > x0) & (rectangles[:, 1] < y1) &
+                          (rectangles[:, 3] > y0))
+            clipped = rectangles[intersects].copy()
+            clipped[:, :2] = np.maximum(clipped[:, :2], [x0, y0])
+            clipped[:, 2:] = np.minimum(clipped[:, 2:], [x1, y1])
+            if _rectangle_union_area(clipped) < tile_w * tile_h:
+                selected_mask[index] = True
+        result = np.flatnonzero(selected_mask)
+        remaining = source_pixels - _rectangle_union_area(rectangles[result])
+        if remaining:
+            raise RuntimeError("Source coverage reconstruction failed its exact union check.")
+        return result, {
+            "source_covered_pixels": source_pixels, "base_covered_pixels": base_pixels,
+            "missing_pixels_before": source_pixels - base_pixels,
+            "missing_pixels_after": remaining,
+            "added_frame_count": len(result) - len(base),
+            "selected_frame_count": len(result),
+            "selection_seconds": time.perf_counter() - started,
+            "canvas_shape_yx": [height, width], "coverage_grid_bytes": 0,
+            "coverage_method": "exact_rectangle_sweep",
+        }
     sentinel = count + 1
     # One tally encodes source count in the low range and selected coverage in
     # multiples of sentinel. No source-only count can reach that sentinel.
@@ -536,13 +595,23 @@ def _refine_scan_positions(timestamps, coords, paths, selected):
                   "median_error_after": float(np.median(after)),
                   "fraction_improved": float(np.mean(after < before))}
     if np.median(after) >= np.median(before):
-        raise RuntimeError(f"Held-out overlaps did not improve; image refinement stopped: {validation}")
+        reason = "Held-out overlaps did not improve; retaining recorded stage positions."
+        print(f"[ScanStitcher] {reason} {validation}")
+        return coords, {
+            "method": "Recorded stage positions; image refinement rejected",
+            "applied": False, "reason": reason,
+            "registration_keyframe_indices": frame_ids.tolist(),
+            "attempted_pairs": len(pairs), "accepted_pairs": len(edges),
+            "validation": validation,
+            "elapsed_seconds": time.perf_counter() - started,
+        }
     corrections = _solve_scan_positions(edges, len(frame_ids))
     if not np.isfinite(corrections).all() or np.max(np.linalg.norm(corrections, axis=1)) > 128:
         raise RuntimeError("Global registration corrections exceed conservative bounds.")
     all_corrections = np.column_stack([
         np.interp(timestamps, timestamps[frame_ids], corrections[:, axis]) for axis in range(2)])
     return coords + all_corrections, {
+        "applied": True,
         "method": "Confidence-filtered overlap translations, robust graph solve with stage prior",
         "registration_keyframe_indices": frame_ids.tolist(), "attempted_pairs": len(pairs),
         "accepted_pairs": len(edges), "validation": validation, "edges": edges,
@@ -764,7 +833,9 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
             "downsample": config.output_downsample,
             "legacy_downsample_unused": stitcher.downsample,
             "stitch_mode": "pixel_drift_fast",
-            "registration_mode": "image_refined_stage_prior" if registration is not None else "stage_only",
+            "registration_mode": ("image_refined_stage_prior"
+                                  if registration is not None and registration.get("applied", False)
+                                  else "stage_only"),
             "registration": registration,
             "canvas_shape": [height, width, 3], "num_frames": len(selected),
             "source_frame_count": source_count, "eligible_frame_count": len(paths),

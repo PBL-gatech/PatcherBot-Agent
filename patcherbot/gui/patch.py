@@ -587,9 +587,8 @@ class ButtonTabWidget(QtWidgets.QWidget):
                 if exit_code != 0 and self._seq_active_style and self._seq_button:
                     self._seq_button.setStyleSheet("")
                     self._seq_active_style = False
-                if exit_code != 0 and self._seq_cmds in (
-                        getattr(self, 'pipette_calibration', None),
-                        getattr(self, 'pipette_anchor', None)):
+                if (exit_code != 0
+                        and self._seq_cmds == getattr(self, 'pipette_calibration', None)):
                     self._seq_index = len(self._seq_cmds)
                     return
                 # Launch next command after current one finishes
@@ -864,14 +863,6 @@ class ClassicPatchButtons(ButtonTabWidget):
             self.patch_interface.store_calibration_positions,
             self.patch_interface.move_to_safe_space,
         ]
-        calibration_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'utils')
-        self.pipette_anchor = [
-            lambda: self.patch_interface.read_calibration(os.path.join(calibration_dir, 'stage_calibration_40x.json')),
-            lambda: self.patch_interface.read_calibration(os.path.join(calibration_dir, 'pipette_calibration.json')),
-            self.pipette_interface.center_pipette,
-            self.patch_interface.store_calibration_positions,
-            self.patch_interface.move_to_safe_space,
-        ]
         self.pipette_cleaning_calibration = [self.patch_interface.store_cleaning_position,self.patch_interface.move_pipette_up,self.patch_interface.move_to_safe_space]
 
 
@@ -895,12 +886,9 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         # Add a box for calibration setup
         # buttonList = [['Calibrate Stage','Calibrate Pipette'],['set home space','set safe space'],['Store Cleaning Position'],['Clear Calibration']]
-        buttonList = [['Anchor Pipette', 'Anchor Cell Plane'], ['Calibrate Stage','Calibrate Pipette'],
+        buttonList = [['Calibrate Stage','Calibrate Pipette'],
                       ['Calibrate 4x Objective'], ['Store Cleaning Position'], ['Load Calibration','Clear Calibration']]
-        cmds = [[self.pipette_anchor,
-                 [lambda: self.patch_interface.read_calibration(os.path.join(calibration_dir, 'stage_calibration_40x.json')),
-                  self.pipette_interface.set_floor, self.pipette_interface.move_microscope]],
-                [self.stage_calibration, self.pipette_calibration],
+        cmds = [[self.stage_calibration, self.pipette_calibration],
                 [self.patch_interface.calibrate_stage_4x],
                 # [self.patch_interface.store_home_position, self.patch_interface.store_safe_position],
                 [self.pipette_cleaning_calibration],
@@ -929,7 +917,8 @@ class ClassicPatchButtons(ButtonTabWidget):
             [self.pipette_interface.go_to_floor,self.pipette_interface.focus_stage],
             [
                 self.patch_interface.start_selecting_corners,
-                [[self.patch_interface.move_to_scan_start, self.start_recording, self.patch_interface.start_scan,
+                [[self.patch_interface.move_to_scan_start, self.start_recording,
+                  (self.patch_interface.start_scan, camera_recorder),
                   (self.stop_recording, False),
                   (self.patch_interface.stitch_scan,
                    (self.recorder.folder_path, (self.recorder, camera_recorder)))]],
