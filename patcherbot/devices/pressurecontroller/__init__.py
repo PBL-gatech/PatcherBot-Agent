@@ -3,3 +3,4 @@ from .BasePressureController import *
 from .IBBPressureController import IBBPressureController
 from .TestPressureController import TestPressureController
 from .MoscowPressureController import MoscowPressureController
+from .SerialPressureController import SerialPressureController

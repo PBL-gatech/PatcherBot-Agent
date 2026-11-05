@@ -59,6 +59,15 @@ def create_protocol_graphs(graph_interface, recording_state_manager):
     }
 
 def main():
+    """Own rig resources through startup failures, GUI shutdown, and exceptions."""
+    manager = RigConfigManager()
+    try:
+        _run_gui(manager)
+    finally:
+        manager.close_devices()
+
+
+def _run_gui(manager):
     """
     Starts the Patch GUI application and prepares the rig for use.
 
@@ -77,7 +86,9 @@ def main():
         Exception: If any other error occurs during initialization.
     """
     app = QApplication(sys.argv)
-    manager = RigConfigManager()
+    # Stop acquisition before releasing shared ports on normal Qt shutdown.
+    # main() also cleans up if startup or the event loop raises unexpectedly.
+    app.aboutToQuit.connect(manager.close_devices)
     manager.ensure_default_config()
 
     selector = RigSelectorDialog(manager)

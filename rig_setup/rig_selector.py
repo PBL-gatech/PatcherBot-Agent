@@ -155,6 +155,8 @@ class SettingsDialog(QDialog):
             field = next((f for f in self.fields if f["key"] == key), {})
             typ = field.get("type", "str")
             if text == "" and field.get("optional"):
+                if 'empty_value' in field:
+                    _set_nested(params, key, field['empty_value'])
                 continue
             try:
                 val = _coerce(text, typ)
@@ -733,6 +735,15 @@ class RigBuilderDialog(QDialog):
                 isinstance(data, dict)
                 and data.get("class") == target_class
             ):
+                # Fake/generic pressure have templates with the same runtime class.
+                # Restore the saved hardware/simulation variant so sensor fields
+                # remain editable and a loaded hardware setup is not labelled as
+                # fully simulated. No additional JSON discriminator is needed.
+                if slot == "pressure" and target_class.endswith((".FakePressureController", ".SerialPressureController")):
+                    saved_reader = (spec.get("params") or {}).get("readerSerial")
+                    template_reader = data.get("params", {}).get("readerSerial")
+                    if (saved_reader is None) != (template_reader is None):
+                        continue
                 match_idx = i
                 break
 

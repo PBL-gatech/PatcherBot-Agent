@@ -29,6 +29,8 @@ import logging
 import re
 from pathlib import Path
 import inspect
+import math
+import time
 from typing import Any, Dict, List, Tuple
 import yaml
 
@@ -159,6 +161,37 @@ def _default_ai_features() -> Dict[str, Any]:
     return {
         "enabled": True,
     }
+
+
+# Shared pressure field definitions keep the Moscow, generic serial, and hybrid
+# fake templates aligned with their constructor parameters. These describe the
+# editor only; ports are opened later by build_devices(), never by the dialog.
+_PRESSURE_SENSOR_FIELDS = [
+    {"key": "readerSerial.port", "label": "Sensor reader port", "type": "str"},
+    {"key": "readerSerial.baudrate", "label": "Sensor reader baud", "type": "int"},
+    {"key": "readerSerial.timeout", "label": "Reader timeout (s)", "type": "float", "optional": True},
+    {"key": "readerSerial.boot_delay", "label": "Reader boot delay (s)", "type": "float", "optional": True},
+    {"key": "sensor_channel", "label": "Sensor channel ID", "type": "int", "optional": True},
+    {"key": "sensor_pin", "label": "Analog pin (e.g. A2; blank: firmware default)", "type": "str", "optional": True, "empty_value": None},
+    {"key": "sensor_offset", "label": "Sensor zero offset (ADC counts)", "type": "float", "optional": True},
+    {"key": "sensor_scale", "label": "Sensor scale (ADC counts/mbar)", "type": "float", "optional": True},
+    {"key": "serial_cmd_timeout", "label": "Command timeout (s)", "type": "float", "optional": True},
+]
+_PRESSURE_OUTPUT_FIELDS = [
+    {"key": "channel", "label": "Pressure output channel", "type": "int"},
+    {"key": "controllerSerial.port", "label": "Controller port", "type": "str"},
+    {"key": "controllerSerial.baudrate", "label": "Controller baud", "type": "int"},
+    {"key": "controllerSerial.timeout", "label": "Controller timeout (s)", "type": "float", "optional": True},
+]
+_GENERIC_PRESSURE_FIELDS = [
+    {"key": "native_zero", "label": "Output zero (DAC units)", "type": "float", "optional": True},
+    {"key": "native_per_mbar", "label": "Output scale (DAC units/mbar)", "type": "float", "optional": True},
+    {"key": "native_min", "label": "Minimum DAC value", "type": "int", "optional": True},
+    {"key": "native_max", "label": "Maximum DAC value (default: twice zero)", "type": "int", "optional": True},
+    {"key": "startup_pressure", "label": "Startup setpoint (mbar)", "type": "float", "optional": True},
+    {"key": "startup_atm", "label": "Startup atmosphere mode (true/false)", "type": "bool", "optional": True},
+    {"key": "initialize_output", "label": "Send startup commands (true/false)", "type": "bool", "optional": True},
+]
 
 
 # Available device options (used by the builder UI).
@@ -355,10 +388,25 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
     ],
     "pressure": [
         {
-            "label": "FakePressureController",
+            "label": "FakePressureController (fully simulated)",
             "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
             "params": {},
             "fields": [],
+        },
+        {
+            # Same runtime class, but a separate selectable template so choosing
+            # fully simulated pressure never silently introduces a hardware port.
+            "label": "FakePressureController (real sensors, simulated outputs)",
+            "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
+            "params": {
+                "readerSerial": {"port": "COM4", "baudrate": 9600, "timeout": 0, "boot_delay": 2},
+                "sensor_channel": 0,
+                # Existing nominal calibration; replace for each physical sensor.
+                "sensor_offset": 516.72,
+                "sensor_scale": 0.3923,
+                "serial_cmd_timeout": 1,
+            },
+            "fields": [*_PRESSURE_SENSOR_FIELDS],
         },
         {
             "label": "MoscowPressureController",
@@ -366,18 +414,53 @@ DEVICE_OPTIONS: Dict[str, List[Dict[str, Any]]] = {
             "params": {
                 "channel": 4,
                 "controllerSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0},
-                "readerSerial": {"port": "COM9", "baudrate": 9600, "timeout": 0},
+                "readerSerial": {"port": "COM9", "baudrate": 9600, "timeout": 0, "boot_delay": 2},
+                "sensor_channel": 0,
+                "sensor_offset": 516.72,
+                "sensor_scale": 0.3923,
                 "serial_cmd_timeout": 1,
             },
+            "fields": [*_PRESSURE_OUTPUT_FIELDS, *_PRESSURE_SENSOR_FIELDS],
+        },
+        {
+            "label": "SerialPressureController (generic)",
+            "class": "patcherbot.devices.pressurecontroller.SerialPressureController.SerialPressureController",
+            "params": {
+                "channel": 4,
+                "controllerSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0},
+                "readerSerial": {"port": "COM9", "baudrate": 9600, "timeout": 0, "boot_delay": 2},
+                "sensor_channel": 0,
+                "sensor_offset": 516.72,
+                "sensor_scale": 0.3923,
+                "serial_cmd_timeout": 1,
+                "native_zero": 1962,
+                "native_per_mbar": 3062 / 1100,
+                "native_min": 0,
+                "native_max": None,
+                "startup_pressure": 0,
+                "startup_atm": False,
+                "initialize_output": True,
+            },
+            "fields": [*_PRESSURE_OUTPUT_FIELDS, *_PRESSURE_SENSOR_FIELDS, *_GENERIC_PRESSURE_FIELDS],
+        },
+        {
+            "label": "SerialPressureController (output only, no sensor)",
+            "class": "patcherbot.devices.pressurecontroller.SerialPressureController.SerialPressureController",
+            "params": {
+                "channel": 4,
+                "controllerSerial": {"port": "COM5", "baudrate": 9600, "timeout": 0},
+                "serial_cmd_timeout": 1,
+                "native_zero": 1962,
+                "native_per_mbar": 3062 / 1100,
+                "native_min": 0,
+                "native_max": None,
+                "startup_pressure": 0,
+                "startup_atm": False,
+                "initialize_output": True,
+            },
             "fields": [
-                {"key": "channel", "label": "Channel", "type": "int"},
-                {"key": "controllerSerial.port", "label": "Controller Port", "type": "str"},
-                {"key": "controllerSerial.baudrate", "label": "Controller Baud", "type": "int"},
-                {"key": "controllerSerial.timeout", "label": "Controller Timeout", "type": "float", "optional": True},
-                {"key": "readerSerial.port", "label": "Reader Port", "type": "str"},
-                {"key": "readerSerial.baudrate", "label": "Reader Baud", "type": "int"},
-                {"key": "readerSerial.timeout", "label": "Reader Timeout", "type": "float", "optional": True},
-                {"key": "serial_cmd_timeout", "label": "Command Timeout", "type": "float", "optional": True},
+                *_PRESSURE_OUTPUT_FIELDS, *_GENERIC_PRESSURE_FIELDS,
+                {"key": "serial_cmd_timeout", "label": "Command timeout (s)", "type": "float", "optional": True},
             ],
         },
         {
@@ -485,6 +568,8 @@ class RigConfigManager:
         self.cal_config_dir = cal_config_dir or CAL_CONFIG_DIR
         self.patch_config_dir = patch_config_dir or PATCH_CONFIG_DIR
         self.protocol_config_dir = protocol_config_dir or PROTOCOL_CONFIG_DIR
+        # One resource group per build: never reuse connections across rigs.
+        self._build_resources = []
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.cal_config_dir.mkdir(parents=True, exist_ok=True)
         self.patch_config_dir.mkdir(parents=True, exist_ok=True)
@@ -587,6 +672,23 @@ class RigConfigManager:
         return self.build_devices(config, active_pipette_count=active_pipette_count)
 
     def build_devices(self, config: Dict[str, Any], active_pipette_count: int | None = None) -> Dict[str, Any]:
+        """Build a rig with its own shared serial cache and failure cleanup.
+
+        Repeated port dictionaries within this build inject the SAME serial object.
+        Conflicting settings fail rather than opening a port a second time. The
+        manager owns these connections; call close_devices() on application exit.
+        Earlier successful builds remain independent if this manager is reused.
+        """
+        resources = {'serial': {}, 'devices': []}
+        self._build_resources.append(resources)
+        try:
+            return self._build_devices(config, active_pipette_count, resources)
+        except BaseException:
+            self._close_resources(resources)
+            self._build_resources = [r for r in self._build_resources if r is not resources]
+            raise
+
+    def _build_devices(self, config, active_pipette_count, resources):
         """
         Instantiate all devices from configuration.
 
@@ -610,7 +712,9 @@ class RigConfigManager:
             )
         devices_cfg = config.get("devices", {})
         self._apply_pressure_calibration(config, devices_cfg)
-        base_instances: Dict[str, Any] = {}
+        # Internal resource state follows recursive parameter/reference resolution.
+        # It is removed from the public device mapping returned below.
+        base_instances: Dict[str, Any] = {'_rig_resources': resources}
         for slot in DEVICE_SLOTS:
             if slot not in devices_cfg:
                 raise RigConfigError(f"Missing device slot '{slot}' in configuration.")
@@ -702,9 +806,42 @@ class RigConfigManager:
                 ai_enabled = bool(calibration_cfg.get("use_ai_features"))
             setattr(camera, "use_ai_features", ai_enabled)
 
-        all_devices = {**base_instances, **derived}
+        all_devices = {k: v for k, v in base_instances.items() if k != '_rig_resources'}
+        all_devices.update(derived)
         LOGGER.info("Initialized devices: %s", ", ".join(sorted(all_devices.keys())))
         return all_devices
+
+    @staticmethod
+    def _close_resources(resources):
+        """Stop initialized acquisition before closing each owned port once.
+
+        Track each successful constructor immediately, including partial device
+        lists, so later constructor/post-attribute failures can be cleaned up.
+        Cleanup continues after individual stop/close failures.
+        """
+        seen = set()
+        for device in reversed(resources['devices']):
+            if id(device) in seen:
+                continue
+            seen.add(id(device))
+            try:
+                stop = getattr(device, 'stop_acquisition', None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                LOGGER.exception('Failed stopping device during rig cleanup')
+        resources['devices'].clear()
+        for _, _, connection in resources['serial'].values():
+            try:
+                connection.close()
+            except Exception:
+                LOGGER.exception('Failed closing rig serial connection')
+        resources['serial'].clear()
+
+    def close_devices(self):
+        """Idempotently release rigs built by this manager, including shared ports."""
+        while self._build_resources:
+            self._close_resources(self._build_resources.pop())
 
     def _instantiate_slot(self, slot: str, cfg: Dict[str, Any], instances: Dict[str, Any]) -> Any:
         """
@@ -738,6 +875,7 @@ class RigConfigManager:
         except Exception as exc:
             raise RigConfigError(f"Failed to instantiate {class_path} for slot '{slot}': {exc}") from exc
 
+        instances['_rig_resources']['devices'].append(instance)
         for attr, value in post_attrs.items():
             try:
                 setattr(instance, attr, value)
@@ -858,14 +996,58 @@ class RigConfigManager:
                 return instances[ref]
             # Detect serial configs (simple dict with port + baudrate)
             if "port" in value and ("baudrate" in value or "baud" in value):
-                try:
-                    import serial  # type: ignore
-                    serial_kwargs = {k: v for k, v in value.items()}
-                    return serial.Serial(**serial_kwargs)
-                except Exception as exc:  # pragma: no cover
-                    raise RigConfigError(f"pyserial is required for serial configs: {exc}") from exc
+                return self._resolve_serial(value, instances['_rig_resources'])
             return {k: self._resolve_value(v, instances) for k, v in value.items()}
         return value
+
+    @staticmethod
+    def _resolve_serial(value, resources):
+        """Normalize settings and open each port once in the current build.
+
+        Optional boot_delay (seconds, default 0) belongs to rig initialization,
+        not pyserial. It runs once after opening, before any device can poll.
+        Cache the requested settings separately: sensor drivers may subsequently
+        adjust live serial timeouts, which must not change configuration matching.
+        """
+        try:
+            import serial
+
+            kwargs = dict(value)
+            boot_delay = float(kwargs.pop('boot_delay', 0))
+            if not math.isfinite(boot_delay) or boot_delay < 0:
+                raise ValueError('boot_delay must be finite and nonnegative')
+            if 'baud' in kwargs:
+                baud = kwargs.pop('baud')
+                if 'baudrate' in kwargs and kwargs['baudrate'] != baud:
+                    raise ValueError('baud and baudrate disagree')
+                kwargs['baudrate'] = baud
+            port = kwargs['port']
+            # Windows COM names are case-insensitive; also recognize \\.\COMn.
+            if isinstance(port, str) and re.fullmatch(r'(?:\\\\\.\\)?COM[0-9]+', port, re.I):
+                port = port.upper().removeprefix('\\\\.\\')
+                kwargs['port'] = port
+            # Compare effective defaults, so omitted timeout=None or bytesize=8
+            # matches an explicit default. Preserve additional platform kwargs.
+            settings = {
+                name: p.default
+                for name, p in inspect.signature(serial.SerialBase.__init__).parameters.items()
+                if name != 'self' and p.default is not inspect.Parameter.empty
+            }
+            settings.update(kwargs)
+            cached = resources['serial'].get(port)
+            if cached is not None:
+                previous_settings, previous_delay, connection = cached
+                if settings != previous_settings or boot_delay != previous_delay:
+                    raise RigConfigError(f"Conflicting serial settings for port {port!r}.")
+                return connection
+            connection = serial.Serial(**kwargs)
+            resources['serial'][port] = (settings, boot_delay, connection)
+            time.sleep(boot_delay)
+            return connection
+        except RigConfigError:
+            raise
+        except Exception as exc:
+            raise RigConfigError(f"Failed opening rig serial port: {exc}") from exc
 
     def _validate_config(self, config: Dict[str, Any]) -> None:
         """

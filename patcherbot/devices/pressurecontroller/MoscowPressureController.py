@@ -33,7 +33,7 @@ class MoscowPressureController(PressureController):
                  valid_products=None, valid_vids=None,
                  native_zero=None, native_per_mbar=None,
                  sensor_offset=None, sensor_scale=None,
-                 serial_cmd_timeout=None):
+                 serial_cmd_timeout=None, sensor_channel=0, sensor_pin=None):
         """
         Initialize a MoscowPressureController instance.
 
@@ -57,14 +57,40 @@ class MoscowPressureController(PressureController):
             sensor_offset (float, optional): Alias for `readerOffset`.
             sensor_scale (float, optional): Alias for `readerScale`.
             serial_cmd_timeout (float, optional): Alias for `serialCmdTimeout`.
+            sensor_channel (int, optional): Logical sensor ID in MultiPressureRR
+                responses. Independent of
+                the pressure-output `channel`. Defaults to 0, also the only
+                supported input for legacy S<number>E sensor responses.
+            sensor_pin (str, optional): Physical analog input such as A2 or A10.
+                None leaves the firmware mapping untouched. Explicit pins require
+                the updated configurable MultiPressureRR sketch and board support.
 
         Raises:
             Exception: If `controllerSerial` or `readerSerial` are not provided.
         
         Notes:
-            - Sets initial pressure to 0 mBar and starts the acquisition thread at 60 Hz.
+            - Sets initial pressure to 0 mBar and starts acquisition at 20 Hz.
             - Sets initial state to non-atmospheric mode (controlled pressure).
             - Any argument that is `None` will be replaced with the class default.
+            - For two sensors on one board, inject the SAME open readerSerial
+              object into both controllers and select sensor_channel=0 and 1.
+              The base class shares complete frames, locks serial transactions,
+              and applies each instance's readerOffset/readerScale separately.
+              The caller handles Arduino startup time and shared-port closure.
+
+        Example (reader and output are already open, Arduino boot complete)::
+
+            first = MoscowPressureController(4, controllerSerial=output,
+                                             readerSerial=reader, sensor_channel=0)
+            second = MoscowPressureController(5, controllerSerial=output,
+                                              readerSerial=reader, sensor_channel=1)
+
+        These sensor IDs default to A0/A1; sensor_pin can remap or activate IDs.
+        Supply sensor_offset
+        and sensor_scale separately for each calibrated sensor. Stop acquisition
+        on BOTH controllers before the caller closes reader. Acquisition getters
+        return None after a sensor fault; the existing GUI may display None as
+        zero until its unavailable-data handling is updated separately.
         """
         super().__init__()
         # time.sleep(2) # wait for arduino to boot up
@@ -112,10 +138,14 @@ class MoscowPressureController(PressureController):
         self.setpoint_raw = None
         self.lastVal = 0.0
 
+        # Validate/bind the shared sensor before sending any output commands or
+        # starting acquisition. Existing single-sensor setups use channel 0.
+        self._configure_pressure_sensor(sensor_channel, sensor_pin)
+
         # set initial configuration of pressure controller
         self.set_ATM(False)
         self.set_pressure(0) # set initial pressure to 0 mbar
-        self.start_acquisition() # start pressure acquisition thread at 60 hz
+        self.start_acquisition() # 20 Hz; shared reader caches all sensor inputs
 
 
     def set_pressure(self, pressure):
@@ -183,30 +213,16 @@ class MoscowPressureController(PressureController):
 
     def measure(self) -> float:
         '''
-        Read the pressure sensor value from the Arduino
+        Read this controller's sensor channel, using the base shared transport.
         
         Returns:
             float: Measured pressure in mBar.
+
+        Accepts both S<number>E and S0:<value>,1:<value>E firmware replies.
+        Timeouts, malformed-only replies, and missing channels raise instead
+        of returning an old lastVal. Acquisition exposes unavailable data as None.
         '''
-        pressureVal = self.lastVal
-
-        # Send a request command to the Arduino
-        self.readerSerial.write(b'R')
-        # Wait for the response
-        if self.readerSerial.in_waiting > 0:
-            reading = self.readerSerial.readline().decode('utf-8').strip()
-            if reading.startswith("S") and reading.endswith("E"):
-                pressure_str = reading[1:-1]
-                try:
-                    pressureVal = float(pressure_str)
-                    pressureVal = float((pressureVal - self.readerOffset) / self.readerScale) # conversion to raw because the seeed is not working
-                    self.lastVal = pressureVal
-                except ValueError:
-                    self.warning("Invalid pressure data received")
-
-        else:
-            self.warning("No data received from pressure sensor")
-        return pressureVal
+        return self._measure_serial_pressure()
     
     def pulse(self, delayMs):
         '''Tell the onboard arduino to pulse pressure for a certain period of time

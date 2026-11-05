@@ -16,15 +16,15 @@
     "stage_controller": {
       "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
       "params": {
-        "min": [
-          -240000,
-          50000,
-          280000
-        ],
         "max": [
           -230000,
           60000,
           290000
+        ],
+        "min": [
+          -240000,
+          50000,
+          280000
         ],
         "x": [
           -235000,
@@ -63,15 +63,15 @@
       {
         "class": "patcherbot.devices.manipulator.fakemanipulator.FakeManipulator",
         "params": {
-          "min": [
-            0,
-            0,
-            0
-          ],
           "max": [
             4000,
             20000,
             20000
+          ],
+          "min": [
+            0,
+            0,
+            0
           ],
           "x": [
             200,
@@ -138,11 +138,35 @@
     "pressure": [
       {
         "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
-        "params": {}
+        "params": {
+          "readerSerial": {
+            "baudrate": 9600,
+            "boot_delay": 2.0,
+            "port": "COM4",
+            "timeout": 0.0
+          },
+          "sensor_channel": 0,
+          "sensor_offset": 516.72,
+          "sensor_scale": 0.3923,
+          "serial_cmd_timeout": 1.0,
+          "sensor_pin": "A0"
+        }
       },
       {
         "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
-        "params": {}
+        "params": {
+          "readerSerial": {
+            "baudrate": 9600,
+            "boot_delay": 2.0,
+            "port": "COM4",
+            "timeout": 0.0
+          },
+          "sensor_channel": 1,
+          "sensor_offset": 516.72,
+          "sensor_scale": 0.3923,
+          "serial_cmd_timeout": 1.0,
+          "sensor_pin": "A1"
+        }
       },
       {
         "class": "patcherbot.devices.pressurecontroller.BasePressureController.FakePressureController",
