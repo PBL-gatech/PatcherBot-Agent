@@ -43,6 +43,10 @@ class GraphInterface(TaskInterface):
     def set_pressure(self, pressure):
         self.execute(self.pressure.set_pressure, argument=pressure)
 
+    def pressure_is_simulated(self):
+        """True when this pipette's pressure controller is a stand-in with no real pressure line."""
+        return bool(getattr(self.pressure, "simulated", False))
+
     @command(category='Pressure',
               description='get pressure setpoint')
     def get_pressure(self):

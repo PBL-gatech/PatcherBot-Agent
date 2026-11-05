@@ -3,7 +3,7 @@
 Calibration configuration parameters for manipulator units.
 """
 import param
-from .Config import Config, NumberWithUnit, Number, Boolean, Tuple
+from .Config import Config, NumberWithUnit, Number, Boolean, Tuple, List
 
 __all__ = ["CalibrationConfig"]
 
@@ -74,6 +74,11 @@ class CalibrationConfig(Config):
     reader_scale = Number(0.3923,
                           doc="Pressure reader scale factor to convert to raw units",
                           bounds=(0.001, 10))
+    # Optional per-pipette overrides of the four values above. Entry i is
+    # None or a dict with any of native_zero, native_per_mbar, reader_offset,
+    # reader_scale, and applies to the rig's pressure[i] controller.
+    pressure_calibrations = List(default=[],
+                                 doc="Per-pipette pressure calibration overrides")
     pipette_detector_model = param.String(default="",
                                           doc="Pipette detector model path")
     pipette_detector_model_version = param.Selector(

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.controller import AutoPatcher
 from patcherbot.utils import EPhysLogger, RecordingStateManager
+from patcherbot.utils.pipette_keys import pipette_key_for
 from patcherbot.devices.pressurecontroller.BasePressureController import PressureController
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
@@ -50,10 +51,11 @@ class AutoPatchInterface(TaskInterface):
             cleaned = {k: v for k, v in protocol_data.items() if v is not None}
             self.protocol_config.from_dict(cleaned)
         self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
-        self.amplifiers = amplifier if isinstance(amplifier, dict) else {"amplifier_0": amplifier}
+        # Per-pipette devices are keyed pipette_<n>; a single device serves pipette_0.
+        self.amplifiers = amplifier if isinstance(amplifier, dict) else {pipette_key_for(0): amplifier}
         self.amplifier = next(iter(self.amplifiers.values()))
         self.daq = daq
-        self.pressures = pressure if isinstance(pressure, dict) else {"pressure_0": pressure}
+        self.pressures = pressure if isinstance(pressure, dict) else {pipette_key_for(0): pressure}
         self.pressure = next(iter(self.pressures.values()))
         self.pipette_controller = pipette_interface
         self.recording_state_manager = recording_state_manager
@@ -63,13 +65,12 @@ class AutoPatchInterface(TaskInterface):
         # One DAQ for the whole rig; each pipette gets a view onto it (no copies).
         self.protocol_daQs = {}
         self.autopatchers = {}
-        for pipette_number, (pipette_key, calibrated_unit) in enumerate(
-                self.pipette_controller.calibrated_units.items(), start=1):
-            pipette_amplifier = self._device_for_pipette(self.amplifiers, "amplifier", pipette_number)
-            pipette_pressure = self._device_for_pipette(self.pressures, "pressure", pipette_number)
-            protocol_daq = PipetteDAQView(daq, self._daq_key_for_pipette(daq, pipette_key))
-            self.protocol_daQs[pipette_key] = protocol_daq
-            self.autopatchers[pipette_key] = AutoPatcher(
+        for key, calibrated_unit in self.pipette_controller.calibrated_units.items():
+            pipette_amplifier = self._device_for_pipette(self.amplifiers, key)
+            pipette_pressure = self._device_for_pipette(self.pressures, key)
+            protocol_daq = PipetteDAQView(daq, self._daq_key_for_pipette(daq, key))
+            self.protocol_daQs[key] = protocol_daq
+            self.autopatchers[key] = AutoPatcher(
                 pipette_amplifier,
                 protocol_daq,
                 pipette_pressure,
@@ -120,10 +121,13 @@ class AutoPatchInterface(TaskInterface):
         return shared
 
     @staticmethod
-    def _device_for_pipette(devices, slot, pipette_number):
+    def _device_for_pipette(devices, key):
+        """The device for pipette ``key``; a single device serves every pipette."""
+        if key in devices:
+            return devices[key]
         if len(devices) == 1:
             return next(iter(devices.values()))
-        return devices.get(f"{slot}_{pipette_number - 1}", next(iter(devices.values())))
+        raise KeyError(f"No device configured for {key}; available: {list(devices)}")
 
     def set_protocol_selection(self, pipette_key, protocol_name, selected):
         self.protocol_selections[pipette_key][protocol_name] = bool(selected)

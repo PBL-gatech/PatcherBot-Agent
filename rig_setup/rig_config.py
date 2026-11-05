@@ -32,6 +32,8 @@ import inspect
 from typing import Any, Dict, List, Tuple
 import yaml
 
+from patcherbot.utils.pipette_keys import pipette_key_for
+
 LOGGER = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
@@ -639,15 +641,15 @@ class RigConfigManager:
                             "Expected a device mapping."
                         )
 
-                    instance_key = f"{slot}_{i}"
-
+                    # Every pipette slot is keyed by the global pipette key;
+                    # the slot-specific name is only used in log messages.
                     instance = self._instantiate_slot(
-                        instance_key,
+                        f"{slot}_{i}",
                         dev_cfg,
                         base_instances,
                     )
 
-                    instance_dict[instance_key] = instance
+                    instance_dict[pipette_key_for(i)] = instance
 
                 base_instances[slot] = instance_dict
 
@@ -723,7 +725,7 @@ class RigConfigManager:
         controllers = instances.get("pipette_controller")
         if isinstance(controllers, dict):
             return list(controllers)
-        return ["pipette_0"]   # single-device config; PipetteInterface uses this key
+        return [pipette_key_for(0)]   # single-device config; PipetteInterface uses this key
 
     def _instantiate_slot(self, slot: str, cfg: Dict[str, Any], instances: Dict[str, Any],
                           default_kwargs: Dict[str, Any] | None = None) -> Any:
@@ -1035,7 +1037,7 @@ class RigConfigManager:
                 calibration_fallback.update(cleaned)
             if any(
                 key in cleaned
-                for key in ("native_zero", "native_per_mbar", "reader_offset", "reader_scale")
+                for key in (*self._PRESSURE_CALIBRATION_KEYS, "pressure_calibrations")
             ):
                 has_pressure_overrides = True
 
@@ -1100,7 +1102,16 @@ class RigConfigManager:
         config.pop("ai_features", None)
         config["_has_pressure_calibration_overrides"] = has_pressure_overrides
 
+    _PRESSURE_CALIBRATION_KEYS = ("native_zero", "native_per_mbar", "reader_offset", "reader_scale")
+
     def _apply_pressure_calibration(self, config: Dict[str, Any], devices_cfg: Dict[str, Any]) -> None:
+        """Copy pressure calibration into each real pressure controller's params.
+
+        ``devices.pressure`` may be one device or a per-pipette list (a single
+        device counts as entry 0). Every real controller gets the top-level
+        calibration values; ``pressure_calibrations[i]`` (optional) overrides
+        them for ``pressure[i]``. Fake controllers are skipped.
+        """
         if not bool(config.get("_has_pressure_calibration_overrides", False)):
             return
         calibration = config.get("_resolved_calibration")
@@ -1109,25 +1120,33 @@ class RigConfigManager:
         if not isinstance(calibration, dict):
             return
         pressure_cfg = devices_cfg.get("pressure")
-        if not isinstance(pressure_cfg, dict):
-            return
-        params = pressure_cfg.get("params") or {}
-        if not isinstance(params, dict):
-            params = {}
-        class_path = pressure_cfg.get("class") or pressure_cfg.get("class_path") or ""
+        entries = pressure_cfg if isinstance(pressure_cfg, list) else [pressure_cfg]
+        per_pipette = calibration.get("pressure_calibrations") or []
 
-        updates: Dict[str, Any] = {}
-        if calibration.get("native_zero") is not None:
-            updates["native_zero"] = calibration["native_zero"]
-        if calibration.get("native_per_mbar") is not None:
-            updates["native_per_mbar"] = calibration["native_per_mbar"]
-        if "IBBPressureController" not in str(class_path):
-            if calibration.get("reader_offset") is not None:
-                updates["sensor_offset"] = calibration["reader_offset"]
-            if calibration.get("reader_scale") is not None:
-                updates["sensor_scale"] = calibration["reader_scale"]
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            class_path = str(entry.get("class") or entry.get("class_path") or "")
+            if class_path.endswith("FakePressureController"):
+                continue
+            values = {key: calibration.get(key) for key in self._PRESSURE_CALIBRATION_KEYS}
+            override = per_pipette[index] if index < len(per_pipette) else None
+            if isinstance(override, dict):
+                values.update({k: v for k, v in override.items() if k in self._PRESSURE_CALIBRATION_KEYS})
 
-        if updates:
-            merged = dict(params)
-            merged.update(updates)
-            pressure_cfg["params"] = merged
+            updates: Dict[str, Any] = {}
+            if values["native_zero"] is not None:
+                updates["native_zero"] = values["native_zero"]
+            if values["native_per_mbar"] is not None:
+                updates["native_per_mbar"] = values["native_per_mbar"]
+            if "IBBPressureController" not in class_path:
+                if values["reader_offset"] is not None:
+                    updates["sensor_offset"] = values["reader_offset"]
+                if values["reader_scale"] is not None:
+                    updates["sensor_scale"] = values["reader_scale"]
+
+            if updates:
+                params = entry.get("params") or {}
+                merged = dict(params) if isinstance(params, dict) else {}
+                merged.update(updates)
+                entry["params"] = merged

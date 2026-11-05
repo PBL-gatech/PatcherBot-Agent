@@ -1,6 +1,6 @@
 import logging
 
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSlider, QPushButton, QToolButton,QSlider, QToolButton, QComboBox
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSlider, QPushButton, QToolButton, QComboBox, QSizePolicy
 from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot
 from matplotlib.colors import LinearSegmentedColormap, to_hex
@@ -28,6 +28,7 @@ from patcherbot.interface.graph import GraphInterface
 
 __all__ = [
     "EPhysGraph",
+    "PipetteEphysPanel",
     "CurrentProtocolGraph",
     "VoltageProtocolGraph",
     "LeakSubtractionGraph",
@@ -611,6 +612,139 @@ class NoiseGraph(QWidget):
         if freqs is not None and fft_magnitude is not None:
             self.fftPlot.plot(freqs, fft_magnitude, pen="k")
 
+class PipetteEphysPanel(QWidget):
+    """One pipette's column in the Electrophysiology window.
+
+    Shows the command, response, pressure and resistance traces for one
+    GraphInterface and records them to its own rig-recorder file.
+    """
+
+    def __init__(self, label, graph_interface: GraphInterface,
+                 recording_state_manager: RecordingStateManager,
+                 recorder_filename="graph_recording", update_dt_ms=42,
+                 show_title=True, show_axis_titles=True):
+        super().__init__()
+        self.label = label
+        self.graph_interface = graph_interface
+        self.recording_state_manager = recording_state_manager
+        self.update_dt_ms = update_dt_ms
+        self.selected = False
+
+        self.titleLabel = QLabel(label)
+        self.titleLabel.setAlignment(Qt.AlignCenter)
+        self.titleLabel.setVisible(show_title)
+
+        self.cmdPlot = PlotWidget()
+        self.respPlot = PlotWidget()
+        self.pressurePlot = PlotWidget()
+        self.resistancePlot = PlotWidget()
+        self.plots = (self.cmdPlot, self.respPlot, self.pressurePlot, self.resistancePlot)
+        for plot in self.plots:
+            plot.setBackground("w")
+            plot.getAxis("left").setPen("k")
+            plot.getAxis("bottom").setPen("k")
+
+        # Only the leftmost column spells out the y-axis names; the others
+        # show units alone to leave more room for the traces.
+        def left(text):
+            return text if show_axis_titles else None
+        self.cmdPlot.setLabel("left", left("Command Voltage"), units="V")
+        self.cmdPlot.setLabel("bottom", "Time", units="s")
+        self.respPlot.setLabel("left", left("Current (resp)"), units="A")
+        self.respPlot.setLabel("bottom", "Time", units="s")
+        self.pressurePlot.setLabel("left", left("Pressure"), units="mbar")
+        self.pressurePlot.setLabel("bottom", "Time", units="s")
+        self.resistancePlot.setLabel("left", left("Resistance"), units="Ohms")
+        self.resistancePlot.setLabel("bottom", "Samples", units="")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.titleLabel)
+        for plot in self.plots:
+            layout.addWidget(plot)
+        self.setLayout(layout)
+        # Columns share the window's width rather than widening it, so more
+        # pipettes means a narrower (time-compressed) view of each.
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+        self.pressureData = deque(maxlen=100)
+        self.resistanceDeque = deque(maxlen=100)
+        self.lastReadData = None
+        self.lastrespData = None
+        self.last_pressure = None
+        self.last_packet = None
+
+        self.recorder = FileLogger(
+            recording_state_manager,
+            folder_path="experiments/Data/rig_recorder_data/",
+            recorder_filename=recorder_filename,
+        )
+        self._update_title()
+
+    def set_selected(self, selected):
+        self.selected = bool(selected)
+        self._update_title()
+
+    def _update_title(self, resistance=None):
+        parts = [self.label]
+        if resistance is not None:
+            parts.append(f"R: {resistance:.2f} MΩ")
+        if self.graph_interface.pressure_is_simulated():
+            parts.append("sim. pressure")
+        self.titleLabel.setText(" · ".join(parts))
+        self.titleLabel.setStyleSheet(
+            "font-weight: bold; background-color: #cfe3ff;" if self.selected else "")
+
+    def refresh(self):
+        """Fetch this pipette's latest pressure and DAQ packet, plot and record them."""
+        pressure = self.graph_interface.get_last_pressure()
+        # No measurement yet (e.g. right after start-up): show 0 mbar.
+        pressure = int(pressure) if pressure is not None else 0
+        self.last_pressure = pressure
+        self.pressureData.append(pressure)
+        pressureX = [i * self.update_dt_ms / 1000 for i in range(len(self.pressureData))]
+        self.pressurePlot.clear()
+        self.pressurePlot.plot(pressureX, list(self.pressureData))
+
+        daq_data = self.graph_interface.get_last_data()
+        self.last_packet = daq_data
+        if daq_data is None:
+            return
+        timeData = daq_data.get("timeData")
+        respData = daq_data.get("respData")
+        readData = daq_data.get("readData")
+        totalResistance = daq_data.get("totalResistance")
+
+        if timeData is not None and readData is not None:
+            self.cmdPlot.clear()
+            self.cmdPlot.plot(timeData, readData, pen="k")
+            self.lastReadData = readData
+
+        if timeData is not None and respData is not None:
+            self.respPlot.clear()
+            self.respPlot.plot(timeData, respData, pen="k")
+            self.lastrespData = respData
+
+        if totalResistance is not None:
+            self.resistanceDeque.append(totalResistance)
+            x_vals = list(range(len(self.resistanceDeque)))
+            self.resistancePlot.clear()
+            self.resistancePlot.plot(x_vals, list(self.resistanceDeque), pen="k")
+        self._update_title(totalResistance)
+
+        if self.recording_state_manager.is_recording_enabled():
+            try:
+                self.recorder.write_graph_data(
+                    datetime.now().timestamp(),
+                    pressure,
+                    totalResistance,
+                    list(self.lastrespData) if self.lastrespData is not None else [],
+                    list(self.lastReadData) if self.lastReadData is not None else []
+                )
+            except Exception as e:
+                logging.error(f"Error writing graph data for {self.label}: {e}")
+
+
 class EPhysGraph(QWidget):
     pressureLowerBound = -450
     pressureUpperBound = 730
@@ -630,8 +764,9 @@ class EPhysGraph(QWidget):
         """
         Initialize the electrophysiology GUI.
         :param graph_interface: A GraphInterface, or an ordered ``{label: GraphInterface}``
-            dict with one entry per pipette. With several pipettes a dropdown
-            chooses which one the window shows and controls.
+            dict with one entry per pipette. Every pipette gets its own column of
+            plots (first entry leftmost); the bottom bar controls the pipette
+            chosen in its "Control" picker.
         :param recording_state_manager: The recording state manager used for data logging.
         """
         super().__init__()
@@ -642,28 +777,25 @@ class EPhysGraph(QWidget):
                 raise ValueError("EPhysGraph needs at least one GraphInterface")
             self.graph_interfaces = dict(graph_interface)
         else:
-            self.graph_interfaces = {"Pipette 1": graph_interface}
+            self.graph_interfaces = {"Pipette 0": graph_interface}
         self.graph_interface = next(iter(self.graph_interfaces.values()))  # ONLY import GraphInterface!
+        self.updateDt = 42   # ms
 
-        # Initialize plots.
-        self.cmdPlot = PlotWidget()
-        self.respPlot = PlotWidget()
-        self.pressurePlot = PlotWidget()
-        self.resistancePlot = PlotWidget()
-
-        for plot in [self.cmdPlot, self.respPlot, self.pressurePlot, self.resistancePlot]:
-            plot.setBackground("w")
-            plot.getAxis("left").setPen("k")
-            plot.getAxis("bottom").setPen("k")
-
-        self.cmdPlot.setLabel("left", "Command Voltage", units="V")
-        self.cmdPlot.setLabel("bottom", "Time", units="s")
-        self.respPlot.setLabel("left", "Current (resp)", units="A")
-        self.respPlot.setLabel("bottom", "Time", units="s")
-        self.pressurePlot.setLabel("left", "Pressure", units="mbar")
-        self.pressurePlot.setLabel("bottom", "Time", units="s")
-        self.resistancePlot.setLabel("left", "Resistance", units="Ohms")
-        self.resistancePlot.setLabel("bottom", "Samples", units="")
+        # One column of plots per pipette. The first pipette keeps the
+        # original recorder file name so existing analysis scripts still work.
+        several = len(self.graph_interfaces) > 1
+        self.panels = {}
+        for index, (label, interface) in enumerate(self.graph_interfaces.items()):
+            suffix = "" if index == 0 else "_" + "_".join(label.strip().lower().split())
+            self.panels[label] = PipetteEphysPanel(
+                label, interface, recording_state_manager,
+                recorder_filename="graph_recording" + suffix,
+                update_dt_ms=self.updateDt,
+                show_title=several,
+                show_axis_titles=index == 0,
+            )
+        self.selected_panel = next(iter(self.panels.values()))
+        self.selected_panel.set_selected(several)
 
         # Build bottom control bar.
         self.bottomBar = QWidget()
@@ -671,14 +803,15 @@ class EPhysGraph(QWidget):
         bottomBarLayout.setContentsMargins(0, 0, 0, 0)  # Preserve zero margins as in old UI.
         self.bottomBar.setLayout(bottomBarLayout)
 
-        # Pipette selector, only when several pipettes are in use.
-        self.pipetteDropdown = None
-        if len(self.graph_interfaces) > 1:
-            self.pipetteDropdown = QComboBox()
-            self.pipetteDropdown.addItems(list(self.graph_interfaces))
-            self.pipetteDropdown.currentTextChanged.connect(self._select_pipette)
-            bottomBarLayout.addWidget(self.pipetteDropdown)
-            self.setWindowTitle(f"Electrophysiology - {self.pipetteDropdown.currentText()}")
+        # Which pipette the bar controls; only shown with several pipettes.
+        self.pipettePicker = None
+        if several:
+            self.pipettePickerLabel = QLabel("Control:")
+            bottomBarLayout.addWidget(self.pipettePickerLabel)
+            self.pipettePicker = QComboBox()
+            self.pipettePicker.addItems(list(self.graph_interfaces))
+            self.pipettePicker.currentTextChanged.connect(self._select_pipette)
+            bottomBarLayout.addWidget(self.pipettePicker)
 
         self.resistanceLabel = QLabel("Resistance:")
         bottomBarLayout.addWidget(self.resistanceLabel)
@@ -797,31 +930,20 @@ class EPhysGraph(QWidget):
         self.bottomBar.setMaximumHeight(20)
         self.bottomBar.setMinimumHeight(20)
 
-        # Compose main layout.
+        # Compose main layout: pipette columns side by side, bar underneath.
+        panelLayout = QHBoxLayout()
+        panelLayout.setContentsMargins(0, 0, 0, 0)
+        for panel in self.panels.values():
+            panelLayout.addWidget(panel, 1)
         mainLayout = QVBoxLayout()
-        for plot in [self.cmdPlot, self.respPlot, self.pressurePlot, self.resistancePlot]:
-            mainLayout.addWidget(plot)
+        mainLayout.addLayout(panelLayout)
         mainLayout.addWidget(self.bottomBar)
         self.setLayout(mainLayout)
-
-        # Data containers.
-        self.pressureData = deque(maxlen=100)
-        self.resistanceDeque = deque(maxlen=100)
-        self.lastReadData = None
-        self.lastrespData = None
-
-        # Recorder for saving data.
-        self.recorder = FileLogger(
-            recording_state_manager,
-            folder_path="experiments/Data/rig_recorder_data/",
-            recorder_filename="graph_recording"
-        )
 
         # cellMode type switch
         self.modelType.clicked.connect(self.toggleModeType)
 
-        # QTimer for periodic GUI updates 
-        self.updateDt = 42   # ms
+        # QTimer for periodic GUI updates
         self.updateTimer = QtCore.QTimer()
         self.updateTimer.timeout.connect(self.update_plot)
         self.updateTimer.start(self.updateDt)
@@ -833,26 +955,23 @@ class EPhysGraph(QWidget):
         self.raise_()
 
     def _select_pipette(self, label):
-        """Show and control another pipette.
+        """Point the bottom bar at another pipette.
 
-        Swaps the GraphInterface (DAQ view, amplifier, pressure) and clears
-        the previous pipette's history. The laser is shared, so its cached
-        settings carry over.
+        Every pipette keeps plotting in its own column; this only changes which
+        pipette the bar's controls and readouts (and the noise check) act on.
+        The laser is shared, so its cached settings carry over.
         """
-        new_interface = self.graph_interfaces.get(label)
-        if new_interface is None or new_interface is self.graph_interface:
+        new_panel = self.panels.get(label)
+        if new_panel is None or new_panel is self.selected_panel:
             return
+        new_interface = new_panel.graph_interface
         new_interface.adopt_laser_state(self.graph_interface)
+        self.selected_panel.set_selected(False)
+        new_panel.set_selected(True)
+        self.selected_panel = new_panel
         self.graph_interface = new_interface
         self.noiseGraph.graph_interface = new_interface
-        self.setWindowTitle(f"Electrophysiology - {label}")
 
-        self.pressureData.clear()
-        self.resistanceDeque.clear()
-        self.lastReadData = None
-        self.lastrespData = None
-        for plot in (self.cmdPlot, self.respPlot, self.pressurePlot, self.resistancePlot):
-            plot.clear()
         self.resistanceLabel.setText("Resistance:")
         self.accessResistanceLabel.setText("Access Resistance: N/A")
         self.membraneResistanceLabel.setText("Membrane Resistance: N/A")
@@ -861,89 +980,48 @@ class EPhysGraph(QWidget):
         self.handle_zap_duration_change()   # apply the selected zap duration to this amplifier
         self.updateModeType()
         self.updatePressureATM()
+        self._update_bar()
 
     def update_plot(self):
         """
-        Periodically update plots with the latest pressure and DAQ data retrieved via GraphInterface.
+        Periodically refresh every pipette's column, then the bottom bar from
+        the pipette it controls.
         """
-        # --- Update Pressure Plot ---
-        pressure = self.graph_interface.get_last_pressure()
+        for panel in self.panels.values():
+            panel.refresh()
+        self._update_bar()
+        self.update_laser_controls()
+
+    def _update_bar(self):
+        """Show the controlled pipette's latest pressure and DAQ readouts in the bar."""
+        panel = self.selected_panel
+        pressure = panel.last_pressure
         if pressure is not None:
-            pressure = int(pressure)
-        else:
-            # When running with a fake rig there might not yet be
-            # any pressure measurements.  Avoid raising an exception
-            # and simply display 0 mbar until data is available.
-            pressure = 0
-        pressure_set = int(self.graph_interface.get_pressure())
-        if pressure is not None:
-            self.pressureData.append(pressure)
-            pressureX = [i * self.updateDt / 1000 for i in range(len(self.pressureData))]
-            self.pressurePlot.clear()
-            self.pressurePlot.plot(pressureX, list(self.pressureData))
+            pressure_set = int(self.graph_interface.get_pressure())
             # Update the slider only if the user is not interacting with it.
             if not self.pressureCommandSlider.isSliderDown():
                 self.pressureCommandSlider.setValue(pressure)
             self.pressureCommandBox.setPlaceholderText(f"Set to: {pressure_set} mbar")
-            # update the perssure label with the current pressure
-            self.pressureLabel.setText(f"Pressure: {pressure:.2f} mbar")
-            # update the atmospheric pressure button
+            simulated = " (simulated)" if self.graph_interface.pressure_is_simulated() else ""
+            self.pressureLabel.setText(f"Pressure{simulated}: {pressure:.2f} mbar")
             self.updatePressureATM()
 
-        # --- Update DAQ Data (Command & Response) ---
-        daq_data = self.graph_interface.get_last_data()
-        if daq_data is not None:
-            timeData = daq_data.get("timeData")
-            respData = daq_data.get("respData")
-            readData = daq_data.get("readData")
-            totalResistance = daq_data.get("totalResistance")
-            accessResistance = daq_data.get("accessResistance")
-            membraneResistance = daq_data.get("membraneResistance")
-            membraneCapacitance = daq_data.get("membraneCapacitance")
-
-            if timeData is not None and readData is not None:
-                self.cmdPlot.clear()
-                self.cmdPlot.plot(timeData, readData, pen="k")
-                self.lastReadData = readData
-
-            if timeData is not None and respData is not None:
-                self.respPlot.clear()
-                self.respPlot.plot(timeData, respData, pen="k")
-                self.lastrespData = respData
-
-            if totalResistance is not None:
-                self.resistanceDeque.append(totalResistance)
-                self.resistanceLabel.setText(f"Resistance: {totalResistance:.2f} MΩ")
-                x_vals = list(range(len(self.resistanceDeque)))
-                self.resistancePlot.clear()
-                self.resistancePlot.plot(x_vals, list(self.resistanceDeque), pen="k")
-            if accessResistance is not None:
-                self.accessResistanceLabel.setText(f"Access Resistance: {accessResistance:.2f} MΩ")
-            if membraneResistance is not None:
-                self.membraneResistanceLabel.setText(f"Membrane Resistance: {membraneResistance:.2f} MΩ")
-            if membraneCapacitance is not None:
-                self.membraneCapacitanceLabel.setText(f"Membrane Capacitance: {membraneCapacitance:.2f} pF")
-            
-            # --- Cell Mode ---
-            self.updateModeType()
-
-
-            # --- Data Recording ---
-            if self.recording_state_manager.is_recording_enabled():
-                timestamp = datetime.now().timestamp()
-                currentPressure = pressure if pressure is not None else 0
-                try:
-                    self.recorder.write_graph_data(
-                        timestamp,
-                        currentPressure,
-                        totalResistance,
-                        list(self.lastrespData) if self.lastrespData is not None else [],
-                        list(self.lastReadData) if self.lastReadData is not None else []
-                    )
-                except Exception as e:
-                    logging.error(f"Error writing graph data: {e}")
-
-        self.update_laser_controls()
+        daq_data = panel.last_packet
+        if daq_data is None:
+            return
+        totalResistance = daq_data.get("totalResistance")
+        accessResistance = daq_data.get("accessResistance")
+        membraneResistance = daq_data.get("membraneResistance")
+        membraneCapacitance = daq_data.get("membraneCapacitance")
+        if totalResistance is not None:
+            self.resistanceLabel.setText(f"Resistance: {totalResistance:.2f} MΩ")
+        if accessResistance is not None:
+            self.accessResistanceLabel.setText(f"Access Resistance: {accessResistance:.2f} MΩ")
+        if membraneResistance is not None:
+            self.membraneResistanceLabel.setText(f"Membrane Resistance: {membraneResistance:.2f} MΩ")
+        if membraneCapacitance is not None:
+            self.membraneCapacitanceLabel.setText(f"Membrane Capacitance: {membraneCapacitance:.2f} pF")
+        self.updateModeType()
 
     def pressureCommandSliderChanged(self):
         """

@@ -11,6 +11,7 @@ import logging
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 
 from patcherbot.controller import TaskController
+from patcherbot.utils.pipette_keys import pipette_label
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
 from patcherbot.gui.tabs.show_cells import CellListWindow
@@ -119,7 +120,7 @@ class PatchGui(ManipulatorGui):
 
         grid.addWidget(QtWidgets.QLabel("Protocol"), 0, 0)
         for column, pipette_key in enumerate(pipette_keys, start=1):
-            grid.addWidget(QtWidgets.QLabel(f"Pipette {column}"), 0, column, alignment=Qt.AlignCenter)
+            grid.addWidget(QtWidgets.QLabel(pipette_label(pipette_key)), 0, column, alignment=Qt.AlignCenter)
 
         self.protocol_checkboxes = {}
         for row, (protocol_name, label) in enumerate(protocol_rows, start=1):

@@ -47,6 +47,8 @@ class PressureAcquisitionThread(threading.Thread):
 
 
 class PressureController(TaskController):
+    simulated = False  # True for controllers that drive no real pressure line
+
     def __init__(self):
         super().__init__()
         self._pressure = collections.defaultdict(int)
@@ -141,6 +143,8 @@ class PressureController(TaskController):
 
 
 class FakePressureController(PressureController):
+    simulated = True
+
     def __init__(self):
         super(FakePressureController, self).__init__()
         self.pressure = 0

@@ -15,6 +15,7 @@ set_global_exception_hook()
 
 from patcherbot.utils.log_utils import setup_logging
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
+from patcherbot.utils.pipette_keys import pipette_label
 from patcherbot.interface import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
 from patcherbot.interface.graph import GraphInterface
@@ -106,18 +107,17 @@ def main():
     # One GraphInterface per pipette: that pipette's DAQ view, amplifier and
     # pressure controller (as already paired up by AutoPatchInterface).
     pipette_graph_interfaces = {
-        f"Pipette {index}": GraphInterface(
+        pipette_label(pipette_key): GraphInterface(
             autopatcher.amplifier,
             patch_controller.protocol_daQs[pipette_key],
             autopatcher.pressure,
             recording_state_manager,
             laser=laser,
         )
-        for index, (pipette_key, autopatcher) in enumerate(
-            patch_controller.autopatchers.items(), start=1)
+        for pipette_key, autopatcher in patch_controller.autopatchers.items()
     }
     gui = PatchGui(camera, pipette_camera, pipette_controller, patch_controller, recording_state_manager)
-    # The Electrophysiology window has a dropdown to pick which pipette it shows.
+    # The Electrophysiology window shows every pipette side by side.
     graphs = EPhysGraph(pipette_graph_interfaces, recording_state_manager)
     # graphs.location_on_the_screen()
     graphs.show()

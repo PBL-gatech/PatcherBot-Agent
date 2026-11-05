@@ -17,6 +17,7 @@ import nidaqmx.constants
 import serial
 
 from patcherbot.controller.base import TaskController
+from patcherbot.utils.pipette_keys import pipette_key_for
 
 __all__ = ['NiDAQ', 'ArduinoDAQ', 'FakeDAQ', 'PipetteChannels', 'PipetteDAQView',
            'build_channel_map', 'enumerated_channels']
@@ -56,7 +57,7 @@ def build_channel_map(pipette_keys=None, channels=None, default_channels=None):
     channels: optional list of ``{"read", "resp", "cmd"}`` specs, one per pipette.
     default_channels: ``f(index) -> PipetteChannels`` used when ``channels`` is None.
     """
-    keys = [str(key) for key in pipette_keys] if pipette_keys else ["pipette_0"]
+    keys = [str(key) for key in pipette_keys] if pipette_keys else [pipette_key_for(0)]
     if len(set(keys)) != len(keys):
         raise ValueError(f"Duplicate pipette keys: {keys}")
     if channels is not None:
@@ -1195,7 +1196,7 @@ class NiDAQ(DAQ):
         # NiDAQ is still wired for ONE pipette (one AI pair + one AO). Its
         # channels are keyed by their physical names so the multi-channel
         # version can extend this map without changing callers.
-        keys = list(pipette_keys) if pipette_keys else ["pipette_0"]
+        keys = list(pipette_keys) if pipette_keys else [pipette_key_for(0)]
         channel_map = build_channel_map(
             keys[:1],
             channels=[{
@@ -2440,7 +2441,7 @@ class ArduinoDAQ(DAQ):
 
     def __init__(self, DAQSerial=None, pipette_keys=None):
         # Single pipette: the serial stream carries one (read, resp) pair.
-        keys = list(pipette_keys) if pipette_keys else ["pipette_0"]
+        keys = list(pipette_keys) if pipette_keys else [pipette_key_for(0)]
         self._arduino_channel_map = build_channel_map(
             keys[:1], channels=[{"read": "ai0", "resp": "ai1", "cmd": "ao0"}])
         if DAQSerial is not None and isinstance(DAQSerial, serial.Serial):
