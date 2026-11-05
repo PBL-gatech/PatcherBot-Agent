@@ -143,30 +143,6 @@ def multi_pipette_protocol(method):
     return wrapper
 
 
-def per_pipette_protocol(method):
-    """Adapter for a protocol body still written for ONE pipette.
-
-    Gives it the same ``pipettes=[...]`` -> ``{pipette_key: result}`` interface
-    as multi_pipette_protocol, but runs the body once per pipette, one after
-    another (not synchronous). Replace with multi_pipette_protocol once the
-    body reads every pipette's channels together.
-    """
-    @functools.wraps(method)
-    def wrapper(self, *args, pipettes=None, **kwargs):
-        keys = self._resolve_pipettes(pipettes)
-        with self._protocol_lock:
-            if len(keys) > 1 and not getattr(self, "_warned_sequential_protocols", False):
-                self._warned_sequential_protocols = True
-                self.warning(f"{type(self).__name__} runs protocols one pipette at a time "
-                             "(not synchronous across pipettes)")
-            results = {}
-            for key in keys:
-                with self.for_pipette(key):
-                    results[key] = method(self, *args, **kwargs)
-            return results
-    return wrapper
-
-
 class _PerPipetteAttribute:
     """Descriptor that stores a DAQ attribute per pipette."""
 
@@ -229,11 +205,21 @@ class DAQAcquisitionThread(threading.Thread):
         self._fail_streak = 0            # counts consecutive bad fits
         self._fail_limit  = 3            # restart threshold
 
+        # REVIEW(pause): _idle_evt is clear only while this thread may touch
+        # the hardware (one square-wave cycle). DAQ._park_live_thread waits
+        # for it, so protocols never close/rebuild tasks mid-read.
+        self._idle_evt.set()
         while self.running:
             # ---------- wait until resumed ---------------------------------
             self._pause_evt.wait()
             if not self.running:
                 break
+            self._idle_evt.clear()
+            if not self._pause_evt.is_set():
+                # REVIEW(pause): a pause arrived between wait() and clear();
+                # step back without touching the hardware.
+                self._idle_evt.set()
+                continue
 
             cycle_start = time.perf_counter()
 
@@ -302,6 +288,9 @@ class DAQAcquisitionThread(threading.Thread):
 
             except Exception as e:
                 logging.warning(f"Error in DAQAcquisitionThread: {e}")
+
+            finally:
+                self._idle_evt.set()        # REVIEW(pause): hardware released
 
             # ---------- honour requested interval --------------------------
             elapsed       = time.perf_counter() - cycle_start
@@ -617,16 +606,26 @@ class DAQ(TaskController):
             self._daq_acq_thread.join()
             self._daq_acq_thread = None
             
+    def _park_live_thread(self, timeout: float = 2.0):
+        """Stop the live test pulse thread between cycles, leaving the tasks running.
+
+        REVIEW(pause): blocks until the thread has finished any cycle in
+        progress (see DAQAcquisitionThread.run). Undo with ``_pause_evt.set()``.
+        Returns False if the thread was already parked.
+        """
+        if not self._pause_evt.is_set():
+            return False
+        self._pause_evt.clear()                     # ask thread to park
+        if not self._idle_evt.wait(timeout):
+            raise TimeoutError("DAQ thread failed to become idle")
+        return True
+
     def pause_acquisition(self, timeout: float = 2.0):
         """
         Block until the acquisition thread is parked **and** both DAQmx tasks
         have been stopped, giving the caller sole ownership of the hardware.
         """
-        if self._pause_evt.is_set():
-            self._pause_evt.clear()                 # ask thread to park
-            if not self._idle_evt.wait(timeout):
-                raise TimeoutError("DAQ thread failed to become idle")
-
+        if self._park_live_thread(timeout):
             # --- stop the streaming tasks ---------------------------------
             try:
                 if hasattr(self, "ai_task"): self.ai_task.stop()
@@ -729,12 +728,107 @@ class DAQ(TaskController):
         """
         raise NotImplementedError("Implement in subclass.")
 
-    def getDataFromVoltageProtocol(self, *args, **kwargs):
-        """Run the voltage-step protocol (V-clamp).
+    @multi_pipette_protocol
+    def getDataFromVoltageProtocol(
+            self,
+            keys,
+            *,                       # keyword-only
+            wave_freq: int = 40,
+            samplesPerSec: int = 50_000,   # 50 kS/s
+            dutyCycle: float = 0.5,
+            amplitude: float = 0.5,
+            recordingTime: float = 0.025,  # 25 ms period
+            max_attempts: int = 15,
+            membrane_hold: float | None = None
+    ):
+        """Membrane test on the live stream, every requested pipette at once.
 
-        Sub-classes **must** implement this.
+        Runs square-wave cycles until each pipette has 5 acceptable capacitance
+        fits (or ``max_attempts``). Each cycle is ONE read covering every
+        pipette still collecting. The live thread is parked meanwhile but the
+        tasks keep streaming. Returns ``{key: mean capacitance (pF) or None}``.
         """
-        raise NotImplementedError("Implement in subclass.")
+        for key in keys:
+            self._pipette_state(key)["voltage_membrane_test"] = None
+        capacitances = {key: [] for key in keys}
+        first_good = {}
+        first_any = {}
+        attempts = 0
+        parked = self._park_live_thread()
+        time.sleep(recordingTime * 2)        # let the stream move past the last cycle
+        try:
+            while attempts < max_attempts:
+                collecting = [key for key in keys if len(capacitances[key]) < 5]
+                if not collecting:
+                    break
+                attempts += 1
+                cycle = self.getDataFromSquareWave(
+                    wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime,
+                    pipettes=collecting,
+                )
+                for key, result in cycle.items():
+                    first_any.setdefault(key, result)
+                    membrane_capacitance = result[5]
+                    if (membrane_capacitance is not None
+                            and np.isfinite(membrane_capacitance)
+                            and 0 < membrane_capacitance < 250):   # pF, arbitrary upper limit
+                        first_good.setdefault(key, result)
+                        capacitances[key].append(membrane_capacitance)
+                    else:
+                        self.debug(f"Voltage step attempt {attempts} ({key}): unacceptable fit -> skipped")
+                time.sleep(recordingTime)    # so consecutive reads don't overlap in the FIFO
+        finally:
+            if parked:
+                self._pause_evt.set()
+
+        results = {}
+        for key in keys:
+            if len(capacitances[key]) < 5:
+                self.warning(f"Voltage protocol ({key}): {len(capacitances[key])} acceptable "
+                             f"traces (expected 5) within {attempts} attempts")
+            with self.for_pipette(key):
+                # Show the first acceptable trace; fall back to the first one.
+                results[key] = self._store_membrane_test(
+                    first_good.get(key, first_any.get(key)), capacitances[key],
+                    membrane_hold, amplitude)
+        return results
+
+    def _membrane_step_mV(self, command, amplitude):
+        """Size of the membrane-test command step, in mV."""
+        return float(amplitude * self.V_CLAMP_VOLT_PER_VOLT * 1e3)
+
+    def _store_membrane_test(self, first_result, capacitances, membrane_hold, amplitude):
+        """Store one pipette's membrane-test results (active pipette)."""
+        if first_result is None:
+            self.voltageMembraneCapacitance = None
+            return None
+
+        (self.voltage_protocol_data,
+         self.voltage_command_data,
+         self.voltageTotalResistance,
+         self.voltageMembraneResistance,
+         self.voltageAccessResistance,
+         _) = first_result
+        protocol_data, command_data = first_result[:2]
+        self.voltage_membrane_test = {
+            "time": protocol_data[0].copy(),
+            "response": protocol_data[1].copy(),
+            "command": command_data[1].copy(),
+            "step_mV": self._membrane_step_mV(command_data[1], amplitude),
+            "hold_mV": membrane_hold * 1e3 if membrane_hold is not None else None,
+            "color": "#000000",
+        }
+        self.voltageMembraneCapacitance = (
+            float(np.mean(capacitances)) if capacitances else None
+        )
+        self.latestMembraneCapacitance = self.voltageMembraneCapacitance
+        if self.voltageTotalResistance is not None:
+            self.totalResistance = self.voltageTotalResistance
+        if self.voltageMembraneResistance is not None:
+            self.latestMembraneResistance = self.voltageMembraneResistance
+        if self.voltageAccessResistance is not None:
+            self.latestAccessResistance = self.voltageAccessResistance
+        return self.voltageMembraneCapacitance
 
     def getVoltageClampSweep(self, *args, **kwargs):
         """Run the voltage-step protocol (V-clamp).
@@ -1186,40 +1280,61 @@ class PipetteDAQView:
 #  NI-DAQ Subclass
 # ========================================================
 class NiDAQ(DAQ):
+    """NI-DAQmx DAQ serving every pipette on the rig at once.
+
+    All pipettes' AI channels (read + resp) live in ONE AI task and all their
+    command channels in ONE AO task, armed on the AI start trigger. Every
+    pipette is therefore sampled on the same clock and stimulated in the same
+    samples; each read returns every pipette's data together.
+    """
     C_CLAMP_AMP_PER_VOLT = 400 * 1e-12  # 400 pA per V (DAQ output)
     C_CLAMP_VOLT_PER_VOLT = (10 * 1e-3) / (1e-3)  # 10 mV per V (DAQ input)
     V_CLAMP_VOLT_PER_VOLT = (20 * 1e-3)  # 20 mV per V (DAQ output)
     V_CLAMP_VOLT_PER_AMP = (2 * 1e-9)   # 2 mV per pA (DAQ input)
 
-    def __init__(self, readDev, readChannel, cmdDev, cmdChannel, respDev, respChannel,
-                 pipette_keys=None):
-        # NiDAQ is still wired for ONE pipette (one AI pair + one AO). Its
-        # channels are keyed by their physical names so the multi-channel
-        # version can extend this map without changing callers.
+    def __init__(self, readDev=None, readChannel=None, cmdDev=None, cmdChannel=None,
+                 respDev=None, respChannel=None, pipette_keys=None, channels=None):
+        """
+        channels: list of ``{"read": "Dev1/ai17", "resp": "Dev1/ai19",
+            "cmd": "Dev1/ao0"}`` (full physical channel names), one per
+            pipette in rig order, so entry n belongs to pipette_<n>.
+        readDev ... respChannel: legacy single-pipette form. Gives one channel
+            set; any further pipettes share it (with a warning).
+        """
         keys = list(pipette_keys) if pipette_keys else [pipette_key_for(0)]
-        channel_map = build_channel_map(
-            keys[:1],
-            channels=[{
-                "read": f"{readDev}/{readChannel}",
-                "resp": f"{respDev}/{respChannel}",
-                "cmd": f"{cmdDev}/{cmdChannel}",
-            }],
-        )
+        legacy = (readDev, readChannel, cmdDev, cmdChannel, respDev, respChannel)
+        if channels is not None:
+            if any(value is not None for value in legacy):
+                raise ValueError("Give NiDAQ either 'channels' or the single-pipette "
+                                 "readDev/readChannel/... params, not both")
+            channel_map = build_channel_map(keys, channels=channels)
+        else:
+            if any(value is None for value in legacy):
+                raise ValueError("NiDAQ needs a 'channels' list or all of readDev, readChannel, "
+                                 "cmdDev, cmdChannel, respDev, respChannel")
+            channel_map = build_channel_map(
+                keys[:1],
+                channels=[{
+                    "read": f"{readDev}/{readChannel}",
+                    "resp": f"{respDev}/{respChannel}",
+                    "cmd": f"{cmdDev}/{cmdChannel}",
+                }],
+            )
         super().__init__(channel_map=channel_map)
-        if len(keys) > 1:
+        if channels is None and len(keys) > 1:
             self.warning(
                 f"NiDAQ has channels for 1 pipette but {len(keys)} were selected; "
                 f"{keys[1:]} will share {keys[0]}'s channels."
             )
-        self.readDev = readDev
-        self.cmdDev = cmdDev
-        self.respDev = respDev
-        self.readChannel = readChannel
-        self.cmdChannel = cmdChannel
-        self.respChannel = respChannel
-        self.info(f'Using {self.readDev}/{self.readChannel} for reading; '
-                  f'{self.cmdDev}/{self.cmdChannel} for command; '
-                  f'and {self.respDev}/{self.respChannel} for response.')
+        self._check_single_task_devices()
+        for key, spec in self.channel_map.items():
+            self.info(f"{key}: read {spec.read}, response {spec.resp}, command {spec.cmd}")
+
+        # Channels (and pipettes) held by the current AI / AO tasks, in task order.
+        self._ai_task_keys = []
+        self._ai_task_channels = []
+        self._ao_task_keys = []
+
         # 1) Pre-generate the square wave buffer
         self.createSquareWave(
             wave_freq=40, samplesPerSec=50000,
@@ -1237,6 +1352,119 @@ class NiDAQ(DAQ):
             recordingTime=0.025,
             interval= 0.000  # 0 ms per cycle
         )
+
+    # --------------------------------------------------------------
+    # Task building: every task holds the channels of several pipettes
+    # --------------------------------------------------------------
+    @staticmethod
+    def _device_of(physical_channel):
+        return physical_channel.split("/")[0]
+
+    @staticmethod
+    def _routing_device(device):
+        # On cDAQ the routable trigger lines live on the CHASSIS, not the module.
+        return device.split("Mod")[0] if "Mod" in device else device
+
+    def _check_single_task_devices(self):
+        """Warn if the AI channels can't all go into one task."""
+        devices = {self._device_of(name) for name in self.ai_channels}
+        chassis = {self._routing_device(device).lower() for device in devices}
+        if len(chassis) > 1:
+            self.warning(f"AI channels span several devices {sorted(devices)}; one AI task "
+                         "can only hold them if the devices are synchronized for "
+                         "multi-device tasks.")
+
+    def _start_trigger_terminal(self):
+        """AI start-trigger terminal the AO task is armed on (LabVIEW
+        "Get Terminal with Device Prefix" -> "/<device>/ai/StartTrigger")."""
+        device = self._device_of(self.ai_channels[0])
+        return f"/{self._routing_device(device)}/ai/StartTrigger"
+
+    def _add_ai_channels(self, task, keys=None):
+        """Add each pipette's read + resp channel to ``task``; return the channel order."""
+        keys = self.pipette_keys if keys is None else list(keys)
+        names = [name for key in keys
+                 for name in (self.channel_map[key].read, self.channel_map[key].resp)]
+        for name in names:
+            task.ai_channels.add_ai_voltage_chan(
+                name,
+                terminal_config=nidaqmx.constants.TerminalConfiguration.DIFF,
+                min_val=-10.0, max_val=10.0,
+            )
+        return names
+
+    def _add_ao_channels(self, task, keys=None):
+        """Add each pipette's command channel to ``task``."""
+        keys = self.pipette_keys if keys is None else list(keys)
+        for key in keys:
+            task.ao_channels.add_ao_voltage_chan(self.channel_map[key].cmd)
+        return keys
+
+    def _new_ai_task(self, keys=None):
+        """Create ``self.ai_task`` holding ``keys``' channels and remember its layout."""
+        self.ai_task = nidaqmx.Task()
+        self._ai_task_keys = self.pipette_keys if keys is None else list(keys)
+        self._ai_task_channels = self._add_ai_channels(self.ai_task, self._ai_task_keys)
+        return self.ai_task
+
+    def _new_ao_task(self, keys=None):
+        """Create ``self.ao_task`` holding ``keys``' command channels."""
+        self.ao_task = nidaqmx.Task()
+        self._ao_task_keys = self._add_ao_channels(self.ao_task, keys)
+        return self.ao_task
+
+    def _ao_block(self, waves, keys=None):
+        """AO write data for ``keys`` (default: the AO task's pipettes).
+
+        ``waves`` is one wave sent to every pipette, or ``{key: wave}`` where
+        a missing/None entry means 0 V on that pipette. Returns a 1-D array
+        for one channel and a (channels x samples) array for several.
+        """
+        keys = self._ao_task_keys if keys is None else list(keys)
+        if isinstance(waves, dict):
+            rows = [waves.get(key) for key in keys]
+        else:
+            rows = [waves] * len(keys)
+        length = max((len(row) for row in rows if row is not None), default=0)
+        rows = [np.zeros(length) if row is None else np.asarray(row, dtype=float) for row in rows]
+        return rows[0] if len(rows) == 1 else np.vstack(rows)
+
+    def _split_rows(self, raw, keys=None):
+        """Split one AI read into ``{key: [read, resp]}``.
+
+        ``keys`` are the pipettes the task was built with (default: the
+        running AI task's); rows are in _add_ai_channels order.
+        """
+        keys = self._ai_task_keys if keys is None else list(keys)
+        names = [name for key in keys
+                 for name in (self.channel_map[key].read, self.channel_map[key].resp)]
+        by_channel = self._rows_to_channel_dict(raw, names)
+        return {
+            key: np.vstack([by_channel[self.channel_map[key].read],
+                            by_channel[self.channel_map[key].resp]])
+            for key in keys
+        }
+
+    def _read_train(self, exp_samples, timeout=2.0):
+        """Wait for one full train and read it for every pipette in the AI task."""
+        while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
+            self.sleep(0.002)
+        return self._split_rows(self.ai_task.read(exp_samples, timeout=timeout))
+
+    def _close_tasks(self):
+        """Stop and close the current AI/AO tasks (errors ignored)."""
+        for task_name in ("ai_task", "ao_task"):
+            task = getattr(self, task_name, None)
+            if task is None:
+                continue
+            try:
+                task.stop()
+            except Exception:
+                pass
+            try:
+                task.close()
+            except Exception:
+                pass
 
     def _restartAcquisition(self):
         try:
@@ -1261,61 +1489,42 @@ class NiDAQ(DAQ):
         Configure the continuous AI + AO pair so they start exactly like
         INIT_memtest.vi in LabVIEW:
 
-        ▸ AI owns its own sample clock (CONTINUOUS).
-        ▸ AO runs at the same rate, in regeneration mode.
+        ▸ AI owns its own sample clock (CONTINUOUS) and holds every pipette's
+            read + resp channels.
+        ▸ AO runs at the same rate, in regeneration mode, one command channel
+            per pipette (all get the same test pulse).
         ▸ AO is armed with a digital-edge start-trigger that listens to
             the AI StartTrigger ("/<Dev>/ai/StartTrigger").
         ▸ Tasks are started in LabVIEW order:  AO first (armed) → AI starts
             (emits trigger) → AO begins automatically.
         """
-        import nidaqmx
-        import nidaqmx.constants as c
+        c = nidaqmx.constants
 
         # ------------------------------------------------------------------
-        # 1.  ANALOG INPUT  (read + response channels)
+        # 1.  ANALOG INPUT  (read + response channels of every pipette)
         # ------------------------------------------------------------------
-        self.ai_task = nidaqmx.Task()
-        self.ai_task.ai_channels.add_ai_voltage_chan(
-            f"{self.readDev}/{self.readChannel}",
-            terminal_config=c.TerminalConfiguration.DIFF,
-            min_val=-10.0, max_val=10.0,
-        )
-        self.ai_task.ai_channels.add_ai_voltage_chan(
-            f"{self.respDev}/{self.respChannel}",
-            terminal_config=c.TerminalConfiguration.DIFF,
-            min_val=-10.0, max_val=10.0,
-        )
+        self._new_ai_task()
         self.ai_task.timing.cfg_samp_clk_timing(
             rate=self._wave_rate,
             sample_mode=c.AcquisitionType.CONTINUOUS,
         )
-        import nidaqmx.constants as c
 
         # Allow the device to overwrite unread data so the fifo keeps running
         self.ai_task.in_stream.overwrite_mode = c.OverwriteMode.OVERWRITE_UNREAD_SAMPLES
 
         # When we call task.read(), start relative to the newest sample
         self.ai_task.in_stream.read_relative_to = c.ReadRelativeTo.MOST_RECENT_SAMPLE
-        # …and back-up exactly one buffer-length so we still get a full cycle
+        # …and back-up exactly one buffer-length (per channel) so we still get a full cycle
         self.ai_task.in_stream.read_offset = -self._wave_samples
 
         self.ai_task.in_stream.input_buf_size = max(
             self.ai_task.in_stream.input_buf_size,
             self._wave_rate * 10)   # keep 10 s of slack (~200 k samples)
-                # LabVIEW “Get Terminal with Device Prefix”  →  "/<device>/ai/StartTrigger"
-        # On cDAQ the routable line lives on the CHASSIS, not the module.
-        if "Mod" in self.readDev:                 # e.g.  "cDAQ1Mod1"
-            chassis_name = self.readDev.split("Mod")[0]   # "cDAQ1"
-            start_trig_term = f"/{chassis_name}/ai/StartTrigger"
-        else:                                     # PCIe/X-series, USB -- use the device itself
-            start_trig_term = f"/{self.readDev}/ai/StartTrigger"
-
 
         # ------------------------------------------------------------------
-        # 2.  ANALOG OUTPUT  (command channel)
+        # 2.  ANALOG OUTPUT  (one command channel per pipette)
         # ------------------------------------------------------------------
-        self.ao_task = nidaqmx.Task()
-        self.ao_task.ao_channels.add_ao_voltage_chan(f"{self.cmdDev}/{self.cmdChannel}")
+        self._new_ao_task()
         self.ao_task.timing.cfg_samp_clk_timing(
             rate=self._wave_rate,
             sample_mode=c.AcquisitionType.CONTINUOUS,
@@ -1326,13 +1535,13 @@ class NiDAQ(DAQ):
 
         # Arm AO with the AI StartTrigger
         self.ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-            start_trig_term, trigger_edge=c.Edge.RISING
+            self._start_trigger_terminal(), trigger_edge=c.Edge.RISING
         )
 
         # ------------------------------------------------------------------
         # 3.  PRIME AO FIFO  (avoid -200462)
         # ------------------------------------------------------------------
-        self.ao_task.write(self.wave, auto_start=False)
+        self.ao_task.write(self._ao_block(self.wave), auto_start=False)
 
         # ------------------------------------------------------------------
         # 4.  START TASKS  (AO waits → AI fires trigger)
@@ -1349,12 +1558,13 @@ class NiDAQ(DAQ):
         self._cur_wave_amp   = 0.5
         self._cur_wave_rtime = 0.025
 
-    def _setupAcquisitionCurrent(self, recordingTime=500, dutyCycle=0.5):
+    def _setupAcquisitionCurrent(self, recordingTime=500, dutyCycle=0.5, keys=None):
         """
-        Configure a dedicated continuous AI + AO pair for the
-        current-step protocol.  The background stream must be paused first.
+        Configure a dedicated continuous AI + AO pair for the current-step
+        protocol, holding ``keys``' channels (default: every pipette).
+        The background stream must be paused first.
         """
-        import nidaqmx, nidaqmx.constants as c
+        c = nidaqmx.constants
 
         samplesPerSec = 100_000
         dutyCycle     = float(dutyCycle)
@@ -1371,32 +1581,23 @@ class NiDAQ(DAQ):
         # ------------------------------------------------------------------
         # 2. tasks (AI owns clock; AO waits on AI start trigger)
         # ------------------------------------------------------------------
-        self.ai_task = nidaqmx.Task()
-        self.ai_task.ai_channels.add_ai_voltage_chan(
-            f"{self.readDev}/{self.readChannel}",
-            terminal_config=c.TerminalConfiguration.DIFF, min_val=-10.0, max_val=10.0)
-        self.ai_task.ai_channels.add_ai_voltage_chan(
-            f"{self.respDev}/{self.respChannel}",
-            terminal_config=c.TerminalConfiguration.DIFF, min_val=-10.0, max_val=10.0)
+        self._new_ai_task(keys)
         self.ai_task.timing.cfg_samp_clk_timing(
             rate=rate, sample_mode=c.AcquisitionType.CONTINUOUS)
         self.ai_task.in_stream.input_buf_size = max(
             self.ai_task.in_stream.input_buf_size, rate * 10)
 
-        self.ao_task = nidaqmx.Task()
-        self.ao_task.ao_channels.add_ao_voltage_chan(f"{self.cmdDev}/{self.cmdChannel}")
+        self._new_ao_task(keys)
         self.ao_task.timing.cfg_samp_clk_timing(
             rate=rate, sample_mode=c.AcquisitionType.CONTINUOUS,
             samps_per_chan=numSamples)
         self.ao_task.out_stream.regen_mode = c.RegenerationMode.ALLOW_REGENERATION
 
-        start_trig_term = (f"/{self.readDev.split('Mod')[0] if 'Mod' in self.readDev else self.readDev}"
-                           "/ai/StartTrigger")
         self.ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-            start_trig_term, trigger_edge=c.Edge.RISING)
+            self._start_trigger_terminal(), trigger_edge=c.Edge.RISING)
 
         # prime AO FIFO, then start in LabVIEW order (AO-armed → AI-fires)
-        self.ao_task.write(wave, auto_start=False)
+        self.ao_task.write(self._ao_block(wave), auto_start=False)
         self.ao_task.start()
         self.ai_task.start()
 
@@ -1407,13 +1608,14 @@ class NiDAQ(DAQ):
                                  dutyCycle: float,
                                  recordingTime: float,
                                  exp_samples: int,
-                                 buffer_trains: int):
+                                 buffer_trains: int,
+                                 keys=None):
         """
-        Configure the dedicated AI/AO pair for the V-clamp step protocol.
+        Configure the dedicated AI/AO pair for the V-clamp step protocol,
+        holding ``keys``' channels (default: every pipette).
         Mirrors the current-clamp setup while preserving voltage-specific buffer sizing.
         """
-        import nidaqmx
-        import nidaqmx.constants as c
+        c = nidaqmx.constants
 
         # ------------------------------------------------------------------
         # 1. prime buffer (0 V step)
@@ -1430,19 +1632,7 @@ class NiDAQ(DAQ):
         # ------------------------------------------------------------------
         # 2. tasks (AI clock; AO waits on AI start trigger)
         # ------------------------------------------------------------------
-        self.ai_task = nidaqmx.Task()
-        self.ai_task.ai_channels.add_ai_voltage_chan(
-            f"{self.readDev}/{self.readChannel}",
-            terminal_config=c.TerminalConfiguration.DIFF,
-            min_val=-10.0,
-            max_val=10.0,
-        )
-        self.ai_task.ai_channels.add_ai_voltage_chan(
-            f"{self.respDev}/{self.respChannel}",
-            terminal_config=c.TerminalConfiguration.DIFF,
-            min_val=-10.0,
-            max_val=10.0,
-        )
+        self._new_ai_task(keys)
         self.ai_task.timing.cfg_samp_clk_timing(
             rate=samplesPerSec,
             sample_mode=c.AcquisitionType.CONTINUOUS,
@@ -1452,8 +1642,7 @@ class NiDAQ(DAQ):
             exp_samples * buffer_trains,
         )
 
-        self.ao_task = nidaqmx.Task()
-        self.ao_task.ao_channels.add_ao_voltage_chan(f"{self.cmdDev}/{self.cmdChannel}")
+        self._new_ao_task(keys)
         self.ao_task.timing.cfg_samp_clk_timing(
             rate=samplesPerSec,
             sample_mode=c.AcquisitionType.CONTINUOUS,
@@ -1468,19 +1657,15 @@ class NiDAQ(DAQ):
         # ------------------------------------------------------------------
         # 3. trigger routing (AO armed by AI start trigger)
         # ------------------------------------------------------------------
-        start_trig_term = (
-            f"/{self.readDev.split('Mod')[0] if 'Mod' in self.readDev else self.readDev}"
-            "/ai/StartTrigger"
-        )
         self.ao_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-            start_trig_term,
+            self._start_trigger_terminal(),
             trigger_edge=c.Edge.RISING,
         )
 
         # ------------------------------------------------------------------
         # 4. prime AO FIFO and start in LabVIEW order
         # ------------------------------------------------------------------
-        self.ao_task.write(zero_wave, auto_start=False)
+        self.ao_task.write(self._ao_block(zero_wave), auto_start=False)
         self.ao_task.start()
         self.ai_task.start()
 
@@ -1490,19 +1675,23 @@ class NiDAQ(DAQ):
         in the task, then return the requested ones as ``{channel: samples}``.
         """
         names = self._resolve_channels(channels)
+        missing = [name for name in names if name not in self._ai_task_channels]
+        if missing:
+            raise ValueError(f"Channels {missing} are not in the running AI task "
+                             f"({self._ai_task_channels})")
         numSamples = int(samplesPerSec * recordingTime)
         data = self.ai_task.read(
             number_of_samples_per_channel=numSamples,
             timeout=10.0
         )
-        # The task's channels were added in self.ai_channels order.
-        by_channel = self._rows_to_channel_dict(data, self.ai_channels)
+        by_channel = self._rows_to_channel_dict(data, self._ai_task_channels)
         return {name: by_channel[name] for name in names}
 
     def _sendSquareWave(self, wave_freq, samplesPerSec,
                         dutyCycle, amplitude, recordingTime):
         """
         Update the AO buffer *without* disturbing the trigger relationship.
+        Every pipette's command channel gets the same wave.
 
         • If the requested wave is identical to the one already streaming,
         do nothing (prevents DAQmx -200015).
@@ -1511,9 +1700,9 @@ class NiDAQ(DAQ):
         (regen-mode allows this).
         • If rate or length must change, stop *both* tasks, re-configure,
         and restart them **in the same trigger order** (AO-first, AI-second).
-        
+
         """
-        import nidaqmx.constants as c
+        c = nidaqmx.constants
 
         same_shape = (wave_freq     == getattr(self, "_cur_wave_freq",  None) and
                     samplesPerSec == getattr(self, "_cur_wave_rate",  None) and
@@ -1531,7 +1720,7 @@ class NiDAQ(DAQ):
         # ---------- CASE 1: rate & length unchanged  ---------------------------
         if samplesPerSec == self._cur_wave_rate and self._wave_samples == len(self.wave):
             # Task is running; regen_mode lets us replace data in FIFO
-            self.ao_task.write(self.wave, auto_start=False)
+            self.ao_task.write(self._ao_block(self.wave), auto_start=False)
 
         # ---------- CASE 2: rate OR length changed  ----------------------------
         else:
@@ -1546,7 +1735,7 @@ class NiDAQ(DAQ):
                 samps_per_chan=self._wave_samples)
 
             # 3) load new buffer
-            self.ao_task.write(self.wave, auto_start=False)
+            self.ao_task.write(self._ao_block(self.wave), auto_start=False)
 
             # 4) restart in trigger order
             self.ao_task.start()
@@ -1561,25 +1750,30 @@ class NiDAQ(DAQ):
 
     def _sendSquareWaveCurrent(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime):
         """
-        Generate a new current-square-wave buffer on the fly,
-        write it to the always-running AO task, then restore the
-        original membrane-test wave.
+        Queue the next current-step train on the running AO task.
+
+        ``amplitude`` is one value for every pipette, or ``{key: amplitude}``
+        where None means 0 V for that pipette (it has no step this train).
         """
+        def wave_for(value):
+            wave, _, _ = self.createSquareWaveCurrent(
+                wave_freq=wave_freq, samplesPerSec=samplesPerSec,
+                dutyCycle=dutyCycle, amplitude=value,
+                recordingTime=recordingTime
+            )
+            return wave
 
-        import nidaqmx.constants as c
-        # 1) create the current square wave
-        wave, rate, numSamples = self.createSquareWaveCurrent(
-            wave_freq=wave_freq, samplesPerSec=samplesPerSec,
-            dutyCycle=dutyCycle, amplitude=amplitude,
-            recordingTime=recordingTime
-        )   
-
-        # 2) write the new wave to the AO task
-        self.ao_task.write(wave, auto_start=False)
+        if isinstance(amplitude, dict):
+            waves = {key: None if value is None else wave_for(value)
+                     for key, value in amplitude.items()}
+        else:
+            waves = wave_for(amplitude)
+        self.ao_task.write(self._ao_block(waves), auto_start=False)
 
     def _sendSquareWaveVoltage(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime):
         """
-        Generate the next voltage-step wave and queue it on the running AO task.
+        Generate the next voltage-step wave and queue it on the running AO
+        task for every pipette in it.
         """
         wave, _, _ = self.createSquareWaveVoltage(
             wave_freq=wave_freq,
@@ -1589,7 +1783,7 @@ class NiDAQ(DAQ):
             recordingTime=recordingTime,
             store=False,
         )
-        self.ao_task.write(wave, auto_start=False)
+        self.ao_task.write(self._ao_block(wave), auto_start=False)
 
     def _build_optogenetic_timeline(self, protocol_steps: list[dict]):
         stim_timeline: list[dict] = []
@@ -1624,33 +1818,36 @@ class NiDAQ(DAQ):
             while time.perf_counter() < deadline_s:
                 pass
 
-    def _setup_optogenetic_ai_task(self, rate_hz: int, num_samples: int):
+    def _setup_optogenetic_ai_task(self, rate_hz: int, num_samples: int, keys=None):
+        """Finite AI task holding ``keys``' channels (default: every pipette)."""
         ai = nidaqmx.Task()
-        ai.ai_channels.add_ai_voltage_chan(
-            f"{self.readDev}/{self.readChannel}",
-            terminal_config=nidaqmx.constants.TerminalConfiguration.DIFF,
-            min_val=-10.0, max_val=10.0)
-        ai.ai_channels.add_ai_voltage_chan(
-            f"{self.respDev}/{self.respChannel}",
-            terminal_config=nidaqmx.constants.TerminalConfiguration.DIFF,
-            min_val=-10.0, max_val=10.0)
+        self._add_ai_channels(ai, keys)
         ai.timing.cfg_samp_clk_timing(
             rate=rate_hz,
             sample_mode=nidaqmx.constants.AcquisitionType.FINITE,
             samps_per_chan=num_samples)
         return ai
 
-    def _read_optogenetic_ai(self, ai_task, num_samples: int, duration_s: float):
+    def _read_optogenetic_ai(self, ai_task, num_samples: int, duration_s: float, keys=None):
+        """Read the finite task, close it, and return ``{key: [read, resp]}``."""
         raw = ai_task.read(
             number_of_samples_per_channel=num_samples,
             timeout=duration_s + 2.0)
         ai_task.stop()
         ai_task.close()
-        return np.asarray(raw, dtype=float)
+        return self._split_rows(raw, self.pipette_keys if keys is None else keys)
 
-    @per_pipette_protocol
+    # --------------------------------------------------------------
+    # Protocols: every requested pipette is acquired in the same tasks
+    # and reads. Called as daq.<protocol>(pipettes=[...], ...) and
+    # returning {pipette_key: result}. Pipettes not requested get no
+    # channels in the protocol tasks (their command stays at 0 V); the
+    # live test pulse is paused for every pipette meanwhile.
+    # --------------------------------------------------------------
+    @multi_pipette_protocol
     def getLeakSubtraction(
             self,
+            keys,
             *,
             start_voltage: float,
             end_voltage: float,
@@ -1663,17 +1860,16 @@ class NiDAQ(DAQ):
             repeats: int = 4,
     ):
         """
-        Execute a P/4 leak subtraction sequence prior to a voltage sweep.
+        Execute a P/4 leak subtraction sequence prior to a voltage sweep,
+        on every pipette in ``keys`` at once.
 
         For each sweep target, this generates ``repeats`` square pulses whose
         amplitude is ``-(target - holding) / 4``.  Each pulse uses a 50 % duty
         cycle square wave lasting ``pulse_recording_time / 3`` seconds inside a
         baseline–pulse–baseline layout that mirrors ``getVoltageClampSweep``.
-        Averaged traces are stored on ``self.leak_subtraction_data`` for GUI /
-        logging consumers and the raw repeats are discarded after averaging.
+        Averaged traces are stored per pipette on ``leak_subtraction_data``
+        and the raw repeats are discarded after averaging.
         """
-        import numpy as np
-
         if step_voltage == 0:
             raise ValueError("step_voltage must be non-zero")
         if repeats <= 0:
@@ -1721,30 +1917,24 @@ class NiDAQ(DAQ):
                     "repeat_index": repeat_idx,
                 })
 
+        meta = {
+            "holding_voltage": holding_voltage,
+            "targets": targets,
+            "leak_target_voltages": np.array(leak_target_voltages, dtype=float),
+            "leak_step_values": np.array(leak_step_values, dtype=float),
+            "repeats": repeats,
+            "wave_freq": wave_freq,
+            "pulse_recording_time": pulse_recording_time,
+        }
         if not leak_plan:
-            self.leak_subtraction_data = []
-            self.leak_subtraction_meta = {
-                "holding_voltage": holding_voltage,
-                "targets": targets,
-                "leak_step_values": np.array(leak_step_values, dtype=float),
-                "repeats": repeats,
-                "wave_freq": wave_freq,
-                "pulse_recording_time": pulse_recording_time,
-            }
-            return self.leak_subtraction_data
+            for key in keys:
+                with self.for_pipette(key):
+                    self.leak_subtraction_data = []
+                    self.leak_subtraction_meta = dict(meta)
+            return {key: [] for key in keys}
 
         self.pause_acquisition()
-        for task_name in ("ai_task", "ao_task"):
-            task = getattr(self, task_name, None)
-            if task is not None:
-                try:
-                    task.stop()
-                except Exception:
-                    pass
-                try:
-                    task.close()
-                except Exception:
-                    pass
+        self._close_tasks()
 
         buffer_trains = max(len(leak_plan) + 2, 4)
         _, _, num_samples = self.createSquareWaveVoltage(
@@ -1765,9 +1955,12 @@ class NiDAQ(DAQ):
             recordingTime=pulse_recording_time,
             exp_samples=exp_samples,
             buffer_trains=buffer_trains,
+            keys=keys,
         )
 
-        if leak_plan:
+        pulses_by_target = {key: [[] for _ in range(targets.size)] for key in keys}
+
+        try:
             first_amp = leak_plan[0]["ao_amplitude"]
             self._sendSquareWaveVoltage(
                 wave_freq=wave_freq,
@@ -1777,13 +1970,8 @@ class NiDAQ(DAQ):
                 recordingTime=pulse_recording_time,
             )
 
-        while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
-            self.sleep(0.002)
-        _ = self.ai_task.read(exp_samples, timeout=2.0)
+            self._read_train(exp_samples)        # discard the 0 V prime train
 
-        pulses_by_target: list[list[dict]] = [[] for _ in range(targets.size)]
-
-        try:
             for idx, pulse in enumerate(leak_plan):
                 if idx + 1 < len(leak_plan):
                     next_amp = leak_plan[idx + 1]["ao_amplitude"]
@@ -1795,74 +1983,52 @@ class NiDAQ(DAQ):
                         recordingTime=pulse_recording_time,
                     )
 
-                while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
-                    self.sleep(0.002)
-
-                raw = np.asarray(self.ai_task.read(exp_samples, timeout=2.0), dtype=float)
-                self._squareWaveProcessor(raw, samplesPerSec, pulse["ao_amplitude"])
-
+                trains = self._read_train(exp_samples)   # every pipette, one read
                 time_vec = np.linspace(0, total_duration, exp_samples, dtype=float)
-                resp_vec = raw[1] * self.V_CLAMP_VOLT_PER_AMP
-                command_vec = raw[0] * self.V_CLAMP_VOLT_PER_VOLT
-
-                pulses_by_target[pulse["target_index"]].append({
-                    "time": time_vec,
-                    "response": resp_vec,
-                    "command": command_vec,
-                    "repeat_index": pulse["repeat_index"],
-                })
+                for key, raw in trains.items():
+                    with self.for_pipette(key):
+                        self._squareWaveProcessor(raw, samplesPerSec, pulse["ao_amplitude"])
+                    pulses_by_target[key][pulse["target_index"]].append({
+                        "time": time_vec,
+                        "response": raw[1] * self.V_CLAMP_VOLT_PER_AMP,
+                        "command": raw[0] * self.V_CLAMP_VOLT_PER_VOLT,
+                        "repeat_index": pulse["repeat_index"],
+                    })
 
                 self.info(
                     f"Captured P/4 leak pulse {pulse['repeat_index'] + 1}/{repeats} "
                     f"for {pulse['target_voltage'] * 1e3:.0f} mV sweep target."
                 )
         finally:
-            try:
-                self.ai_task.stop(); self.ao_task.stop()
-                self.ai_task.close(); self.ao_task.close()
-            except Exception:
-                pass
+            self._close_tasks()
             self.resume_acquisition()
 
-        leak_results: list[dict] = []
-        for idx, target in enumerate(targets):
-            pulses = pulses_by_target[idx]
-            if not pulses:
-                continue
+        results = {}
+        for key in keys:
+            leak_results: list[dict] = []
+            for idx, target in enumerate(targets):
+                pulses = pulses_by_target[key][idx]
+                if not pulses:
+                    continue
+                leak_results.append({
+                    "time": pulses[0]["time"].copy(),
+                    "response": np.vstack([p["response"] for p in pulses]).mean(axis=0),
+                    "command": np.vstack([p["command"] for p in pulses]).mean(axis=0),
+                    "target_voltage": target,
+                    "leak_target_voltage": leak_target_voltages[idx],
+                    "leak_step_voltage": leak_step_values[idx],
+                    "repeat_count": len(pulses),
+                })
+            with self.for_pipette(key):
+                self.leak_subtraction_data = leak_results
+                self.leak_subtraction_meta = dict(meta)
+            results[key] = leak_results
+        return results
 
-            time_vec = pulses[0]["time"].copy()
-            resp_stack = np.vstack([p["response"] for p in pulses])
-            cmd_stack = np.vstack([p["command"] for p in pulses])
-
-            avg_resp = resp_stack.mean(axis=0)
-            avg_cmd = cmd_stack.mean(axis=0)
-
-            leak_results.append({
-                "time": time_vec,
-                "response": avg_resp,
-                "command": avg_cmd,
-                "target_voltage": target,
-                "leak_target_voltage": leak_target_voltages[idx],
-                "leak_step_voltage": leak_step_values[idx],
-                "repeat_count": len(pulses),
-            })
-
-        self.leak_subtraction_data = leak_results
-        self.leak_subtraction_meta = {
-            "holding_voltage": holding_voltage,
-            "targets": targets,
-            "leak_target_voltages": np.array(leak_target_voltages, dtype=float),
-            "leak_step_values": np.array(leak_step_values, dtype=float),
-            "repeats": repeats,
-            "wave_freq": wave_freq,
-            "pulse_recording_time": pulse_recording_time,
-        }
-
-        return self.leak_subtraction_data
-
-    @per_pipette_protocol
+    @multi_pipette_protocol
     def getVoltageClampSweep(
             self,
+            keys,
             *,
             start_voltage: float,
             end_voltage: float,
@@ -1874,12 +2040,10 @@ class NiDAQ(DAQ):
             recordingTime: float = 0.750
     ):
         """
-        Run a finite V-clamp sweep that mirrors the I-clamp protocol lifecycle.
-        Returns a list of [time, response, command] arrays processed identically
-        to the membrane-test traces.
+        Run a finite V-clamp sweep on every pipette in ``keys`` at once.
+        Returns ``{key: [[time, response, command], ...]}`` processed
+        identically to the membrane-test traces.
         """
-        import numpy as np
-
         if step_voltage == 0:
             raise ValueError("step_voltage must be non-zero")
 
@@ -1899,23 +2063,11 @@ class NiDAQ(DAQ):
             if targets.size == 0 or abs(targets[-1] - end_voltage) > 1e-9:
                 targets = np.append(targets, end_voltage)
 
-        self.vclamp_steps = targets
-        self.info(f"V-clamp pulses (pA): {self.vclamp_steps}")
-        self.vclamp_hold_value = holding_voltage
-        self.voltage_protocol_data = []
+        self.info(f"V-clamp steps (V): {targets}")
+        sweeps = {key: [] for key in keys}
 
         self.pause_acquisition()
-        for task_name in ("ai_task", "ao_task"):
-            task = getattr(self, task_name, None)
-            if task is not None:
-                try:
-                    task.stop()
-                except Exception:
-                    pass
-                try:
-                    task.close()
-                except Exception:
-                    pass
+        self._close_tasks()
         buffer_trains = max(len(targets) + 2, 4)
         _, _, num_samples = self.createSquareWaveVoltage(
             wave_freq=wave_freq,
@@ -1934,99 +2086,65 @@ class NiDAQ(DAQ):
             recordingTime=recordingTime,
             exp_samples=exp_samples,
             buffer_trains=buffer_trains,
+            keys=keys,
         )
 
-        if targets.size:
-            first_delta = targets[0] - holding_voltage
-            first_amp = first_delta / self.V_CLAMP_VOLT_PER_VOLT
-            self._sendSquareWaveVoltage(
-                wave_freq, samplesPerSec, dutyCycle, first_amp, recordingTime
-            )
-
-
-        while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
-            self.sleep(0.002)
-        _ = self.ai_task.read(exp_samples, timeout=2.0)
-
-        sweeps: list[list[np.ndarray]] = []
-
         try:
+            if targets.size:
+                first_amp = (targets[0] - holding_voltage) / self.V_CLAMP_VOLT_PER_VOLT
+                self._sendSquareWaveVoltage(
+                    wave_freq, samplesPerSec, dutyCycle, first_amp, recordingTime
+                )
+
+            self._read_train(exp_samples)        # discard the 0 V prime train
+
             for idx, target in enumerate(targets):
                 if idx + 1 < len(targets):
-                    next_delta = targets[idx + 1] - holding_voltage
-                    next_amp = next_delta / self.V_CLAMP_VOLT_PER_VOLT
+                    next_amp = (targets[idx + 1] - holding_voltage) / self.V_CLAMP_VOLT_PER_VOLT
                     self._sendSquareWaveVoltage(
                         wave_freq, samplesPerSec, dutyCycle, next_amp, recordingTime
                     )
                     self.info(f"Waiting for {target*1000:.0f} mV train…")
 
-                while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
-                    self.sleep(0.002)
-
-                raw = np.asarray(self.ai_task.read(exp_samples, timeout=2.0), dtype=float)
+                trains = self._read_train(exp_samples)   # every pipette, one read
                 step_amp_volts = (target - holding_voltage) / self.V_CLAMP_VOLT_PER_VOLT
-                self._squareWaveProcessor(raw, samplesPerSec, step_amp_volts)
-
                 time_vec = np.linspace(0, total_duration, exp_samples, dtype=float)
-                resp_vec = raw[1] * self.V_CLAMP_VOLT_PER_AMP
-                command_vec = raw[0] * self.V_CLAMP_VOLT_PER_VOLT
-                sweeps.append([time_vec, resp_vec, command_vec])
+                for key, raw in trains.items():
+                    with self.for_pipette(key):
+                        self._squareWaveProcessor(raw, samplesPerSec, step_amp_volts)
+                    sweeps[key].append([time_vec,
+                                        raw[1] * self.V_CLAMP_VOLT_PER_AMP,
+                                        raw[0] * self.V_CLAMP_VOLT_PER_VOLT])
                 self.info(f"Captured {target*1000:.0f} mV pulse")
 
         finally:
-            try:
-                self.ai_task.stop(); self.ao_task.stop()
-                self.ai_task.close(); self.ao_task.close()
-            except Exception:
-                pass
+            self._close_tasks()
             self.resume_acquisition()
 
-        self.voltage_protocol_data = sweeps
-        if targets.size and self.voltage_membrane_test is not None:
-            self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
+        for key in keys:
+            with self.for_pipette(key):
+                self.vclamp_steps = targets
+                self.vclamp_hold_value = holding_voltage
+                self.voltage_protocol_data = sweeps[key]
+                if targets.size and self.voltage_membrane_test is not None:
+                    self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
+        return sweeps
 
-        return self.voltage_protocol_data
+    def _current_pulses(self, custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp):
+        """Current steps (pA) for the active pipette.
 
-    @per_pipette_protocol
-    def getDataFromCurrentProtocol(self,
-                                   custom: bool = False,
-                                   factor: float | None = None,
-                                   startCurrentPicoAmp: float | None = None,
-                                   endCurrentPicoAmp: float | None = None,
-                                   stepCurrentPicoAmp: float = 10,
-                                   recordingTimeMs: float = 500,
-                                   dutyCycle: float = 0.5):
+        The default (non-custom) range is −2 … +10 pA/pF in 1 pA/pF steps of
+        that pipette's own membrane capacitance; raises if it has none.
         """
-        Run an entire I-clamp step protocol on one continuous stream.
-        Returns
-        -------
-        (list_of_traces, pulses_array, pulse_count)
-        """
-        # ───────── constants ─────────
-        samplesPerSec  = 100_000
-        dutyCycle      = float(dutyCycle)
-        recordingTime  = recordingTimeMs * 1e-3   # 0.25 s / segment
-        wave_freq      = 1.0 / recordingTime      # 4 Hz
-        fullRecTime    = 4 * recordingTime        # 1.0 s / train
-        exp_samples    = int(samplesPerSec * fullRecTime)
-
-        # ─ 1. build pulse list ───────
         if not custom:
-            # Ensure we have a sensible capacitance measurement
-            if (self.voltageMembraneCapacitance is None or
-                not np.isfinite(self.voltageMembraneCapacitance) or
-                self.voltageMembraneCapacitance <= 0):
-                raise RuntimeError("Bad capacitance measurement; aborting I-clamp protocol.")
-
+            capacitance = self.voltageMembraneCapacitance
+            if capacitance is None or not np.isfinite(capacitance) or capacitance <= 0:
+                raise RuntimeError("Bad capacitance measurement")
             # Convert to absolute pF, round *down* to the nearest whole pF
-            cap_pf = int(abs(self.voltageMembraneCapacitance))
-
-            # Normalised stimulus: −2 pA/pF … +10 pA/pF with 1 pA/pF increments
+            cap_pf = int(abs(capacitance))
             startCurrentPicoAmp = -2 * cap_pf
             endCurrentPicoAmp   = 10 * cap_pf
             stepCurrentPicoAmp  = cap_pf
-
-        # Keep legacy manual mode untouched when custom=True
 
         startCurrentPicoAmp = max(startCurrentPicoAmp, -20000)
         endCurrentPicoAmp   = min(endCurrentPicoAmp,   20000)
@@ -2036,74 +2154,114 @@ class NiDAQ(DAQ):
                            stepCurrentPicoAmp, dtype=float)
         if 0.0 not in pulses:
             pulses = np.sort(np.append(pulses, 0.0))
+        return pulses
 
-        self.pulses       = pulses
-        self.pulseRange   = len(pulses)
-        self.current_protocol_data = []
-        self.info(f"I-clamp pulses (pA): {pulses}")
-
-        # ─ 2. park background stream ─
-        self.pause_acquisition()
-        for t in ("ai_task", "ao_task"):
-            try:
-                getattr(self, t).stop(); getattr(self, t).close()
-            except Exception:
-                pass
-
-        # ─ 3. start dedicated tasks (prime buffer = 0 pA test) ──────────
-        self._setupAcquisitionCurrent(recordingTime * 1e3, dutyCycle=dutyCycle)   # expects ms
-
-        # a) queue FIRST real pulse so it will become train #2
-        next_amp_V = (pulses[0] * 1e-12) / self.C_CLAMP_AMP_PER_VOLT
-        self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
-                                    dutyCycle, next_amp_V, recordingTime)
-
-        # b) wait 1 s and discard train #1 (0 pA prime)
-        while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
-            self.sleep(0.002)
-        _ = self.ai_task.read(exp_samples, timeout=2.0)
-
-        try:
-            for idx, pulse in enumerate(pulses):
-                # ─── queue the NEXT pulse *before* waiting ───────────────
-                if idx + 1 < len(pulses):
-                    future_amp_V = (pulses[idx + 1] * 1e-12) \
-                                    / self.C_CLAMP_AMP_PER_VOLT
-                    self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
-                                                dutyCycle, future_amp_V,
-                                                recordingTime)
-
-                self.info(f"Waiting for {pulse:.0f} pA train…")
-
-                # ─── wait until exactly one full train is ready ─────────
-                while self.ai_task.in_stream.avail_samp_per_chan < exp_samples:
-                    self.sleep(0.002)
-
-                # ─── read it (matches current pulse) ────────────────────
-                raw = np.asarray(self.ai_task.read(exp_samples, timeout=2.0),
-                                 dtype=float)
-                resp = raw[1] / self.C_CLAMP_VOLT_PER_VOLT
-                read = raw[0]
-                tvec = np.linspace(0, fullRecTime, exp_samples, dtype=float)
-                self.current_protocol_data.append([tvec, resp, read])
-
-                self.info(f"Captured {pulse:.0f} pA pulse")
-
-        finally:
-            # ─ 4. restore background stream ────────────────────────────
-            try:
-                self.ai_task.stop();  self.ao_task.stop()
-                self.ai_task.close(); self.ao_task.close()
-            except Exception:
-                pass
-            self.resume_acquisition()
-
-        return self.current_protocol_data, self.pulses, self.pulseRange
-
-    @per_pipette_protocol
-    def getDataFromHoldingProtocol(self, *, rate_hz: int = 50_000, duration_s: float = 60.0):
+    @multi_pipette_protocol
+    def getDataFromCurrentProtocol(self,
+                                   keys,
+                                   custom: bool = False,
+                                   factor: float | None = None,
+                                   startCurrentPicoAmp: float | None = None,
+                                   endCurrentPicoAmp: float | None = None,
+                                   stepCurrentPicoAmp: float = 10,
+                                   recordingTimeMs: float = 500,
+                                   dutyCycle: float = 0.5):
         """
-        OLD-STYLE baseline read-out (no command output).
+        Run an I-clamp step protocol on every pipette in ``keys`` at once,
+        on one continuous stream.
+
+        Each pipette gets its own step list (scaled by its own capacitance),
+        so in train i every pipette receives its own step; pipettes that have
+        run out of steps get 0 V. A pipette without a usable capacitance is
+        skipped (no channels, no data).
+
+        Returns ``{key: (list_of_traces, pulses_array, pulse_count)}``.
+        """
+        # ───────── constants ─────────
+        samplesPerSec  = 100_000
+        dutyCycle      = float(dutyCycle)
+        recordingTime  = recordingTimeMs * 1e-3   # 0.25 s / segment
+        wave_freq      = 1.0 / recordingTime      # 4 Hz
+        fullRecTime    = 4 * recordingTime        # 1.0 s / train
+        exp_samples    = int(samplesPerSec * fullRecTime)
+
+        # ─ 1. build each pipette's pulse list ───────
+        pulses_by_key = {}
+        for key in keys:
+            with self.for_pipette(key):
+                try:
+                    pulses_by_key[key] = self._current_pulses(
+                        custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
+                except RuntimeError as exc:
+                    self.error(f"{key}: {exc}; skipping its I-clamp protocol.")
+                    continue
+                self.info(f"{key} I-clamp pulses (pA): {pulses_by_key[key]}")
+        active = [key for key in keys if key in pulses_by_key]
+        traces = {key: [] for key in active}
+
+        def amplitudes(train_index):
+            """{key: AO volts for that train, or None once a pipette is done}."""
+            return {key: ((pulses_by_key[key][train_index] * 1e-12) / self.C_CLAMP_AMP_PER_VOLT
+                          if train_index < len(pulses_by_key[key]) else None)
+                    for key in active}
+
+        if active:
+            train_count = max(len(pulses_by_key[key]) for key in active)
+
+            # ─ 2. park background stream ─
+            self.pause_acquisition()
+            self._close_tasks()
+
+            # ─ 3. start dedicated tasks (prime buffer = 0 pA test) ──────────
+            self._setupAcquisitionCurrent(recordingTime * 1e3, dutyCycle=dutyCycle,
+                                          keys=active)   # expects ms
+
+            try:
+                # a) queue FIRST real pulses so they become train #2
+                self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
+                                            dutyCycle, amplitudes(0), recordingTime)
+
+                # b) wait 1 s and discard train #1 (0 pA prime)
+                self._read_train(exp_samples)
+
+                for idx in range(train_count):
+                    # ─── queue the NEXT pulses *before* waiting ──────────
+                    if idx + 1 < train_count:
+                        self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
+                                                    dutyCycle, amplitudes(idx + 1),
+                                                    recordingTime)
+
+                    self.info(f"Waiting for I-clamp train {idx + 1}/{train_count}…")
+
+                    # ─── read it: one read for every pipette ────────────
+                    trains = self._read_train(exp_samples)
+                    tvec = np.linspace(0, fullRecTime, exp_samples, dtype=float)
+                    for key, raw in trains.items():
+                        if idx < len(pulses_by_key[key]):
+                            traces[key].append([tvec, raw[1] / self.C_CLAMP_VOLT_PER_VOLT, raw[0]])
+
+                    self.info(f"Captured I-clamp train {idx + 1}/{train_count}")
+
+            finally:
+                # ─ 4. restore background stream ────────────────────────
+                self._close_tasks()
+                self.resume_acquisition()
+
+        results = {}
+        for key in keys:
+            pulses = pulses_by_key.get(key, np.array([], dtype=float))
+            with self.for_pipette(key):
+                self.pulses = pulses
+                self.pulseRange = len(pulses)
+                self.current_protocol_data = traces.get(key, [])
+                results[key] = (self.current_protocol_data, pulses, len(pulses))
+        return results
+
+    @multi_pipette_protocol
+    def getDataFromHoldingProtocol(self, keys, *, rate_hz: int = 50_000, duration_s: float = 60.0):
+        """
+        OLD-STYLE baseline read-out (no command output), every pipette in
+        ``keys`` in the same finite AI task.
 
         • Suspends the membrane-test thread.
         • Builds one finite AI-only task at 50 kS/s for 60 s
@@ -2113,12 +2271,9 @@ class NiDAQ(DAQ):
 
         Returns
         -------
-        np.ndarray
-            [time_s, resp_A, read_V]
+        {key: np.ndarray [time_s, resp_A, read_V]}
         """
-        import nidaqmx
-        import nidaqmx.constants as c
-        import numpy as np
+        c = nidaqmx.constants
 
         # -------------------------------------------------- 1. park background
         self.pause_acquisition()
@@ -2128,14 +2283,7 @@ class NiDAQ(DAQ):
 
             # ---------------------------------------------- 2. finite AI task
             ai = nidaqmx.Task()
-            ai.ai_channels.add_ai_voltage_chan(
-                f"{self.readDev}/{self.readChannel}",
-                terminal_config=c.TerminalConfiguration.DIFF,
-                min_val=-10.0, max_val=10.0)
-            ai.ai_channels.add_ai_voltage_chan(
-                f"{self.respDev}/{self.respChannel}",
-                terminal_config=c.TerminalConfiguration.DIFF,
-                min_val=-10.0, max_val=10.0)
+            self._add_ai_channels(ai, keys)
             ai.timing.cfg_samp_clk_timing(
                 rate=rate_hz,
                 sample_mode=c.AcquisitionType.FINITE,
@@ -2147,34 +2295,41 @@ class NiDAQ(DAQ):
                 timeout=duration_s + 2.0)
             ai.stop(); ai.close()
 
-            raw = np.array(raw, dtype=float)
-            # Keep unit conversions consistent with other V-clamp protocol paths.
-            resp = raw[1] * self.V_CLAMP_VOLT_PER_AMP
-            read = raw[0] * self.V_CLAMP_VOLT_PER_VOLT
             t = np.linspace(0, duration_s, num_samples, dtype=float)
-
-            self.holding_protocol_data = np.array([t, resp, read])
-            return self.holding_protocol_data
+            results = {}
+            for key, rows in self._split_rows(raw, keys).items():
+                # Keep unit conversions consistent with other V-clamp protocol paths.
+                with self.for_pipette(key):
+                    self.holding_protocol_data = np.array([
+                        t,
+                        rows[1] * self.V_CLAMP_VOLT_PER_AMP,
+                        rows[0] * self.V_CLAMP_VOLT_PER_VOLT,
+                    ])
+                    results[key] = self.holding_protocol_data
+            return results
 
         finally:
             # ---------------------------------------------- 3. resume stream
             self.resume_acquisition()
 
-    @per_pipette_protocol
+    @multi_pipette_protocol
     def getDataFromOptogeneticProtocol(
         self,
+        keys,
         *,
         laser,
         protocol_steps: list[dict],
         rate_hz: int = 50_000,
     ):
         """
-        Modified holding protocol that records only during optogenetic "on" steps.
+        Modified holding protocol that records only during optogenetic "on"
+        steps. Each "on" step is one finite AI task covering every pipette in
+        ``keys``, so the laser fires once and every pipette records it.
 
         Returns
         -------
-        (list[list[np.ndarray]], list[dict])
-            One trace per on-step plus the stimulation timeline.
+        {key: (list[list[np.ndarray]], list[dict])}
+            Per pipette: one trace per on-step plus the stimulation timeline.
         """
         if laser is None:
             raise ValueError("laser is required")
@@ -2193,7 +2348,7 @@ class NiDAQ(DAQ):
             except Exception:
                 pass
             t0 = time.perf_counter()
-            aligned_traces: list[list[np.ndarray]] = []
+            aligned_traces = {key: [] for key in keys}
             aligned_pulses: list[dict] = []
 
             for step in stim_timeline:
@@ -2232,7 +2387,7 @@ class NiDAQ(DAQ):
                         laser.power_off()
                         continue
 
-                    ai = self._setup_optogenetic_ai_task(rate_hz, num_samples)
+                    ai = self._setup_optogenetic_ai_task(rate_hz, num_samples, keys)
                     ai.start()
 
                     # Laser on from 1/3 to 2/3 of the recording window.
@@ -2251,14 +2406,16 @@ class NiDAQ(DAQ):
                     except Exception:
                         pass
 
-                    raw = self._read_optogenetic_ai(ai, num_samples, duration_s)
+                    rows_by_key = self._read_optogenetic_ai(ai, num_samples, duration_s, keys)
                     ai = None
 
-                    resp = raw[1] * self.V_CLAMP_VOLT_PER_AMP
-                    read = raw[0] * self.V_CLAMP_VOLT_PER_VOLT
                     t = np.linspace(0, duration_s, num_samples, dtype=float)
-
-                    aligned_traces.append([t, resp, read])
+                    for key, raw in rows_by_key.items():
+                        aligned_traces[key].append([
+                            t,
+                            raw[1] * self.V_CLAMP_VOLT_PER_AMP,
+                            raw[0] * self.V_CLAMP_VOLT_PER_VOLT,
+                        ])
                     aligned_pulses.append({
                         "wavelength": wavelength,
                         "power_percent": power_percent,
@@ -2287,30 +2444,29 @@ class NiDAQ(DAQ):
                 actual_timeline.append(entry)
 
             stim_used = actual_timeline or stim_timeline
-            if not aligned_traces:
-                aligned_traces = []
-                aligned_pulses = []
-
-            self.optogenetic_protocol_data = aligned_traces
-            self.optogenetic_stim_data = stim_used
-            if protocol_type is None and self.optogenetic_stim_data:
-                protocol_type = self.optogenetic_stim_data[0].get("protocol_type")
-            self.optogenetic_protocol_type = protocol_type
-            self.optogenetic_pulses = aligned_pulses
-            self.optogenetic_pulseRange = len(aligned_pulses)
-
+            if protocol_type is None and stim_used:
+                protocol_type = stim_used[0].get("protocol_type")
             protocol_key = self._normalize_optogenetic_protocol_key(protocol_type)
-            entry = {
-                "data": aligned_traces,
-                "pulses": aligned_pulses,
-                "pulse_range": len(aligned_pulses),
-                "stim_data": stim_used,
-                "protocol_type": protocol_type,
-                "protocol_key": protocol_key,
-            }
-            with self._optogenetic_queue_lock:
-                self.optogenetic_protocol_queue.append(entry)
-            return self.optogenetic_protocol_data, self.optogenetic_stim_data
+
+            results = {}
+            for key in keys:
+                with self.for_pipette(key):
+                    self.optogenetic_protocol_data = aligned_traces[key]
+                    self.optogenetic_stim_data = stim_used
+                    self.optogenetic_protocol_type = protocol_type
+                    self.optogenetic_pulses = list(aligned_pulses)
+                    self.optogenetic_pulseRange = len(aligned_pulses)
+                    with self._optogenetic_queue_lock:
+                        self.optogenetic_protocol_queue.append({
+                            "data": aligned_traces[key],
+                            "pulses": list(aligned_pulses),
+                            "pulse_range": len(aligned_pulses),
+                            "stim_data": stim_used,
+                            "protocol_type": protocol_type,
+                            "protocol_key": protocol_key,
+                        })
+                results[key] = (aligned_traces[key], stim_used)
+            return results
 
         finally:
             try:
@@ -2323,112 +2479,6 @@ class NiDAQ(DAQ):
             except Exception:
                 pass
             self.resume_acquisition()
-
-    @per_pipette_protocol
-    def getDataFromVoltageProtocol(
-            self,
-            *,                       # keyword-only
-            wave_freq: int = 40,
-            samplesPerSec: int = 50_000,   # 50 kS/s
-            dutyCycle: float = 0.5,
-            amplitude: float = 0.5,
-            recordingTime: float = 0.025,  # 25 ms period
-            max_attempts: int = 15,
-            membrane_hold: float | None = None
-    ):
-        """
-        • Pauses the DAQAcquisitionThread (tasks keep streaming).
-        • Collects **five acceptable** traces (≤ `max_attempts` cycles).
-            – First acceptable trace populates the usual voltage-protocol
-            attributes (`voltage_protocol_data`, Rₐ, Rₘ, …).
-            – All five capacitances are averaged → `voltageMembraneCapacitance`.
-
-        • Resumes the acquisition thread.
-
-        Returns
-        -------
-        float | None
-            Averaged capacitance (pF), or None if no acceptable trace was found.
-        """
-        import math, time, numpy as np
-        self.voltage_membrane_test = None
-
-
-        # ─── 1. Pause the worker thread (leave AI / AO running) ─────────
-        self._pause_evt.clear()
-        time.sleep(recordingTime * 2)        # let current cycle pass
-
-        cm_values   = []      # acceptable capacitances
-        first_saved = False
-        attempts    = 0
-
-        try:
-            while attempts < max_attempts and len(cm_values) < 5:
-                attempts += 1
-
-                # ─── 2. Grab one square-wave cycle on the live stream ──
-                key = self.active_pipette_key
-                result = self.getDataFromSquareWave(
-                    wave_freq, samplesPerSec, dutyCycle,
-                    amplitude, recordingTime, pipettes=[key]
-                )[key]
-                (prot_data, cmd_data,
-                totalR, memR, accR, memC) = result
-
-                # ─── 3. Acceptability check ────────────────────────────
-                good_cm = (memC is not None
-                        and math.isfinite(memC)
-                        and memC > 0
-                        and memC < 250)  # pF, arbitrary upper limit
-                self.info(f'cm: {memC:.2f} pF, ')
-
-                if good_cm:
-                    # store the first good trace exactly as before
-                    if not first_saved:
-                        (self.voltage_protocol_data,
-                        self.voltage_command_data,
-                        self.voltageTotalResistance,
-                        self.voltageMembraneResistance,
-                        self.voltageAccessResistance,
-                        self.voltageMembraneCapacitance) = result
-                        hold_mV = membrane_hold * 1e3 if membrane_hold is not None else None
-                        self.voltage_membrane_test = {
-                            "time": np.copy(prot_data[0]),
-                            "response": np.copy(prot_data[1]),
-                            "command": np.copy(cmd_data[1]),
-                            "step_mV": float(amplitude * self.V_CLAMP_VOLT_PER_VOLT * 1e3),
-                            "hold_mV": hold_mV,
-                            "color": "#000000"
-                        }
-                        first_saved = True
-
-                    cm_values.append(memC)
-                else:
-                    self.warning(f"Voltage step attempt {attempts}: "
-                                "unacceptable fit -> skipped")
-
-                # wait one extra period so traces do not overlap in FIFO
-                time.sleep(recordingTime)
-
-            if not cm_values:
-                # no acceptable trace at all
-                self.error("Voltage protocol: no acceptable trace found")
-                self.voltageMembraneCapacitance = None
-                return None
-
-            # ─── 4. Average capacitance ──────────────────────────────
-            self.voltageMembraneCapacitance = float(np.mean(cm_values))
-            self.info(f"Averages: cm: {self.voltageMembraneCapacitance:.2f} pF, ")
-
-            if len(cm_values) < 5:
-                self.warning(f"Voltage protocol collected only {len(cm_values)} "
-                            f"good traces (expected 5) within {attempts} attempts")
-
-        finally:
-            # ─── 5. Resume background acquisition ──────────────────────
-            self._pause_evt.set()
-
-        return self.voltageMembraneCapacitance
 
 # ========================================================
 #  ArduinoDAQ Subclass
@@ -2940,87 +2990,6 @@ class FakeDAQ(DAQ):
                 results[key] = self.holding_protocol_data
         return results
 
-    @multi_pipette_protocol
-    def getDataFromVoltageProtocol(
-            self,
-            keys,
-            *,                       # keyword-only
-            wave_freq: int = 40,
-            samplesPerSec: int = 50_000,   # 50 kS/s
-            dutyCycle: float = 0.5,
-            amplitude: float = 0.5,
-            recordingTime: float = 0.025,  # 25 ms period
-            max_attempts: int = 15,
-            membrane_hold: float | None = None
-    ):
-        """Membrane test: square-wave cycles until each pipette has 5 good
-        capacitance fits (or max_attempts). Each cycle is one read covering
-        every pipette still collecting. Returns ``{key: mean capacitance or None}``."""
-        for key in keys:
-            self._pipette_state(key)["voltage_membrane_test"] = None
-        capacitances = {key: [] for key in keys}
-        first_results = {}
-        attempts = 0
-        self._pause_evt.clear()          # one pause of the live thread for all pipettes
-        try:
-            while attempts < max_attempts:
-                collecting = [key for key in keys if len(capacitances[key]) < 5]
-                if not collecting:
-                    break
-                attempts += 1
-                cycle = self.getDataFromSquareWave(
-                    wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime,
-                    pipettes=collecting,
-                )
-                for key, result in cycle.items():
-                    first_results.setdefault(key, result)
-                    membrane_capacitance = result[5]
-                    if (membrane_capacitance is not None
-                            and np.isfinite(membrane_capacitance)
-                            and 0 < membrane_capacitance < 250):
-                        capacitances[key].append(membrane_capacitance)
-        finally:
-            self._pause_evt.set()
-
-        results = {}
-        for key in keys:
-            with self.for_pipette(key):
-                results[key] = self._store_membrane_test(
-                    first_results.get(key), capacitances[key], membrane_hold)
-        return results
-
-    def _store_membrane_test(self, first_result, capacitances, membrane_hold):
-        """Store one pipette's membrane-test results (active pipette)."""
-        if first_result is None:
-            self.voltageMembraneCapacitance = None
-            return None
-
-        (self.voltage_protocol_data,
-         self.voltage_command_data,
-         self.voltageTotalResistance,
-         self.voltageMembraneResistance,
-         self.voltageAccessResistance,
-         _) = first_result
-        protocol_data, command_data = first_result[:2]
-        self.voltage_membrane_test = {
-            "time": protocol_data[0].copy(),
-            "response": protocol_data[1].copy(),
-            "command": command_data[1].copy(),
-            "step_mV": float(
-                (np.percentile(command_data[1], 95)
-                 - np.percentile(command_data[1], 5)) * 1e3
-            ),
-            "hold_mV": membrane_hold * 1e3 if membrane_hold is not None else None,
-            "color": "#000000",
-        }
-        self.voltageMembraneCapacitance = (
-            float(np.mean(capacitances)) if capacitances else None
-        )
-        self.latestMembraneCapacitance = self.voltageMembraneCapacitance
-        if self.voltageTotalResistance is not None:
-            self.totalResistance = self.voltageTotalResistance
-        if self.voltageMembraneResistance is not None:
-            self.latestMembraneResistance = self.voltageMembraneResistance
-        if self.voltageAccessResistance is not None:
-            self.latestAccessResistance = self.voltageAccessResistance
-        return self.voltageMembraneCapacitance
+    def _membrane_step_mV(self, command, amplitude):
+        """Measure the step from the recorded command trace."""
+        return float((np.percentile(command, 95) - np.percentile(command, 5)) * 1e3)

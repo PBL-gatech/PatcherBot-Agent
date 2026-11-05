@@ -85,12 +85,18 @@
         "daq": {
             "class": "patcherbot.devices.amplifier.DAQ.NiDAQ",
             "params": {
-                "readDev": "Dev1",
-                "readChannel": "ai17",
-                "cmdDev": "Dev1",
-                "cmdChannel": "ao0",
-                "respDev": "Dev1",
-                "respChannel": "ai19"
+                "channels": [
+                    {
+                        "read": "Dev1/ai17",
+                        "resp": "Dev1/ai19",
+                        "cmd": "Dev1/ao0"
+                    },
+                    {
+                        "read": "Dev1/ai_PIPETTE1_READ_TODO",
+                        "resp": "Dev1/ai_PIPETTE1_RESP_TODO",
+                        "cmd": "Dev1/ao_PIPETTE1_CMD_TODO"
+                    }
+                ]
             }
         },
         "amplifier": [
