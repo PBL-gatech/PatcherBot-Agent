@@ -1,11 +1,15 @@
+import collections
+import contextlib
+import csv
+import functools
+import logging
 import threading
 import time
-import csv
+from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
-import pandas as pd
 import scipy.optimize
-import scipy.signal as signal
 
 # Import your hardware libraries as needed
 import nidaqmx
@@ -15,13 +19,7 @@ import serial
 from patcherbot.controller.base import TaskController
 
 __all__ = ['NiDAQ', 'ArduinoDAQ', 'FakeDAQ', 'PipetteChannels', 'PipetteDAQView',
-           'build_channel_map']
-
-import collections
-import contextlib
-import functools
-import logging
-from dataclasses import dataclass
+           'build_channel_map', 'enumerated_channels']
 
 
 # ========================================================
@@ -75,10 +73,15 @@ def build_channel_map(pipette_keys=None, channels=None, default_channels=None):
 
     channel_map = collections.OrderedDict(zip(keys, specs))
     names = [name for spec in specs for name in (spec.read, spec.resp, spec.cmd)]
-    duplicates = sorted({name for name in names if names.count(name) > 1})
+    duplicates = sorted(name for name, count in collections.Counter(names).items() if count > 1)
     if duplicates:
         raise ValueError(f"Channels assigned to more than one role/pipette: {duplicates}")
     return channel_map
+
+
+def enumerated_channels(index):
+    """Default channel names for pipette ``index``: ai{2i} (read), ai{2i+1} (resp), ao{i} (cmd)."""
+    return PipetteChannels(f"ai{2 * index}", f"ai{2 * index + 1}", f"ao{index}")
 
 
 # State the DAQ keeps separately for each pipette. Reading or writing one of
@@ -94,7 +97,6 @@ _PER_PIPETTE_FIELDS = {
     "holding_voltage": None,
     "pulses": None,
     "pulseRange": None,
-    "latest_protocol_data": None,
     "current_protocol_data": None,
     "voltage_protocol_data": None,
     "voltage_command_data": None,
@@ -134,7 +136,7 @@ def multi_pipette_protocol(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, pipettes=None, **kwargs):
-        keys = self._protocol_pipettes(pipettes)
+        keys = self._resolve_pipettes(pipettes)
         with self._protocol_lock:
             return method(self, keys, *args, **kwargs)
     return wrapper
@@ -150,7 +152,7 @@ def per_pipette_protocol(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, pipettes=None, **kwargs):
-        keys = self._protocol_pipettes(pipettes)
+        keys = self._resolve_pipettes(pipettes)
         with self._protocol_lock:
             if len(keys) > 1 and not getattr(self, "_warned_sequential_protocols", False):
                 self._warned_sequential_protocols = True
@@ -239,7 +241,8 @@ class DAQAcquisitionThread(threading.Thread):
                 results = self.daq.getDataFromSquareWave(
                     self.wave_freq, self.samplesPerSec,
                     self.dutyCycle, self.amplitude,
-                    self.recordingTime
+                    self.recordingTime,
+                    pipettes=self.daq.pipette_keys,
                 )
                 if not results:              # empty FIFO read → retry
                     continue
@@ -332,8 +335,9 @@ class DAQ(TaskController):
 
     def __init__(self, channel_map=None):
         """
-        channel_map: ordered ``{pipette_key: PipetteChannels}``. One DAQ serves
-        every pipette on the rig; defaults to a single pipette on ai0/ai1/ao0.
+        channel_map: ordered ``{pipette_key: PipetteChannels}`` from
+        build_channel_map (which validates it). One DAQ serves every pipette
+        on the rig; defaults to a single pipette on ai0/ai1/ao0.
         """
         super().__init__()
         # Per-pipette state must exist before any per-pipette attribute is
@@ -342,14 +346,8 @@ class DAQ(TaskController):
         self._pipette_states = {}
         self._active = threading.local()
         if channel_map is None:
-            channel_map = build_channel_map(
-                default_channels=lambda i: PipetteChannels(f"ai{2 * i}", f"ai{2 * i + 1}", f"ao{i}")
-            )
-        self.channel_map = collections.OrderedDict(
-            (key, PipetteChannels.from_spec(spec)) for key, spec in channel_map.items()
-        )
-        if not self.channel_map:
-            raise ValueError("A DAQ needs at least one pipette channel set")
+            channel_map = build_channel_map(default_channels=enumerated_channels)
+        self.channel_map = collections.OrderedDict(channel_map)
         for key in self.channel_map:
             self._pipette_state(key)
 
@@ -357,8 +355,6 @@ class DAQ(TaskController):
         self._deviceLock = threading.Lock()
         # Protocols use the shared hardware one at a time.
         self._protocol_lock = threading.RLock()
-        self.isRunningProtocol = False
-        self.equalizer = False
         self._pause_evt = threading.Event(); self._pause_evt.set()   # allow run
         self._idle_evt  = threading.Event(); self._idle_evt.set()    # initially idle
         self.sweep_clip = None
@@ -435,20 +431,14 @@ class DAQ(TaskController):
         return names
 
     def _resolve_pipettes(self, pipettes=None):
-        """Normalize a ``pipettes`` argument to a list of pipette keys (None = all)."""
+        """Normalize a ``pipettes`` argument to a validated list of pipette keys
+        (duplicates dropped, order kept). None means the active pipette only."""
         if pipettes is None:
-            return self.pipette_keys
-        keys = [pipettes] if isinstance(pipettes, str) else list(pipettes)
+            return [self.active_pipette_key]
+        keys = [pipettes] if isinstance(pipettes, str) else list(dict.fromkeys(pipettes))
         for key in keys:
             self.channels_for(key)
         return keys
-
-    def _protocol_pipettes(self, pipettes=None):
-        """Pipettes a protocol call covers: the given ones (duplicates dropped,
-        order kept), or just the active pipette when None."""
-        if pipettes is None:
-            return [self.active_pipette_key]
-        return list(dict.fromkeys(self._resolve_pipettes(pipettes)))
 
     @staticmethod
     def _rows_to_channel_dict(raw, channel_names):
@@ -460,13 +450,17 @@ class DAQ(TaskController):
             raise ValueError(f"Got {rows.shape[0]} rows of data for {len(channel_names)} channels")
         return {name: rows[index].copy() for index, name in enumerate(channel_names)}
 
-    def _pipette_raw(self, data, pipette_key):
-        """Stack one pipette's (read, resp) rows into the 2xN array the
-        single-pipette processing code expects."""
-        spec = self.channels_for(pipette_key)
-        read, resp = data[spec.read], data[spec.resp]
-        n = min(read.size, resp.size)
-        return np.vstack([read[:n], resp[:n]])
+    def _read_pipettes(self, keys, samplesPerSec, recordingTime):
+        """ONE read covering every listed pipette -> ``{key: (read, resp)}``.
+
+        All pipettes come from the same acquisition (one hardware task
+        holding all their channels), so they share one sample clock.
+        """
+        specs = [self.channels_for(key) for key in keys]
+        data = self._readAnalogInput(
+            samplesPerSec, recordingTime,
+            channels=[name for spec in specs for name in (spec.read, spec.resp)])
+        return {key: (data[spec.read], data[spec.resp]) for key, spec in zip(keys, specs)}
 
     def setCellMode(self, mode: bool) -> None:
         self.cellMode = mode
@@ -656,22 +650,20 @@ class DAQ(TaskController):
         process each pipette.
 
         Returns ``{pipette_key: (time/resp, time/read, totalR, memR, accR, memC)}``.
-        ``pipettes`` defaults to every configured pipette.
+        ``pipettes`` defaults to the active pipette only.
         """
         keys = self._resolve_pipettes(pipettes)
-        channels = [name for key in keys
-                    for name in (self.channel_map[key].read, self.channel_map[key].resp)]
         with self._deviceLock:
             # Device-specific wrappers (implemented in subclasses)
             self._sendSquareWave(wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
-            data = self._readAnalogInput(samplesPerSec, recordingTime, channels=channels)
+            traces = self._read_pipettes(keys, samplesPerSec, recordingTime)
 
         results = {}
-        for key in keys:
+        for key, (read, resp) in traces.items():
             # cellMode and conversions are per pipette
             with self.for_pipette(key):
                 results[key] = self._squareWaveProcessor(
-                    self._pipette_raw(data, key), samplesPerSec, amplitude, sweep_clip=None)
+                    np.vstack([read, resp]), samplesPerSec, amplitude, sweep_clip=None)
         return results
       
     # --------------------------
@@ -1160,10 +1152,6 @@ class PipetteDAQView:
         object.__setattr__(self, "daq", daq)
         object.__setattr__(self, "pipette_key", pipette_key)
 
-    @property
-    def channels(self):
-        return self.daq.channels_for(self.pipette_key)
-
     def __getattr__(self, name):
         daq = self.daq
         if name in _PER_PIPETTE_FIELDS:
@@ -1178,6 +1166,9 @@ class PipetteDAQView:
                 return value(*args, **kwargs)
 
         call_for_pipette.__name__ = name
+        # TaskInterface.execute() runs only methods of a TaskController and
+        # finds the owner through __self__, so expose the shared DAQ.
+        call_for_pipette.__self__ = daq
         return call_for_pipette
 
     def __setattr__(self, name, value):
@@ -2538,7 +2529,7 @@ class FakeDAQ(DAQ):
         super().__init__(channel_map=build_channel_map(
             pipette_keys,
             channels=channels,
-            default_channels=lambda i: PipetteChannels(f"ai{2 * i}", f"ai{2 * i + 1}", f"ao{i}"),
+            default_channels=enumerated_channels,
         ))
         for key in self.pipette_keys:
             self._pipette_state(key)["totalResistance"] = 6 * 10 ** 6  # baseline fake resistance
@@ -2725,16 +2716,6 @@ class FakeDAQ(DAQ):
             raise ValueError(f"No paired current/voltage traces found in {graph_file}")
         return traces
 
-    def _read_pipettes(self, keys):
-        """ONE read covering every listed pipette -> ``{key: (read, resp)}``.
-
-        All pipettes come from the same tick, as they would from one
-        hardware task containing all their channels.
-        """
-        specs = [self.channels_for(key) for key in keys]
-        data = self._read_recorded([name for spec in specs for name in (spec.read, spec.resp)])
-        return {key: (data[spec.read], data[spec.resp]) for key, spec in zip(keys, specs)}
-
     @staticmethod
     def _recorded_time(sample_count, rate_hz):
         if rate_hz <= 0:
@@ -2786,10 +2767,12 @@ class FakeDAQ(DAQ):
         for target in targets:
             leak_step = -(target - holding_voltage) / 4.0
             leak_target = holding_voltage + leak_step
-            repeat_reads = [self._read_pipettes(keys) for _ in range(repeats)]
+            repeat_reads = [self._read_pipettes(keys, samplesPerSec, pulse_recording_time)
+                            for _ in range(repeats)]
             for key in keys:
                 traces = [read[key] for read in repeat_reads]
-                sample_count = min(min(command.size, response.size) for command, response in traces)
+                # repeats come from separate reads, which can differ in length
+                sample_count = min(command.size for command, _ in traces)
                 commands = np.vstack([command[:sample_count] for command, _ in traces])
                 responses = np.vstack([response[:sample_count] for _, response in traces])
                 data_by_key[key].append({
@@ -2837,12 +2820,11 @@ class FakeDAQ(DAQ):
         targets = self._trace_targets(start_voltage, end_voltage, step_voltage)
         sweeps = {key: [] for key in keys}
         for _ in targets:
-            for key, (command, response) in self._read_pipettes(keys).items():
-                sample_count = min(command.size, response.size)
+            for key, (command, response) in self._read_pipettes(keys, samplesPerSec, recordingTime).items():
                 sweeps[key].append([
-                    self._recorded_time(sample_count, samplesPerSec),
-                    response[:sample_count],
-                    command[:sample_count],
+                    self._recorded_time(command.size, samplesPerSec),
+                    response,
+                    command,
                 ])
 
         results = {}
@@ -2915,16 +2897,16 @@ class FakeDAQ(DAQ):
         sweep_count = max(len(pulses) for pulses in pulses_by_key.values())
         for sweep_index in range(sweep_count):
             stepping = [key for key in keys if sweep_index < len(pulses_by_key[key])]
-            for key, (command_voltage, response_current) in self._read_pipettes(stepping).items():
-                sample_count = min(command_voltage.size, response_current.size)
-                command_current = response_current[:sample_count]
-                response_voltage = command_voltage[:sample_count]
+            traces = self._read_pipettes(stepping, 100_000, recording_time)
+            for key, (command_voltage, response_current) in traces.items():
+                command_current = response_current
+                response_voltage = command_voltage
                 if self.C_CLAMP_AMP_PER_VOLT not in (None, 0):
                     command_current = command_current / self.C_CLAMP_AMP_PER_VOLT
                 if self.C_CLAMP_VOLT_PER_VOLT not in (None, 0):
                     response_voltage = response_voltage / self.C_CLAMP_VOLT_PER_VOLT
                 sweeps[key].append([
-                    self._recorded_time(sample_count, 100_000),
+                    self._recorded_time(command_voltage.size, 100_000),
                     response_voltage,
                     command_current,
                 ])
@@ -2942,10 +2924,8 @@ class FakeDAQ(DAQ):
     @multi_pipette_protocol
     def getDataFromHoldingProtocol(self, keys, *, rate_hz: int = 50_000, duration_s: float = 60.0):
         results = {}
-        for key, (command, response) in self._read_pipettes(keys).items():
-            sample_count = min(command.size, response.size)
-            command = command[:sample_count]
-            response = response[:sample_count]
+        for key, (command, response) in self._read_pipettes(keys, rate_hz, duration_s).items():
+            sample_count = command.size
             with self.for_pipette(key):
                 hold_voltage = self.holding_voltage
                 if hold_voltage is None:

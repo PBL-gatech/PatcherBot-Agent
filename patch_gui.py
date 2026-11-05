@@ -69,10 +69,8 @@ def main():
     cellSorterManip = rig_devices["cell_sorter_manipulator"]
     cellSorterController = rig_devices["cell_sorter_controller"]
     amplifiers = rig_devices["amplifier"]
-    amplifier = primary_device(amplifiers)
     daq = rig_devices["daq"]
     pressures = rig_devices["pressure"]
-    pressure = primary_device(pressures)
     lamp = rig_devices["lamp"]
     laser = rig_devices["laser"]
 
@@ -105,13 +103,25 @@ def main():
         config_data=patch_data,
         protocol_data=protocol_data,
     )
-    graph_interface = GraphInterface(amplifier, daq, pressure, recording_state_manager, laser=laser)
+    # One GraphInterface per pipette: that pipette's DAQ view, amplifier and
+    # pressure controller (as already paired up by AutoPatchInterface).
+    pipette_graph_interfaces = {
+        f"Pipette {index}": GraphInterface(
+            autopatcher.amplifier,
+            patch_controller.protocol_daQs[pipette_key],
+            autopatcher.pressure,
+            recording_state_manager,
+            laser=laser,
+        )
+        for index, (pipette_key, autopatcher) in enumerate(
+            patch_controller.autopatchers.items(), start=1)
+    }
     gui = PatchGui(camera, pipette_camera, pipette_controller, patch_controller, recording_state_manager)
-    graphs = EPhysGraph(graph_interface, recording_state_manager)
+    # The Electrophysiology window has a dropdown to pick which pipette it shows.
+    graphs = EPhysGraph(pipette_graph_interfaces, recording_state_manager)
     # graphs.location_on_the_screen()
     graphs.show()
 
-    protocol_graphs = []
     protocol_graph_types = (
         CurrentProtocolGraph,
         VoltageProtocolGraph,
@@ -120,31 +130,11 @@ def main():
         OptogeneticStimProtocolGraph,
         OptogeneticWavelengthProtocolGraph,
     )
-    for pipette_index, (pipette_key, protocol_daq) in enumerate(
-            patch_controller.protocol_daQs.items(), start=1):
-        suffix = pipette_key.rsplit("_", 1)[-1]
-        protocol_amplifier = amplifiers.get(f"amplifier_{suffix}", amplifier) if isinstance(
-            amplifiers, dict
-        ) else amplifier
-        protocol_pressure = pressures.get(f"pressure_{suffix}", pressure) if isinstance(
-            pressures, dict
-        ) else pressure
-        protocol_graph_interface = GraphInterface(
-            protocol_amplifier,
-            protocol_daq,
-            protocol_pressure,
-            recording_state_manager,
-            laser=laser,
-        )
-        pipette_name = f"Pipette {pipette_index}"
-        protocol_graphs.extend(
-            graph_type(
-                protocol_graph_interface,
-                recording_state_manager,
-                pipette_name=pipette_name,
-            )
-            for graph_type in protocol_graph_types
-        )
+    protocol_graphs = [
+        graph_type(graph_interface, recording_state_manager, pipette_name=pipette_name)
+        for pipette_name, graph_interface in pipette_graph_interfaces.items()
+        for graph_type in protocol_graph_types
+    ]
 
 
     gui.initialize()

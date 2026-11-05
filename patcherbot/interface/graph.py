@@ -125,6 +125,15 @@ class GraphInterface(TaskInterface):
     def get_laser_power(self):
         return self._laser_power
 
+    def adopt_laser_state(self, other):
+        """Take over another interface's cached laser settings.
+
+        The laser is shared by every pipette, so when the GUI switches to
+        another pipette's interface the cached power/wavelength must follow.
+        """
+        self._laser_power = other._laser_power
+        self._last_laser_wavelength = other._last_laser_wavelength
+
     @command(category='Laser',
               description='set laser power percent',
               default_arg=0)

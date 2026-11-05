@@ -67,7 +67,7 @@ class AutoPatchInterface(TaskInterface):
                 self.pipette_controller.calibrated_units.items(), start=1):
             pipette_amplifier = self._device_for_pipette(self.amplifiers, "amplifier", pipette_number)
             pipette_pressure = self._device_for_pipette(self.pressures, "pressure", pipette_number)
-            protocol_daq = PipetteDAQView(daq, self._daq_key_for_pipette(daq, pipette_key, pipette_number))
+            protocol_daq = PipetteDAQView(daq, self._daq_key_for_pipette(daq, pipette_key))
             self.protocol_daQs[pipette_key] = protocol_daq
             self.autopatchers[pipette_key] = AutoPatcher(
                 pipette_amplifier,
@@ -85,7 +85,7 @@ class AutoPatchInterface(TaskInterface):
         self.protocol_selections = {
             pipette_key: {
                 protocol_name: bool(getattr(self.protocol_config, protocol_name))
-                for protocol_name in self._PROTOCOL_SELECTION_NAMES
+                for protocol_name in self._PROTOCOL_RUNNERS
             }
             for pipette_key in self.autopatchers
         }
@@ -96,29 +96,28 @@ class AutoPatchInterface(TaskInterface):
         self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
 
-    _PROTOCOL_SELECTION_NAMES = (
-        "voltage_protocol",
-        "current_protocol",
-        "voltage_sweep_protocol",
-        "holding_protocol",
-        "opto_random_wavelength_protocol",
-        "opto_random_power_protocol",
-    )
+    # Protocol selection names, in run order -> AutoPatcher prepare_/finish_ suffix
+    _PROTOCOL_RUNNERS = {
+        "voltage_protocol": "voltage_protocol",
+        "current_protocol": "current_protocol",
+        "voltage_sweep_protocol": "voltage_sweep_protocol",
+        "holding_protocol": "holding_protocol",
+        "opto_random_wavelength_protocol": "optogenetic_protocol",
+        "opto_random_power_protocol": "optogenetic_protocol",
+    }
 
-    def _daq_key_for_pipette(self, daq, pipette_key, pipette_number):
+    def _daq_key_for_pipette(self, daq, pipette_key):
         """Match a pipette to its DAQ channel set.
 
-        The rig builder gives the DAQ the same pipette keys, so normally this
-        is ``pipette_key``. Otherwise fall back to position, then to the first
-        channel set (a DAQ wired for fewer pipettes than were selected).
+        The rig builder gives the DAQ the same pipette keys, so this is
+        normally ``pipette_key``. A DAQ wired for fewer pipettes than were
+        selected shares its first channel set.
         """
-        daq_keys = list(daq.channel_map)
         if pipette_key in daq.channel_map:
             return pipette_key
-        if pipette_number - 1 < len(daq_keys):
-            return daq_keys[pipette_number - 1]
-        self.warning(f"DAQ has no channels for {pipette_key}; it will share {daq_keys[0]}'s channels")
-        return daq_keys[0]
+        shared = daq.primary_pipette_key
+        self.warning(f"DAQ has no channels for {pipette_key}; it will share {shared}'s channels")
+        return shared
 
     @staticmethod
     def _device_for_pipette(devices, slot, pipette_number):
@@ -128,16 +127,6 @@ class AutoPatchInterface(TaskInterface):
 
     def set_protocol_selection(self, pipette_key, protocol_name, selected):
         self.protocol_selections[pipette_key][protocol_name] = bool(selected)
-
-    # Selection name -> AutoPatcher prepare_/finish_ suffix
-    _PROTOCOL_RUNNERS = {
-        "voltage_protocol": "voltage_protocol",
-        "current_protocol": "current_protocol",
-        "voltage_sweep_protocol": "voltage_sweep_protocol",
-        "holding_protocol": "holding_protocol",
-        "opto_random_wavelength_protocol": "optogenetic_protocol",
-        "opto_random_power_protocol": "optogenetic_protocol",
-    }
 
     @staticmethod
     def _opto_params(protocol_name, config):
@@ -201,15 +190,7 @@ class AutoPatchInterface(TaskInterface):
         """Run each selected protocol for all its pipettes at once:
         prepare every pipette in parallel, ONE DAQ acquisition per step
         covering all of them, then finish every pipette in parallel."""
-        protocol_order = (
-            "voltage_protocol",
-            "current_protocol",
-            "voltage_sweep_protocol",
-            "holding_protocol",
-            "opto_random_wavelength_protocol",
-            "opto_random_power_protocol",
-        )
-        for protocol_name in protocol_order:
+        for protocol_name in self._PROTOCOL_RUNNERS:
             task_controller.abort_if_requested()
             task_controller.success_if_requested()
             selected = [

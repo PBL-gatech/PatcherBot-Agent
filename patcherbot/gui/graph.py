@@ -625,16 +625,25 @@ class EPhysGraph(QWidget):
         "infrared": ("Infrared", "#000000"),
     }
 
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager):
+    def __init__(self, graph_interface: "GraphInterface | dict[str, GraphInterface]",
+                 recording_state_manager: RecordingStateManager):
         """
         Initialize the electrophysiology GUI.
-        :param graph_interface: An instance of GraphInterface that abstracts hardware operations.
+        :param graph_interface: A GraphInterface, or an ordered ``{label: GraphInterface}``
+            dict with one entry per pipette. With several pipettes a dropdown
+            chooses which one the window shows and controls.
         :param recording_state_manager: The recording state manager used for data logging.
         """
         super().__init__()
         self.setWindowTitle("Electrophysiology")
         self.recording_state_manager = recording_state_manager
-        self.graph_interface = graph_interface  # ONLY import GraphInterface!
+        if isinstance(graph_interface, dict):
+            if not graph_interface:
+                raise ValueError("EPhysGraph needs at least one GraphInterface")
+            self.graph_interfaces = dict(graph_interface)
+        else:
+            self.graph_interfaces = {"Pipette 1": graph_interface}
+        self.graph_interface = next(iter(self.graph_interfaces.values()))  # ONLY import GraphInterface!
 
         # Initialize plots.
         self.cmdPlot = PlotWidget()
@@ -661,6 +670,15 @@ class EPhysGraph(QWidget):
         bottomBarLayout = QHBoxLayout()
         bottomBarLayout.setContentsMargins(0, 0, 0, 0)  # Preserve zero margins as in old UI.
         self.bottomBar.setLayout(bottomBarLayout)
+
+        # Pipette selector, only when several pipettes are in use.
+        self.pipetteDropdown = None
+        if len(self.graph_interfaces) > 1:
+            self.pipetteDropdown = QComboBox()
+            self.pipetteDropdown.addItems(list(self.graph_interfaces))
+            self.pipetteDropdown.currentTextChanged.connect(self._select_pipette)
+            bottomBarLayout.addWidget(self.pipetteDropdown)
+            self.setWindowTitle(f"Electrophysiology - {self.pipetteDropdown.currentText()}")
 
         self.resistanceLabel = QLabel("Resistance:")
         bottomBarLayout.addWidget(self.resistanceLabel)
@@ -738,7 +756,8 @@ class EPhysGraph(QWidget):
         self.zapButton.setFixedWidth(50)
         self.zapButton.clicked.connect(self.handle_zap_button_press)
         bottomBarLayout.addWidget(self.zapButton)
-        self.graph_interface.set_zap_duration(25e-6)  # Default zap duration in seconds
+        for interface in self.graph_interfaces.values():
+            interface.set_zap_duration(25e-6)  # Default zap duration in seconds
 
         # Laser controls.
         initial_power = self.graph_interface.get_laser_power()
@@ -812,6 +831,36 @@ class EPhysGraph(QWidget):
 
         self.show()
         self.raise_()
+
+    def _select_pipette(self, label):
+        """Show and control another pipette.
+
+        Swaps the GraphInterface (DAQ view, amplifier, pressure) and clears
+        the previous pipette's history. The laser is shared, so its cached
+        settings carry over.
+        """
+        new_interface = self.graph_interfaces.get(label)
+        if new_interface is None or new_interface is self.graph_interface:
+            return
+        new_interface.adopt_laser_state(self.graph_interface)
+        self.graph_interface = new_interface
+        self.noiseGraph.graph_interface = new_interface
+        self.setWindowTitle(f"Electrophysiology - {label}")
+
+        self.pressureData.clear()
+        self.resistanceDeque.clear()
+        self.lastReadData = None
+        self.lastrespData = None
+        for plot in (self.cmdPlot, self.respPlot, self.pressurePlot, self.resistancePlot):
+            plot.clear()
+        self.resistanceLabel.setText("Resistance:")
+        self.accessResistanceLabel.setText("Access Resistance: N/A")
+        self.membraneResistanceLabel.setText("Membrane Resistance: N/A")
+        self.membraneCapacitanceLabel.setText("Membrane Capacitance: N/A")
+
+        self.handle_zap_duration_change()   # apply the selected zap duration to this amplifier
+        self.updateModeType()
+        self.updatePressureATM()
 
     def update_plot(self):
         """

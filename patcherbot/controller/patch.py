@@ -895,17 +895,15 @@ class AutoPatcher(TaskController):
 
     @record_state("run_protocols")
     def run_protocols(self):
-        self.daq.setCellMode(True)
+        # Each prepare_*/finish_* sets the cell mode its protocol needs.
         holding = self.getHolding()
         if self.protocol_config.voltage_protocol:
             self.run_voltage_protocol()
             self.sleep(0.25)
         if self.protocol_config.current_protocol:
-            self.daq.setCellMode(False)
             self.iholding = holding
             self.run_current_protocol()
             self.sleep(0.25)
-            self.daq.setCellMode(True)
         if self.protocol_config.voltage_sweep_protocol:
             self.run_voltage_sweep_protocol()
             self.sleep(0.25)
@@ -978,8 +976,7 @@ class AutoPatcher(TaskController):
         for index, (method_name, kwargs) in enumerate(steps):
             if index:
                 self.sleep(0.25)
-            result = getattr(self.daq, method_name)(**kwargs)
-            results.append(result.get(pipette_key) if isinstance(result, dict) else result)
+            results.append(getattr(self.daq, method_name)(**kwargs)[pipette_key])
         return results
 
     def _run_split_protocol(self, prepare, finish, *args):
