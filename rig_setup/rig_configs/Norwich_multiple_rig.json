@@ -42,7 +42,7 @@
                 "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
                 "params": {
                     "serial": {
-                        "port": "COM11",
+                        "port": "COM7",
                         "baudrate": 9600
                     },
                     "max_speed": 100000,
@@ -99,20 +99,12 @@
                 ]
             }
         },
-        "amplifier": [
-            {
-                "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
-                "params": {
-                    "channel": 1
-                }
-            },
-            {
-                "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
-                "params": {
-                    "channel": 2
-                }
+        "amplifier": {
+            "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
+            "params": {
+                "channel": 1
             }
-        ],
+        },
         "pressure": [
             {
                 "class": "patcherbot.devices.pressurecontroller.SerialPressureController.SerialPressureController",

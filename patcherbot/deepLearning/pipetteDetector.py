@@ -254,13 +254,12 @@ class PipetteDetectorYOLO1(PipetteDetector):
                  imgsz: int = 640,
                  conf: float = 0.20) -> None:
         super().__init__()
-        from neuron_detection.models import ModelFactory
+        from ultralytics import YOLO
 
-        repository_root = Path(__file__).resolve().parents[1]
-        default_model = repository_root / "training" / "PipetteDetectorNet7.pt"
+        default_model = Path(__file__).resolve().parent / "pipetteModel" / "BoRigCombo.pt"
         self.model_path = Path(model_path) if model_path is not None else default_model
 
-        self.yolo_model = ModelFactory.create("yolo", {"source": str(self.model_path)})
+        self.yolo_model = YOLO(str(self.model_path))
 
         # Match PipetteDetector1 behavior
         self.pipette_class = 0
@@ -300,9 +299,30 @@ class PipetteDetectorYOLO1(PipetteDetector):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
+    @property
+    def threshold(self):
+        """Confidence threshold exposed to the shared vision callers."""
+        return self.conf_threshold
+
     def detect_pipette(self, img: np.ndarray) -> Optional[Tuple[int, int]]:
+        return self.detect_pipette_details(img)["tip_xy"]
+
+    def detect_pipette_details(self, img, *, expected_tip_xy=None,
+                               pixels_to_um=None, radius_um=50.0, prefer_anchor=False):
+        """Return YOLO confidence and calibrated candidate filtering alongside XY."""
+        prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
+                          box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
+                          radius_rejected_count=0, focus_score=None,
+                          focus_score_supported=False, z_confidence_supported=False)
         if img is None:
-            return None
+            return prediction
+
+        if expected_tip_xy is not None:
+            expected = np.asarray(expected_tip_xy, dtype=float)
+            if expected.shape != (2,) or not np.isfinite(expected).all() or not callable(pixels_to_um):
+                raise ValueError("A finite expected XY and calibrated pixel-to-micron converter are required")
+            if not np.isfinite(radius_um) or radius_um <= 0:
+                raise ValueError("Pipette candidate radius must be positive and finite")
 
         img = self._ensure_color(img)
         img = np.ascontiguousarray(img)  # avoid extra copies in preprocessing
@@ -319,10 +339,10 @@ class PipetteDetectorYOLO1(PipetteDetector):
             )
         except Exception as exc:
             logger.warning("YOLO inference failed: %s", exc)
-            return None
+            return prediction
 
         if not results or results[0] is None or results[0].boxes is None:
-            return None
+            return prediction
 
         boxes = results[0].boxes
         try:
@@ -330,25 +350,41 @@ class PipetteDetectorYOLO1(PipetteDetector):
             conf = boxes.conf.detach().cpu().numpy()
             xywhn = boxes.xywhn.detach().cpu().numpy()
         except Exception:
-            return None
+            return prediction
 
         mask = (cls == self.pipette_class) & (conf >= self.conf_threshold)
         if not np.any(mask):
-            return None
+            return prediction
 
-        conf_sel = conf[mask]
-        xywhn_sel = xywhn[mask]
-        best_idx = int(np.argmax(conf_sel))
-        cx_n, cy_n = float(xywhn_sel[best_idx, 0]), float(xywhn_sel[best_idx, 1])
-
-        if np.isnan(cx_n) or np.isnan(cy_n):
-            return None
-
-        x_pix = int(round(cx_n * w))
-        y_pix = int(round(cy_n * h))
-        if not (0 <= x_pix < w and 0 <= y_pix < h):
-            return None
-        return x_pix, y_pix
+        candidates = []
+        prediction["candidate_count"] = int(np.count_nonzero(mask))
+        for confidence, box in zip(conf[mask], xywhn[mask]):
+            if not np.isfinite(box).all() or not np.isfinite(confidence):
+                continue
+            cx, cy, bw, bh = box * np.array([w, h, w, h])
+            tip = int(round(cx)), int(round(cy))
+            if not (0 <= tip[0] < w and 0 <= tip[1] < h):
+                continue
+            distance = 0.0
+            if expected_tip_xy is not None:
+                offset = np.asarray(pixels_to_um(np.asarray(tip) - expected), dtype=float).reshape(-1)[:2]
+                if offset.size != 2 or not np.isfinite(offset).all():
+                    continue
+                distance = float(np.linalg.norm(offset))
+                if distance > radius_um:
+                    prediction["radius_rejected_count"] += 1
+                    continue
+            candidates.append(dict(tip_xy=tip, box_confidence=float(confidence),
+                                   box_xyxy=(cx-bw/2, cy-bh/2, cx+bw/2, cy+bh/2),
+                                   distance=distance))
+        prediction["accepted_candidate_count"] = len(candidates)
+        if candidates:
+            if prefer_anchor:
+                best = min(candidates, key=lambda candidate: (candidate["distance"], -candidate["box_confidence"]))
+            else:
+                best = max(candidates, key=lambda candidate: candidate["box_confidence"])
+            prediction.update({key: best[key] for key in ("tip_xy", "box_confidence", "box_xyxy")})
+        return prediction
 
 
 class PipetteDetector3(PipetteDetector):

@@ -23,6 +23,7 @@ class _RecordingDAQ:
 class _ProtocolWorker:
     def __init__(self, pipette_key, barriers, events, event_lock):
         self.pipette_key = pipette_key
+        self.amplifier = object()
         self.barriers = barriers
         self.events = events
         self.event_lock = event_lock
@@ -57,6 +58,7 @@ class _ProtocolRunner:
     _prepare_protocol = AutoPatchInterface._prepare_protocol
     _finish_protocol = AutoPatchInterface._finish_protocol
     _merge_protocol_steps = AutoPatchInterface._merge_protocol_steps
+    _run_amplifier_workers = AutoPatchInterface._run_amplifier_workers
     _run_protocol_matrix = AutoPatchInterface._run_protocol_matrix
 
     def warning(self, message):

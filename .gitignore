@@ -95,3 +95,5 @@ experiments/Datasets/temp_dataset.hdf5
 /tests/*
 !/tests/test_fake_pipette_geometry.py
 !/tests/test_parallel_protocol_selection.py
+!/tests/test_norwich_pipette_detector.py
+!/tests/test_shared_amplifier.py

@@ -191,6 +191,7 @@ class RigBuilderDialog(QDialog):
             slot: [] for slot in PIPETTE_DEVICE_SLOTS
         }
         self.initial_config = initial_config
+        self.shared_amplifier = False
         self.pipette_count = self._get_pipette_count(initial_config)
         self._build_ui()
         if self.initial_config:
@@ -355,6 +356,8 @@ class RigBuilderDialog(QDialog):
 
         widgets = {
             "combo": combo,
+            "label": label,
+            "settings_btn": settings_btn,
             "params": {},
         }
 
@@ -479,9 +482,10 @@ class RigBuilderDialog(QDialog):
             for slot in PIPETTE_DEVICE_SLOTS:
 
                 specs = []
+                device_count = 1 if slot == "amplifier" and self.shared_amplifier else self.pipette_count
 
                 for pipette_index in range(
-                    self.pipette_count
+                    device_count
                 ):
 
                     widgets = self.slot_rows[slot][
@@ -505,7 +509,7 @@ class RigBuilderDialog(QDialog):
                         }
                     )
 
-                if self.pipette_count == 1:
+                if device_count == 1:
                     devices[slot] = specs[0]
                 else:
                     devices[slot] = specs
@@ -563,6 +567,8 @@ class RigBuilderDialog(QDialog):
         if not isinstance(devices, dict):
             return
 
+        self.shared_amplifier = isinstance(devices.get("amplifier"), dict)
+
         # ------------------------------------------------------------
         # Shared devices
         # ------------------------------------------------------------
@@ -614,6 +620,20 @@ class RigBuilderDialog(QDialog):
                     device_spec,
                 )
 
+        self._update_amplifier_rows()
+
+    def _update_amplifier_rows(self) -> None:
+        """Show a loaded single amplifier as shared across the pipette rows."""
+        for index, widgets in enumerate(self.slot_rows["amplifier"]):
+            shared_row = self.shared_amplifier and index > 0
+            widgets["combo"].setEnabled(not shared_row)
+            widgets["settings_btn"].setEnabled(not shared_row)
+            widgets["label"].setText(
+                "Amplifier (shared with Pipette 1)" if shared_row
+                else "Amplifier (shared)" if self.shared_amplifier
+                else "Amplifier"
+            )
+
     def _rebuild_pipette_sections(self, preserve_existing: bool = True) -> None:
         """
         Rebuild pipette-specific controls using the rig's configured
@@ -646,6 +666,8 @@ class RigBuilderDialog(QDialog):
 
         if preserve_existing:
             self._restore_pipette_rows()
+
+        self._update_amplifier_rows()
 
     def _clear_layout(self, layout) -> None:
         """Recursively remove widgets and child layouts."""

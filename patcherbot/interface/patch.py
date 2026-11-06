@@ -190,10 +190,28 @@ class AutoPatchInterface(TaskInterface):
                              f"using {reference_key}'s for the shared acquisition")
         return reference
 
+    def _run_amplifier_workers(self, selected, operation):
+        """Run shared-amplifier operations in order, separate amplifiers in parallel."""
+        groups = {}
+        for key in selected:
+            amplifier = self.autopatchers[key].amplifier
+            groups.setdefault(id(amplifier), []).append(key)
+        if not groups:
+            return {}
+
+        def run_group(keys):
+            return {key: operation(key) for key in keys}
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+            for group_results in executor.map(run_group, groups.values()):
+                results.update(group_results)
+        return {key: results[key] for key in selected}
+
     def _run_protocol_matrix(self, task_controller):
         """Run each selected protocol for all its pipettes at once:
-        prepare every pipette in parallel, ONE DAQ acquisition per step
-        covering all of them, then finish every pipette in parallel."""
+        prepare their amplifiers, ONE DAQ acquisition per step covering
+        all of them, then finish without overlapping shared amplifier calls."""
         for protocol_name in self._PROTOCOL_RUNNERS:
             task_controller.abort_if_requested()
             task_controller.success_if_requested()
@@ -204,11 +222,10 @@ class AutoPatchInterface(TaskInterface):
             if not selected:
                 continue
 
-            with ThreadPoolExecutor(max_workers=len(selected)) as executor:
-                prepared = list(executor.map(
-                    lambda key: self._prepare_protocol(key, protocol_name), selected))
+            prepared = self._run_amplifier_workers(
+                selected, lambda key: self._prepare_protocol(key, protocol_name))
             try:
-                steps = self._merge_protocol_steps(protocol_name, dict(zip(selected, prepared)))
+                steps = self._merge_protocol_steps(protocol_name, prepared)
                 daq_keys = list(dict.fromkeys(
                     self.protocol_daQs[key].pipette_key for key in selected))
                 for index, (method_name, kwargs) in enumerate(steps):
@@ -216,9 +233,8 @@ class AutoPatchInterface(TaskInterface):
                         time.sleep(0.25)
                     getattr(self.daq, method_name)(pipettes=daq_keys, **kwargs)
             finally:
-                with ThreadPoolExecutor(max_workers=len(selected)) as executor:
-                    list(executor.map(
-                        lambda key: self._finish_protocol(key, protocol_name), selected))
+                self._run_amplifier_workers(
+                    selected, lambda key: self._finish_protocol(key, protocol_name))
 
 
     @blocking_command(category='Calibration', description='Save X origin',

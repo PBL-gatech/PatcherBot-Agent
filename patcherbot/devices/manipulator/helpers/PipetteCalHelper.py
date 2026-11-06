@@ -2,14 +2,16 @@ import time
 import cv2
 import numpy as np
 import os
+import torch
+from contextlib import nullcontext
 from pathlib import Path
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.manipulator import Manipulator
 from patcherbot.devices.camera import Camera
 from patcherbot.deepLearning.pipetteDetector import (
-    PipetteDetector, PipetteDetector5, configure_pipette_detector,
+    PipetteDetector, PipetteDetector5, PipetteDetectorYOLO1, configure_pipette_detector,
 )
-from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser2
+from patcherbot.deepLearning.pipetteFocuser import PipetteFocuser, PipetteFocuser2
 from threading import Thread
 import logging
 from .pipette_flow import track_pipette_displacement
@@ -34,6 +36,53 @@ class FakePipetteDetector:
 
     def get_pipette_z(self, img):
         return 0.0
+
+
+class _FocusedYOLOPipetteDetector(PipetteDetector):
+    """Expose Norwich's separate XY and focus models to the shared vision API."""
+
+    model_version = "yolo1"
+
+    def __init__(self, detector, focuser):
+        super().__init__()
+        self.adapter = detector
+        self.focuser = focuser
+        self._active_model = (str(detector.model_path), self.model_version)
+
+    def detect_pipette(self, img):
+        return self.adapter.detect_pipette(img)
+
+    def detect_pipette_details(self, img, **options):
+        result = self.adapter.detect_pipette_details(img, **options)
+        if result["tip_xy"] is not None:
+            result["z_um"] = self.get_pipette_z(img)
+        return result
+
+    def get_pipette_z(self, img):
+        if img is None:
+            return None
+        z = float(self.focuser.get_pipette_focus_value(img))
+        return z if np.isfinite(z) else None
+
+
+def _resolve_detector_device(requested):
+    """Resolve automatic placement and validate explicit CUDA before model loading."""
+    device = str(requested or "auto").strip().lower()
+    if device == "auto":
+        return "cuda:0" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
+    if device == "cpu":
+        return device
+    if device == "cuda":
+        device = "cuda:0"
+    if device.startswith("cuda:") and device[5:].isdigit():
+        index = int(device[5:])
+        if torch.cuda.is_available() and index < torch.cuda.device_count():
+            return f"cuda:{index}"
+        raise ValueError(
+            f"Pipette detector device '{device}' is unavailable; use 'auto' or 'cpu' "
+            f"(CUDA device count: {torch.cuda.device_count()})"
+        )
+    raise ValueError(f"Invalid pipette detector device '{requested}'; use 'auto', 'cpu' or 'cuda:N'")
 
 
 def _resolve_model_path(model_name):
@@ -92,28 +141,34 @@ class PipetteCalHelper():
         self.microscope: Microscope = microscope
         self.camera = camera
         self.config = config
-        device = os.getenv("PIPETTE_DETECTOR_DEVICE", "cuda:0")
         model_name = getattr(self.config, "pipette_detector_model", None)
         model_path = _resolve_model_path(model_name)
         model_version = getattr(self.config, "pipette_detector_model_version", "R02")
         if callable(getattr(camera, "get_fake_pipette_tip_xy", None)):
             self.pipetteDetector = FakePipetteDetector(camera, pipette)
         else:
-            try:
-                self.pipetteDetector: PipetteDetector = PipetteDetector5(
-                    model_path=model_path,
-                    device=device,
-                    model_version=model_version,
-                )
-            except Exception as exc:
-                logging.warning(
-                    "Failed to load general pipette model '%s' (%s); using the existing default R02 checkpoint",
-                    model_name,
-                    exc,
-                )
-                self.pipetteDetector = PipetteDetector5(
-                    model_path=None, device=device, model_version="R02",
-                )
+            detector_type = getattr(self.config, "pipette_detector_type", "v5")
+            requested_device = getattr(self.config, "pipette_detector_device", "auto")
+            device = _resolve_detector_device(
+                os.getenv("PIPETTE_DETECTOR_DEVICE", "").strip() or requested_device
+            )
+            if detector_type == "yolo1":
+                focuser_path = _resolve_model_path(getattr(self.config, "pipette_focuser_model", None))
+                for path in (model_path, focuser_path):
+                    if path is not None and not path.is_file():
+                        raise FileNotFoundError(f"Norwich pipette model '{path}' does not exist")
+                logging.info("Initializing Norwich YOLO detector with model='%s', focuser='%s', device='%s'",
+                             model_path, focuser_path, device)
+                try:
+                    detector = PipetteDetectorYOLO1(model_path=model_path, device=device)
+                    focuser = PipetteFocuser(model_path=focuser_path)
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to initialize Norwich pipette detector/focuser: {exc}") from exc
+                self.pipetteDetector = _FocusedYOLOPipetteDetector(detector, focuser)
+            elif detector_type == "v5":
+                self.pipetteDetector = self._load_general_detector(model_path, device, model_version, model_name)
+            else:
+                raise ValueError(f"Invalid pipette detector type '{detector_type}'; choose 'v5' or 'yolo1'")
         configure_pipette_detector(self.pipetteDetector)
         self.calibrated_stage = calibrated_stage
         # Each calibration point will be a tuple:
@@ -122,8 +177,29 @@ class PipetteCalHelper():
         self.calibration_samples = []
         self._flow_reference = None
 
+    @staticmethod
+    def _load_general_detector(model_path, device, model_version, model_name):
+        """Keep the existing v5 fallback separate from Norwich's model selection."""
+        try:
+            return PipetteDetector5(
+                model_path=model_path,
+                device=device,
+                model_version=model_version,
+            )
+        except Exception as exc:
+            logging.warning(
+                "Failed to load general pipette model '%s' (%s); using the existing default R02 checkpoint",
+                model_name,
+                exc,
+            )
+            return PipetteDetector5(
+                model_path=None, device=device, model_version="R02",
+            )
+
     def brain_slice_detector(self):
         """Temporarily load the configured specialist into the shared detector."""
+        if isinstance(self.pipetteDetector, _FocusedYOLOPipetteDetector):
+            return nullcontext(self.pipetteDetector)
         model_path = _resolve_model_path(getattr(
             self.config, "pipette_brain_slice_model", "PipetteDetectorNetB.pt",
         ))

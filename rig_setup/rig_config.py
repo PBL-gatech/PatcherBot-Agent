@@ -928,7 +928,9 @@ class RigConfigManager:
                 )
             if slot in PIPETTE_DEVICE_SLOTS:
                 spec = devices[slot]
-                if pipette_count > 1:
+                # A single amplifier mapping explicitly shares one control
+                # handle across all pipettes; lists still select one per pipette.
+                if pipette_count > 1 and not (slot == "amplifier" and isinstance(spec, dict)):
                     if not isinstance(spec, list):
                         raise RigConfigError(
                             f"'{slot}' must contain {pipette_count} "

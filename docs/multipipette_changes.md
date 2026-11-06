@@ -76,7 +76,7 @@ rig JSON (pipette_count, per-pipette device lists, one DAQ)
   - [`_selected_pipette_keys`](../rig_setup/rig_config.py#L723) returns the pipette controller dict's keys, or `[pipette_key_for(0)]` for single-device configs.
 - **Indexed refs.** `$ref:slot[i]` ([L828](../rig_setup/rig_config.py#L828)) resolves positionally into a per-pipette dict. It relies on dict insertion order, which matches `i` because keys are created in order.
 - **[`_validate_config`](../rig_setup/rig_config.py#L900)**
-  - With `pipette_count > 1`, every per-pipette slot must be a list of exactly `pipette_count`.
+  - With `pipette_count > 1`, per-pipette slots must be lists of exactly `pipette_count`. The amplifier may instead be one mapping, sharing the same control handle across pipettes.
   - A shared slot may never be a list.
 - **Pressure calibration, [`_apply_pressure_calibration`](../rig_setup/rig_config.py#L1107):**
   - `devices.pressure` may be a dict or a list (a dict counts as entry 0).
@@ -95,8 +95,8 @@ rig JSON (pipette_count, per-pipette device lists, one DAQ)
     - Its single NiDAQ uses the legacy params, so pipette 1 shares pipette 0's channels.
   - **`Norwich_multiple_rig.json`** (new): `pipette_count: 2`.
     - The second manipulator port is `"COM??"`.
-    - `pressure` is `[SerialPressureController, FakePressureController]`, and MultiClamp channels 1 and 2.
-    - The NiDAQ `channels` list is today's wiring for pipette 0 plus `..._TODO` placeholders for pipette 1.
+    - `pressure` is `[SerialPressureController, FakePressureController]`; one `MultiClampChannel` with `channel: 1` is shared by both pipettes.
+    - The NiDAQ `channels` list retains separate read, response, and command mappings for both pipettes. Sharing the amplifier handle sends amplifier commands to channel 1 only.
   - **`setup_test_rig.json`:** reformatted; still a single NiDAQ.
 - **Check:**
   - per-pipette lists line up by index across slots (entry *i* of each slot belongs to the same physical pipette);

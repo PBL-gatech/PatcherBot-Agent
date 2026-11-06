@@ -79,6 +79,10 @@ class CalibrationConfig(Config):
     # reader_scale, and applies to the rig's pressure[i] controller.
     pressure_calibrations = List(default=[],
                                  doc="Per-pipette pressure calibration overrides")
+    pipette_detector_type = param.Selector(default="v5", objects=["v5", "yolo1"],
+                                           doc="Pipette detector type (restart required)")
+    pipette_detector_device = param.String(default="auto",
+                                            doc="Pipette detector device: auto, cpu, cuda:N (restart required)")
     pipette_detector_model = param.String(default="",
                                           doc="Pipette detector model path")
     pipette_detector_model_version = param.Selector(
@@ -122,6 +126,8 @@ class CalibrationConfig(Config):
             "pipette_y_rotation",
             "clean_move_order",
             "pipette_k_scale",
+            "pipette_detector_type",
+            "pipette_detector_device",
             "pipette_detector_model",
             "pipette_detector_model_version",
             "pipette_brain_slice_model",
