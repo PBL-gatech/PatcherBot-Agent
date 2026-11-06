@@ -169,6 +169,7 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
 
     snapshot_ready = QtCore.pyqtSignal(int, object, object)
     snapshot_failed = QtCore.pyqtSignal(int, str)
+    atlas_position_ready = QtCore.pyqtSignal(object, object)
 
     def __init__(self, scan_viewer, parent=None, position_helper=None):
         super().__init__(scan_viewer, parent)
@@ -192,6 +193,19 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         self._layer_errors = {}
         self._initial_system_fit = False
         self._last_position_key = None
+        self._atlas_states = {}
+        self._atlas_scan_info = {}
+        self._atlas_query_busy = False
+        self._atlas_query_key = self._current_atlas_key = None
+        self._atlas_position_text = self._position_text = ""
+        from collections import deque
+        import threading
+        self._producer_stop = threading.Event()
+        self._producer_active = threading.Event()
+        self._producer_input = None
+        self._snapshot_mailbox = deque(maxlen=1)
+        self._atlas_jobs = deque(maxlen=1)
+        self._atlas_mailbox = deque(maxlen=1)
         self._objective = 40
         self._view_settings = QtCore.QSettings("PatcherBot", "RegisteredGlobalViewer")
         self._cad_angles = {"objective": (0., 0.), "chamber": (0., 0.)}
@@ -222,15 +236,59 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         self._layout.insertLayout(0, controls)
         self.snapshot_ready.connect(self._receive_snapshot)
         self.snapshot_failed.connect(self._receive_failure)
+        self.atlas_position_ready.connect(self._receive_atlas_position)
         scan_viewer.scanLoaded.connect(self._registered_scan_loaded)
         if hasattr(scan_viewer, "layerLoaded"):
             scan_viewer.layerLoaded.connect(self._layer_loaded)
+        if hasattr(scan_viewer, "atlasOverlayChanged"):
+            scan_viewer.atlasOverlayChanged.connect(self._atlas_changed)
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self._refresh_timer.setInterval(24)
         self._refresh_timer.timeout.connect(self.refresh_position)
         self._refresh_timer.start()
         self.destroyed.connect(self._stop_refresh)
+        self._position_producer = threading.Thread(target=self._produce_positions,
+                                                   name="GlobalPositionProducer", daemon=True)
+        self._atlas_producer = threading.Thread(target=self._produce_atlas,
+                                                name="AtlasPositionProducer", daemon=True)
+        self._position_producer.start()
+        self._atlas_producer.start()
+
+    def _produce_positions(self):
+        """Independent cache consumer; publication replaces, never queues, old state."""
+        while not self._producer_stop.is_set():
+            if self._producer_active.is_set() and self._producer_input is not None:
+                generation, helper, transform, objective = self._producer_input
+                try:
+                    state, stage_xy = helper.cached_snapshot(transform, objective=objective)
+                    scope_um = state.get("microscope_z_um")
+                    if scope_um is not None:
+                        if not hasattr(self, "_scope_reference_um"):
+                            self._scope_reference_um = float(scope_um)
+                        state["rig_focus_z_mm"] = -(float(scope_um) - self._scope_reference_um) / 1000.
+                    self._snapshot_mailbox.append((generation, state, stage_xy, None))
+                except Exception as error:
+                    self._snapshot_mailbox.append((generation, None, None, str(error)))
+            self._producer_stop.wait(.024)
+
+    def _produce_atlas(self):
+        """Atlas labels run separately and never delay the geometry producer."""
+        while not self._producer_stop.is_set():
+            if self._producer_active.is_set():
+                try:
+                    key, helper, role, points = self._atlas_jobs.pop()
+                except IndexError:
+                    pass
+                else:
+                    values = {}
+                    for name, xy in points.items():
+                        try:
+                            values[name] = helper.global_to_atlas(xy, role=role)
+                        except Exception as error:
+                            values[name] = {"error": str(error)}
+                    self._atlas_mailbox.append((key, values))
+            self._producer_stop.wait(.2)
 
     def _registered_scan_loaded(self, result):
         self._snapshot_generation += 1
@@ -263,6 +321,8 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
     def _layer_loaded(self, role, result):
         if role not in ("reference", "session") or self.position_helper is None:
             return
+        self._atlas_scan_info[role] = {key: result[key] for key in ("path", "width", "height", "metadata")
+                                      if key in result}
         try:
             transform = self._scan_to_global(role, result)
             state = self.position_helper.snapshot(transform, objective=self._objective)
@@ -272,7 +332,64 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         except (OSError, ValueError, KeyError, TypeError, np.linalg.LinAlgError) as error:
             self._layers.pop(role, None)
             self._layer_errors[role] = str(error)
+        self._atlas_changed(role, self._atlas_states.get(role))
         self._render()
+
+    def _atlas_changed(self, role, data):
+        """Bind the displayed atlas fit to this scan's existing global transform."""
+        if role not in ("reference", "session") or self.position_helper is None:
+            return
+        self._atlas_states[role] = data
+        self.position_helper.set_atlas_alignment(None, role=role)
+        self._snapshot_generation += 1
+        self._atlas_query_key = self._current_atlas_key = None
+        self._atlas_position_text = ""
+        self.position_box.setText(self._position_text)
+        label = getattr(getattr(self.scan_viewer, role + "_view", None), "atlas_position_status", None)
+        if label is not None:
+            label.setText("Atlas position: awaiting a valid alignment and current position.")
+        source = self._atlas_scan_info.get(role)
+        if data is None or source is None or "result" not in data:
+            return
+        try:
+            if Path(data["scan_path"]).resolve() != Path(source["path"]).resolve():
+                return
+            self.position_helper.set_atlas_alignment(data, self._scan_to_global(role, source), role=role)
+        except (ValueError, KeyError, OSError, np.linalg.LinAlgError) as error:
+            self.status.setText("Atlas coordinates unavailable: " + str(error))
+
+    def _refresh_atlas_position(self, state):
+        role = getattr(self.scan_viewer, "active_role", "reference")
+        helper = self.position_helper
+        if not helper.has_atlas_alignment(role):
+            return
+        points = {"Field": np.asarray(state["objective_xyz_mm"])[:2] * 1000}
+        if state.get("pipette_xyz_mm") is not None:
+            points["Pipette"] = np.asarray(state["pipette_xyz_mm"])[:2] * 1000
+        key = (self._snapshot_generation, role, tuple((name, tuple(xy)) for name, xy in points.items()))
+        self._current_atlas_key = key
+        if key == self._atlas_query_key:
+            return
+        self._atlas_query_busy = True
+        self._atlas_query_key = key
+        self._atlas_jobs.append((key, helper, role, points))
+
+    def _receive_atlas_position(self, key, values):
+        self._atlas_query_busy = False
+        if self._closed or key != self._current_atlas_key or key[0] != self._snapshot_generation:
+            return
+        labels = []
+        for name, value in values.items():
+            if "error" in value:
+                labels.append(name + ": " + value["error"])
+            else:
+                ap, dv, ml = value["ccf_um_ap_dv_ml"]
+                labels.append(f"{name}: Allen AP {ap:.0f}, DV {dv:.0f}, ML {ml:.0f} µm; region {value.get('region_id', 'unavailable')}")
+        self._atlas_position_text = " | ".join(labels)
+        self.position_box.setText(self._position_text + "\n" + self._atlas_position_text)
+        label = getattr(getattr(self.scan_viewer, "active_view", None), "atlas_position_status", None)
+        if label is not None:
+            label.setText(self._atlas_position_text)
 
     def _update_overlay(self):
         if not self.scan_viewer.isVisible():
@@ -295,59 +412,39 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                                            None if tip is None else project([tip])[0], direction)
 
     def refresh_position(self):
-        if (self._closed or not (self.isVisible() or self.scan_viewer.isVisible()) or self._snapshot_busy or
-                self.position_helper is None):
+        if (self._closed or not (self.isVisible() or self.scan_viewer.isVisible()) or self.position_helper is None):
+            self._producer_active.clear()
             return
-        # Read existing device API off the GUI thread; no movement/calibration calls.
-        import threading
-        generation = self._snapshot_generation
         transform = None if self._scan_transform is None else self._scan_transform.copy()
-        helper = self.position_helper
-        objective = self._objective
-        self._snapshot_busy = True
-        def read():
-            try:
-                stage_xy = np.asarray(helper.stage.position(), dtype=float)[:2].copy()
-                pipette_position = None
-                unit = helper.unit
-                if len(getattr(unit, "axes", ())) == 3 and callable(getattr(unit, "position", None)):
-                    pipette_position = np.asarray(unit.position(), dtype=float).copy()
-                reference_xy = None
-                if getattr(unit, "calibrated", False) and callable(getattr(unit, "reference_position", None)):
-                    trusted = getattr(unit, "_trusted_tip_reference", None)
-                    needs_refresh = getattr(unit, "must_be_recalibrated", False)
-                    tip_reference = trusted if needs_refresh else (getattr(unit, "_tip_reference", None) or trusted)
-                    if not needs_refresh or trusted is not None:
-                        reference_xy = np.asarray(unit.reference_position(anchor=tip_reference), dtype=float)[:2].copy()
-                snapshot = helper.snapshot(transform, objective=objective, stage_xy=stage_xy,
-                                           pipette_position=pipette_position,
-                                           pipette_reference_xy=reference_xy)
-                microscope = getattr(unit, "microscope", None)
-                if microscope is not None and callable(getattr(microscope, "position", None)):
-                    scale = float(getattr(getattr(microscope, "config", None), "microscope_units_per_um",
-                                          getattr(microscope, "units_per_um", 5.)))
-                    scope_um = float(microscope.position()) / scale
-                    if not hasattr(self, "_scope_reference_um"):
-                        self._scope_reference_um = scope_um
-                    snapshot["rig_focus_z_mm"] = -(scope_um - self._scope_reference_um) / 1000.
-                self.snapshot_ready.emit(generation, snapshot, stage_xy)
-            except Exception as error:
-                try:
-                    self.snapshot_failed.emit(generation, str(error))
-                except RuntimeError:
-                    pass  # The tab was destroyed while the read completed.
-        threading.Thread(target=read, name="GlobalPositionSnapshot", daemon=True).start()
+        self._producer_input = (self._snapshot_generation, self.position_helper, transform, self._objective)
+        self._producer_active.set()
+        try:
+            generation, state, stage_xy, error = self._snapshot_mailbox.pop()
+        except IndexError:
+            pass
+        else:
+            if error is None:
+                self._receive_snapshot(generation, state, stage_xy)
+            else:
+                self._receive_failure(generation, error)
+        try:
+            key, values = self._atlas_mailbox.pop()
+        except IndexError:
+            pass
+        else:
+            self._receive_atlas_position(key, values)
 
     def _receive_snapshot(self, generation, state, stage_xy):
         self._snapshot_busy = False
         if (self._closed or generation != self._snapshot_generation
                 or not (self.isVisible() or self.scan_viewer.isVisible())):
             return
+        self._refresh_atlas_position(state)
         fields = ("scan_pixel_to_world_mm", "objective_xyz_mm", "fov_size_mm", "fov_corners_mm",
                   "pipette_xyz_mm", "pipette_direction_xyz", "objective_transform", "chamber_transform", "stage_bottom_xyz_mm",
                   "objective_rotation_yz_degrees", "chamber_rotation_yz_degrees",
                   "rig_focus_z_mm", "pipette_rig_origin_mm", "pipette_rig_xyz_mm",
-                  "pipette_marker_direction_xyz")
+                  "pipette_marker_direction_xyz", "global_to_rig_rotation")
         key = (generation, self.isVisible(), self.scan_viewer.isVisible(),
                np.asarray(stage_xy, dtype=float).tobytes(),
                tuple(None if state.get(name) is None else np.asarray(state[name], dtype=float).tobytes()
@@ -364,7 +461,8 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         if state.get("pipette_xyz_mm") is not None:
             px, py, pz = np.asarray(state["pipette_xyz_mm"]) * 1000
             text += f" | Pipette X {px:.2f}, Y {py:.2f}, Z {pz:.2f} µm"
-        self.position_box.setText(text)
+        self._position_text = text
+        self.position_box.setText(text + ("\n" + self._atlas_position_text if self._atlas_position_text else ""))
 
     def _receive_failure(self, generation, message):
         self._snapshot_busy = False
@@ -375,6 +473,8 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
     def _stop_refresh(self, *_):
         self._closed = True
         self._refresh_timer.stop()
+        self._producer_active.clear()
+        self._producer_stop.set()
 
     def _lock_changed(self, locked):
         self._view_settings.setValue("view_locked", bool(locked))
@@ -435,6 +535,7 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         if self._anchor is None:
             return
         self.scene.cad_angles.update(self._cad_angles)
+        basis = np.asarray(self._anchor.get("global_to_rig_rotation", np.eye(3)))
         # The scan uses sample coordinates; hardware is shown relative to the
         # fixed objective XY axis. Recorder stage motion is negative raw XY.
         offset = np.r_[np.asarray(self._anchor["objective_xyz_mm"])[:2], 0.]
@@ -444,23 +545,24 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         tip = None if tip is None else np.asarray(tip) - pipette_origin
         if self._anchor.get("pipette_rig_xyz_mm") is not None:
             tip = np.asarray(self._anchor["pipette_rig_xyz_mm"])
+        tip = None if tip is None else basis @ tip
         if self._anchor.get("stage_bottom_xyz_mm") is not None:
-            self.scene.set_stage_bottom(np.asarray(self._anchor["stage_bottom_xyz_mm"]) - offset)
+            self.scene.set_stage_bottom(basis @ (np.asarray(self._anchor["stage_bottom_xyz_mm"]) - offset))
         anchors = self._anchor.get("named_anchors_mm", {})
         for name in set(getattr(self, "_displayed_anchor_names", ())) - set(anchors):
             self.scene.clear_named_anchor(name)
         for name, xyz in anchors.items():
-            position = (tip if name == "pipette" and tip is not None else np.asarray(xyz) -
-                        (pipette_origin if name.startswith("pipette") or name == "cleaning_bath" else offset))
+            position = (tip if name == "pipette" and tip is not None else basis @ (np.asarray(xyz) -
+                        (pipette_origin if name.startswith("pipette") or name == "cleaning_bath" else offset)))
             self.scene.set_named_anchor(name, position)
         self._displayed_anchor_names = set(anchors)
         corners = self._anchor.get("fov_corners_mm")
-        self.scene.set_fov_corners(None if corners is None else np.asarray(corners) - offset)
+        self.scene.set_fov_corners(None if corners is None else (np.asarray(corners) - offset) @ basis.T)
         state = {key: self._anchor[key] for key in ("fov_size_mm", "objective_transform", "chamber_transform")
                  if key in self._anchor}
         state.update(objective_xyz_mm=[0., 0., self._anchor.get("rig_focus_z_mm", 0.)], pipette_xyz_mm=tip)
         self.scene.set_state(**state)
-        self.scene.items["origin"].setData(pos=np.asarray([-offset]))
+        self.scene.items["origin"].setData(pos=np.asarray([basis @ -offset]))
         direction = self._anchor.get("pipette_direction_xyz")
         self.scene.set_pipette_pose(tip if direction is not None else None,
                                     direction)

@@ -32,14 +32,21 @@ from .livefeed import LiveFeedQt
 
 
 class Logger(QtCore.QAbstractTableModel, logging.Handler):
+    entry_ready = QtCore.pyqtSignal(object)
+
     def __init__(self):
         super(Logger, self).__init__()
         # We do not actually use the formatter, but the asctime attribute is
         # available if the formatter requires it
         self.setFormatter(logging.Formatter('%(asctime)s'))
         self.messages = []
+        self._active = True
+        self.entry_ready.connect(self._append_entry, Qt.QueuedConnection)
+        self.destroyed.connect(lambda: self.close())
 
     def emit(self, record):
+        if not self._active:
+            return
         self.format(record)
         entry = (record.levelno,
                  datetime.datetime.strptime(record.asctime, '%Y-%m-%d %H:%M:%S,%f'),
@@ -47,10 +54,26 @@ class Logger(QtCore.QAbstractTableModel, logging.Handler):
                  record.message,
                  record.exc_info,
                  record.thread)  # Not displayed by default
+        self.entry_ready.emit(entry)
+
+    @QtCore.pyqtSlot(object)
+    def _append_entry(self, entry):
+        if not self._active:
+            return
         self.beginInsertRows(QtCore.QModelIndex(),
                              len(self.messages), len(self.messages))
         self.messages.append(entry)
         self.endInsertRows()
+
+    def close(self):
+        # This must remain safe after the QObject has already been destroyed.
+        self.acquire()
+        try:
+            self._active = False
+        finally:
+            self.release()
+        logging.getLogger().removeHandler(self)
+        logging.Handler.close(self)
 
     def rowCount(self, parent=None):
         return len(self.messages)
@@ -281,8 +304,11 @@ class LogNotifyHandler(logging.Handler):
     def __init__(self, signal):
         super(LogNotifyHandler, self).__init__()
         self.signal = signal
+        self._active = True
 
     def emit(self, record):
+        if not self._active:
+            return
         self.format(record)
         if record.exc_info is None:
             message = record.message
@@ -290,6 +316,15 @@ class LogNotifyHandler(logging.Handler):
             _, exc, _ = record.exc_info
             message = '{} ({})'.format(record.message, str(exc))
         self.signal.emit(message)
+
+    def close(self):
+        self.acquire()
+        try:
+            self._active = False
+        finally:
+            self.release()
+        logging.getLogger('patcherbot').removeHandler(self)
+        logging.Handler.close(self)
 
 
 class RecordingDialog(QDialog):
@@ -620,7 +655,10 @@ class CameraGui(QtWidgets.QMainWindow):
         handler.setLevel(logging.WARNING)
         handler.addFilter(lambda record: record.levelno >= logging.ERROR or bool(getattr(record, "detection_overlay", False)))
         logging.getLogger('patcherbot').addHandler(handler)
+        self._log_notify_handler = handler
+        self.destroyed.connect(lambda: handler.close())
         self.log_signal.connect(self.error_status, Qt.QueuedConnection)
+        QtWidgets.QApplication.instance().aboutToQuit.connect(self._close_gui_log_handlers)
 
     def _update_switch_button_text(self):
         if not hasattr(self, 'switch_view_button') or self.switch_view_button is None:
@@ -883,11 +921,16 @@ class CameraGui(QtWidgets.QMainWindow):
         self.register_key_action(Qt.Key_I, Qt.SHIFT,
                                  self.toggle_recording)
 
+    def _close_gui_log_handlers(self):
+        self.log_window.logger.close()
+        self._log_notify_handler.close()
+
     def close(self):
         '''
         Close the GUI.
         '''
         logging.info('closing GUI')
+        self._close_gui_log_handlers()
         for attr_name in ('main_camera', 'aux_camera'):
             cam = getattr(self, attr_name, None)
             if cam is None:

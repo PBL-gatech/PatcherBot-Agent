@@ -36,6 +36,7 @@ def read_scan_image(path, native=False, enhance=False):
     from PIL import Image
 
     path = resolve_scan_image(path)
+    original = path.stat()
     if path.suffix.lower() in (".tif", ".tiff"):
         with tifffile.TiffFile(path) as tif:
             page = tif.pages[0]
@@ -98,7 +99,11 @@ def read_scan_image(path, native=False, enhance=False):
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         gray[~valid] = 0
         pixels = np.repeat(gray[:, :, None], 3, axis=2)
+    identity = path.stat()
+    if (identity.st_size, identity.st_mtime_ns) != (original.st_size, original.st_mtime_ns):
+        raise ValueError("The scan changed while loading; reopen it.")
     return {"path": str(path), "width": width, "height": height,
+            "source_identity": (identity.st_size, identity.st_mtime_ns),
             "pixels": np.ascontiguousarray(pixels), "native": native,
             "enhanced": enhance}
 
@@ -170,6 +175,7 @@ class _AtlasWorker(QtCore.QThread):
                 raise ValueError("No atlas registration was returned.")
             overlay = self.registrar.render_overlay(result)
             data = {"result": result, "transform": transform,
+                    "source_size": (scan["width"], scan["height"]),
                     "rotation_degrees_clockwise": self.angle, **overlay}
             try:
                 current = source.stat()
@@ -457,10 +463,10 @@ class ScanViewerTab(ParamConfig):
     def set_global_overlay(self, corners_px, pipette_px=None, pipette_direction_px=None):
         """Display anchored positions in native scan pixels without moving the rig."""
         scene = self.view.scene()
-        for item in self._global_overlay_items:
-            scene.removeItem(item)
-        self._global_overlay_items = []
         if corners_px is None or self._item is None:
+            for item in self._global_overlay_items:
+                scene.removeItem(item)
+            self._global_overlay_items = []
             return
         corners = np.asarray(corners_px, dtype=float)
         if corners.shape != (4, 2) or not np.isfinite(corners).all():
@@ -468,25 +474,37 @@ class ScanViewerTab(ParamConfig):
         pen = QtGui.QPen(QtGui.QColor("#00e5ff"), 2)
         pen.setCosmetic(True)
         polygon = QtGui.QPolygonF([QtCore.QPointF(float(x), float(y)) for x, y in corners])
-        self._global_overlay_items.append(scene.addPolygon(polygon, pen))
+        if self._global_overlay_items:
+            self._global_overlay_items[0].setPolygon(polygon)
+        else:
+            self._global_overlay_items.append(scene.addPolygon(polygon, pen))
+        marker = self._global_overlay_items[1] if len(self._global_overlay_items) > 1 else None
+        expected_type = QtWidgets.QGraphicsEllipseItem if pipette_direction_px is None else QtWidgets.QGraphicsPolygonItem
+        if marker is not None and (pipette_px is None or not isinstance(marker, expected_type)):
+            scene.removeItem(marker)
+            self._global_overlay_items.pop()
+            marker = None
         if pipette_px is not None:
             point = np.asarray(pipette_px, dtype=float)
             if point.shape != (2,) or not np.isfinite(point).all():
                 raise ValueError("The pipette marker must contain two finite pixel coordinates.")
             if pipette_direction_px is None:
-                marker = QtWidgets.QGraphicsEllipseItem(-4, -4, 8, 8)
+                if marker is None:
+                    marker = QtWidgets.QGraphicsEllipseItem(-4, -4, 8, 8)
             else:
                 direction = np.asarray(pipette_direction_px, dtype=float)
                 if direction.shape != (2,) or not np.isfinite(direction).all() or np.linalg.norm(direction) == 0:
                     raise ValueError("Pipette direction must contain two finite nonzero pixel components.")
-                marker = QtWidgets.QGraphicsPolygonItem()
+                if marker is None:
+                    marker = QtWidgets.QGraphicsPolygonItem()
                 marker.setData(0, direction / np.linalg.norm(direction))
             marker.setPen(QtGui.QPen(QtGui.QColor("#ff0000"), 1))
             marker.setBrush(QtGui.QBrush(QtGui.QColor("#ff0000")))
             marker.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations)
             marker.setPos(float(point[0]), float(point[1]))
-            scene.addItem(marker)
-            self._global_overlay_items.append(marker)
+            if len(self._global_overlay_items) == 1:
+                scene.addItem(marker)
+                self._global_overlay_items.append(marker)
         self._orient_pipette_arrow()
         for item in self._global_overlay_items:
             item.setZValue(20)
@@ -670,6 +688,35 @@ class ScanViewerTab(ParamConfig):
             self._reader.wait()
 
 
+class _AtlasStorageWorker(QtCore.QThread):
+    loaded = QtCore.pyqtSignal(int, object)
+    failed = QtCore.pyqtSignal(int, str)
+
+    def __init__(self, token, path, identity, data, parent):
+        super().__init__(parent)
+        self.token, self.path, self.identity, self.data = token, path, identity, data
+
+    def run(self):
+        try:
+            from patcherbot.deepLearning.AtlasRegistrar import load_scan_registration, save_scan_registration
+            stat = Path(self.path).stat()
+            if self.identity is None or (stat.st_size, stat.st_mtime_ns) != tuple(self.identity):
+                raise ValueError("The source scan changed; reopen it before saving or reloading alignment.")
+            if self.data is None:
+                data = load_scan_registration(self.path)
+                if data is None:
+                    raise ValueError("No saved atlas alignment exists for this scan.")
+            else:
+                data = dict(self.data)
+                data["saved_path"] = str(save_scan_registration(
+                    self.path, data["result"], data["rotation_degrees_clockwise"],
+                    data["transform"], data["rgba"], data["ccf_bounds_um_ap_dv_ml"], data["source_size"]))
+                data.pop("save_error", None)
+            self.loaded.emit(self.token, data)
+        except Exception as error:
+            self.failed.emit(self.token, str(error))
+
+
 class LinkedScanViewerTab(ScanViewerTab):
     """Publish existing Atlas display state for the registered 3D scene."""
 
@@ -677,24 +724,136 @@ class LinkedScanViewerTab(ScanViewerTab):
 
     def __init__(self, *args, **kwargs):
         self._published_atlas = None
+        self._alignment_base = self._alignment_data = None
+        self._source_identity = None
+        self._storage_worker = None
         super().__init__(*args, **kwargs)
+        row = QtWidgets.QHBoxLayout()
+        for name, label, low, high, default, step in (
+                ("tx", "Atlas X px", -100000., 100000., 0., 1.),
+                ("ty", "Y px", -100000., 100000., 0., 1.),
+                ("angle", "Rotation", -180., 180., 0., .5),
+                ("scale", "Scale", .01, 100., 1., .01)):
+            row.addWidget(QtWidgets.QLabel(label))
+            control = QtWidgets.QDoubleSpinBox()
+            control.setRange(low, high)
+            control.setDecimals(3)
+            control.setSingleStep(step)
+            control.setValue(default)
+            control.valueChanged.connect(self._alignment_changed)
+            setattr(self, "atlas_" + name, control)
+            row.addWidget(control)
+        self.save_alignment_button = QtWidgets.QPushButton("Save alignment")
+        self.reload_alignment_button = QtWidgets.QPushButton("Reload alignment")
+        self.save_alignment_button.clicked.connect(self.save_alignment)
+        self.reload_alignment_button.clicked.connect(self.reload_alignment)
+        row.addWidget(self.save_alignment_button)
+        row.addWidget(self.reload_alignment_button)
+        self.layout().insertLayout(2, row)
+        self.atlas_position_status = QtWidgets.QLabel("Atlas position: load or save an alignment.")
+        self.atlas_position_status.setWordWrap(True)
+        self.layout().insertWidget(4, self.atlas_position_status)
+
+    def _display_image(self, token, result):
+        if token == self._token:
+            self._source_identity = result.get("source_identity")
+        super()._display_image(token, result)
 
     def _atlas_loaded(self, token, data):
         if token != self._atlas_generation:
             return
+        if data.get("saved_path"):
+            with QtCore.QSignalBlocker(self.rotation):
+                self.rotation.setValue(data["rotation_degrees_clockwise"])
+            self.view.setTransform(QtGui.QTransform().rotate(self.rotation.value()))
+            self._orient_pipette_arrow()
+        if self._atlas_overlay is not None:
+            self.view.scene().removeItem(self._atlas_overlay)
+            self._atlas_overlay = None
         super()._atlas_loaded(token, data)
+        self._alignment_base = np.asarray(data["transform"], dtype=float).copy()
+        self._alignment_data = dict(data)
+        for name, value in (("tx", 0), ("ty", 0), ("angle", 0), ("scale", 1)):
+            control = getattr(self, "atlas_" + name)
+            with QtCore.QSignalBlocker(control):
+                control.setValue(value)
+        self._publish_alignment()
+
+    def _publish_alignment(self):
+        data = self._alignment_data
         result = data["result"]
         self._published_atlas = {
             "rgba": np.asarray(data["rgba"]), "width": result.width,
-            "height": result.height, "scan_to_upright": np.asarray(data["transform"]),
+            "height": result.height, "scan_to_upright": self._scan_to_upright.copy(),
+            "transform": self._scan_to_upright.copy(), "result": result,
+            "source_size": data.get("source_size", (int(self.view.sceneRect().width()), int(self.view.sceneRect().height()))),
+            "scan_path": self.image_path,
             "visible": self.show_atlas.isChecked(),
         }
         self.atlasOverlayChanged.emit(self._published_atlas)
 
+    def _alignment_changed(self, _value=None):
+        if self._alignment_base is None:
+            return
+        center = np.array([self.view.sceneRect().width(), self.view.sceneRect().height()]) / 2
+        angle = np.deg2rad(self.atlas_angle.value())
+        linear = self.atlas_scale.value() * np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        adjustment = np.eye(3)
+        adjustment[:2, :2] = linear
+        adjustment[:2, 2] = center + [self.atlas_tx.value(), self.atlas_ty.value()] - linear @ center
+        self._scan_to_upright = self._alignment_base @ np.linalg.inv(adjustment)
+        result = self._atlas_result
+        height, width = self._alignment_data["rgba"].shape[:2]
+        matrix = np.linalg.inv(self._scan_to_upright) @ np.diag([result.width/width, result.height/height, 1.])
+        self._atlas_overlay.setTransform(QtGui.QTransform(matrix[0, 0], matrix[1, 0], matrix[0, 1],
+                                                          matrix[1, 1], matrix[0, 2], matrix[1, 2]))
+        self._atlas_storage_status = "Alignment changed; save to keep it. Original fit score is unchanged."
+        self._update_atlas_status()
+        self._publish_alignment()
+
+    def save_alignment(self):
+        if self._alignment_data is None:
+            return
+        data = dict(self._alignment_data, transform=self._scan_to_upright.copy(),
+                    source_size=self._published_atlas["source_size"],
+                    rotation_degrees_clockwise=self.rotation.value())
+        self._start_storage(data)
+
+    def reload_alignment(self):
+        self._start_storage(None)
+
+    def _start_storage(self, data):
+        if self.image_path is None or self._storage_worker is not None or self._atlas_worker is not None:
+            return
+        worker = self._storage_worker = _AtlasStorageWorker(
+            self._atlas_generation, self.image_path, self._source_identity, data, self)
+        worker.loaded.connect(self._atlas_loaded)
+        worker.failed.connect(self._atlas_failed)
+        worker.finished.connect(self._storage_finished)
+        self.save_alignment_button.setEnabled(False)
+        self.reload_alignment_button.setEnabled(False)
+        for name in ("tx", "ty", "angle", "scale"):
+            getattr(self, "atlas_" + name).setEnabled(False)
+        worker.start()
+
+    def _storage_finished(self):
+        worker, self._storage_worker = self._storage_worker, None
+        worker.deleteLater()
+        self.save_alignment_button.setEnabled(True)
+        self.reload_alignment_button.setEnabled(True)
+        for name in ("tx", "ty", "angle", "scale"):
+            getattr(self, "atlas_" + name).setEnabled(True)
+
     def _invalidate_atlas(self):
         super()._invalidate_atlas()
+        self._alignment_base = self._alignment_data = None
         self._published_atlas = None
         self.atlasOverlayChanged.emit(None)
+
+    def shutdown(self):
+        if self._storage_worker is not None:
+            self._storage_worker.wait()
+        super().shutdown()
 
     def _overlay_visibility(self, visible):
         super()._overlay_visibility(visible)

@@ -3,8 +3,11 @@
 All public conversion inputs/outputs are native pixels or microns. Only viewer
 snapshots convert to millimetres. No method calibrates, records, or moves hardware.
 """
+import copy
 import json
 from pathlib import Path
+from threading import Lock
+from types import MappingProxyType
 
 import numpy as np
 
@@ -16,6 +19,9 @@ class GlobalPositionHelper:
         self._named_anchors_um = {}
         self._pipette_home_anchor = None
         self._pending_pipette_positions = {}
+        self._atlas_alignments = {}
+        self._atlas_locator = None
+        self._atlas_locator_lock = Lock()
 
     @property
     def registrar(self):
@@ -90,6 +96,89 @@ class GlobalPositionHelper:
 
     def register_pair(self, image4, image40):
         return self.registrar.register_pair(image4, image40)
+
+    @staticmethod
+    def _atlas_role(role):
+        if role not in ("reference", "session"):
+            raise ValueError("Atlas role must be reference or session")
+        return role
+
+    @staticmethod
+    def _atlas_affine(value):
+        matrix = np.array(value, dtype=float, copy=True)
+        if (matrix.shape != (3, 3) or not np.isfinite(matrix).all()
+                or not np.allclose(matrix[2], [0, 0, 1])
+                or abs(np.linalg.det(matrix[:2, :2])) < 1e-12):
+            raise ValueError("Atlas conversion requires a finite invertible 3x3 XY affine")
+        matrix.setflags(write=False)
+        return matrix
+
+    def set_atlas_alignment(self, data, scan_pixel_to_global_um=None, role="reference"):
+        """Bind a saved atlas result to its whole stitched scan, without loading assets.
+
+        Atlas transforms map pixel edges; the global scan matrix maps pixel
+        centres. Bindings own their copied geometry and never modify the input.
+        Passing None removes only the selected role.
+        """
+        role = self._atlas_role(role)
+        if data is None:
+            self._atlas_alignments.pop(role, None)
+            return
+        result = copy.deepcopy(data["result"])
+        size = np.asarray(data["source_size"], dtype=float)
+        result_size = np.asarray([result.width, result.height], dtype=float)
+        if (size.shape != (2,) or not np.isfinite(size).all() or np.any(size < 1)
+                or np.any(size != np.floor(size)) or not np.isfinite(result_size).all()
+                or np.any(result_size < 1) or np.any(result_size != np.floor(result_size))
+                or not callable(getattr(result, "pixel_to_ccf_um", None))):
+            raise ValueError("Atlas alignment needs positive integer scan and atlas dimensions")
+        anchoring = np.asarray(result.anchoring, dtype=float)
+        if anchoring.shape != (9,) or not np.isfinite(anchoring).all():
+            raise ValueError("Atlas anchoring must contain nine finite coordinates")
+        scan_matrix = self._atlas_affine(self.registrar.reference_pixel_to_global_um
+            if scan_pixel_to_global_um is None else scan_pixel_to_global_um)
+        atlas_matrix = self._atlas_affine(data["transform"])
+        inverse = self._atlas_affine(np.linalg.inv(scan_matrix))
+        self._atlas_alignments[role] = MappingProxyType(dict(result=result,
+            source_size=tuple(size), transform=atlas_matrix, global_to_scan=inverse,
+            scan_path=str(data.get("scan_path", ""))))
+
+    def has_atlas_alignment(self, role="reference"):
+        return self._atlas_role(role) in self._atlas_alignments
+
+    def global_to_atlas(self, global_xy, role="reference", include_region=True):
+        """Map global XY microns to Allen CCF AP/DV/ML microns for one scan.
+
+        Region lookup lazily reuses AtlasRegistrar's annotation cache. Assets
+        must already exist locally: this conversion never downloads them.
+        """
+        role = self._atlas_role(role)
+        binding = self._atlas_alignments.get(role)
+        if binding is None:
+            raise RuntimeError(f"No atlas alignment is bound for {role}")
+        point = self._xy(global_xy)
+        if point.shape != (2,):
+            raise ValueError("Atlas lookup expects one global XY point")
+        scan = (binding["global_to_scan"] @ np.r_[point, 1.])[:2]
+        # Remove affine roundoff at exact pixel centres and image boundaries.
+        scan = np.where(np.isclose(scan, np.rint(scan), atol=1e-10, rtol=0), np.rint(scan), scan)
+        if np.any(scan < 0) or np.any(scan >= binding["source_size"]):
+            raise ValueError("Global point is outside the registered scan")
+        atlas = (binding["transform"] @ np.r_[scan + .5, 1.])[:2] - .5
+        atlas = np.where(np.isclose(atlas, np.rint(atlas), atol=1e-10, rtol=0), np.rint(atlas), atlas)
+        result = binding["result"]
+        if np.any(atlas < 0) or np.any(atlas >= [result.width, result.height]):
+            raise ValueError("Global point is outside the upright atlas image")
+        ccf = self._xyz(result.pixel_to_ccf_um(float(atlas[0]), float(atlas[1])))
+        answer = dict(ccf_um_ap_dv_ml=tuple(ccf), scan_pixel_xy=tuple(scan), atlas_pixel_xy=tuple(atlas))
+        if include_region:
+            with self._atlas_locator_lock:
+                if self._atlas_locator is None:
+                    from patcherbot.deepLearning.AtlasRegistrar import AtlasRegistrar
+                    self._atlas_locator = AtlasRegistrar(download_assets=False)
+                located = self._atlas_locator.locate(result, float(atlas[0]), float(atlas[1]))
+            answer["region_id"] = int(located["region_id"])
+        return answer
 
     @staticmethod
     def _xyz(value):
@@ -335,6 +424,47 @@ class GlobalPositionHelper:
                              + global_center - pixel_to_stage @ center)
         return transform
 
+    def cached_snapshot(self, scan_pixel_to_global_um=None, objective=40):
+        """Read published device caches only; never poll, infer, or log.
+
+        Each controller cache is copied once, including shared stage/scope XYZ.
+        These are latest readbacks, not synchronized camera-exposure positions.
+        """
+        caches = {}
+        def cached(device):
+            key = id(device)
+            if key not in caches:
+                value = getattr(device, "current_pos", None)
+                if value is None:
+                    raise RuntimeError("Viewer requires an existing device position cache")
+                caches[key] = self._xyz(value).copy()
+            return caches[key]
+        def coordinates(unit):
+            axes = np.asarray(unit.axes, dtype=int)
+            indices = axes if 0 in axes else axes - 1
+            return cached(unit.dev)[indices].copy()
+        stage = self.stage
+        stage_xy = coordinates(stage)[:2]
+        raw = coordinates(self.unit) if len(self.unit.axes) == 3 else None
+        reference_xy = None
+        if raw is not None and getattr(self.unit, "calibrated", False):
+            trusted = getattr(self.unit, "_trusted_tip_reference", None)
+            refresh = getattr(self.unit, "must_be_recalibrated", False)
+            anchor = trusted if refresh else (getattr(self.unit, "_tip_reference", None) or trusted)
+            if anchor is not None:
+                tip, tip_raw, tip_stage = anchor
+                reference_xy = (np.asarray(tip)[:2] + (np.asarray(self.unit.M) @ (raw - tip_raw))[:2]
+                                + np.asarray(stage.M)[:2, :2] @ (stage_xy - tip_stage))
+            elif not refresh:
+                reference_xy = ((np.asarray(self.unit.M) @ raw + self.unit.r0)[:2]
+                                + np.asarray(stage.M)[:2, :2] @ stage_xy + np.asarray(stage.r0)[:2])
+        result = self.snapshot(scan_pixel_to_global_um, objective=objective, stage_xy=stage_xy,
+                               pipette_position=raw, pipette_reference_xy=reference_xy)
+        scope = getattr(self.unit, "microscope", None)
+        if scope is not None:
+            result["microscope_z_um"] = float(cached(scope.dev)[int(scope.axis) - 1])
+        return result, stage_xy
+
     def snapshot(self, scan_pixel_to_global_um=None, objective=40, z_um=0., stage_xy=None,
                  pipette_position=None, pipette_reference_xy=None):
         """Viewer state in mm; defaults to the recorded reference, with no live read.
@@ -369,6 +499,8 @@ class GlobalPositionHelper:
         pipette_xy_source = None
         pipette_rig_xyz = None
         marker_direction = None
+        rig_rotation = np.eye(3)
+        angles = None
         if anchor is not None:
             raw = anchor["home"] if pipette_position is None else pipette_position
             pipette = self.pipette_to_global(raw) / 1000
@@ -385,7 +517,21 @@ class GlobalPositionHelper:
                 pipette_xy_source = "calibrated_reference_position"
             pipette = pipette.tolist()
             named_anchors["pipette"] = pipette
-            direction = anchor["direction"].tolist()
+            config = self.unit.config
+            angles = np.asarray([config.pipette_y_rotation, config.pipette_z_rotation], dtype=float)
+            direction = self.pipette_shaft_direction(*angles, config.pipette_zero_azimuth)
+            # Mounting angles describe physical rig axes; measured image/global
+            # coordinates retain their calibration. Align the complete rig view
+            # to the same signed safe-retreat convention used by the controller.
+            delta = float(getattr(config, "safe_position_delta_um", 0.))
+            elevation = np.deg2rad(angles[0])
+            retreat = delta * np.array([np.cos(elevation), 0., np.sin(elevation)])
+            measured = self.registrar.pixel_to_micron_matrix(40) @ np.asarray(self.unit.M)[:2] @ retreat
+            if np.linalg.norm(measured) > 1e-12 and np.linalg.norm(direction[:2]) > 1e-12:
+                angle = np.arctan2(direction[1], direction[0]) - np.arctan2(measured[1], measured[0])
+                c, s = np.cos(angle), np.sin(angle)
+                rig_rotation[:2, :2] = [[c, -s], [s, c]]
+            direction = direction.tolist()
             marker_direction = np.r_[self.registrar.pixel_to_micron_matrix(40)
                                       @ np.asarray(self.unit.M)[:2, 0], 0.].tolist()
         return dict(scan_pixel_to_world_mm=viewer_transform.tolist(),
@@ -395,7 +541,8 @@ class GlobalPositionHelper:
                     pipette_xyz_mm=pipette,
                     pipette_direction_xyz=direction,
                     pipette_marker_direction_xyz=marker_direction,
-                    pipette_rotation_yz_degrees=None if anchor is None else anchor["rotations"].tolist(),
+                    global_to_rig_rotation=rig_rotation.tolist(),
+                    pipette_rotation_yz_degrees=None if angles is None else angles.tolist(),
                     pipette_anchor_source=None if anchor is None else anchor["source"],
                     pipette_xy_source=pipette_xy_source,
                     pipette_rig_xyz_mm=pipette_rig_xyz,
