@@ -42,7 +42,7 @@
                 "class": "patcherbot.devices.manipulator.scientificaSerial.ScientificaSerialNoEncoder",
                 "params": {
                     "serial": {
-                        "port": "COM??",
+                        "port": "COM11",
                         "baudrate": 9600
                     },
                     "max_speed": 100000,
