@@ -9,7 +9,7 @@ from patcherbot.configs.Config import Config
 from patcherbot.gui.ParamConfig import ParamConfig
 
 
-REFERENCE_MANIFEST = Path(__file__).resolve().parents[2] / "utils" / "scan_reference.json"
+REFERENCE_MANIFEST = Path(__file__).resolve().parents[2] / "deepLearning" / "globalModel" / "reference" / "scan_reference.json"
 MAX_DECODE_BYTES = 512 * 1024 ** 2
 OVERVIEW_EDGE = 2048
 
@@ -263,6 +263,8 @@ class _ScanView(QtWidgets.QGraphicsView):
 class ScanViewerTab(ParamConfig):
     """Saved scan image tab using the existing configuration-tab framework."""
 
+    scanLoaded = QtCore.pyqtSignal(object)
+
     def __init__(self, config=None, parent=None):
         super().__init__(config if config is not None else Config(name="Scan"),
                          parent=parent, build_ui=False)
@@ -275,6 +277,7 @@ class ScanViewerTab(ParamConfig):
         self._native_requested = False
         self._overview_ratio = 1.0
         self._item = None
+        self._global_overlay_items = []
         self._fit_pending = False
         self._atlas_worker = None
         self._registrar = None
@@ -328,6 +331,10 @@ class ScanViewerTab(ParamConfig):
         self.show_atlas.setChecked(True)
         self.show_atlas.toggled.connect(self._overlay_visibility)
         mapping.addWidget(self.show_atlas)
+        self.show_global_overlay = QtWidgets.QCheckBox("Show 40x / pipette")
+        self.show_global_overlay.setChecked(True)
+        self.show_global_overlay.toggled.connect(self._global_overlay_visibility)
+        mapping.addWidget(self.show_global_overlay)
         mapping.addStretch()
         layout.addLayout(mapping)
         self.atlas_status = QtWidgets.QLabel("Rotate the scan upright, then map it.")
@@ -351,6 +358,7 @@ class ScanViewerTab(ParamConfig):
         self.load_image(REFERENCE_MANIFEST)
 
     def load_image(self, path):
+        self.set_global_overlay(None)
         self._invalidate_atlas()
         self._restore_atlas_pending = True
         with QtCore.QSignalBlocker(self.rotation):
@@ -443,6 +451,66 @@ class ScanViewerTab(ParamConfig):
             level += "; enhanced display"
         self.status.setText(f"{Path(self.image_path).name} — {result['width']} × "
                             f"{result['height']} — {level}")
+        metadata = dict(self.scan_metadata) if isinstance(self.scan_metadata, dict) else {}
+        self.scanLoaded.emit(dict(result, metadata=metadata))
+
+    def set_global_overlay(self, corners_px, pipette_px=None, pipette_direction_px=None):
+        """Display anchored positions in native scan pixels without moving the rig."""
+        scene = self.view.scene()
+        for item in self._global_overlay_items:
+            scene.removeItem(item)
+        self._global_overlay_items = []
+        if corners_px is None or self._item is None:
+            return
+        corners = np.asarray(corners_px, dtype=float)
+        if corners.shape != (4, 2) or not np.isfinite(corners).all():
+            raise ValueError("The 40x footprint must contain four finite pixel coordinates.")
+        pen = QtGui.QPen(QtGui.QColor("#00e5ff"), 2)
+        pen.setCosmetic(True)
+        polygon = QtGui.QPolygonF([QtCore.QPointF(float(x), float(y)) for x, y in corners])
+        self._global_overlay_items.append(scene.addPolygon(polygon, pen))
+        if pipette_px is not None:
+            point = np.asarray(pipette_px, dtype=float)
+            if point.shape != (2,) or not np.isfinite(point).all():
+                raise ValueError("The pipette marker must contain two finite pixel coordinates.")
+            if pipette_direction_px is None:
+                marker = QtWidgets.QGraphicsEllipseItem(-4, -4, 8, 8)
+            else:
+                direction = np.asarray(pipette_direction_px, dtype=float)
+                if direction.shape != (2,) or not np.isfinite(direction).all() or np.linalg.norm(direction) == 0:
+                    raise ValueError("Pipette direction must contain two finite nonzero pixel components.")
+                marker = QtWidgets.QGraphicsPolygonItem()
+                marker.setData(0, direction / np.linalg.norm(direction))
+            marker.setPen(QtGui.QPen(QtGui.QColor("#ff0000"), 1))
+            marker.setBrush(QtGui.QBrush(QtGui.QColor("#ff0000")))
+            marker.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations)
+            marker.setPos(float(point[0]), float(point[1]))
+            scene.addItem(marker)
+            self._global_overlay_items.append(marker)
+        self._orient_pipette_arrow()
+        for item in self._global_overlay_items:
+            item.setZValue(20)
+        self._global_overlay_visibility(self.show_global_overlay.isChecked())
+
+    def _orient_pipette_arrow(self):
+        """Keep the arrow screen-sized while its direction follows scan rotation."""
+        transform = self.view.transform()
+        origin = transform.map(QtCore.QPointF(0., 0.))
+        for marker in self._global_overlay_items:
+            direction = marker.data(0)
+            if direction is None:
+                continue
+            endpoint = transform.map(QtCore.QPointF(*direction)) - origin
+            direction = np.array([endpoint.x(), endpoint.y()])
+            direction /= np.linalg.norm(direction)
+            side = np.array([-direction[1], direction[0]])
+            marker.setPolygon(QtGui.QPolygonF([QtCore.QPointF(0., 0.),
+                QtCore.QPointF(*(-12 * direction + 5 * side)),
+                QtCore.QPointF(*(-12 * direction - 5 * side))]))
+
+    def _global_overlay_visibility(self, visible):
+        for item in self._global_overlay_items:
+            item.setVisible(visible)
 
     def _read_failed(self, token, error):
         if token == self._token:
@@ -489,6 +557,7 @@ class ScanViewerTab(ParamConfig):
         self._restore_atlas_pending = False
         self._invalidate_atlas()
         self.view.setTransform(QtGui.QTransform().rotate(angle))
+        self._orient_pipette_arrow()
         self.fit_image()
 
     def _overlay_visibility(self, visible):
@@ -599,3 +668,130 @@ class ScanViewerTab(ParamConfig):
             self._atlas_provider.shutdown()
         if self._reader is not None:
             self._reader.wait()
+
+
+class LinkedScanViewerTab(ScanViewerTab):
+    """Publish existing Atlas display state for the registered 3D scene."""
+
+    atlasOverlayChanged = QtCore.pyqtSignal(object)
+
+    def __init__(self, *args, **kwargs):
+        self._published_atlas = None
+        super().__init__(*args, **kwargs)
+
+    def _atlas_loaded(self, token, data):
+        if token != self._atlas_generation:
+            return
+        super()._atlas_loaded(token, data)
+        result = data["result"]
+        self._published_atlas = {
+            "rgba": np.asarray(data["rgba"]), "width": result.width,
+            "height": result.height, "scan_to_upright": np.asarray(data["transform"]),
+            "visible": self.show_atlas.isChecked(),
+        }
+        self.atlasOverlayChanged.emit(self._published_atlas)
+
+    def _invalidate_atlas(self):
+        super()._invalidate_atlas()
+        self._published_atlas = None
+        self.atlasOverlayChanged.emit(None)
+
+    def _overlay_visibility(self, visible):
+        super()._overlay_visibility(visible)
+        if self._published_atlas is not None:
+            self._published_atlas = dict(self._published_atlas, visible=bool(visible))
+            self.atlasOverlayChanged.emit(self._published_atlas)
+
+
+class ScanWorkspace(ParamConfig):
+    """Independent saved-bottom and session views using the existing scan widget."""
+
+    scanLoaded = QtCore.pyqtSignal(object)
+    layerLoaded = QtCore.pyqtSignal(str, object)
+    atlasOverlayChanged = QtCore.pyqtSignal(str, object)
+
+    def __init__(self, config=None, parent=None):
+        super().__init__(config if config is not None else Config(name="Scan"),
+                         parent=parent, build_ui=False)
+        self.tabs = QtWidgets.QTabWidget(self)
+        self.reference_view = LinkedScanViewerTab(parent=self.tabs)
+        self.session_view = LinkedScanViewerTab(parent=self.tabs)
+        self.tabs.addTab(self.reference_view, "Reference bottom")
+        self.tabs.addTab(self.session_view, "Session scan / Allen")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.tabs)
+        self._results = {}
+        self._atlas_results = {}
+        self.reference_view.scanLoaded.connect(lambda result: self._loaded("reference", result))
+        self.session_view.scanLoaded.connect(lambda result: self._loaded("session", result))
+        self.reference_view.atlasOverlayChanged.connect(lambda result: self._atlas_changed("reference", result))
+        self.session_view.atlasOverlayChanged.connect(lambda result: self._atlas_changed("session", result))
+        self.tabs.currentChanged.connect(self._selection_changed)
+        QtCore.QTimer.singleShot(0, self.load_default_reference)
+
+    @property
+    def active_view(self):
+        return self.tabs.currentWidget()
+
+    @property
+    def active_role(self):
+        return "reference" if self.active_view is self.reference_view else "session"
+
+    @property
+    def image_path(self):
+        return self.active_view.image_path
+
+    @property
+    def scan_metadata(self):
+        return self.active_view.scan_metadata
+
+    def load_default_reference(self):
+        """Load the saved map only; viewing never invokes a donor rebuild."""
+        try:
+            from patcherbot.deepLearning.ObjectiveRegistrar import ObjectiveRegistrar
+            source = ObjectiveRegistrar.shared().reference_image_path
+            if source is None or not Path(source).is_file():
+                raise ValueError("Saved reference image is unavailable")
+            self.reference_view.load_image(source)
+        except (ImportError, OSError, ValueError, KeyError) as error:
+            self.reference_view.status.setText("Reference could not be loaded: " + str(error))
+
+    def _loaded(self, role, result):
+        result = dict(result)
+        result["metadata"] = dict(result.get("metadata", {}), registration_role=role)
+        self._results[role] = result
+        self.layerLoaded.emit(role, result)
+        if role == self.active_role:
+            self.scanLoaded.emit(result)
+
+    def _atlas_changed(self, role, result):
+        self._atlas_results[role] = result
+        self.atlasOverlayChanged.emit(role, result)
+
+    def _selection_changed(self, index):
+        result = self._results.get(self.active_role)
+        if result is not None:
+            self.scanLoaded.emit(result)
+        else:
+            self.active_view.set_global_overlay(None)
+
+    def open_image(self):
+        self.tabs.setCurrentWidget(self.session_view)
+        self.session_view.open_image()
+
+    def load_image(self, path):
+        """Newly completed scans go to the session without replacing the bottom."""
+        self.tabs.setCurrentWidget(self.session_view)
+        self.session_view.load_image(path)
+
+    def open_reference(self):
+        self.tabs.setCurrentWidget(self.reference_view)
+        self.load_default_reference()
+
+    def set_global_overlay(self, corners_px, pipette_px=None, pipette_direction_px=None):
+        self.active_view.set_global_overlay(corners_px, pipette_px, pipette_direction_px)
+
+    def shutdown(self):
+        self.reference_view.shutdown()
+        self.session_view.shutdown()

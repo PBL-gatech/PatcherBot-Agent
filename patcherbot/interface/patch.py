@@ -680,6 +680,8 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.cleaning_bath_position = self.pipette_controller.calibrated_unit.position()
         self.current_autopatcher.calibrated_unit.config.bath_position = tuple(self.current_autopatcher.cleaning_bath_position)
         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position.copy()
+        self.pipette_controller.calibrated_unit.global_position_helper.set_pipette_cleaning_bath_position(
+            self.current_autopatcher.cleaning_bath_position)
         # save calibration to file
         self.pipette_controller.write_calibration()
 
@@ -694,6 +696,8 @@ class AutoPatchInterface(TaskInterface):
         z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.safe_stage_position = [x,y,z]
         self.current_autopatcher.calibrated_stage.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
+        self.pipette_controller.calibrated_unit.global_position_helper.set_pipette_safe_position(
+            self.current_autopatcher.safe_position)
         self.info(f'safe space position stored: {self.current_autopatcher.safe_position} and {self.current_autopatcher.safe_stage_position}')
 
     @command(category='Patch',
@@ -708,6 +712,10 @@ class AutoPatchInterface(TaskInterface):
         z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.home_stage_position = [x,y,z]
         self.current_autopatcher.calibrated_stage.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
+        self.pipette_controller.calibrated_unit.global_position_helper.set_pipette_home_anchor(
+            self.current_autopatcher.home_position, self.current_autopatcher.home_stage_position,
+            home_z_um=0.0, safe_pipette_xyz=self.current_autopatcher.safe_position,
+            cleaning_bath_xyz=self.current_autopatcher.cleaning_bath_position)
         self.info(f'safe home position stored: {self.current_autopatcher.home_position} and {self.current_autopatcher.home_stage_position}')
 
 
@@ -741,6 +749,12 @@ class AutoPatchInterface(TaskInterface):
         self.pipette_controller.home_stage_position = self.current_autopatcher.home_stage_position
         self.pipette_controller.safe_stage_position = self.current_autopatcher.safe_stage_position
         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position
+        # This workflow just centered/focused the tip: home defines the current
+        # 40x focal reference plane, independently of the stored cell floor.
+        self.pipette_controller.calibrated_unit.global_position_helper.set_pipette_home_anchor(
+            self.current_autopatcher.home_position, self.current_autopatcher.home_stage_position,
+            home_z_um=0.0, safe_pipette_xyz=self.current_autopatcher.safe_position,
+            cleaning_bath_xyz=self.current_autopatcher.cleaning_bath_position)
         self.pipette_controller.write_calibration()
 
     
@@ -809,6 +823,7 @@ class AutoPatchInterface(TaskInterface):
              description='clear all stored positions',
                 success_message='All positions cleared')
     def clear_positions(self) -> None:
+        self.pipette_controller.calibrated_unit.global_position_helper.clear_pipette_home_anchor()
         self.current_autopatcher.cleaning_bath_position = None
         self.current_autopatcher.rinsing_bath_position = None
         self.current_autopatcher.home_position = None

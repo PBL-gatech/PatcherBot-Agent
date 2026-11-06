@@ -92,3 +92,6 @@ experiments/Datasets/temp_dataset.hdf5
 experiments/Datasets/temp_dataset.hdf5
 /patcherbot/devices/amplifier/amplifier_utils
 /tmp
+/patcherbot/deepLearning/globalModel/chamber_cad
+/patcherbot/deepLearning/globalModel/40_objective_cad
+*.zip

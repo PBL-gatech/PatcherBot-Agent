@@ -13,7 +13,8 @@ from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 from patcherbot.controller import TaskController
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
-from patcherbot.gui.tabs.scan_viewer import ScanViewerTab
+from patcherbot.gui.tabs.scan_viewer import ScanWorkspace as ScanViewerTab
+from patcherbot.gui.tabs.global_viewer import RegisteredGlobalViewerTab as GlobalViewerTab
 from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
 from patcherbot.interface.patch import AutoPatchInterface
@@ -73,6 +74,25 @@ class PatchGui(ManipulatorGui):
         self.scan_window.finished.connect(lambda _: self.show_scan_button.setChecked(False))
         self.status_bar.insertPermanentWidget(2, self.show_scan_button)
         self.patch_interface.scan_stitched.connect(self.scan_viewer.load_image)
+        self.global_viewer = GlobalViewerTab(self.scan_viewer, parent=self)
+        self.global_window = QtWidgets.QDialog(self)
+        self.global_window.setWindowTitle('Global System View')
+        self.global_window.setWindowFlag(QtCore.Qt.WindowMaximizeButtonHint, True)
+        self.global_window.setSizeGripEnabled(True)
+        self.global_window.resize(1200, 900)
+        global_layout = QtWidgets.QVBoxLayout(self.global_window)
+        global_layout.addWidget(self.global_viewer)
+        self.show_global_button = QtWidgets.QPushButton('Show 3D')
+        self.show_global_button.setCheckable(True)
+        self.show_global_button.toggled.connect(self.global_window.setVisible)
+        self.show_global_button.toggled.connect(
+            lambda checked: self.show_global_button.setText('Hide 3D' if checked else 'Show 3D'))
+        self.show_global_button.clicked.connect(
+            lambda checked: self.global_window.raise_() if checked else None)
+        self.show_global_button.clicked.connect(
+            lambda checked: self.global_window.activateWindow() if checked else None)
+        self.global_window.finished.connect(lambda _: self.show_global_button.setChecked(False))
+        self.status_bar.insertPermanentWidget(3, self.show_global_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
         self._cell_list_timer.timeout.connect(self._refresh_cell_list_window)
@@ -125,6 +145,8 @@ class PatchGui(ManipulatorGui):
         self._recording_indicator_timer.start(100)
 
     def close(self):
+        self.global_viewer._stop_refresh()
+        self.global_window.close()
         self.scan_viewer.shutdown()
         self._display_position_timer.stop()
         self.pipette_interface.display_positions = None

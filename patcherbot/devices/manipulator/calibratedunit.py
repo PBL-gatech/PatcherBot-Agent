@@ -96,6 +96,15 @@ class CalibratedUnit(ManipulatorUnit):
         )
 
 
+    @property
+    def global_position_helper(self):
+        """Image-anchor coordinate access without changing device calibration."""
+        if ("_global_position_helper" not in self.__dict__
+                or self._global_position_helper.unit is not self):
+            from .helpers.GlobalPositionHelper import GlobalPositionHelper
+            self._global_position_helper = GlobalPositionHelper(self)
+        return self._global_position_helper
+
     def detect_pipette(self, observer=None):
         evidence = None
         if observer is None:

@@ -36,6 +36,10 @@ class CalibrationConfig(Config):
     scan_speed = NumberWithUnit(10000, unit="um/s",
                                 doc="stage speed used while scanning",
                                 bounds=(1, 100000))
+    objective_donor_4x = param.String(default="",
+                                    doc="4x source recording folder for rebuilding objective registration")
+    objective_donor_40x = param.String(default="",
+                                     doc="40x source recording folder for rebuilding objective registration")
 
     stage_x_axis_flip = Boolean(False,
                                 doc="Flip the x axis of the stage")
@@ -47,6 +51,12 @@ class CalibrationConfig(Config):
     pipette_y_rotation = NumberWithUnit(25, unit="degrees",
                                 doc="Rotation of the pipette in the xz plane (degrees)",
                                 bounds=(-90, 90))
+    chamber_z_rotation = NumberWithUnit(180, unit="degrees",
+                                doc="Viewer-only chamber mounting rotation around Z; does not change stage calibration",
+                                bounds=(-360, 360))
+    pipette_zero_azimuth = NumberWithUnit(-90, unit="degrees",
+                                doc="Viewer-only pipette mounting azimuth at zero Z rotation: 0 = +X, -90 = -Y; does not change hardware calibration",
+                                bounds=(-360, 360))
     clean_move_order = param.List(default=["y", "x", "z"],
                                 item_type=str,
                                 doc="Axis command order for cleaning approach; safe-space return uses reverse order")

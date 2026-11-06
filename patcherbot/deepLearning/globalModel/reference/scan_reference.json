@@ -1,0 +1,245 @@
+{
+  "schema_version": 2,
+  "kind": "scan_reference",
+  "objective": "4x",
+  "status": "candidate_reference_requires_experiment_anchor",
+  "image_path": "scan_reference.tif",
+  "image_sha256": "25d1094ada762fea7afe7a0334a4381cc94ac14764605f85e0d81f5f8783889f",
+  "annotated_image_path": "scan_reference_center.png",
+  "annotated_image_sha256": "bc8e4cf166e0dde0342836a38fff26dd0a2696e10ac597135f7b0d756c55068a",
+  "method_path": "scan_reference_method.md",
+  "source_image_path": "../../../../experiments/Data/scan_stitch_data/2026_11_04-16_20/scan_0dfb27068131414ebdda79ba4a4a7165_downsampled_2x.tif",
+  "full_resolution_source_image_path": "../../../../experiments/Data/scan_stitch_data/2026_11_04-16_20/scan_0dfb27068131414ebdda79ba4a4a7165.tif",
+  "metadata_path": "../../../../experiments/Data/scan_stitch_data/2026_11_04-16_20/scan_0dfb27068131414ebdda79ba4a4a7165_meta.json",
+  "raw_recording_path": "../../../../experiments/Data/rig_recorder_data/2026_11_04-16_20",
+  "movement_recording_sha256": "1e3a549a949fd3c299314f4b0de31f3e529b93e7abf9896b4b6b76f6cc2aa474",
+  "image_shape_yxc": [
+    5279,
+    4380,
+    3
+  ],
+  "center": {
+    "rim": "second / middle visible rim",
+    "image_xy_pixels": [
+      1952.0,
+      1888.0
+    ],
+    "radius_pixels": 1974.0,
+    "stage_xy_um": [
+      28133.09269495447,
+      -49116.88706701439
+    ],
+    "display_stage_xy_um": [
+      28130,
+      -49120
+    ],
+    "stage_coordinate_meaning": "Recorded stage XY that would place the estimated rim center at the 1280x1280 camera frame center.",
+    "boundary_selection_uncertainty_pixels_approx": 40,
+    "stage_uncertainty_um_approx": 150,
+    "uncertainty_note": "Practical rim-selection estimate, not a confidence interval or validated absolute accuracy bound; calibration and later drift are additional uncertainties."
+  },
+  "rim_fit": {
+    "nominal_quarter_scale_circle_xy_radius_pixels": [
+      1951.4574593911027,
+      1887.8400716265505,
+      1973.4775922992824
+    ],
+    "exact_resize_center_xy_pixels": [
+      1952.9574593911027,
+      1890.4146584754665
+    ],
+    "adopted_center_note": "Retains previously reported rounded nominal-factor-four center (1952,1888). Exact analysis-resize pixel-center correction differs by less than 3 pixels, within the working rim uncertainty.",
+    "candidate_points": 561,
+    "retained_points": 481,
+    "median_retained_residual_pixels": 11.1928
+  },
+  "coordinate_transform": {
+    "calibration_M": [
+      [
+        -0.5649701635002611,
+        0.04735024136849305
+      ],
+      [
+        -0.04735024136849305,
+        -0.5649701635002611
+      ]
+    ],
+    "calibration_r0": [
+      0.0,
+      0.0
+    ],
+    "flip_x": true,
+    "flip_y": true,
+    "output_origin_xy_pixels": [
+      14956.099346020466,
+      -29553.733676988733
+    ],
+    "pixel_scale_xy": [
+      1.0,
+      1.0
+    ],
+    "full_shape_yxc": [
+      10557,
+      8759,
+      3
+    ],
+    "downsampled_shape_yxc": [
+      5279,
+      4380,
+      3
+    ],
+    "camera_center_xy_pixels": [
+      640,
+      640
+    ],
+    "center_full_image_xy_pixels": [
+      3904.0542237442924,
+      3776.142261792006
+    ],
+    "center_world_xy_pixels": [
+      18860.15356976476,
+      -25777.591415196726
+    ],
+    "microns_per_downsampled_pixel_approx": 3.5276422969524517,
+    "covering_frame_stage_estimate_range_um": [
+      1.1479755550863047,
+      0.9398157569230534
+    ]
+  },
+  "local_frame_observations": [
+    {
+      "original_frame_index": 1342,
+      "frame_name": "5688_1793827415.858921.webp",
+      "frame_timestamp": 1793827415.858921,
+      "stage_xy_um": [
+        27755.5,
+        -50109.0
+      ],
+      "tile_origin_world_pixels": [
+        18054.099346020466,
+        -26995.733676988733
+      ],
+      "feature_pixels_from_frame_top_left": [
+        806.0542237442933,
+        1218.142261792007
+      ],
+      "feather_weight_unnormalized": 29317.21375240951,
+      "estimated_center_stage_xy_um": [
+        28132.532640646426,
+        -49117.28448748101
+      ]
+    },
+    {
+      "original_frame_index": 1362,
+      "frame_name": "5712_1793827416.944594.webp",
+      "frame_timestamp": 1793827416.944594,
+      "stage_xy_um": [
+        29042.5,
+        -50217.2
+      ],
+      "tile_origin_world_pixels": [
+        18786.099346020466,
+        -26995.733676988733
+      ],
+      "feature_pixels_from_frame_top_left": [
+        74.05422374429327,
+        1218.142261792007
+      ],
+      "feather_weight_unnormalized": 4642.684523778621,
+      "estimated_center_stage_xy_um": [
+        28132.926306475943,
+        -49117.6538011811
+      ]
+    },
+    {
+      "original_frame_index": 1585,
+      "frame_name": "5969_1793827428.267262.webp",
+      "frame_timestamp": 1793827428.267262,
+      "stage_xy_um": [
+        28932.0,
+        -49453.3
+      ],
+      "tile_origin_world_pixels": [
+        18687.099346020466,
+        -26569.733676988733
+      ],
+      "feature_pixels_from_frame_top_left": [
+        173.05422374429327,
+        792.142261792007
+      ],
+      "feather_weight_unnormalized": 84913.69992143885,
+      "estimated_center_stage_xy_um": [
+        28133.680616201513,
+        -49117.10016224711
+      ]
+    },
+    {
+      "original_frame_index": 1607,
+      "frame_name": "5993_1793827429.321579.webp",
+      "frame_timestamp": 1793827429.321579,
+      "stage_xy_um": [
+        27645.2,
+        -49345.2
+      ],
+      "tile_origin_world_pixels": [
+        17955.099346020466,
+        -26569.733676988733
+      ],
+      "feature_pixels_from_frame_top_left": [
+        905.0542237442933,
+        792.142261792007
+      ],
+      "feather_weight_unnormalized": 182920.19835474927,
+      "estimated_center_stage_xy_um": [
+        28133.486950371996,
+        -49116.83084854701
+      ]
+    },
+    {
+      "original_frame_index": 1789,
+      "frame_name": "6205_1793827438.728443.webp",
+      "frame_timestamp": 1793827438.728443,
+      "stage_xy_um": [
+        27810.0,
+        -48613.8
+      ],
+      "tile_origin_world_pixels": [
+        18014.099346020466,
+        -26148.733676988733
+      ],
+      "feature_pixels_from_frame_top_left": [
+        846.0542237442933,
+        371.14226179200705
+      ],
+      "feather_weight_unnormalized": 161489.56267088692,
+      "estimated_center_stage_xy_um": [
+        28132.56769812019,
+        -49116.713985424176
+      ]
+    },
+    {
+      "original_frame_index": 1810,
+      "frame_name": "6229_1793827439.781185.webp",
+      "frame_timestamp": 1793827439.781185,
+      "stage_xy_um": [
+        29117.7,
+        -48723.7
+      ],
+      "tile_origin_world_pixels": [
+        18758.099346020466,
+        -26148.733676988733
+      ],
+      "feature_pixels_from_frame_top_left": [
+        102.05422374429327,
+        371.14226179200705
+      ],
+      "feather_weight_unnormalized": 38350.83191142086,
+      "estimated_center_stage_xy_um": [
+        28132.569456832163,
+        -49117.01558295541
+      ]
+    }
+  ],
+  "frame_catalog_note": "Saved stitch metadata contains 4890 frames; 4926 were present during later analysis. The six relevant frame indices are 1342 through 1810; all preceding files were written over 154 seconds before scan end, before the late writes. The local observations are stored explicitly to avoid dependence on future catalog ordering.",
+  "notes": "User selected this image as the new reference. Original recording and source TIFFs remain unchanged. No runtime wiring, calibration matrix, or hardware position was changed."
+}

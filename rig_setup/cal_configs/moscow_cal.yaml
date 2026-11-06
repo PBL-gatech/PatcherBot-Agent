@@ -1,5 +1,7 @@
 position_update: 1000
 record_overlays: false
+objective_donor_4x: experiments/Data/rig_recorder_data/2026_11_04-16_20
+objective_donor_40x: experiments/Data/rig_recorder_data/2026_11_05-11_47
 autofocus_dist: 15
 stage_diag_move: 500
 frame_lag: 4
@@ -9,6 +11,8 @@ stage_x_axis_flip: false
 stage_y_axis_flip: true
 pipette_z_rotation: -60.75
 pipette_y_rotation: 25
+chamber_z_rotation: 180
+pipette_zero_azimuth: -90
 clean_move_order:
 - y
 - x
