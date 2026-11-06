@@ -2,12 +2,11 @@ native_zero: 2033
 native_per_mbar: 2.9263
 reader_offset: 515.975015533536
 reader_scale: 0.327021812354884
-pipette_detector_model: PipetteDetectorNetX.pt
-pipette_detector_model_version: R02
-pipette_brain_slice_model: PipetteDetectorNetX.pt
-pipette_brain_slice_model_version: R02
+pipette_detector_type: yolo1
+pipette_detector_model: BoRigCombo.pt
+pipette_detector_device: auto
 pipette_focuser_model: regression_model2.onnx
-use_ai_features: false
+use_ai_features: true
 position_update: 1000
 autofocus_dist: 50
 stage_diag_move: 500
