@@ -92,9 +92,9 @@
                         "cmd": "Dev1/ao0"
                     },
                     {
-                        "read": "Dev1/ai_PIPETTE1_READ_TODO",
-                        "resp": "Dev1/ai_PIPETTE1_RESP_TODO",
-                        "cmd": "Dev1/ao_PIPETTE1_CMD_TODO"
+                        "read": "Dev1/ai21",
+                        "resp": "Dev1/ai23",
+                        "cmd": "Dev1/ao3"
                     }
                 ]
             }
