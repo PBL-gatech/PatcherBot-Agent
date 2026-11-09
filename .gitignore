@@ -97,3 +97,4 @@ experiments/Datasets/temp_dataset.hdf5
 !/tests/test_parallel_protocol_selection.py
 !/tests/test_norwich_pipette_detector.py
 !/tests/test_shared_amplifier.py
+!/tests/test_nidaq_signal_path.py

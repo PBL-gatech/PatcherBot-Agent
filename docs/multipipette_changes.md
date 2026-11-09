@@ -95,8 +95,8 @@ rig JSON (pipette_count, per-pipette device lists, one DAQ)
     - Its single NiDAQ uses the legacy params, so pipette 1 shares pipette 0's channels.
   - **`Norwich_multiple_rig.json`** (new): `pipette_count: 2`.
     - The second manipulator port is `"COM??"`.
-    - `pressure` is `[SerialPressureController, FakePressureController]`; one `MultiClampChannel` with `channel: 1` is shared by both pipettes.
-    - The NiDAQ `channels` list retains separate read, response, and command mappings for both pipettes. Sharing the amplifier handle sends amplifier commands to channel 1 only.
+    - `pressure` is `[SerialPressureController, FakePressureController]`; one `MultiClampAmplifier` serves headstages 1 and 2 independently.
+    - NiDAQ command-monitor inputs (`read`) are `Dev1/ai19` and `Dev1/ai23`; response inputs (`resp`) are `Dev1/ai17` and `Dev1/ai21`. Command outputs remain `Dev1/ao0` and `Dev1/ao3`.
   - **`setup_test_rig.json`:** reformatted; still a single NiDAQ.
 - **Check:**
   - per-pipette lists line up by index across slots (entry *i* of each slot belongs to the same physical pipette);
@@ -162,6 +162,7 @@ rig JSON (pipette_count, per-pipette device lists, one DAQ)
   - [`_readAnalogInput`](../patcherbot/devices/amplifier/DAQ.py#L1672) maps rows by the running task's channel order and raises if a requested channel isn't in it;
   - [`_sendSquareWave`](../patcherbot/devices/amplifier/DAQ.py#L1690) has the same three cases as before, with every write going through `_ao_block`.
 - **Protocol task setup:** `_setupAcquisitionCurrent` / `_setupAcquisitionVoltage` take `keys=`. `_sendSquareWaveCurrent` accepts a per-pipette `{key: amplitude or None}`.
+- **Single-pipette lifecycle retained:** the voltage membrane test uses the running test-pulse stream while parking its background reader. Current steps and voltage sweeps pause that stream and use dedicated protocol tasks. The live ephys graphs retain the last background packet during protocol capture. Separate headstages prepare concurrently; each MultiClamp DLL selection/call remains locked. Each protocol capture uses one AI/AO task pair containing both selected headstages.
 - **Protocols** (all `@multi_pipette_protocol`, results stored per pipette under `for_pipette`, per-pipette return shapes unchanged):
   - **[`getLeakSubtraction`](../patcherbot/devices/amplifier/DAQ.py#L1848) / [`getVoltageClampSweep`](../patcherbot/devices/amplifier/DAQ.py#L2029):** one continuous AI + non-regenerating AO pair for all keys. Each queued train is the same wave on every pipette. Each `_read_train` is split per pipette, and `_squareWaveProcessor` still runs per pipette with its result discarded (as in baseline).
   - **[`getDataFromCurrentProtocol`](../patcherbot/devices/amplifier/DAQ.py#L2160):** a per-pipette step list from [`_current_pulses`](../patcherbot/devices/amplifier/DAQ.py#L2133), using each pipette's `voltageMembraneCapacitance`.

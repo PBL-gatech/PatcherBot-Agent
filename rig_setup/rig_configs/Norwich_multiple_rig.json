@@ -87,13 +87,13 @@
             "params": {
                 "channels": [
                     {
-                        "read": "Dev1/ai17",
-                        "resp": "Dev1/ai19",
+                        "read": "Dev1/ai19",
+                        "resp": "Dev1/ai17",
                         "cmd": "Dev1/ao0"
                     },
                     {
-                        "read": "Dev1/ai21",
-                        "resp": "Dev1/ai23",
+                        "read": "Dev1/ai23",
+                        "resp": "Dev1/ai21",
                         "cmd": "Dev1/ao3"
                     }
                 ]

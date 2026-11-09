@@ -199,8 +199,10 @@ class AutoPatchInterface(TaskInterface):
         return reference
 
     def _run_amplifier_workers(self, selected, operation):
-        """Run ``operation(key)`` for each pipette: pipettes on the same physical
-        amplifier one after another, separate amplifiers in parallel.
+        """Run separate headstages in parallel, sharing a channel sequentially.
+
+        MultiClamp's existing DLL lock protects each channel-selection/call;
+        settling waits for different headstages can overlap.
 
         Returns ``({key: result}, {key: exception})`` for the pipettes that
         succeeded / failed; one failure doesn't stop the others.
@@ -208,9 +210,7 @@ class AutoPatchInterface(TaskInterface):
         groups = {}
         for key in selected:
             amplifier = self.autopatchers[key].amplifier
-            # Headstages of one MultiClamp share it (see MultiClampAmplifier).
-            physical = getattr(amplifier, "shared_amplifier", amplifier)
-            groups.setdefault(id(physical), []).append(key)
+            groups.setdefault(id(amplifier), []).append(key)
         if not groups:
             return {}, {}
 

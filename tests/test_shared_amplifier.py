@@ -29,8 +29,8 @@ class SharedAmplifierTests(unittest.TestCase):
         # pipette_0 -> MultiClamp channel 1, pipette_1 -> channel 2
         self.assertEqual(amplifier["params"], {"channels": [1, 2]})
         self.assertEqual(self.config["devices"]["daq"]["params"]["channels"], [
-            {"read": "Dev1/ai17", "resp": "Dev1/ai19", "cmd": "Dev1/ao0"},
-            {"read": "Dev1/ai21", "resp": "Dev1/ai23", "cmd": "Dev1/ao3"},
+            {"read": "Dev1/ai19", "resp": "Dev1/ai17", "cmd": "Dev1/ao0"},
+            {"read": "Dev1/ai23", "resp": "Dev1/ai21", "cmd": "Dev1/ao3"},
         ])
 
     def test_build_instantiates_one_amplifier_for_one_or_two_pipettes(self):
@@ -62,7 +62,7 @@ class SharedAmplifierTests(unittest.TestCase):
                         {"pipette_0": devices["amplifier"]}, key
                     ), selected_amplifier)
                 if count == 2:
-                    self.assertEqual(devices["daq"].channel_map["pipette_1"].resp, "Dev1/ai23")
+                    self.assertEqual(devices["daq"].channel_map["pipette_1"].resp, "Dev1/ai21")
 
     def test_per_pipette_amplifier_lists_still_validate(self):
         config = deepcopy(self.config)
@@ -130,26 +130,22 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
         self.assertEqual(result, dict(zip(keys, keys)))
         self.assertEqual(errors, {})
 
-    def test_headstages_of_one_multiclamp_run_one_after_another(self):
+    def test_headstages_of_one_multiclamp_overlap_their_settling_waits(self):
         multiclamp = object()
         keys = ["pipette_0", "pipette_1"]
         runner = SimpleNamespace(autopatchers={
             key: SimpleNamespace(amplifier=SimpleNamespace(shared_amplifier=multiclamp))
             for key in keys
         })
-        active = []
-        overlaps = []
+        both_running = threading.Barrier(2)
 
         def operation(key):
-            active.append(key)
-            overlaps.append(len(active))
-            threading.Event().wait(0.05)
-            active.remove(key)
+            both_running.wait(timeout=2)
             return key
 
-        result, _ = AutoPatchInterface._run_amplifier_workers(runner, keys, operation)
+        result, errors = AutoPatchInterface._run_amplifier_workers(runner, keys, operation)
         self.assertEqual(result, dict(zip(keys, keys)))
-        self.assertEqual(max(overlaps), 1)
+        self.assertEqual(errors, {})
 
     def test_one_failure_does_not_stop_the_other_pipette(self):
         keys = ["pipette_0", "pipette_1"]
