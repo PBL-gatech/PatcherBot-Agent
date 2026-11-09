@@ -122,18 +122,23 @@ def main():
     # graphs.location_on_the_screen()
     graphs.show()
 
-    protocol_graph_types = (
+    # One window per protocol showing every pipette (pipette 0 blue,
+    # pipette 1 orange); data files are still written per pipette.
+    combined_graph_types = (
         CurrentProtocolGraph,
         VoltageProtocolGraph,
         LeakSubtractionGraph,
         HoldingProtocolGraph,
-        OptogeneticStimProtocolGraph,
-        OptogeneticWavelengthProtocolGraph,
     )
     protocol_graphs = [
+        graph_type(pipette_graph_interfaces, recording_state_manager)
+        for graph_type in combined_graph_types
+    ]
+    # Optogenetic windows stay one per pipette.
+    protocol_graphs += [
         graph_type(graph_interface, recording_state_manager, pipette_name=pipette_name)
         for pipette_name, graph_interface in pipette_graph_interfaces.items()
-        for graph_type in protocol_graph_types
+        for graph_type in (OptogeneticStimProtocolGraph, OptogeneticWavelengthProtocolGraph)
     ]
 
 

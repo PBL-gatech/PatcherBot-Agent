@@ -6,7 +6,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot
 from matplotlib.colors import LinearSegmentedColormap, to_hex
 
 
-from pyqtgraph import PlotWidget
+from pyqtgraph import PlotWidget, PlotDataItem, mkPen
 
 
 
@@ -39,24 +39,79 @@ __all__ = [
 ]
 
 
+# Colour family per pipette, by position in the window: pipette 0 keeps the
+# original Prussian-blue gradient, pipette 1 is the same gradient in orange.
+PIPETTE_GRADIENTS = [
+    ("#003153", "#ffffff"),   # pipette 0: blue
+    ("#b34700", "#ffffff"),   # pipette 1: orange
+]
+
+
+def _pipette_shades(position, fractions):
+    """Hex colours along pipette ``position``'s gradient (0 = darkest, 1 = white)."""
+    start, end = PIPETTE_GRADIENTS[position % len(PIPETTE_GRADIENTS)]
+    cmap = LinearSegmentedColormap.from_list("", [start, end])
+    return [to_hex(cmap(float(fraction))) for fraction in fractions]
+
+
+class _PipetteTraces:
+    """One pipette's data source, logger and plotted items in a protocol window."""
+
+    def __init__(self, position, label, graph_interface, ephys_filename, recording_state_manager):
+        self.position = position
+        self.label = label
+        self.graph_interface = graph_interface
+        self.pipette_slug = "" if label is None else "_" + "_".join(label.strip().lower().split())
+        self.file_prefix = self.pipette_slug.lstrip("_") + "_" if self.pipette_slug else ""
+        # Files stay per pipette, named as before: <protocol>_pipette_<n>.
+        self.ephys_logger = EPhysLogger(ephys_filename=f"{ephys_filename}{self.pipette_slug}",
+                                        recording_state_manager=recording_state_manager)
+        self.items = []
+        self.latest = None
+
+    @property
+    def base_color(self):
+        return PIPETTE_GRADIENTS[self.position % len(PIPETTE_GRADIENTS)][0]
+
+
 class ProtocolGraph(QWidget):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+    def __init__(self, graph_interface: "GraphInterface | dict[str, GraphInterface]",
+                 recording_state_manager: RecordingStateManager,
                  window_title: str, y_label: str, y_unit: str,
                  x_label: str, x_unit: str, ephys_filename: str,
                  pipette_name: str | None = None):
+        """
+        :param graph_interface: one GraphInterface, or an ordered
+            ``{label: GraphInterface}`` dict to draw several pipettes in this
+            window (first entry blue, second orange, with a legend).
+        """
         super().__init__()
         self.recording_state_manager = recording_state_manager
-        self.graph_interface= graph_interface
-        self.pipette_name = pipette_name
-        self.pipette_slug = (
-            "" if pipette_name is None else
-            "_" + "_".join(pipette_name.strip().lower().split())
-        )
-        self.file_prefix = self.pipette_slug.lstrip("_") + "_" if self.pipette_slug else ""
+        if isinstance(graph_interface, dict):
+            if not graph_interface:
+                raise ValueError("ProtocolGraph needs at least one GraphInterface")
+            interfaces = dict(graph_interface)
+        else:
+            interfaces = {pipette_name: graph_interface}
+        self.pipettes = [
+            _PipetteTraces(position, label, interface, ephys_filename, recording_state_manager)
+            for position, (label, interface) in enumerate(interfaces.items())
+        ]
+        self.multi_pipette = len(self.pipettes) > 1
+
+        # Single-pipette attributes (used by the optogenetic windows).
+        first = self.pipettes[0]
+        self.graph_interface = first.graph_interface
+        self.ephys_logger = first.ephys_logger
+        self.pipette_name = first.label
+        self.pipette_slug = first.pipette_slug
+        self.file_prefix = first.file_prefix
 
         # Set window title and layout
-        display_title = f"{window_title} - {pipette_name}" if pipette_name else window_title
-        self.setWindowTitle(display_title)
+        self.window_title = window_title
+        if not self.multi_pipette and first.label:
+            window_title = f"{window_title} - {first.label}"
+        self.setWindowTitle(window_title)
         layout = QVBoxLayout()
 
         # Create and configure the PlotWidget
@@ -68,7 +123,16 @@ class ProtocolGraph(QWidget):
         self.plotWidget.setLabel("bottom", x_label, units=x_unit)
         layout.addWidget(self.plotWidget)
 
+        # Colour key: one entry per pipette (not tied to any plotted trace).
+        self.legend = None
+        self._legend_samples = {}
+        if self.multi_pipette:
+            self.legend = self.plotWidget.addLegend()
+            for pipette in self.pipettes:
+                self._set_legend_label(pipette, pipette.label)
+
         self.latestDisplayedData = None
+        self._drawn_sample = None
 
         self.setLayout(layout)
         self.raise_()
@@ -86,15 +150,45 @@ class ProtocolGraph(QWidget):
         if not self.updateTimer.isActive():
             logging.info(f"{window_title} Timer not active")
 
-        # Initialize the ephys logger with a protocol-specific filename
-        self.ephys_logger = EPhysLogger(ephys_filename=f"{ephys_filename}{self.pipette_slug}",
-                                        recording_state_manager=self.recording_state_manager)
+    # ----- helpers shared by the protocol windows -----
+    def _set_legend_label(self, pipette, text):
+        if self.legend is None:
+            return
+        old = self._legend_samples.pop(pipette.position, None)
+        if old is not None:
+            self.legend.removeItem(old)
+        sample = PlotDataItem(pen=mkPen(pipette.base_color, width=3))
+        self.legend.addItem(sample, text)
+        self._legend_samples[pipette.position] = sample
+
+    def _start_pipette_update(self, pipette):
+        """Show the window, clear the previous run, and drop this pipette's old traces."""
+        if self.isHidden():
+            self.setHidden(False)
+        index = self.recording_state_manager.sample_number
+        if index != self._drawn_sample:
+            # A new protocol run: start from an empty plot.
+            self.plotWidget.clear()
+            for other in self.pipettes:
+                other.items = []
+            self._drawn_sample = index
+        for item in pipette.items:
+            self.plotWidget.removeItem(item)
+        pipette.items = []
+        return index
+
+    def _plot(self, pipette, x, y, pen):
+        item = self.plotWidget.plot(x, y, pen=pen)
+        pipette.items.append(item)
+        return item
 
     def update_plot(self):
         """This method should be overridden by subclasses."""
         raise NotImplementedError("Subclasses must implement update_plot()")
+
+
 class CurrentProtocolGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+    def __init__(self, graph_interface, recording_state_manager: RecordingStateManager,
                  *, pipette_name: str | None = None):
         super().__init__(graph_interface, recording_state_manager,
                          window_title="Current Protocol",
@@ -103,51 +197,44 @@ class CurrentProtocolGraph(ProtocolGraph):
                          ephys_filename="CurrentProtocol", pipette_name=pipette_name)
 
     def update_plot(self):
-        # Check if new data exists and if it’s different from what was last displayed
-        if self.graph_interface.daq.current_protocol_data is None or self.latestDisplayedData == self.graph_interface.daq.current_protocol_data:
-            return
+        finished = []
+        for pipette in self.pipettes:
+            daq = pipette.graph_interface.daq
+            data = daq.current_protocol_data
+            # Nothing new, or the same list we already drew.
+            if data is None or data is pipette.latest:
+                continue
+            index = self._start_pipette_update(pipette)
 
-        index = self.recording_state_manager.sample_number
+            # One shade of this pipette's colour per current step.
+            color_range = daq.pulseRange
+            color_range = 1 if color_range is None else int(color_range)
+            logging.debug(f"color range: {color_range}")
+            colors = _pipette_shades(pipette.position,
+                                     [i / color_range for i in range(max(color_range, len(data)))])
+            pulses = daq.pulses
 
-        # If the window was hidden, show it again
-        if self.isHidden():
-            self.setHidden(False)
+            for i, graph in enumerate(data):
+                timeData, respData, readData = graph[0], graph[1], graph[2]
+                self._plot(pipette, timeData, respData, colors[i])
+                pulse = str(pulses[i]) if pulses is not None else str(i)
+                pipette.ephys_logger.write_ephys_data(index, timeData, readData, respData,
+                                                      colors[i] + "_" + pulse)
+            pipette.latest = data
+            if len(data) >= color_range:
+                finished.append(pipette)
 
-        # Create a gradient color list based on the number of pulses
-        color_range = self.graph_interface.daq.pulseRange
-        if color_range is None:
-            color_range = 1
-        else:
-            color_range = int(color_range)
-        logging.debug(f"color range: {color_range}")
-        start_color = "#003153"  # Prussian Blue
-        end_color = "#ffffff"    # White
-        cmap = LinearSegmentedColormap.from_list("", [start_color, end_color])
-        colors = [to_hex(cmap(float(i) / color_range)) for i in range(color_range)]
-        pulses = self.graph_interface.daq.pulses
+        # Save after every pipette is drawn, so each saved plot shows them all.
+        for pipette in finished:
+            pipette.ephys_logger.save_ephys_plot(self.recording_state_manager.sample_number,
+                                                 self.plotWidget)
+            pipette.graph_interface.daq.current_protocol_data = None  # Reset after saving
+            pipette.latest = None
+        self.latestDisplayedData = [pipette.latest for pipette in self.pipettes]
 
-        self.plotWidget.clear()
 
-        # Plot each pulse and log its data
-        for i, graph in enumerate(self.graph_interface.daq.current_protocol_data):
-            timeData = graph[0]
-            respData = graph[1]
-            readData = graph[2]
-            self.plotWidget.plot(timeData, respData, pen=colors[i])
-
-            pulse = str(pulses[i]) if pulses is not None else str(i)
-            marker = colors[i] + "_" + pulse
-            self.ephys_logger.write_ephys_data(index, timeData, readData, respData, marker)
-            if i == color_range - 1:
-                # logging.info("Saving current ephys plot")
-                self.ephys_logger.save_ephys_plot(index, self.plotWidget)
-                self.graph_interface.daq.current_protocol_data = None  # Reset after saving
-
-        # Update latestDisplayedData (make a copy if data is still present)
-        self.latestDisplayedData = (self.graph_interface.daq.current_protocol_data.copy() 
-                                    if self.graph_interface.daq.current_protocol_data is not None else None)
 class VoltageProtocolGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+    def __init__(self, graph_interface, recording_state_manager: RecordingStateManager,
                  *, pipette_name: str | None = None):
         super().__init__(graph_interface, recording_state_manager,
                          window_title="Voltage Protocol (Membrane Test)",
@@ -156,95 +243,92 @@ class VoltageProtocolGraph(ProtocolGraph):
                          ephys_filename="VoltageProtocol", pipette_name=pipette_name)
 
     def update_plot(self):
-        daq = self.graph_interface.daq
-        sweeps_raw = daq.voltage_protocol_data
-        membrane_test = daq.voltage_membrane_test
-        if isinstance(sweeps_raw, np.ndarray):
-            sweeps = []
-        elif sweeps_raw is None:
-            sweeps = []
-        else:
-            sweeps = list(sweeps_raw)
+        drawn = []
+        for pipette in self.pipettes:
+            daq = pipette.graph_interface.daq
+            sweeps_raw = daq.voltage_protocol_data
+            membrane_test = daq.voltage_membrane_test
+            if isinstance(sweeps_raw, np.ndarray) or sweeps_raw is None:
+                sweeps = []
+            else:
+                sweeps = list(sweeps_raw)
+            if membrane_test is None and not sweeps:
+                continue
+            index = self._start_pipette_update(pipette)
 
-        has_sweeps = len(sweeps) > 0
-        if membrane_test is None and not has_sweeps:
-            return
+            # Render sweep traces with this pipette's gradient
+            if sweeps:
+                sweep_count = len(sweeps)
+                colors = _pipette_shades(pipette.position,
+                                         [i / max(sweep_count - 1, 1) for i in range(sweep_count)])
+                steps = getattr(daq, "vclamp_steps", None)
+                for i, trace in enumerate(sweeps):
+                    timeData, respData, commandData = trace
+                    self._plot(pipette, timeData, respData, colors[i])
+                    if steps is not None and i < len(steps):
+                        step_label = f"{int(round(steps[i] * 1e3))}mV"
+                    else:
+                        step_label = f"step{i}"
+                    pipette.ephys_logger.write_ephys_data(
+                        index, timeData, commandData, respData, f"{colors[i]}_{step_label}")
+                drawn.append((pipette, None))
 
+            # Plot and export membrane-test data
+            if membrane_test is not None:
+                # Single pipette: the original colour (black); several: the
+                # pipette's own darkest shade so traces can be told apart.
+                mem_color = (pipette.base_color if self.multi_pipette
+                             else membrane_test.get("color", "#000000"))
+                timeData = membrane_test.get("time")
+                respData = membrane_test.get("response")
+                commandData = membrane_test.get("command")
+                step_mV = membrane_test.get("step_mV")
+                sweep_hold_mV = membrane_test.get("sweep_hold_mV", membrane_test.get("hold_mV"))
+                fit_ok = membrane_test.get("fit_ok", True)
+
+                if timeData is not None and respData is not None:
+                    self._plot(pipette, timeData, respData, mem_color)
+                self._show_fit_state(pipette, fit_ok)
+
+                step_label = f"{int(round(step_mV))}mV" if step_mV is not None else "step"
+                hold_label = f"{int(round(sweep_hold_mV))}mV" if sweep_hold_mV is not None else "hold"
+                if timeData is not None and respData is not None:
+                    pipette.ephys_logger.write_ephys_data(
+                        index, timeData, commandData, respData, mem_color,
+                        filename_override=(f"{pipette.file_prefix}MembraneTest_{index}_"
+                                           f"{mem_color}_{hold_label}_{step_label}"))
+                    drawn.append((pipette, f"{pipette.file_prefix}MembraneTest_{index}"))
+
+            # Reset DAQ buffers after plotting
+            daq.voltage_protocol_data = None
+            daq.voltage_membrane_test = None
+            daq.vclamp_steps = None
+            daq.vclamp_hold_value = None
+
+        # Save after every pipette is drawn, so each saved plot shows them all.
         index = self.recording_state_manager.sample_number
+        for pipette, filename_override in drawn:
+            if filename_override is None:
+                pipette.ephys_logger.save_ephys_plot(index, self.plotWidget)
+            else:
+                pipette.ephys_logger.save_ephys_plot(index, self.plotWidget,
+                                                     filename_override=filename_override)
+        if drawn:
+            self.latestDisplayedData = len(drawn)
 
-        if self.isHidden():
-            self.setHidden(False)
+    def _show_fit_state(self, pipette, fit_ok):
+        """Mark a membrane test whose capacitance fit failed (the trace shown
+        is then the first, unfit one)."""
+        suffix = "" if fit_ok else " (no Cm fit)"
+        if self.multi_pipette:
+            self._set_legend_label(pipette, f"{pipette.label}{suffix}")
+        else:
+            base = self.window_title + (f" - {pipette.label}" if pipette.label else "")
+            self.setWindowTitle(base + suffix)
 
-        self.plotWidget.clear()
 
-        # Render sweep traces with gradient colours
-        if has_sweeps:
-            sweep_count = len(sweeps)
-            start_color = "#003153"
-            end_color = "#ffffff"
-            cmap = LinearSegmentedColormap.from_list("", [start_color, end_color])
-            colors = [to_hex(cmap(float(i) / max(sweep_count - 1, 1))) for i in range(sweep_count)]
-            steps = getattr(daq, "vclamp_steps", None)
-
-            for i, trace in enumerate(sweeps):
-                timeData, respData, commandData = trace
-                color = colors[i]
-                self.plotWidget.plot(timeData, respData, pen=color)
-
-                if steps is not None and i < len(steps):
-                    step_label = f"{int(round(steps[i] * 1e3))}mV"
-                else:
-                    step_label = f"step{i}"
-                marker = f"{color}_{step_label}"
-
-                self.ephys_logger.write_ephys_data(
-                    index,
-                    timeData,
-                    commandData,
-                    respData,
-                    marker
-                )
-            self.ephys_logger.save_ephys_plot(index, self.plotWidget)
-
-        # Plot and export membrane-test data
-        if membrane_test is not None:
-            mem_color = membrane_test.get("color", "#000000")
-            timeData = membrane_test.get("time")
-            respData = membrane_test.get("response")
-            commandData = membrane_test.get("command")
-            step_mV = membrane_test.get("step_mV")
-            sweep_hold_mV = membrane_test.get("sweep_hold_mV", membrane_test.get("hold_mV"))
-
-            if timeData is not None and respData is not None:
-                self.plotWidget.plot(timeData, respData, pen=mem_color)
-
-            step_label = f"{int(round(step_mV))}mV" if step_mV is not None else "step"
-            hold_label = f"{int(round(sweep_hold_mV))}mV" if sweep_hold_mV is not None else "hold"
-
-            filename_override = f"{self.file_prefix}MembraneTest_{index}_{mem_color}_{hold_label}_{step_label}"
-            if timeData is not None and respData is not None:
-                self.ephys_logger.write_ephys_data(
-                    index,
-                    timeData,
-                    commandData,
-                    respData,
-                    mem_color,
-                    filename_override=filename_override
-                )
-                self.ephys_logger.save_ephys_plot(
-                    index,
-                    self.plotWidget,
-                    filename_override=f"{self.file_prefix}MembraneTest_{index}"
-                )
-
-        # Reset DAQ buffers after plotting
-        self.latestDisplayedData = {"membrane": membrane_test is not None, "sweeps": len(sweeps)}
-        daq.voltage_protocol_data = None
-        daq.voltage_membrane_test = None
-        daq.vclamp_steps = None
-        daq.vclamp_hold_value = None
 class LeakSubtractionGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+    def __init__(self, graph_interface, recording_state_manager: RecordingStateManager,
                  *, pipette_name: str | None = None):
         super().__init__(
             graph_interface,
@@ -259,58 +343,46 @@ class LeakSubtractionGraph(ProtocolGraph):
         )
 
     def update_plot(self):
-        daq = self.graph_interface.daq
-        leak_data = getattr(daq, "leak_subtraction_data", None)
-        if leak_data is None or len(leak_data) == 0:
-            return
+        drawn = []
+        for pipette in self.pipettes:
+            daq = pipette.graph_interface.daq
+            leak_data = getattr(daq, "leak_subtraction_data", None)
+            if leak_data is None or len(leak_data) == 0:
+                continue
+            index = self._start_pipette_update(pipette)
+
+            sweep_count = len(leak_data)
+            colors = _pipette_shades(pipette.position,
+                                     [i / max(sweep_count - 1, 1) for i in range(sweep_count)])
+            for i, entry in enumerate(leak_data):
+                timeData = entry["time"]
+                respData = entry["response"]
+                commandData = entry["command"]
+                self._plot(pipette, timeData, respData, colors[i])
+
+                target_voltage = entry.get("target_voltage")
+                if target_voltage is not None:
+                    step_label = f"{int(round(target_voltage * 1e3))}mV"
+                else:
+                    step_label = f"step{i}"
+                pipette.ephys_logger.write_ephys_data(
+                    index, timeData, commandData, respData, f"{colors[i]}_{step_label}")
+
+            drawn.append(pipette)
+            daq.leak_subtraction_data = None
+            daq.leak_subtraction_meta = None
 
         index = self.recording_state_manager.sample_number
+        for pipette in drawn:
+            pipette.ephys_logger.save_ephys_plot(
+                index, self.plotWidget,
+                filename_override=f"{pipette.file_prefix}LeakSubtraction_{index}")
+        if drawn:
+            self.latestDisplayedData = len(drawn)
 
-        if self.isHidden():
-            self.setHidden(False)
 
-        self.plotWidget.clear()
-
-        sweep_count = len(leak_data)
-        start_color = "#003153"
-        end_color = "#ffffff"
-        cmap = LinearSegmentedColormap.from_list("", [start_color, end_color])
-        colors = [to_hex(cmap(float(i) / max(sweep_count - 1, 1))) for i in range(sweep_count)]
-
-        for i, entry in enumerate(leak_data):
-            timeData = entry["time"]
-            respData = entry["response"]
-            commandData = entry["command"]
-            color = colors[i]
-
-            self.plotWidget.plot(timeData, respData, pen=color)
-
-            target_voltage = entry.get("target_voltage")
-            if target_voltage is not None:
-                step_label = f"{int(round(target_voltage * 1e3))}mV"
-            else:
-                step_label = f"step{i}"
-
-            marker = f"{color}_{step_label}"
-            self.ephys_logger.write_ephys_data(
-                index,
-                timeData,
-                commandData,
-                respData,
-                marker
-            )
-
-        self.ephys_logger.save_ephys_plot(
-            index,
-            self.plotWidget,
-            filename_override=f"{self.file_prefix}LeakSubtraction_{index}"
-        )
-
-        self.latestDisplayedData = sweep_count
-        daq.leak_subtraction_data = None
-        daq.leak_subtraction_meta = None
 class HoldingProtocolGraph(ProtocolGraph):
-    def __init__(self, graph_interface: GraphInterface, recording_state_manager: RecordingStateManager,
+    def __init__(self, graph_interface, recording_state_manager: RecordingStateManager,
                  *, pipette_name: str | None = None):
         super().__init__(graph_interface, recording_state_manager,
                          window_title="Holding Protocol (E/I PSC Test)",
@@ -319,28 +391,25 @@ class HoldingProtocolGraph(ProtocolGraph):
                          ephys_filename="HoldingProtocol", pipette_name=pipette_name)
 
     def update_plot(self):
-        if self.graph_interface.daq.holding_protocol_data is None:
-            return
+        drawn = []
+        for pipette in self.pipettes:
+            daq = pipette.graph_interface.daq
+            data = daq.holding_protocol_data
+            if data is None:
+                continue
+            index = self._start_pipette_update(pipette)
+            # Single pipette: black as before; several: the pipette's colour.
+            color = pipette.base_color if self.multi_pipette else "k"
+            self._plot(pipette, data[0, :], data[1, :], color)
+            pipette.ephys_logger.write_ephys_data(index, data[0, :], data[1, :], data[2, :], color)
+            drawn.append(pipette)
+            self.latestDisplayedData = data.copy()
+            daq.holding_protocol_data = None  # Reset after plotting
 
         index = self.recording_state_manager.sample_number
+        for pipette in drawn:
+            pipette.ephys_logger.save_ephys_plot(index, self.plotWidget)
 
-        if self.isHidden():
-            self.setHidden(False)
-
-        self.plotWidget.clear()
-        colors = ["k"]
-        self.plotWidget.plot(self.graph_interface.daq.holding_protocol_data[0, :],
-                             self.graph_interface.daq.holding_protocol_data[1, :],
-                             pen=colors[0])
-        self.ephys_logger.write_ephys_data(index,
-                                           self.graph_interface.daq.holding_protocol_data[0, :],
-                                           self.graph_interface.daq.holding_protocol_data[1, :],
-                                           self.graph_interface.daq.holding_protocol_data[2, :],
-                                           colors[0])
-        self.ephys_logger.save_ephys_plot(index, self.plotWidget)
-
-        self.latestDisplayedData = self.graph_interface.daq.holding_protocol_data.copy()
-        self.graph_interface.daq.holding_protocol_data = None  # Reset after plotting
 
 class OptogeneticBaseGraph(ProtocolGraph):
     def __init__(

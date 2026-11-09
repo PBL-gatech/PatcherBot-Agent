@@ -122,12 +122,20 @@ class AutoPatchInterface(TaskInterface):
 
     @staticmethod
     def _device_for_pipette(devices, key):
-        """The device for pipette ``key``; a single device serves every pipette."""
+        """The device for pipette ``key``; a single device serves every pipette.
+
+        A device that serves several pipettes through separate parts (e.g. a
+        MultiClampAmplifier with one channel per headstage) provides
+        ``for_pipette(key)``, which returns this pipette's part.
+        """
         if key in devices:
-            return devices[key]
-        if len(devices) == 1:
-            return next(iter(devices.values()))
-        raise KeyError(f"No device configured for {key}; available: {list(devices)}")
+            device = devices[key]
+        elif len(devices) == 1:
+            device = next(iter(devices.values()))
+        else:
+            raise KeyError(f"No device configured for {key}; available: {list(devices)}")
+        for_pipette = getattr(device, "for_pipette", None)
+        return for_pipette(key) if callable(for_pipette) else device
 
     def set_protocol_selection(self, pipette_key, protocol_name, selected):
         self.protocol_selections[pipette_key][protocol_name] = bool(selected)
@@ -191,22 +199,37 @@ class AutoPatchInterface(TaskInterface):
         return reference
 
     def _run_amplifier_workers(self, selected, operation):
-        """Run shared-amplifier operations in order, separate amplifiers in parallel."""
+        """Run ``operation(key)`` for each pipette: pipettes on the same physical
+        amplifier one after another, separate amplifiers in parallel.
+
+        Returns ``({key: result}, {key: exception})`` for the pipettes that
+        succeeded / failed; one failure doesn't stop the others.
+        """
         groups = {}
         for key in selected:
             amplifier = self.autopatchers[key].amplifier
-            groups.setdefault(id(amplifier), []).append(key)
+            # Headstages of one MultiClamp share it (see MultiClampAmplifier).
+            physical = getattr(amplifier, "shared_amplifier", amplifier)
+            groups.setdefault(id(physical), []).append(key)
         if not groups:
-            return {}
+            return {}, {}
 
         def run_group(keys):
-            return {key: operation(key) for key in keys}
+            outcome = {}
+            for key in keys:
+                try:
+                    outcome[key] = (True, operation(key))
+                except Exception as exc:
+                    outcome[key] = (False, exc)
+            return outcome
 
-        results = {}
+        outcomes = {}
         with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-            for group_results in executor.map(run_group, groups.values()):
-                results.update(group_results)
-        return {key: results[key] for key in selected}
+            for group_outcome in executor.map(run_group, groups.values()):
+                outcomes.update(group_outcome)
+        results = {key: outcomes[key][1] for key in selected if outcomes[key][0]}
+        errors = {key: outcomes[key][1] for key in selected if not outcomes[key][0]}
+        return results, errors
 
     def _run_protocol_matrix(self, task_controller):
         """Run each selected protocol for all its pipettes at once:
@@ -222,9 +245,12 @@ class AutoPatchInterface(TaskInterface):
             if not selected:
                 continue
 
-            prepared = self._run_amplifier_workers(
+            prepared, prepare_errors = self._run_amplifier_workers(
                 selected, lambda key: self._prepare_protocol(key, protocol_name))
             try:
+                if prepare_errors:
+                    key, error = next(iter(prepare_errors.items()))
+                    raise RuntimeError(f"{protocol_name}: amplifier setup failed for {key}") from error
                 steps = self._merge_protocol_steps(protocol_name, prepared)
                 daq_keys = list(dict.fromkeys(
                     self.protocol_daQs[key].pipette_key for key in selected))
@@ -233,8 +259,12 @@ class AutoPatchInterface(TaskInterface):
                         time.sleep(0.25)
                     getattr(self.daq, method_name)(pipettes=daq_keys, **kwargs)
             finally:
-                self._run_amplifier_workers(
+                # Every selected pipette is cleaned up, including one whose
+                # setup failed partway (it may already be in the protocol's mode).
+                _, finish_errors = self._run_amplifier_workers(
                     selected, lambda key: self._finish_protocol(key, protocol_name))
+                for key, error in finish_errors.items():
+                    self.error(f"{protocol_name}: amplifier cleanup failed for {key}: {error}")
 
 
     @blocking_command(category='Calibration', description='Save X origin',

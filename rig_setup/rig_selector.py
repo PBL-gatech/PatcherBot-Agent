@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
 )
 
+from patcherbot.utils.pipette_keys import pipette_key_for, pipette_label
 from .rig_config import (
     DEVICE_SLOTS,
     SHARED_DEVICE_SLOTS,
@@ -419,7 +420,7 @@ class RigBuilderDialog(QDialog):
 
         if slot in PIPETTE_DEVICE_SLOTS:
             title = (
-                f"Pipette {instance_index + 1} - "
+                f"{pipette_label(pipette_key_for(instance_index))} - "
                 f"{slot.replace('_', ' ').title()}"
             )
         else:
@@ -497,7 +498,7 @@ class RigBuilderDialog(QDialog):
                     if not opt or "class" not in opt:
                         raise RigConfigError(
                             f"No class selected for '{slot}' "
-                            f"on Pipette {pipette_index + 1}."
+                            f"on {pipette_label(pipette_key_for(pipette_index))}."
                         )
 
                     specs.append(
@@ -650,7 +651,7 @@ class RigBuilderDialog(QDialog):
         for pipette_index in range(self.pipette_count):
 
             group = QGroupBox(
-                f"Pipette {pipette_index + 1}"
+                pipette_label(pipette_key_for(pipette_index))
             )
 
             group_layout = QVBoxLayout(group)

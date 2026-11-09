@@ -817,6 +817,9 @@ class DAQ(TaskController):
             "step_mV": self._membrane_step_mV(command_data[1], amplitude),
             "hold_mV": membrane_hold * 1e3 if membrane_hold is not None else None,
             "color": "#000000",
+            # False when no trace gave an acceptable Cm fit and this is the
+            # first (unfit) trace, shown so the window isn't empty.
+            "fit_ok": bool(capacitances),
         }
         self.voltageMembraneCapacitance = (
             float(np.mean(capacitances)) if capacitances else None
@@ -1948,19 +1951,21 @@ class NiDAQ(DAQ):
         exp_samples = num_samples
         total_duration = exp_samples / samplesPerSec
 
-        self._setupAcquisitionVoltage(
-            wave_freq=wave_freq,
-            samplesPerSec=samplesPerSec,
-            dutyCycle=dutyCycle,
-            recordingTime=pulse_recording_time,
-            exp_samples=exp_samples,
-            buffer_trains=buffer_trains,
-            keys=keys,
-        )
-
         pulses_by_target = {key: [[] for _ in range(targets.size)] for key in keys}
 
         try:
+            # Task setup is inside the try so a rejected setup still restores
+            # the live stream (finally below).
+            self._setupAcquisitionVoltage(
+                wave_freq=wave_freq,
+                samplesPerSec=samplesPerSec,
+                dutyCycle=dutyCycle,
+                recordingTime=pulse_recording_time,
+                exp_samples=exp_samples,
+                buffer_trains=buffer_trains,
+                keys=keys,
+            )
+
             first_amp = leak_plan[0]["ao_amplitude"]
             self._sendSquareWaveVoltage(
                 wave_freq=wave_freq,
@@ -2079,17 +2084,19 @@ class NiDAQ(DAQ):
         )
         exp_samples = num_samples
         total_duration = num_samples / samplesPerSec
-        self._setupAcquisitionVoltage(
-            wave_freq=wave_freq,
-            samplesPerSec=samplesPerSec,
-            dutyCycle=dutyCycle,
-            recordingTime=recordingTime,
-            exp_samples=exp_samples,
-            buffer_trains=buffer_trains,
-            keys=keys,
-        )
 
         try:
+            # Inside the try so a rejected setup still restores the live stream.
+            self._setupAcquisitionVoltage(
+                wave_freq=wave_freq,
+                samplesPerSec=samplesPerSec,
+                dutyCycle=dutyCycle,
+                recordingTime=recordingTime,
+                exp_samples=exp_samples,
+                buffer_trains=buffer_trains,
+                keys=keys,
+            )
+
             if targets.size:
                 first_amp = (targets[0] - holding_voltage) / self.V_CLAMP_VOLT_PER_VOLT
                 self._sendSquareWaveVoltage(
@@ -2193,7 +2200,8 @@ class NiDAQ(DAQ):
                     pulses_by_key[key] = self._current_pulses(
                         custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
                 except RuntimeError as exc:
-                    self.error(f"{key}: {exc}; skipping its I-clamp protocol.")
+                    self.error(f"{key}: {exc} (run the voltage protocol first, or use "
+                               "custom current steps); skipping its I-clamp protocol.")
                     continue
                 self.info(f"{key} I-clamp pulses (pA): {pulses_by_key[key]}")
         active = [key for key in keys if key in pulses_by_key]
@@ -2205,47 +2213,52 @@ class NiDAQ(DAQ):
                           if train_index < len(pulses_by_key[key]) else None)
                     for key in active}
 
-        if active:
-            train_count = max(len(pulses_by_key[key]) for key in active)
+        if not active:
+            raise RuntimeError(
+                "I-clamp protocol: no pipette has a usable membrane capacitance; "
+                "run the voltage protocol first, or use custom current steps.")
 
-            # ─ 2. park background stream ─
-            self.pause_acquisition()
-            self._close_tasks()
+        train_count = max(len(pulses_by_key[key]) for key in active)
 
-            # ─ 3. start dedicated tasks (prime buffer = 0 pA test) ──────────
+        # ─ 2. park background stream ─
+        self.pause_acquisition()
+        self._close_tasks()
+
+        try:
+            # ─ 3. start dedicated tasks (prime buffer = 0 pA test) ──────
+            # Inside the try so a rejected setup still restores the live stream.
             self._setupAcquisitionCurrent(recordingTime * 1e3, dutyCycle=dutyCycle,
                                           keys=active)   # expects ms
 
-            try:
-                # a) queue FIRST real pulses so they become train #2
-                self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
-                                            dutyCycle, amplitudes(0), recordingTime)
+            # a) queue FIRST real pulses so they become train #2
+            self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
+                                        dutyCycle, amplitudes(0), recordingTime)
 
-                # b) wait 1 s and discard train #1 (0 pA prime)
-                self._read_train(exp_samples)
+            # b) wait 1 s and discard train #1 (0 pA prime)
+            self._read_train(exp_samples)
 
-                for idx in range(train_count):
-                    # ─── queue the NEXT pulses *before* waiting ──────────
-                    if idx + 1 < train_count:
-                        self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
-                                                    dutyCycle, amplitudes(idx + 1),
-                                                    recordingTime)
+            for idx in range(train_count):
+                # ─── queue the NEXT pulses *before* waiting ──────────
+                if idx + 1 < train_count:
+                    self._sendSquareWaveCurrent(wave_freq, samplesPerSec,
+                                                dutyCycle, amplitudes(idx + 1),
+                                                recordingTime)
 
-                    self.info(f"Waiting for I-clamp train {idx + 1}/{train_count}…")
+                self.info(f"Waiting for I-clamp train {idx + 1}/{train_count}…")
 
-                    # ─── read it: one read for every pipette ────────────
-                    trains = self._read_train(exp_samples)
-                    tvec = np.linspace(0, fullRecTime, exp_samples, dtype=float)
-                    for key, raw in trains.items():
-                        if idx < len(pulses_by_key[key]):
-                            traces[key].append([tvec, raw[1] / self.C_CLAMP_VOLT_PER_VOLT, raw[0]])
+                # ─── read it: one read for every pipette ────────────
+                trains = self._read_train(exp_samples)
+                tvec = np.linspace(0, fullRecTime, exp_samples, dtype=float)
+                for key, raw in trains.items():
+                    if idx < len(pulses_by_key[key]):
+                        traces[key].append([tvec, raw[1] / self.C_CLAMP_VOLT_PER_VOLT, raw[0]])
 
-                    self.info(f"Captured I-clamp train {idx + 1}/{train_count}")
+                self.info(f"Captured I-clamp train {idx + 1}/{train_count}")
 
-            finally:
-                # ─ 4. restore background stream ────────────────────────
-                self._close_tasks()
-                self.resume_acquisition()
+        finally:
+            # ─ 4. restore background stream ────────────────────────
+            self._close_tasks()
+            self.resume_acquisition()
 
         results = {}
         for key in keys:

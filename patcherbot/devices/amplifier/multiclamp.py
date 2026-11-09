@@ -21,12 +21,13 @@ import ctypes
 import functools
 import logging
 import os
+import threading
 import traceback
 import time
 
 from patcherbot.devices.amplifier.amplifier import Amplifier
 
-__all__ = ['MultiClampChannel', 'MultiClamp']
+__all__ = ['MultiClampChannel', 'MultiClamp', 'MultiClampAmplifier']
 
 NO_ERROR = 6000
 
@@ -77,9 +78,12 @@ def needs_select(func):
     """
     @functools.wraps(func)
     def wrapper(self, *args, **kwds):
-        if not MultiClampChannel.selected_device == self:
-            self.select_amplifier()
-        return func(self, *args, **kwds)
+        # One lock for every channel: selecting a channel and then talking to
+        # it must not interleave with another thread doing the same.
+        with MultiClampChannel.dll_lock:
+            if not MultiClampChannel.selected_device == self:
+                self.select_amplifier()
+            return func(self, *args, **kwds)
     return wrapper
 
 
@@ -177,6 +181,8 @@ class MultiClampChannel(Amplifier):
     all_devices = None
     # The currently selected device
     selected_device = None
+    # Serializes calls to the MultiClamp DLL across channels and threads
+    dll_lock = threading.RLock()
 
     def __init__(self, **kwds):
         self.dll = ctypes.WinDLL(os.path.join(MultiClampChannel.dll_path,
@@ -734,6 +740,45 @@ class MultiClampChannel(Amplifier):
     def close(self):
         self.dll.MCCMSG_DestroyObject(self.msg_handler)
         self.msg_handler = None
+
+
+class MultiClampAmplifier(object):
+    """
+    One MultiClamp amplifier serving several pipettes, one headstage each.
+
+    Parameters
+    ----------
+    channels
+        MultiClamp channel number for each pipette, in pipette order: entry n
+        is pipette_n's channel. ``[1, 2]`` drives pipette_0 through channel 1
+        and pipette_1 through channel 2 (MultiClamp channels count from 1).
+    identification
+        Extra identification passed to every channel (e.g. ``serial=...``)
+        when more than one amplifier is connected.
+    """
+    def __init__(self, channels=(1, 2), **identification):
+        if not channels:
+            raise ValueError("MultiClampAmplifier needs at least one channel")
+        self.channels = [int(channel) for channel in channels]
+        self.headstages = []
+        for channel in self.channels:
+            headstage = MultiClampChannel(channel=channel, **identification)
+            # Lets callers recognise headstages of the same physical amplifier.
+            headstage.shared_amplifier = self
+            self.headstages.append(headstage)
+
+    def for_pipette(self, pipette_key):
+        """The headstage (MultiClampChannel) that drives ``pipette_key``."""
+        from patcherbot.utils.pipette_keys import pipette_index
+        index = pipette_index(pipette_key)
+        if index is None or not 0 <= index < len(self.headstages):
+            raise KeyError(f"No MultiClamp channel configured for {pipette_key!r}; "
+                           f"channels per pipette: {self.channels}")
+        return self.headstages[index]
+
+    def close(self):
+        for headstage in self.headstages:
+            headstage.close()
 
 
 

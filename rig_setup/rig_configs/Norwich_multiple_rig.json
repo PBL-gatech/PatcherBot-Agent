@@ -100,9 +100,12 @@
             }
         },
         "amplifier": {
-            "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
+            "class": "patcherbot.devices.amplifier.multiclamp.MultiClampAmplifier",
             "params": {
-                "channel": 1
+                "channels": [
+                    1,
+                    2
+                ]
             }
         },
         "pressure": [
