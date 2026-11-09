@@ -17,6 +17,7 @@ from patcherbot.gui.tabs.scan_viewer import ScanWorkspace as ScanViewerTab
 from patcherbot.gui.tabs.global_viewer import RegisteredGlobalViewerTab as GlobalViewerTab
 from patcherbot.gui.tabs.show_cells import CellListWindow
 from patcherbot.gui.manipulator import ManipulatorGui
+from patcherbot.gui.collapsible import CollapsibleGroupBox
 from patcherbot.interface.patch import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
@@ -73,7 +74,8 @@ class PatchGui(ManipulatorGui):
             lambda checked: self.scan_window.activateWindow() if checked else None)
         self.scan_window.finished.connect(lambda _: self.show_scan_button.setChecked(False))
         self.status_bar.insertPermanentWidget(2, self.show_scan_button)
-        self.patch_interface.scan_stitched.connect(self.scan_viewer.load_image)
+        self.scan_viewer.attach_atlas_view(self.atlas_window.scan_viewer)
+        self.patch_interface.scan_stitched.connect(self._scan_stitched)
         self.global_viewer = GlobalViewerTab(self.scan_viewer, parent=self)
         self.global_window = QtWidgets.QDialog(self)
         self.global_window.setWindowTitle('Global System View')
@@ -92,7 +94,7 @@ class PatchGui(ManipulatorGui):
         self.show_global_button.clicked.connect(
             lambda checked: self.global_window.activateWindow() if checked else None)
         self.global_window.finished.connect(lambda _: self.show_global_button.setChecked(False))
-        self.status_bar.insertPermanentWidget(3, self.show_global_button)
+        self.status_bar.insertPermanentWidget(1, self.show_global_button)
         self._cell_list_timer = QtCore.QTimer(self)
         self._cell_list_timer.setInterval(500)
         self._cell_list_timer.timeout.connect(self._refresh_cell_list_window)
@@ -144,10 +146,25 @@ class PatchGui(ManipulatorGui):
         )
         self._recording_indicator_timer.start(100)
 
+    def _scan_stitched(self, result):
+        """Route completed scans by acquisition role; retain legacy path support."""
+        if isinstance(result, dict):
+            path, role = result["path"], result.get("role", "session")
+        else:
+            path, role = result, "session"
+        if role == "atlas":
+            self.atlas_window.scan_viewer.load_image(path)
+            self.atlas_window.show_scan()
+        elif role == "session":
+            self.scan_viewer.load_image(path)
+        else:
+            logging.error("Unknown completed scan role: %s", role)
+
     def close(self):
         self.global_viewer._stop_refresh()
         self.global_window.close()
         self.scan_viewer.shutdown()
+        self.atlas_window.scan_viewer.shutdown()
         self._display_position_timer.stop()
         self.pipette_interface.display_positions = None
         return super(PatchGui, self).close()
@@ -411,99 +428,6 @@ class PatchGui(ManipulatorGui):
         self.cell_list_window.update_cells(cells, stage_reference, full_refresh=full_refresh)
         self._cell_list_signature = signature
 
-class CollapsibleGroupBox(QtWidgets.QGroupBox):
-    def __init__(self, title="", parent=None):
-        super(CollapsibleGroupBox, self).__init__(parent)
-        self.setTitle("")  # Set the group box title to be blank to allow custom styling
-
-        # Apply styles for rounded corners, grey borders, and consistent font
-        self.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid lightgray;  /* Light grey border */
-                border-radius: 8px;           /* Rounded corners with 8px radius */
-                margin-top: 10px;             /* Adjust top margin for visual separation */
-                font-family: Arial, Helvetica, sans-serif;  /* Consistent font family */
-                font-size: 14px;              /* Consistent font size for the group box */
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top center;
-                padding: 0 3px;
-                font-weight: bold;            /* Bold for the group box title */
-            }
-            QWidget {
-                background-color: #f9f9f9;    /* Light grey background for the content area */
-                border-radius: 8px;
-                font-family: Arial, Helvetica, sans-serif;  /* Consistent font family */
-                font-size: 14px;              /* Consistent font size for content area */
-            }
-            QPushButton {
-                background-color: #ffffff;     /* White background for buttons */
-                border: 1px solid lightgray;   /* Light grey border for buttons */
-                border-radius: 6px;            /* Slightly rounded corners for buttons */
-                padding: 6px;                  /* Padding for a better button look */
-                font-family: Arial, Helvetica, sans-serif;  /* Consistent font family */
-                font-size: 14px;               /* Adjusted font size for buttons */
-                outline: none;                 /* Remove default focus outline */
-            }
-            QPushButton:hover {
-                background-color: rgba(173, 216, 230, 0.5);  /* Light blue with 50% transparency on hover */
-                border: 1px solid #87CEEB;       /* Soft blue border on hover */
-            }
-            QPushButton:pressed {
-                background-color: #d1e7ff;     /* Light blue when pressed for a subtle effect */
-            }
-            QPushButton:focus {
-                border: 1px solid #87CEEB;      /* Consistent border color on focus (soft blue) */
-                outline: none;                  /* Remove blue edge or highlight on focus */
-            }
-        """)
-
-        # Create a toggle button (arrow) for expanding/collapsing
-        self.toggle_button = QtWidgets.QToolButton()
-        self.toggle_button.setStyleSheet("QToolButton { border: none; font-family: Arial, Helvetica, sans-serif; font-size: 14px; }")
-        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.toggle_button.setArrowType(Qt.DownArrow)
-        self.toggle_button.setText(title)
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.setChecked(True)
-        self.toggle_button.clicked.connect(self.on_toggle)
-
-        # Layout for the toggle button
-        self.header_layout = QtWidgets.QHBoxLayout()
-        self.header_layout.addWidget(self.toggle_button, alignment=Qt.AlignLeft)
-        self.header_layout.addStretch()
-
-        # Content area
-        self.content_area = QtWidgets.QWidget()
-        self.content_layout = QtWidgets.QVBoxLayout()
-        self.content_area.setLayout(self.content_layout)
-
-        # Main layout of the collapsible group box
-        self.main_layout = QtWidgets.QVBoxLayout()
-        self.main_layout.addLayout(self.header_layout)
-        self.main_layout.addWidget(self.content_area)
-        self.main_layout.setContentsMargins(5, 5, 5, 5)  # Add some margin to create spacing inside
-        self.setLayout(self.main_layout)
-
-    def on_toggle(self):
-        if self.toggle_button.isChecked():
-            self.content_area.show()
-            self.toggle_button.setArrowType(Qt.DownArrow)
-        else:
-            self.content_area.hide()
-            self.toggle_button.setArrowType(Qt.RightArrow)
-
-    def setContentLayout(self, layout):
-        # Remove existing layout if any
-        while self.content_layout.count():
-            child = self.content_layout.takeAt(0)
-            if child.widget():
-                child.widget().setParent(None)
-        self.content_layout.addLayout(layout)
-
-
-
 class ButtonTabWidget(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -576,6 +500,7 @@ class ButtonTabWidget(QtWidgets.QWidget):
             for button_info in self.section_buttons[section]:
                 button = button_info[0]
                 button.setStyleSheet("")  # This will revert to the style from CollapsibleGroupBox
+
 
     def _run_next_seq_command(self):
         if self._seq_index >= len(self._seq_cmds):
@@ -906,48 +831,49 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.origin_status.hide()
         origin_layout.addWidget(self.origin_status)
 
-        # Add a box for calibration setup
-        # buttonList = [['Calibrate Stage','Calibrate Pipette'],['set home space','set safe space'],['Store Cleaning Position'],['Clear Calibration']]
-        buttonList = [['Calibrate Stage','Calibrate Pipette'],
-                      ['Calibrate 4x Objective'], ['Store Cleaning Position'], ['Load Calibration','Clear Calibration']]
+        # Calibration retains the main objective and pipette setup.
+        buttonList = [['Calibrate Stage', 'Calibrate Pipette'],
+                      ['Store Cleaning Position'], ['Load Calibration', 'Clear Calibration']]
         cmds = [[self.stage_calibration, self.pipette_calibration],
-                [self.patch_interface.calibrate_stage_4x],
-                # [self.patch_interface.store_home_position, self.patch_interface.store_safe_position],
                 [self.pipette_cleaning_calibration],
-                [self.load_calibration, self.patch_interface.clear_positions]
-        ]
-        self.addButtonList('calibration', layout, buttonList, cmds, sequential=True, 
-                        change_color_on_complete=True, completion_color="rgba(173, 216, 230, 0.5)",
-                        extra_widget=origin_controls)
-        self.get_section_button('calibration', 'Calibrate 4x Objective').setToolTip(
-            'Select and focus the 4x objective, then calibrate the XY stage only.')
+                [self.load_calibration, self.patch_interface.clear_positions]]
+        self.addButtonList('calibration', layout, buttonList, cmds, sequential=True,
+                           change_color_on_complete=True,
+                           completion_color="rgba(173, 216, 230, 0.5)")
         load_button = self.get_section_button('calibration', 'Load Calibration')
         load_button.clicked.disconnect()
         load_button.clicked.connect(self.load_calibration)
 
-        # Add a box for movement commands 
-        buttonList = [
-            ['Move to Safe Position','Move to Home Position'],
-            ['Move to cell plane','Focus Stage'],
-            ['Store corners', 'Start Scan'],
-            ['Move group up', 'Move group down'],
-            ['Center Pipette','Clean pipette','Focus Pipette'],
-        ]
-        cmds = [
-            [self.patch_interface.move_to_safe_space, self.patch_interface.move_to_home_space],
+        # Both scan types share acquisition and differ only in the recorded role.
+        buttonList = [['Set Stage Floor', 'Calibrate Scanner'],
+                      ['Store Corners'], ['Atlas Scan', 'Session Scan']]
+        cmds = [[self.pipette_interface.set_stage_floor, self.patch_interface.calibrate_stage_4x],
+                [self.patch_interface.start_selecting_corners],
+                [self._scan_commands('atlas', camera_recorder),
+                 self._scan_commands('session', camera_recorder)]]
+        self.addButtonList('registration', layout, buttonList, cmds, sequential=True,
+                           change_color_on_complete=True,
+                           completion_color="rgba(173, 216, 230, 0.5)",
+                           extra_widget=origin_controls)
+        self.get_section_button('registration', 'Calibrate Scanner').setToolTip(
+            'Select and focus the 4x scanner objective, then calibrate the XY stage only.')
+        self.get_section_button('registration', 'Store Corners').setToolTip(
+            'Shift-right-click the top-left corner, then the bottom-right corner in the live camera view.')
+        self.get_section_button('registration', 'Atlas Scan').setToolTip(
+            'Scan tissue without the harp for atlas fitting.')
+        self.get_section_button('registration', 'Session Scan').setToolTip(
+            'Scan cells or tissue with the harp for the current session.')
 
-            [self.pipette_interface.go_to_floor,self.pipette_interface.focus_stage],
-            [
-                self.patch_interface.start_selecting_corners,
-                [[self.patch_interface.move_to_scan_start, self.start_recording,
-                  (self.patch_interface.start_scan, camera_recorder),
-                  (self.stop_recording, False),
-                  (self.patch_interface.stitch_scan,
-                   (self.recorder.folder_path, (self.recorder, camera_recorder)))]],
-            ],
-            [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
-            [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
-        ]
+        buttonList = [['Move to Safe Position', 'Move to Home Position'],
+                      ['Move to cell plane', 'Focus Stage', 'Go to Stage Floor'],
+                      ['Move group up', 'Move group down'],
+                      ['Center Pipette', 'Clean pipette', 'Focus Pipette']]
+        cmds = [[self.patch_interface.move_to_safe_space, self.patch_interface.move_to_home_space],
+                [self.pipette_interface.go_to_floor, self.pipette_interface.focus_stage,
+                 self.pipette_interface.go_to_stage_floor],
+                [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
+                [self.pipette_interface.center_pipette, self.patch_interface.clean_pipette,
+                 self.pipette_interface.focus_pipette]]
         self.addButtonList('movement', layout, buttonList, cmds, sequential=True)
 
         # Find Pipette path
@@ -1004,6 +930,14 @@ class ClassicPatchButtons(ButtonTabWidget):
 
         self.setLayout(layout)
 
+    def _scan_commands(self, role, camera_recorder):
+        return [self.patch_interface.move_to_scan_start, self.start_recording,
+                (self.patch_interface.start_scan,
+                 {"camera_recorder": camera_recorder, "role": role}),
+                (self.stop_recording, False),
+                (self.patch_interface.stitch_scan,
+                 (self.recorder.folder_path, (self.recorder, camera_recorder)))]
+
     def set_origin_busy(self, busy):
         for button in self.origin_buttons.values():
             button.setEnabled(not busy)
@@ -1016,7 +950,7 @@ class ClassicPatchButtons(ButtonTabWidget):
 
     def set_origin_complete(self, axis):
         self._set_button_completion_style(
-            self.origin_buttons[axis], self.section_colors['calibration'])
+            self.origin_buttons[axis], self.section_colors['registration'])
 
     def restore_tares(self, tares):
         if tares is None:

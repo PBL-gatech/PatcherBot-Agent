@@ -122,6 +122,7 @@ class PipetteInterface(TaskInterface):
     @command(category='Manipulators',
                 description='Write current calibration to file')
     def write_calibration(self):
+        from copy import deepcopy
         if not self.calibrated_stage.calibrated:
             raise RuntimeError('Stage not calibrated')
         if not self.calibrated_unit.calibrated:
@@ -132,6 +133,11 @@ class PipetteInterface(TaskInterface):
             if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
                 raise ValueError('Cell floor must be a finite coordinate or unset')
             floor_z = float(floor_z)
+        stage_floor = getattr(self.microscope, 'stage_floor', None)
+        if stage_floor is not None:
+            if isinstance(stage_floor, bool) or not isinstance(stage_floor, Real) or not math.isfinite(stage_floor):
+                raise ValueError('Stage floor must be a finite coordinate or unset')
+            stage_floor = float(stage_floor)
         
         # concatenate home position and home stage position
         if self.home_position is None or self.home_stage_position is None:
@@ -154,17 +160,24 @@ class PipetteInterface(TaskInterface):
                 self.folder_created = True
 
             
-            # Write calibration data to the file in the specified folder
+            calibration = {
+                'manip': self.calibrated_unit.save_configuration(),
+                'stage': self.calibrated_stage.save_configuration(),
+                'home': self.home,
+                'safe': self.safe,
+                'bath': self.cleaning_bath_position,
+                'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
+                'stage_floor': stage_floor,
+                'display_anchor': (getattr(self, '_loaded_display_anchor', None)
+                    if getattr(self.calibrated_unit, 'must_be_recalibrated', False)
+                    and getattr(self, '_loaded_display_anchor', None) is not None
+                    and np.array_equal(self._loaded_display_anchor['home'], self.home) else None),
+                'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+            }
+            snapshot = deepcopy(calibration)
             with open(file_path, 'wb') as f:
-                pickle.dump({
-                    'manip': self.calibrated_unit.save_configuration(),
-                    'stage': self.calibrated_stage.save_configuration(),
-                    'home': self.home,
-                    'safe': self.safe,
-                    'bath': self.cleaning_bath_position,
-                    'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
-                    'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-                }, f)
+                pickle.dump(calibration, f)
+            self._calibration_snapshot = snapshot
             self.info('Calibration written to file')
         except Exception as e:
             self.error(f'Error writing calibration to file: {e}')
@@ -173,12 +186,18 @@ class PipetteInterface(TaskInterface):
     @command(category='Manipulators',
                 description='read most recent calibration from file')
     def read_calibration(self, config_filename='calibration.pickle'):
+        from copy import deepcopy
         '''
         Read calibration from file.
         '''
         if os.path.isfile(config_filename):
             with open(config_filename, 'rb') as f:
                 cal = pickle.load(f)
+                stage_floor = cal.get('stage_floor')
+                if stage_floor is not None:
+                    if isinstance(stage_floor, bool) or not isinstance(stage_floor, Real) or not math.isfinite(stage_floor):
+                        raise ValueError('Saved stage floor must be a finite coordinate or unset')
+                    stage_floor = float(stage_floor)
                 floor_z = cal.get('floor_Z')
                 if floor_z is not None:
                     if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
@@ -209,6 +228,29 @@ class PipetteInterface(TaskInterface):
                     bath = np.asarray(bath, dtype=float)
                     if bath.shape != (3,) or not np.isfinite(bath).all():
                         raise ValueError('Saved bath position must contain three finite coordinates')
+                # Keep saved image geometry separate from the runtime offsets,
+                # which load_configuration intentionally invalidates for motion.
+                display_tip = None
+                display = cal.get('display_anchor')
+                if display is not None:
+                    if (not isinstance(display, dict) or display.get('version') != 1
+                            or display.get('objective') != 40):
+                        raise ValueError('Unsupported saved pipette display anchor')
+                    saved_home = np.asarray(display.get('home'), dtype=float)
+                    display_tip = np.asarray(display.get('tip_xy'), dtype=float)
+                    if (saved_home.shape != (6,) or not np.array_equal(saved_home, home)
+                            or display_tip.shape != (2,) or not np.isfinite(display_tip).all()):
+                        raise ValueError('Saved pipette display anchor does not match home')
+                elif all('r0' in cal[key] for key in ('manip', 'stage')):
+                    manip_offset = np.asarray(cal['manip']['r0'], dtype=float)
+                    stage_offset = np.asarray(cal['stage']['r0'], dtype=float)
+                    if (manip_offset.shape != (3,) or stage_offset.shape not in ((2,), (3,))
+                            or not np.isfinite(manip_offset).all() or not np.isfinite(stage_offset).all()):
+                        raise ValueError('Saved calibration offsets must contain finite image coordinates')
+                    display_tip = ((cal['manip']['M'] @ home[:3] + manip_offset)[:2]
+                                   + cal['stage']['M'] @ home[3:5] + stage_offset[:2])
+                    if not np.isfinite(display_tip).all():
+                        raise ValueError('Saved pipette home projection is not finite')
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
                 self.calibrated_unit._tip_reference = None
@@ -219,6 +261,9 @@ class PipetteInterface(TaskInterface):
                 self.safe_stage_position = safe[3:].copy()
                 self.cleaning_bath_position = bath
                 self.microscope.floor_Z = floor_z
+                self.microscope.stage_floor = stage_floor
+                self._loaded_display_anchor = (None if display_tip is None else
+                    dict(version=1, objective=40, home=home.tolist(), tip_xy=display_tip.tolist()))
 
                 source_saved_at = cal.get('saved_at')
                 try:
@@ -235,6 +280,7 @@ class PipetteInterface(TaskInterface):
                     'source_session': os.path.basename(os.path.dirname(source_file)),
                     'reloaded_at': datetime.now().astimezone().isoformat(timespec='seconds'),
                 }
+                self._calibration_snapshot = deepcopy(cal)
                 self.info(
                     f"Calibration reloaded from {source_file}; "
                     f"file saved at: {source_saved_at or 'unknown'}; "
@@ -313,6 +359,52 @@ class PipetteInterface(TaskInterface):
         z_scale = self.calibrated_unit.config.microscope_units_per_um
         self.microscope.floor_Z = self.microscope.position() / z_scale
         self.info(f'Cell plane position set to {self.microscope.floor_Z}')
+
+    def _persist_stage_floor(self, stage_floor):
+        """Update session metadata without re-saving reset motion calibration."""
+        import tempfile
+        from copy import deepcopy
+        target = os.path.join(self.folder_path, 'calibration.pickle')
+        snapshot = getattr(self, '_calibration_snapshot', None)
+        if snapshot is not None:
+            calibration = deepcopy(snapshot)
+        else:
+            reference = getattr(self, 'loaded_calibration_reference', None) or {}
+            source = reference.get('source_file') or target
+            if not os.path.isfile(source):
+                return False  # Initial setup: the normal calibration save includes it.
+            with open(source, 'rb') as stream:
+                calibration = pickle.load(stream)
+        if not isinstance(calibration, dict):
+            raise ValueError('Calibration file must contain a calibration dictionary')
+        calibration['stage_floor'] = float(stage_floor)
+        calibration['saved_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+        os.makedirs(self.folder_path, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='wb', dir=self.folder_path,
+                                             prefix='calibration.', suffix='.tmp', delete=False) as stream:
+                temporary = stream.name
+                pickle.dump(calibration, stream)
+            os.replace(temporary, target)
+            self._calibration_snapshot = deepcopy(calibration)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+        return True
+
+    @command(category='Microscope',
+             description='Set the position of the stage floor (basin)',
+             success_message='Stage floor position stored')
+    def set_stage_floor(self):
+        z_scale = self.calibrated_unit.config.microscope_units_per_um
+        stage_floor = self.microscope.position() / z_scale
+        if isinstance(stage_floor, bool) or not isinstance(stage_floor, Real) or not math.isfinite(stage_floor):
+            raise ValueError('Stage floor must be a finite coordinate')
+        persisted = self._persist_stage_floor(stage_floor)
+        self.microscope.stage_floor = float(stage_floor)
+        state = 'saved to session calibration' if persisted else 'will save with the first calibration'
+        self.info(f'Stage floor position set to {self.microscope.stage_floor}; {state}')
 
     @command(category='Stage',
              description='Move stage vertically by {:.0f}μm',
@@ -449,3 +541,11 @@ class PipetteInterface(TaskInterface):
         if self.microscope.floor_Z is None:
             raise RuntimeError("Coverslip floor must be set.")
         self.execute(self.microscope.move_to_floor)
+
+    @blocking_command(category='Microscope',
+                      description='Go to the stage floor (basin)',
+                      task_description='Go to the stage floor (basin)')
+    def go_to_stage_floor(self):
+        if self.microscope.stage_floor is None:
+            raise RuntimeError("Stage floor must be set.")
+        self.execute(self.microscope.move_to_stage_floor)

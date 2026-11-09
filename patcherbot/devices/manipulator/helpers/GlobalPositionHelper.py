@@ -99,8 +99,8 @@ class GlobalPositionHelper:
 
     @staticmethod
     def _atlas_role(role):
-        if role not in ("reference", "session"):
-            raise ValueError("Atlas role must be reference or session")
+        if role not in ("reference", "session", "atlas"):
+            raise ValueError("Atlas role must be reference, session, or atlas")
         return role
 
     @staticmethod
@@ -267,9 +267,17 @@ class GlobalPositionHelper:
         self._pipette_home_anchor = dict(home=home.copy(), global_home=origin,
             matrix=composed, safe=safe, bath=bath, direction=direction / np.linalg.norm(direction),
             objective=objective, source=source, home_z_um=float(home_z_um), rotations=angles.copy(),
+            home_scope_z_um=float(stage[2]),
             home_view_center_mm=np.r_[self.stage_to_global(stage[:2], objective) / 1000, 0.])
         self._pending_pipette_positions = {name: point.copy() for name, point in
                                             (("safe", safe), ("bath", bath)) if point is not None}
+
+    def restore_pipette_home_anchor(self, home_pipette_xyz, home_stage_xyz, *, tip_xy,
+                                    safe_pipette_xyz=None, cleaning_bath_xyz=None):
+        """Restore display geometry without trusting a detection or refreshing motion."""
+        self.set_pipette_home_anchor(home_pipette_xyz, home_stage_xyz, home_z_um=0.,
+            tip_xy=tip_xy, safe_pipette_xyz=safe_pipette_xyz, cleaning_bath_xyz=cleaning_bath_xyz)
+        self._pipette_home_anchor["source"] = "restored_calibration_projection"
 
     def clear_pipette_home_anchor(self):
         self._pipette_home_anchor = None
@@ -463,6 +471,9 @@ class GlobalPositionHelper:
         scope = getattr(self.unit, "microscope", None)
         if scope is not None:
             result["microscope_z_um"] = float(cached(scope.dev)[int(scope.axis) - 1])
+            if result["stage_floor_um"] is not None:
+                result["focus_height_above_stage_floor_um"] = (
+                    float(scope.up_direction) * (result["microscope_z_um"] - result["stage_floor_um"]))
         return result, stage_xy
 
     def snapshot(self, scan_pixel_to_global_um=None, objective=40, z_um=0., stage_xy=None,
@@ -534,6 +545,23 @@ class GlobalPositionHelper:
             direction = direction.tolist()
             marker_direction = np.r_[self.registrar.pixel_to_micron_matrix(40)
                                       @ np.asarray(self.unit.M)[:2, 0], 0.].tolist()
+        # The physical basin reference is independent of cell floor and home.
+        # Store only a conversion offset; never change calibrated/global Z.
+        scope = getattr(self.unit, "microscope", None)
+        stage_floor = getattr(scope, "stage_floor", None)
+        floor_global_z = pipette_height = None
+        if stage_floor is not None:
+            if isinstance(stage_floor, (bool, np.bool_)) or not np.isfinite(stage_floor):
+                raise ValueError("Stage floor must be finite driver microns or unset")
+            stage_floor = float(stage_floor)
+            scope_up = float(scope.up_direction)
+            if scope_up not in (-1., 1.):
+                raise ValueError("Microscope up_direction must be -1 or 1")
+            if anchor is not None and "home_scope_z_um" in anchor:
+                floor_global_z = (anchor["home_z_um"]
+                                  + scope_up * (stage_floor - anchor["home_scope_z_um"]))
+                if pipette is not None:
+                    pipette_height = float(pipette[2]) * 1000 - floor_global_z
         return dict(scan_pixel_to_world_mm=viewer_transform.tolist(),
                     objective_xyz_mm=[float(center[0]) / 1000, float(center[1]) / 1000, float(z_um) / 1000],
                     fov_size_mm=(fov / 1000).tolist(),
@@ -544,6 +572,10 @@ class GlobalPositionHelper:
                     global_to_rig_rotation=rig_rotation.tolist(),
                     pipette_rotation_yz_degrees=None if angles is None else angles.tolist(),
                     pipette_anchor_source=None if anchor is None else anchor["source"],
+                    stage_floor_um=stage_floor,
+                    stage_floor_global_z_um=floor_global_z,
+                    focus_height_above_stage_floor_um=None,
+                    pipette_height_above_stage_floor_um=pipette_height,
                     pipette_xy_source=pipette_xy_source,
                     pipette_rig_xyz_mm=pipette_rig_xyz,
                     pipette_rig_origin_mm=None if anchor is None else anchor["home_view_center_mm"].tolist(),

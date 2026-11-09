@@ -263,7 +263,10 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                 try:
                     state, stage_xy = helper.cached_snapshot(transform, objective=objective)
                     scope_um = state.get("microscope_z_um")
-                    if scope_um is not None:
+                    focus_height = state.get("focus_height_above_stage_floor_um")
+                    if focus_height is not None:
+                        state["rig_focus_z_mm"] = float(focus_height) / 1000.
+                    elif scope_um is not None:
                         if not hasattr(self, "_scope_reference_um"):
                             self._scope_reference_um = float(scope_um)
                         state["rig_focus_z_mm"] = -(float(scope_um) - self._scope_reference_um) / 1000.
@@ -312,16 +315,24 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
     def _scan_to_global(self, role, result):
         if role == "reference":
             return np.array(self.position_helper.registrar.reference_pixel_to_global_um)
-        metadata = result.get("metadata", {})
-        shape = metadata.get("canvas_shape")
-        factor = 1. if shape is None else np.array([float(shape[1]) / result["width"],
-                                                   float(shape[0]) / result["height"]])
-        return self.position_helper.registered_session_mosaic(metadata, downsample_factor=factor)
+        registration = result.get("reference_registration")
+        if not registration or not registration.get("accepted"):
+            raise ValueError("Scan has not passed image registration to the reference")
+        transform = np.asarray(registration["scan_to_reference_native"], dtype=float)
+        if transform.shape != (3, 3) or not np.isfinite(transform).all():
+            raise ValueError("Invalid scan-to-reference image transform")
+        return np.asarray(self.position_helper.registrar.reference_pixel_to_global_um) @ transform
 
     def _layer_loaded(self, role, result):
-        if role not in ("reference", "session") or self.position_helper is None:
+        if role not in ("reference", "session", "atlas") or self.position_helper is None:
             return
-        self._atlas_scan_info[role] = {key: result[key] for key in ("path", "width", "height", "metadata")
+        if result is None:
+            self._layers.pop(role, None)
+            self._atlas_scan_info.pop(role, None)
+            self._atlas_changed(role, None)
+            self._update_overlay()
+            return
+        self._atlas_scan_info[role] = {key: result[key] for key in ("path", "width", "height", "metadata", "reference_registration")
                                       if key in result}
         try:
             transform = self._scan_to_global(role, result)
@@ -337,7 +348,7 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
 
     def _atlas_changed(self, role, data):
         """Bind the displayed atlas fit to this scan's existing global transform."""
-        if role not in ("reference", "session") or self.position_helper is None:
+        if role not in ("reference", "session", "atlas") or self.position_helper is None:
             return
         self._atlas_states[role] = data
         self.position_helper.set_atlas_alignment(None, role=role)
@@ -361,6 +372,9 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
     def _refresh_atlas_position(self, state):
         role = getattr(self.scan_viewer, "active_role", "reference")
         helper = self.position_helper
+        atlas_view = getattr(self.scan_viewer, "atlas_view", None)
+        if atlas_view is not None and atlas_view.isVisible():
+            role = "atlas"
         if not helper.has_atlas_alignment(role):
             return
         points = {"Field": np.asarray(state["objective_xyz_mm"])[:2] * 1000}
@@ -387,11 +401,36 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                 labels.append(f"{name}: Allen AP {ap:.0f}, DV {dv:.0f}, ML {ml:.0f} µm; region {value.get('region_id', 'unavailable')}")
         self._atlas_position_text = " | ".join(labels)
         self.position_box.setText(self._position_text + "\n" + self._atlas_position_text)
-        label = getattr(getattr(self.scan_viewer, "active_view", None), "atlas_position_status", None)
+        target = getattr(self.scan_viewer, key[1] + "_view", None)
+        label = getattr(target or getattr(self.scan_viewer, "active_view", None), "atlas_position_status", None)
         if label is not None:
             label.setText(self._atlas_position_text)
 
     def _update_overlay(self):
+        registered_views = getattr(self.scan_viewer, "registered_views", None)
+        if registered_views is not None:
+            for role, view in registered_views():
+                if not view.isVisible():
+                    continue
+                layer = self._layers.get(role)
+                if self._anchor is None or layer is None:
+                    view.set_global_overlay(None)
+                    continue
+                corners = self._anchor.get("fov_corners_mm")
+                if corners is None:
+                    view.set_global_overlay(None)
+                    continue
+                transform = layer["transform"]
+                def project(points):
+                    return np.linalg.lstsq(transform[:3, :2],
+                        (np.asarray(points) - transform[:3, 3]).T, rcond=None)[0].T
+                tip = self._anchor.get("pipette_xyz_mm")
+                direction = self._anchor.get("pipette_marker_direction_xyz")
+                direction = None if direction is None else np.linalg.lstsq(
+                    transform[:3, :2], direction, rcond=None)[0]
+                view.set_global_overlay(project(corners),
+                    None if tip is None else project([tip])[0], direction)
+            return
         if not self.scan_viewer.isVisible():
             return
         if not self._scan_registration_valid or self._anchor is None or self._scan is None:
@@ -412,7 +451,10 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                                            None if tip is None else project([tip])[0], direction)
 
     def refresh_position(self):
-        if (self._closed or not (self.isVisible() or self.scan_viewer.isVisible()) or self.position_helper is None):
+        registered_views = getattr(self.scan_viewer, "registered_views", None)
+        scans_visible = (any(view.isVisible() for _, view in registered_views())
+                         if registered_views is not None else self.scan_viewer.isVisible())
+        if (self._closed or not (self.isVisible() or scans_visible) or self.position_helper is None):
             self._producer_active.clear()
             return
         transform = None if self._scan_transform is None else self._scan_transform.copy()
@@ -436,16 +478,21 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
 
     def _receive_snapshot(self, generation, state, stage_xy):
         self._snapshot_busy = False
+        registered_views = getattr(self.scan_viewer, "registered_views", None)
+        view_visibility = (tuple((role, view.isVisible()) for role, view in registered_views())
+                           if registered_views is not None else (("scan", self.scan_viewer.isVisible()),))
         if (self._closed or generation != self._snapshot_generation
-                or not (self.isVisible() or self.scan_viewer.isVisible())):
+                or not (self.isVisible() or any(visible for _, visible in view_visibility))):
             return
         self._refresh_atlas_position(state)
         fields = ("scan_pixel_to_world_mm", "objective_xyz_mm", "fov_size_mm", "fov_corners_mm",
                   "pipette_xyz_mm", "pipette_direction_xyz", "objective_transform", "chamber_transform", "stage_bottom_xyz_mm",
                   "objective_rotation_yz_degrees", "chamber_rotation_yz_degrees",
                   "rig_focus_z_mm", "pipette_rig_origin_mm", "pipette_rig_xyz_mm",
-                  "pipette_marker_direction_xyz", "global_to_rig_rotation")
-        key = (generation, self.isVisible(), self.scan_viewer.isVisible(),
+                  "pipette_marker_direction_xyz", "global_to_rig_rotation", "stage_floor_um",
+                  "stage_floor_global_z_um", "focus_height_above_stage_floor_um",
+                  "pipette_height_above_stage_floor_um")
+        key = (generation, self.isVisible(), view_visibility,
                np.asarray(stage_xy, dtype=float).tobytes(),
                tuple(None if state.get(name) is None else np.asarray(state[name], dtype=float).tobytes()
                      for name in fields),
@@ -461,6 +508,14 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         if state.get("pipette_xyz_mm") is not None:
             px, py, pz = np.asarray(state["pipette_xyz_mm"]) * 1000
             text += f" | Pipette X {px:.2f}, Y {py:.2f}, Z {pz:.2f} µm"
+        if state.get("stage_floor_um") is None:
+            text += "\nStage floor unset; floor-relative heights unavailable."
+        else:
+            focus_height = state.get("focus_height_above_stage_floor_um")
+            pipette_height = state.get("pipette_height_above_stage_floor_um")
+            focus_text = "unavailable" if focus_height is None else f"{focus_height:.2f} µm"
+            pipette_text = "unavailable" if pipette_height is None else f"{pipette_height:.2f} µm"
+            text += f"\nHeight above stage floor: focus {focus_text} | pipette {pipette_text}"
         self._position_text = text
         self.position_box.setText(text + ("\n" + self._atlas_position_text if self._atlas_position_text else ""))
 
@@ -536,6 +591,8 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
             return
         self.scene.cad_angles.update(self._cad_angles)
         basis = np.asarray(self._anchor.get("global_to_rig_rotation", np.eye(3)))
+        floor_z_um = self._anchor.get("stage_floor_global_z_um")
+        floor_offset = np.array([0., 0., 0. if floor_z_um is None else float(floor_z_um) / 1000.])
         # The scan uses sample coordinates; hardware is shown relative to the
         # fixed objective XY axis. Recorder stage motion is negative raw XY.
         offset = np.r_[np.asarray(self._anchor["objective_xyz_mm"])[:2], 0.]
@@ -545,32 +602,47 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         tip = None if tip is None else np.asarray(tip) - pipette_origin
         if self._anchor.get("pipette_rig_xyz_mm") is not None:
             tip = np.asarray(self._anchor["pipette_rig_xyz_mm"])
-        tip = None if tip is None else basis @ tip
+        tip = None if tip is None else basis @ tip - floor_offset
         if self._anchor.get("stage_bottom_xyz_mm") is not None:
-            self.scene.set_stage_bottom(basis @ (np.asarray(self._anchor["stage_bottom_xyz_mm"]) - offset))
+            basin = basis @ (np.asarray(self._anchor["stage_bottom_xyz_mm"]) - offset)
+            if self._anchor.get("stage_floor_um") is not None:
+                basin[2] = 0.
+            self.scene.set_stage_bottom(basin)
         anchors = self._anchor.get("named_anchors_mm", {})
         for name in set(getattr(self, "_displayed_anchor_names", ())) - set(anchors):
             self.scene.clear_named_anchor(name)
         for name, xyz in anchors.items():
             position = (tip if name == "pipette" and tip is not None else basis @ (np.asarray(xyz) -
                         (pipette_origin if name.startswith("pipette") or name == "cleaning_bath" else offset)))
+            if not (name == "pipette" and tip is not None):
+                position = position - floor_offset
+            if name == "stage" and self._anchor.get("stage_floor_um") is not None:
+                position[2] = 0.
             self.scene.set_named_anchor(name, position)
         self._displayed_anchor_names = set(anchors)
         corners = self._anchor.get("fov_corners_mm")
-        self.scene.set_fov_corners(None if corners is None else (np.asarray(corners) - offset) @ basis.T)
+        corners = None if corners is None else (np.asarray(corners) - offset) @ basis.T - floor_offset
+        focus_height = self._anchor.get("focus_height_above_stage_floor_um")
+        focus_z = self._anchor.get("rig_focus_z_mm", 0.) if focus_height is None else float(focus_height) / 1000.
+        if corners is not None and focus_height is not None:
+            corners[:, 2] = focus_z
+        self.scene.set_fov_corners(corners)
         state = {key: self._anchor[key] for key in ("fov_size_mm", "objective_transform", "chamber_transform")
                  if key in self._anchor}
-        state.update(objective_xyz_mm=[0., 0., self._anchor.get("rig_focus_z_mm", 0.)], pipette_xyz_mm=tip)
+        # Display-only direction correction; hardware and calibrated Z stay unchanged.
+        state.update(objective_xyz_mm=[0., 0., -focus_z], pipette_xyz_mm=tip)
         self.scene.set_state(**state)
-        self.scene.items["origin"].setData(pos=np.asarray([basis @ -offset]))
+        self.scene.items["origin"].setData(pos=np.asarray([basis @ -offset - floor_offset]))
         direction = self._anchor.get("pipette_direction_xyz")
         self.scene.set_pipette_pose(tip if direction is not None else None,
                                     direction)
         if not self._initial_system_fit:
             self.scene.reset_view()
             self._initial_system_fit = True
+        floor_status = ("Recorded stage floor: Z=0" if self._anchor.get("stage_floor_um") is not None
+                        else "Stage floor unset; provisional basin reference")
         status = ("Objective fixed in XY; stage follows recorded movement | "
-                  "Basin floor at slope bottom (provisional) | "
+                  f"{floor_status} | "
                   f"Objective working distance: {self.scene.OBJECTIVE_WORKING_DISTANCE_MM:.3f} mm")
         if "session" in self._layers:
             status += " | Session placement uses recorded stage mapping"

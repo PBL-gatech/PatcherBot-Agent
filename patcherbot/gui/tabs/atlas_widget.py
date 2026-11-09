@@ -251,6 +251,18 @@ class AtlasWindow(QtWidgets.QDialog):
         self.setWindowFlag(QtCore.Qt.WindowMaximizeButtonHint, True)
         self.setSizeGripEnabled(True)
         layout = QtWidgets.QVBoxLayout(self)
-        self.atlas_widget = AtlasWidget(self, provider=provider)
-        layout.addWidget(self.atlas_widget)
+        from patcherbot.gui.tabs.scan_viewer import LinkedScanViewerTab
+        self.tabs = QtWidgets.QTabWidget(self)
+        self.atlas_widget = AtlasWidget(self.tabs, provider=provider)
+        self.scan_viewer = LinkedScanViewerTab(parent=self.tabs, atlas_tools=True)
+        self.tabs.addTab(self.atlas_widget, "Plain atlas")
+        self.tabs.addTab(self.scan_viewer, "Atlas scan / Allen")
+        self.tabs.setTabEnabled(1, False)
+        self.scan_viewer.scanLoaded.connect(lambda result: self.show_scan())
+        layout.addWidget(self.tabs)
         self.resize(1000, 800)
+
+    def show_scan(self):
+        """Display the complete no-harp scan workspace once a scan is supplied."""
+        self.tabs.setTabEnabled(1, True)
+        self.tabs.setCurrentWidget(self.scan_viewer)

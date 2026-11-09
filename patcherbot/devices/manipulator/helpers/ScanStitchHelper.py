@@ -1,6 +1,7 @@
 """Connect the existing patch-controller scan to the fast stitcher."""
 from pathlib import Path
 import time
+import json
 from uuid import uuid4
 
 
@@ -8,14 +9,19 @@ class ScanStitchHelper:
     def __init__(self, stage):
         self.stage = stage
         self.record = None
+        self.scan_role = "session"
 
     def begin(self):
         if not self.stage.calibrated:
             raise RuntimeError("Load or calibrate the stage matrix before scanning.")
         if len(self.stage.scan_corner_positions) != 2:
             raise RuntimeError("Store both scan corners before scanning.")
+        if self.scan_role not in ("session", "atlas"):
+            raise ValueError("Scan role must be session or atlas")
         self.record = {
             "start": time.time(), "end": None,
+            "registration_role": self.scan_role,
+            "scan_bounds_pixels": [c["stage_pixels"].tolist() for c in self.stage.scan_corner_positions],
             "stage": {"M": self.stage.M.tolist(), "r0": self.stage.r0.tolist()},
             # Use the validated reference's tile-placement convention.
             "flip_x": True,
@@ -38,7 +44,7 @@ class ScanStitchHelper:
         from patcherbot.utils.scanStitcherFast import FastStitchConfig
 
         destination = Path(__file__).resolve().parents[4] / "experiments" / "Data" / "scan_stitch_data" / source.name
-        prefix = "scan_" + uuid4().hex
+        prefix = "scan_" + uuid4().hex + "_" + self.record["registration_role"]
         stitcher = ScanStitcher(
             date_time_folder=str(source), use_calibration=False,
             scan_time_window=(self.record["start"], self.record["end"]),
@@ -49,5 +55,12 @@ class ScanStitchHelper:
         stitcher.use_calibration = True
         stitcher.calibration_file = None
         destination.mkdir(parents=True, exist_ok=True)
-        return stitcher.stitch_fast(output_path=str(destination / (prefix + ".tif")),
-                                    config=FastStitchConfig(refine_images=True))
+        metadata_path = destination / (prefix + "_meta.json")
+        output = stitcher.stitch_fast(output_path=str(destination / (prefix + ".tif")),
+                                     metadata_path=str(metadata_path),
+                                     config=FastStitchConfig(refine_images=True))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(registration_role=self.record["registration_role"],
+                        scan_bounds_pixels=self.record["scan_bounds_pixels"])
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        return output

@@ -1,17 +1,43 @@
 """Saved scan display with rotation and registration sidecars beside each scan."""
 from pathlib import Path
 import json
+import logging
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from patcherbot.configs.Config import Config
 from patcherbot.gui.ParamConfig import ParamConfig
+from patcherbot.gui.collapsible import CollapsibleGroupBox
 
 
 REFERENCE_MANIFEST = Path(__file__).resolve().parents[2] / "deepLearning" / "globalModel" / "reference" / "scan_reference.json"
 MAX_DECODE_BYTES = 512 * 1024 ** 2
 OVERVIEW_EDGE = 2048
+
+
+def _log_reference_fit_result(role, scan, registration):
+    """Send fit evidence to the application's console and file log handlers."""
+    state = "Error" if registration.get("error") else (
+        "Accepted" if registration.get("accepted") else "Rejected")
+    reason = registration.get("reason") or (
+        "Image alignment passed geometric checks." if registration.get("accepted")
+        else "No valid reference alignment was returned.")
+    details = [f"Scan ({role}): {scan.get('path', 'Unavailable')}",
+               "Reference: " + registration.get("reference_identity", {}).get("path", "Unavailable"),
+               f"Result: {state}. {reason}"]
+    labels = {"source_features": "Session features", "reference_features": "Reference features",
+              "matches": "Matched features", "inliers": "Consistent matches",
+              "heldout_inliers": "Held-out consistent matches",
+              "median_error_overview_px": "Median error (overview pixels)",
+              "rotation_degrees": "Rotation (degrees)", "overview_scale": "Overview scale"}
+    for key, value in registration.get("metrics", {}).items():
+        details.append(f"{labels.get(key, key)}: {value}")
+    if registration.get("save_error"):
+        details.append("Result could not be saved: " + registration["save_error"])
+    level = logging.ERROR if registration.get("error") else (
+        logging.INFO if registration.get("accepted") else logging.WARNING)
+    logging.getLogger(__name__).log(level, "Reference alignment completed\n%s", "\n".join(details))
 
 
 def resolve_scan_image(path):
@@ -270,8 +296,11 @@ class ScanViewerTab(ParamConfig):
     """Saved scan image tab using the existing configuration-tab framework."""
 
     scanLoaded = QtCore.pyqtSignal(object)
+    imageLoadStarted = QtCore.pyqtSignal()
+    imageLoadFailed = QtCore.pyqtSignal(str)
 
-    def __init__(self, config=None, parent=None):
+    def __init__(self, config=None, parent=None, atlas_tools=True):
+        self.atlas_tools = bool(atlas_tools)
         super().__init__(config if config is not None else Config(name="Scan"),
                          parent=parent, build_ui=False)
         self.image_path = None
@@ -301,10 +330,14 @@ class ScanViewerTab(ParamConfig):
         toolbar = QtWidgets.QHBoxLayout()
         for label, action in (("Open scan…", self.open_image),
                               ("Open reference", self.open_reference),
-                              ("Fit", self.fit_image),
+                              ("Fit image to window", self.fit_image),
                               ("Native detail", self.load_native)):
             button = QtWidgets.QPushButton(label)
             button.clicked.connect(action)
+            if action == self.open_image:
+                self.open_scan_button = button
+            elif action == self.open_reference:
+                self.open_reference_button = button
             toolbar.addWidget(button)
         self.enhance_detail = QtWidgets.QCheckBox("Enhance detail")
         self.enhance_detail.setToolTip(
@@ -314,7 +347,9 @@ class ScanViewerTab(ParamConfig):
         toolbar.addStretch()
         self.coordinates = QtWidgets.QLabel("Image pixels")
         toolbar.addWidget(self.coordinates)
-        layout.addLayout(toolbar)
+        self.display_controls = CollapsibleGroupBox("Scan display", self)
+        self.display_controls.setContentLayout(toolbar)
+        layout.addWidget(self.display_controls)
         mapping = QtWidgets.QHBoxLayout()
         mapping.addWidget(QtWidgets.QLabel("Upright rotation"))
         self.rotation = QtWidgets.QDoubleSpinBox()
@@ -340,12 +375,16 @@ class ScanViewerTab(ParamConfig):
         self.show_global_overlay = QtWidgets.QCheckBox("Show 40x / pipette")
         self.show_global_overlay.setChecked(True)
         self.show_global_overlay.toggled.connect(self._global_overlay_visibility)
-        mapping.addWidget(self.show_global_overlay)
+        toolbar.addWidget(self.show_global_overlay)
         mapping.addStretch()
-        layout.addLayout(mapping)
+        self.mapping_controls = CollapsibleGroupBox("Atlas fitting", self)
+        self.mapping_controls.setContentLayout(mapping)
+        layout.addWidget(self.mapping_controls)
+        self.mapping_controls.setVisible(self.atlas_tools)
         self.atlas_status = QtWidgets.QLabel("Rotate the scan upright, then map it.")
         self.atlas_status.setWordWrap(True)
         layout.addWidget(self.atlas_status)
+        self.atlas_status.setVisible(self.atlas_tools)
         self.view = _ScanView(self)
         self.view.zoom_changed.connect(self._zoom_changed)
         self.view.pixel_hovered.connect(self._pixel_hovered)
@@ -364,6 +403,7 @@ class ScanViewerTab(ParamConfig):
         self.load_image(REFERENCE_MANIFEST)
 
     def load_image(self, path):
+        self.imageLoadStarted.emit()
         self.set_global_overlay(None)
         self._invalidate_atlas()
         self._restore_atlas_pending = True
@@ -477,7 +517,8 @@ class ScanViewerTab(ParamConfig):
         if self._global_overlay_items:
             self._global_overlay_items[0].setPolygon(polygon)
         else:
-            self._global_overlay_items.append(scene.addPolygon(polygon, pen))
+            self._global_overlay_items.append(scene.addPolygon(
+                polygon, pen, QtGui.QBrush(QtGui.QColor(0, 229, 255, 95 if self.atlas_tools else 35))))
         marker = self._global_overlay_items[1] if len(self._global_overlay_items) > 1 else None
         expected_type = QtWidgets.QGraphicsEllipseItem if pipette_direction_px is None else QtWidgets.QGraphicsPolygonItem
         if marker is not None and (pipette_px is None or not isinstance(marker, expected_type)):
@@ -534,6 +575,7 @@ class ScanViewerTab(ParamConfig):
         if token == self._token:
             self._native_requested = False
             self.status.setText(f"Image could not be loaded: {error}")
+            self.imageLoadFailed.emit(error)
 
     def _zoom_changed(self, scale):
         if scale > self._overview_ratio * 1.25:
@@ -749,10 +791,14 @@ class LinkedScanViewerTab(ScanViewerTab):
         self.reload_alignment_button.clicked.connect(self.reload_alignment)
         row.addWidget(self.save_alignment_button)
         row.addWidget(self.reload_alignment_button)
-        self.layout().insertLayout(2, row)
+        self.alignment_controls = CollapsibleGroupBox("Alignment adjustment", self)
+        self.alignment_controls.setContentLayout(row)
+        self.layout().insertWidget(2, self.alignment_controls)
+        self.alignment_controls.setVisible(self.atlas_tools)
         self.atlas_position_status = QtWidgets.QLabel("Atlas position: load or save an alignment.")
         self.atlas_position_status.setWordWrap(True)
         self.layout().insertWidget(4, self.atlas_position_status)
+        self.atlas_position_status.setVisible(self.atlas_tools)
 
     def _display_image(self, token, result):
         if token == self._token:
@@ -862,6 +908,41 @@ class LinkedScanViewerTab(ScanViewerTab):
             self.atlasOverlayChanged.emit(self._published_atlas)
 
 
+class _ReferenceRegistrationWorker(QtCore.QThread):
+    completed = QtCore.pyqtSignal(str, int, object, object)
+
+    def __init__(self, role, generation, scan, parent):
+        super().__init__(parent)
+        self.role, self.generation, self.scan = role, generation, scan
+        self.force = False
+
+    def run(self):
+        try:
+            from patcherbot.deepLearning.ObjectiveRegistrar import ObjectiveRegistrar
+            from patcherbot.utils.scanReferenceRegistration import (
+                register_scan_to_reference, load_registration, save_registration)
+            scan = read_scan_image(self.scan["path"])
+            if scan["source_identity"] != self.scan.get("source_identity", scan["source_identity"]):
+                raise ValueError("Scan changed after display; reopen it.")
+            reference = read_scan_image(ObjectiveRegistrar.shared().reference_image_path)
+            registration = None if self.force else load_registration(scan, reference)
+            fresh = registration is None
+            if fresh:
+                registration = register_scan_to_reference(scan, reference)
+            for image in (scan, reference):
+                stat = Path(image["path"]).stat()
+                if (stat.st_size, stat.st_mtime_ns) != tuple(image["source_identity"]):
+                    raise ValueError("A source image changed during registration; reopen the scan.")
+            if fresh:
+                try:
+                    save_registration(registration, self.scan["path"])
+                except OSError as error:
+                    registration["save_error"] = str(error)
+        except Exception as error:
+            registration = dict(accepted=False, error=True, reason=str(error))
+        self.completed.emit(self.role, self.generation, self.scan, registration)
+
+
 class ScanWorkspace(ParamConfig):
     """Independent saved-bottom and session views using the existing scan widget."""
 
@@ -873,21 +954,60 @@ class ScanWorkspace(ParamConfig):
         super().__init__(config if config is not None else Config(name="Scan"),
                          parent=parent, build_ui=False)
         self.tabs = QtWidgets.QTabWidget(self)
-        self.reference_view = LinkedScanViewerTab(parent=self.tabs)
-        self.session_view = LinkedScanViewerTab(parent=self.tabs)
+        self.reference_view = LinkedScanViewerTab(parent=self.tabs, atlas_tools=False)
+        self.session_view = LinkedScanViewerTab(parent=self.tabs, atlas_tools=False)
+        self.reference_view.open_scan_button.clicked.disconnect()
+        self.reference_view.open_scan_button.clicked.connect(self.open_image)
+        for view in (self.reference_view, self.session_view):
+            view.open_reference_button.clicked.disconnect()
+            view.open_reference_button.clicked.connect(self.open_reference)
         self.tabs.addTab(self.reference_view, "Reference bottom")
-        self.tabs.addTab(self.session_view, "Session scan / Allen")
+        self.tabs.addTab(self.session_view, "Session scan")
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.tabs)
+        self.reference_fit_status = QtWidgets.QLabel("Reference alignment: no session scan loaded.")
+        self.reference_fit_status.setWordWrap(True)
+        layout.addWidget(self.reference_fit_status)
+        self.reference_fit_controls = CollapsibleGroupBox("Session reference alignment", self)
+        fit_layout = QtWidgets.QVBoxLayout()
+        self.reference_fit_button = QtWidgets.QPushButton("Fit session to reference")
+        self.reference_fit_button.setEnabled(False)
+        self.reference_fit_button.clicked.connect(self.fit_session_to_reference)
+        fit_layout.addWidget(self.reference_fit_button)
+        self.reference_fit_details = QtWidgets.QPlainTextEdit()
+        self.reference_fit_details.setReadOnly(True)
+        self.reference_fit_details.setMaximumHeight(110)
+        self.reference_fit_details.setPlaceholderText("Alignment measurements appear here after fitting.")
+        fit_layout.addWidget(self.reference_fit_details)
+        self.reference_fit_controls.setContentLayout(fit_layout)
+        layout.addWidget(self.reference_fit_controls)
+        layout.addWidget(self.tabs, 1)
+        self._session_scan_result = None
         self._results = {}
+        self._session_loaded = False
         self._atlas_results = {}
+        self._registration_generations = {}
+        self._registration_workers = []
+        self._closed = False
+        self.session_view.imageLoadStarted.connect(self._session_load_started)
+        self.session_view.imageLoadFailed.connect(self._session_load_failed)
         self.reference_view.scanLoaded.connect(lambda result: self._loaded("reference", result))
         self.session_view.scanLoaded.connect(lambda result: self._loaded("session", result))
         self.reference_view.atlasOverlayChanged.connect(lambda result: self._atlas_changed("reference", result))
         self.session_view.atlasOverlayChanged.connect(lambda result: self._atlas_changed("session", result))
         self.tabs.currentChanged.connect(self._selection_changed)
         QtCore.QTimer.singleShot(0, self.load_default_reference)
+
+    def attach_atlas_view(self, view):
+        """Route a separate no-harp Atlas view through the shared scan roles."""
+        self.atlas_view = view
+        view.imageLoadStarted.connect(lambda: self._invalidate_reference_registration("atlas"))
+        view.scanLoaded.connect(lambda result: self._loaded("atlas", result))
+        view.atlasOverlayChanged.connect(lambda result: self._atlas_changed("atlas", result))
+
+    def registered_views(self):
+        return [(role, getattr(self, role + "_view")) for role in ("reference", "session", "atlas")
+                if hasattr(self, role + "_view")]
 
     @property
     def active_view(self):
@@ -919,10 +1039,119 @@ class ScanWorkspace(ParamConfig):
     def _loaded(self, role, result):
         result = dict(result)
         result["metadata"] = dict(result.get("metadata", {}), registration_role=role)
+        if role != "reference":
+            if role == "session":
+                previous = self._session_scan_result
+                self._session_scan_result = result
+                self._session_loaded = True
+                if (previous is not None and result.get("source_identity") is not None
+                        and previous.get("path") == result.get("path")
+                        and previous.get("source_identity") == result["source_identity"]):
+                    return  # Zoom/detail refreshes preserve the last fit and its results.
+                self.tabs.setCurrentWidget(self.session_view)
+            self._start_reference_fit(role, result)
+            return
         self._results[role] = result
         self.layerLoaded.emit(role, result)
         if role == self.active_role:
             self.scanLoaded.emit(result)
+
+    def _start_reference_fit(self, role, result, force=False):
+        logging.getLogger(__name__).info(
+            "Reference alignment started (%s): %s; %s", role, result["path"],
+            "fresh fit requested" if force else "checking saved fit or matching images")
+        self._invalidate_reference_registration(role)
+        generation = self._registration_generations[role]
+        getattr(self, role + "_view").status.setText("Matching scan to reference...")
+        if role == "session":
+            self.reference_fit_button.setEnabled(False)
+            self.reference_fit_status.setText("Reference alignment: fitting session scan...")
+            self.reference_fit_details.setPlainText("Session: " + result["path"])
+        worker = _ReferenceRegistrationWorker(role, generation, result, self)
+        worker.force = force
+        self._registration_workers.append(worker)
+        worker.completed.connect(self._reference_registered)
+        worker.finished.connect(lambda worker=worker: self._registration_finished(worker))
+        worker.start()
+
+    def fit_session_to_reference(self):
+        if self._session_scan_result is not None and self.reference_fit_button.isEnabled():
+            self._start_reference_fit("session", self._session_scan_result, force=True)
+
+    def _show_reference_fit_result(self, result, registration):
+        state = "Error" if registration.get("error") else (
+            "Accepted" if registration.get("accepted") else "Rejected")
+        reason = registration.get("reason") or ("Image alignment passed geometric checks."
+            if registration.get("accepted") else "No valid reference alignment was returned.")
+        self.reference_fit_status.setText(f"Reference alignment: {state}. {reason}")
+        self.reference_fit_button.setEnabled(self._session_loaded)
+        details = ["Session: " + result.get("path", ""),
+                   "Reference: " + registration.get("reference_identity", {}).get("path", "Unavailable"),
+                   "Result: " + state + ". " + reason]
+        labels = {"source_features": "Session features", "reference_features": "Reference features",
+                  "matches": "Matched features", "inliers": "Consistent matches",
+                  "heldout_inliers": "Held-out consistent matches",
+                  "median_error_overview_px": "Median error (overview pixels)",
+                  "rotation_degrees": "Rotation (degrees)", "overview_scale": "Overview scale"}
+        for key, value in registration.get("metrics", {}).items():
+            if key in labels:
+                details.append(f"{labels[key]}: {value:.4g}" if isinstance(value, float)
+                               else f"{labels[key]}: {value}")
+        if registration.get("save_error"):
+            details.append("Result could not be saved: " + registration["save_error"])
+        self.reference_fit_details.setPlainText("\n".join(details))
+
+    def _session_load_failed(self, error):
+        if self._session_loaded:
+            self.session_view.status.setText("Image detail could not be loaded: " + error)
+            return
+        self.reference_view.status.setText("Session could not be loaded; showing reference: " + error)
+        self.reference_fit_status.setText("Reference alignment: image could not be loaded. " + error)
+
+    def _session_load_started(self):
+        self._session_scan_result = None
+        self.reference_fit_button.setEnabled(False)
+        self.reference_fit_status.setText("Reference alignment: waiting for session image to load...")
+        self.reference_fit_details.clear()
+        self._session_loaded = False
+        self._invalidate_reference_registration("session")
+
+    def _invalidate_reference_registration(self, role):
+        self._registration_generations[role] = self._registration_generations.get(role, 0) + 1
+        self._results.pop(role, None)
+        self.layerLoaded.emit(role, None)
+        getattr(self, role + "_view").set_global_overlay(None)
+        if role == "session" and not self._session_loaded:
+            self.tabs.setCurrentWidget(self.reference_view)
+
+    def _reference_registered(self, role, generation, result, registration):
+        if self._closed or generation != self._registration_generations.get(role):
+            return
+        _log_reference_fit_result(role, result, registration)
+        view = getattr(self, role + "_view")
+        if role == "session":
+            self._show_reference_fit_result(result, registration)
+        if not registration.get("accepted"):
+            message = "Reference match rejected: " + registration.get("reason", "insufficient evidence")
+            view.status.setText(message)
+            if role == "session":
+                self.reference_view.status.setText(message)
+                view.status.setText(message + "; session image remains available without alignment.")
+            return
+        result = dict(result, reference_registration=registration)
+        self._results[role] = result
+        self.layerLoaded.emit(role, result)
+        self.atlasOverlayChanged.emit(role, self._atlas_results.get(role))
+        view.status.setText("Reference image match accepted; stage calibration unchanged" + ("; sidecar could not be saved" if registration.get("save_error") else ""))
+        if role == "session" and self.active_role != "session":
+            self.tabs.setCurrentWidget(self.session_view)
+        elif role == self.active_role:
+            self.scanLoaded.emit(result)
+
+    def _registration_finished(self, worker):
+        if worker in self._registration_workers:
+            self._registration_workers.remove(worker)
+        worker.deleteLater()
 
     def _atlas_changed(self, role, result):
         self._atlas_results[role] = result
@@ -934,14 +1163,16 @@ class ScanWorkspace(ParamConfig):
             self.scanLoaded.emit(result)
         else:
             self.active_view.set_global_overlay(None)
+            if self.active_role == "session" and not self._session_loaded:
+                self.tabs.setCurrentWidget(self.reference_view)
 
     def open_image(self):
-        self.tabs.setCurrentWidget(self.session_view)
+        self.tabs.setCurrentWidget(self.reference_view)
         self.session_view.open_image()
 
     def load_image(self, path):
         """Newly completed scans go to the session without replacing the bottom."""
-        self.tabs.setCurrentWidget(self.session_view)
+        self.tabs.setCurrentWidget(self.reference_view)
         self.session_view.load_image(path)
 
     def open_reference(self):
@@ -952,5 +1183,8 @@ class ScanWorkspace(ParamConfig):
         self.active_view.set_global_overlay(corners_px, pipette_px, pipette_direction_px)
 
     def shutdown(self):
+        self._closed = True
+        for worker in list(self._registration_workers):
+            worker.wait()
         self.reference_view.shutdown()
         self.session_view.shutdown()

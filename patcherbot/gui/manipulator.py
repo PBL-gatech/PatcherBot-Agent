@@ -1,4 +1,4 @@
-﻿# coding=utf-8
+# coding=utf-8
 from types import MethodType
 import logging
 import time
@@ -111,7 +111,7 @@ class ManipulatorGui(CameraGui):
             painter.drawLine(int(c_x), c_y,
                              int(c_x + round(length_in_um*scaled_length)), c_y)
             if text:
-                painter.drawText(c_x, c_y - 10, '{}Âµm'.format(length_in_um))
+                painter.drawText(c_x, c_y - 10, '{} µm'.format(length_in_um))
             painter.end()
 
     def register_commands(self, manipulator_keys = True):

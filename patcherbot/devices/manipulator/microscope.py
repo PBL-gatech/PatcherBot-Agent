@@ -7,6 +7,8 @@ TODO:
 * steps for stack acquisition?
 '''
 from patcherbot.devices.manipulator import Manipulator
+import math
+from numbers import Real
 import time
 import warnings
 try:
@@ -32,6 +34,7 @@ class Microscope(Manipulator):
         self.axis = axis
         self.up_direction = -1.0 # Up is negative on microscope Z by default
         self.floor_Z = None # This is the Z coordinate of the coverslip
+        self.stage_floor = None  # Independent basin floor in raw driver micrometres.
         self.config = None
         self.units_per_um = 5.0
         self.objective_lift_um = 10000.0
@@ -94,6 +97,16 @@ class Microscope(Manipulator):
         print(f"Moved to floor at {self.floor_Z} um")
         # self.dev.absolute_move(self.floor_Z, self.axis)
         # self.dev.wait_until_still([self.axis])
+
+    def move_to_stage_floor(self):
+        """Move the microscope axis to the independently recorded basin floor."""
+        target = self.stage_floor
+        if target is None:
+            raise RuntimeError("Stage floor must be set.")
+        if isinstance(target, bool) or not isinstance(target, Real) or not math.isfinite(target):
+            raise ValueError("Stage floor must be a finite coordinate.")
+        self.dev.absolute_move(float(target), self.axis)
+        self.dev.wait_until_still([self.axis])
 
     def fix_backlash(self):
         '''
