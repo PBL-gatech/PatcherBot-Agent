@@ -247,6 +247,121 @@ class MultiClampAmplifierTests(unittest.TestCase):
         self.assertEqual(Channel.most, 1)
 
 
+class FakeMultiClampDLL:
+    """Stands in for AxMultiClampMsg.dll: one 700B with headstages 1 and 2.
+
+    Like the real DLL, it remembers per message handler which Commander
+    windows FindFirst/FindNext found, and SelectMultiClamp on a handler that
+    never searched fails with MCCMSG_ERROR_MCCNOTOPEN (6002).
+    """
+    SERIAL = b"00123456"
+
+    def __init__(self):
+        self.created = []
+        self.destroyed = []
+        self.searched = set()
+        self.selects = []           # (handle, channel)
+        self._pending = {}          # handle -> channels left for FindNext
+
+    def MCCMSG_CreateObject(self, err):
+        handle = len(self.created) + 1
+        self.created.append(handle)
+        err._obj.value = 6000
+        return handle
+
+    def MCCMSG_DestroyObject(self, handle):
+        self.destroyed.append(handle)
+
+    def _report(self, handle, model, serial, channel, err):
+        if not self._pending[handle]:
+            err._obj.value = 6002
+            return 0
+        model._obj.value = 1                        # 700B
+        serial.value = self.SERIAL
+        channel._obj.value = self._pending[handle].pop(0)
+        err._obj.value = 6000
+        return 1
+
+    def MCCMSG_FindFirstMultiClamp(self, handle, model, serial, size, port, device, channel, err):
+        self.searched.add(handle)
+        self._pending[handle] = [1, 2]
+        return self._report(handle, model, serial, channel, err)
+
+    def MCCMSG_FindNextMultiClamp(self, handle, model, serial, size, port, device, channel, err):
+        return self._report(handle, model, serial, channel, err)
+
+    def MCCMSG_SelectMultiClamp(self, handle, model, serial, port, device, channel, err):
+        self.selects.append((handle, channel.value))
+        if handle not in self.searched or serial != self.SERIAL:
+            err._obj.value = 6002
+            return 0
+        err._obj.value = 6000
+        return 1
+
+    def MCCMSG_BuildErrorText(self, handle, err, buf, size):
+        buf.value = b"AXMCCMSG: MultiClamp Commander is not open"
+
+    def __getattr__(self, name):                    # every other MCCMSG_* call succeeds
+        if name.startswith("MCCMSG_"):
+            return lambda *args: 1
+        raise AttributeError(name)
+
+
+class MultiClampSharedHandleTests(unittest.TestCase):
+    """Both headstages must talk to Commander through one searched handler."""
+
+    def setUp(self):
+        from patcherbot.devices.amplifier import multiclamp
+        self.multiclamp = multiclamp
+        self.dll = FakeMultiClampDLL()
+        self._reset()
+        self._patch = patch.object(multiclamp.ctypes, "WinDLL", create=True,
+                                   return_value=self.dll)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._reset()
+
+    def _reset(self):
+        cls = self.multiclamp.MultiClampChannel
+        cls.all_devices = None
+        cls.selected_device = None
+        cls._shared_dll = None
+        cls._shared_handle = None
+        cls._handle_users = 0
+
+    def test_two_headstages_share_the_searched_handler(self):
+        amplifier = self.multiclamp.MultiClampAmplifier(channels=[1, 2])
+        self.assertEqual(len(self.dll.created), 1)
+        handle = self.dll.created[0]
+        self.assertEqual({h for h, _ in self.dll.selects}, {handle})
+        self.assertEqual([c for _, c in self.dll.selects], [1, 2])
+
+        amplifier.for_pipette("pipette_0").voltage_clamp()
+        amplifier.for_pipette("pipette_1").current_clamp()
+        self.assertEqual(self.dll.selects[-2:], [(handle, 1), (handle, 2)])
+
+        amplifier.close()
+        self.assertEqual(self.dll.destroyed, [handle])
+        cls = self.multiclamp.MultiClampChannel
+        self.assertIsNone(cls._shared_handle)
+        self.assertIsNone(cls.all_devices)
+        self.assertEqual(cls._handle_users, 0)
+
+    def test_single_channel_config_still_works(self):
+        channel = self.multiclamp.MultiClampChannel(channel=1)
+        self.assertEqual(self.dll.selects, [(self.dll.created[0], 1)])
+        channel.close()
+        self.assertEqual(self.dll.destroyed, self.dll.created)
+
+    def test_failure_names_the_channel_and_releases_the_handler(self):
+        with self.assertRaisesRegex(RuntimeError, "MultiClamp channel 3"):
+            self.multiclamp.MultiClampAmplifier(channels=[1, 3])
+        self.assertEqual(self.dll.destroyed, self.dll.created)
+        self.assertEqual(self.multiclamp.MultiClampChannel._handle_users, 0)
+
+
 class ProtocolMatrixCleanupTests(unittest.TestCase):
     def test_failed_setup_still_cleans_up_every_selected_pipette(self):
         keys = ["pipette_0", "pipette_1"]

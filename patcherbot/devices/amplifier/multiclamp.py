@@ -183,17 +183,41 @@ class MultiClampChannel(Amplifier):
     selected_device = None
     # Serializes calls to the MultiClamp DLL across channels and threads
     dll_lock = threading.RLock()
+    # One DLL message handler shared by every channel. The DLL remembers the
+    # Commander windows found by FindFirst/FindNext per handler, and
+    # SelectMultiClamp only works on a handler that did that search; a fresh
+    # handler per channel fails with "MultiClamp Commander is not open".
+    _shared_dll = None
+    _shared_handle = None
+    _handle_users = 0
 
     def __init__(self, **kwds):
-        self.dll = ctypes.WinDLL(os.path.join(MultiClampChannel.dll_path,
-                                              'AxMultiClampMsg.dll'))
         self.last_error = ctypes.c_int(NO_ERROR)
         self.error_msg = ctypes.create_string_buffer(256)
-        self.msg_handler = self.dll.MCCMSG_CreateObject(ctypes.byref(self.last_error))
-        self.check_error(fail=True)
-        if MultiClampChannel.all_devices is None:
-            MultiClampChannel.all_devices = self.find_amplifiers()
         self.identification = kwds
+        with MultiClampChannel.dll_lock:
+            if MultiClampChannel._shared_handle is None:
+                self.dll = ctypes.WinDLL(os.path.join(MultiClampChannel.dll_path,
+                                                      'AxMultiClampMsg.dll'))
+                self.msg_handler = self.dll.MCCMSG_CreateObject(ctypes.byref(self.last_error))
+                self.check_error(fail=True)
+                MultiClampChannel._shared_dll = self.dll
+                MultiClampChannel._shared_handle = self.msg_handler
+                MultiClampChannel.selected_device = None
+                # Search with the handler that will do the selecting.
+                MultiClampChannel.all_devices = self.find_amplifiers()
+            else:
+                self.dll = MultiClampChannel._shared_dll
+                self.msg_handler = MultiClampChannel._shared_handle
+            MultiClampChannel._handle_users += 1
+            try:
+                self._init_selected()
+            except Exception:
+                self.close()
+                raise
+
+    def _init_selected(self):
+        """Select this channel and set its initial gains (holds dll_lock)."""
         self.select_amplifier()
 
         # Sets the gains: depends on the headstage (feedback resistor)
@@ -738,8 +762,21 @@ class MultiClampChannel(Amplifier):
         return frequency.value
 
     def close(self):
-        self.dll.MCCMSG_DestroyObject(self.msg_handler)
-        self.msg_handler = None
+        """Release this channel; the shared handler goes when the last one closes."""
+        with MultiClampChannel.dll_lock:
+            if self.msg_handler is None:
+                return
+            self.msg_handler = None
+            if MultiClampChannel.selected_device is self:
+                MultiClampChannel.selected_device = None
+            MultiClampChannel._handle_users -= 1
+            if MultiClampChannel._handle_users <= 0:
+                self.dll.MCCMSG_DestroyObject(MultiClampChannel._shared_handle)
+                MultiClampChannel._shared_dll = None
+                MultiClampChannel._shared_handle = None
+                MultiClampChannel._handle_users = 0
+                # Search again on the next connection.
+                MultiClampChannel.all_devices = None
 
 
 class MultiClampAmplifier(object):
@@ -766,7 +803,11 @@ class MultiClampAmplifier(object):
             raise ValueError("MultiClampAmplifier needs at least one channel")
         self.headstages = []
         for channel in self.channels:
-            headstage = MultiClampChannel(channel=channel, **identification)
+            try:
+                headstage = MultiClampChannel(channel=channel, **identification)
+            except Exception as exc:
+                self.close()
+                raise RuntimeError(f"MultiClamp channel {channel}: {exc}") from exc
             # Lets callers recognise headstages of the same physical amplifier.
             headstage.shared_amplifier = self
             self.headstages.append(headstage)
