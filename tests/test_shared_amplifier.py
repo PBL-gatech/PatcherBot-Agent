@@ -195,6 +195,31 @@ class MultiClampAmplifierTests(unittest.TestCase):
         self.assertEqual(AutoPatchInterface._device_for_pipette(devices, "pipette_0").channel, 1)
         self.assertEqual(AutoPatchInterface._device_for_pipette(devices, "pipette_1").channel, 2)
 
+    def test_numpy_channel_array_is_accepted(self):
+        import numpy as np
+        amplifier = self._amplifier(channels=np.array([1., 2.]))
+        self.assertEqual(amplifier.channels, [1, 2])
+        self.assertTrue(all(type(channel) is int for channel in amplifier.channels))
+
+    def test_norwich_config_builds_through_the_rig_loader(self):
+        """The loader turns ``"channels": [1, 2]`` into a numpy array; the
+        amplifier must still build with one headstage per pipette."""
+        from patcherbot.devices.amplifier import multiclamp
+
+        class FakeChannel:
+            def __init__(self, channel, **identification):
+                self.channel = channel
+                self.identification = identification
+
+        manager = RigConfigManager()
+        config = manager.load_config(CONFIG_DIR / "Norwich_multiple_rig.json", load_overlays=False)
+        with patch.object(multiclamp, "MultiClampChannel", FakeChannel):
+            amplifier = manager._instantiate_slot("amplifier", config["devices"]["amplifier"], {})
+        self.assertEqual(amplifier.channels, [1, 2])
+        self.assertEqual(amplifier.for_pipette("pipette_0").channel, 1)
+        self.assertEqual(amplifier.for_pipette("pipette_1").channel, 2)
+        self.assertIs(type(amplifier.for_pipette("pipette_1").channel), int)
+
     def test_dll_calls_are_serialized(self):
         from patcherbot.devices.amplifier import multiclamp
 

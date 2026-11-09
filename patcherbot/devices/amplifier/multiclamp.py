@@ -757,9 +757,13 @@ class MultiClampAmplifier(object):
         when more than one amplifier is connected.
     """
     def __init__(self, channels=(1, 2), **identification):
-        if not channels:
-            raise ValueError("MultiClampAmplifier needs at least one channel")
+        # The rig config loader turns numeric lists into numpy float arrays, so
+        # normalise to plain ints before any truth test (``not array`` raises).
+        if isinstance(channels, (int, float)):
+            channels = [channels]
         self.channels = [int(channel) for channel in channels]
+        if not self.channels:
+            raise ValueError("MultiClampAmplifier needs at least one channel")
         self.headstages = []
         for channel in self.channels:
             headstage = MultiClampChannel(channel=channel, **identification)
