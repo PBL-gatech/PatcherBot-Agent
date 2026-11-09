@@ -43,8 +43,12 @@ class PatchGui(ManipulatorGui):
         self.pipette_interface = pipette_interface
         self.recording_state_manager = recording_state_manager
         self._cell_list_signature = None
+        self._candidate_list_signature = None
         self.cell_list_window = CellListWindow(self)
         self.cell_list_window.closed.connect(self._cells_window_closed)
+        self.cell_list_window.action_requested.connect(self._manage_cells)
+        self.patch_interface.cells_changed.connect(self._refresh_cell_list_window)
+        self.patch_interface.screening_finished.connect(self._screening_finished)
         self.show_cells_button = QtWidgets.QPushButton("Show Cells")
         self.show_cells_button.setCheckable(True)
         self.show_cells_button.clicked.connect(self.toggle_cell_list_window)
@@ -416,7 +420,7 @@ class PatchGui(ManipulatorGui):
         self.show_cells_button.setText("Show Cells")
 
     def _refresh_cell_list_window(self, force=False):
-        if not self.cell_list_window.isVisible():
+        if not force and not self.cell_list_window.isVisible():
             return
         cells = list(self.patch_interface.cells_to_patch)
         try:
@@ -427,6 +431,22 @@ class PatchGui(ManipulatorGui):
         full_refresh = force or (signature != self._cell_list_signature)
         self.cell_list_window.update_cells(cells, stage_reference, full_refresh=full_refresh)
         self._cell_list_signature = signature
+
+        candidates = list(self.patch_interface.proposed_cells)
+        signature = tuple(id(cell) for cell in candidates)
+        full_refresh = force or (signature != self._candidate_list_signature)
+        self.cell_list_window.update_candidates(candidates, full_refresh=full_refresh)
+        self._candidate_list_signature = signature
+
+    @QtCore.pyqtSlot(object)
+    def _manage_cells(self, request):
+        self.patch_command_signal.emit(self.patch_interface.manage_cells, request)
+
+    @QtCore.pyqtSlot()
+    def _screening_finished(self):
+        self.show_cells_button.setChecked(True)
+        self.cell_list_window.show_candidates()
+        self.toggle_cell_list_window(True)
 
 class ButtonTabWidget(QtWidgets.QWidget):
     def __init__(self):
@@ -901,14 +921,16 @@ class ClassicPatchButtons(ButtonTabWidget):
         buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
                       ['Locate Cell','Approach Cell','Hunt Cell'],
                       ['Gigaseal','Break-in','Escape Cell'],
-                      ['Patch Cell','Run Protocols']]
+                      ['Patch Cell','Run Protocols'],
+                      ['Screen Cells']]
         cmds = [[self.patch_interface.start_selecting_cells, self.patch_interface.remove_last_cell, self.patch_interface.center_on_cell],
                 [self.patch_interface.locate_cell, self.patch_interface.approach_cell,
                  [self.start_recording,self.patch_interface.hunt_cell]],
                 [[self.patch_interface.gigaseal], [self.patch_interface.break_in],
                  [self.stop_recording,  self.patch_interface.escape_cell]],
                 [[self.start_recording,  self.patch_interface.patch, self.stop_recording],
-                 [self.stop_recording,  self.patch_interface.run_protocols]]
+                 [self.stop_recording,  self.patch_interface.run_protocols]],
+                 [self.patch_interface.screen_cells]
 ]
         self.addButtonList('patching', layout, buttonList, cmds, sequential=True, change_color_during={
             'Locate Cell',

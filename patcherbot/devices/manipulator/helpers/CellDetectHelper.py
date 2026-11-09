@@ -18,8 +18,9 @@ class CellDetectHelper:
             self.cellDetector = CellDetector2(model_type="pidnet")
         return self.cellDetector
 
-    def detect_cells(self) -> List[Tuple[int, int, float]]:
-        frame = self.camera.last_raw_frame_data()
+    def detect_cells(self, frame=None) -> List[Tuple[int, int, float]]:
+        if frame is None:
+            frame = self.camera.last_raw_frame_data()
         if frame is None or frame[2] is None:
             self.camera.show_circles([])
             return []

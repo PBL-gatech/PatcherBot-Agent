@@ -1,4 +1,4 @@
-﻿"""Global System View tab; anchored snapshots use millimetres.
+"""Global System View tab; anchored snapshots use millimetres.
 
 Supply set_anchor_state(dict) from the anchoring system, or load its JSON:
   scan_pixel_to_world_mm: 4x4 affine mapping native scan [x,y,0,1] to mm
@@ -8,6 +8,7 @@ Supply set_anchor_state(dict) from the anchoring system, or load its JSON:
 The 40x rectangle is parallel to world XY. Snapshots never command hardware.
 """
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -190,6 +191,7 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         self._snapshot_generation = 0
         self._scan_render_key = None
         self._layers = {}
+        self._session_position_transform = None
         self._layer_errors = {}
         self._initial_system_fit = False
         self._last_position_key = None
@@ -305,7 +307,8 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
             self._scan_registration_valid = True
             if role not in self._layers or not hasattr(self.scan_viewer, "layerLoaded"):
                 self._layer_loaded(role, result)
-            self.set_anchor_state(self.position_helper.snapshot(self._scan_transform, objective=self._objective))
+            self.set_anchor_state(self._registered_position_state(
+                self.position_helper.snapshot(self._scan_transform, objective=self._objective)))
         except (OSError, ValueError, KeyError, TypeError) as error:
             self._scan_transform = None
             self._scan_registration_valid = False
@@ -327,15 +330,28 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         if role not in ("reference", "session", "atlas") or self.position_helper is None:
             return
         if result is None:
+            if role == "session":
+                self._session_position_transform = None
             self._layers.pop(role, None)
             self._atlas_scan_info.pop(role, None)
             self._atlas_changed(role, None)
             self._update_overlay()
             return
+        if role == "session":
+            self._session_position_transform = None
         self._atlas_scan_info[role] = {key: result[key] for key in ("path", "width", "height", "metadata", "reference_registration")
                                       if key in result}
         try:
             transform = self._scan_to_global(role, result)
+            if role == "session":
+                self._session_position_transform = None
+                metadata = result.get("metadata", {})
+                if all(key in metadata for key in ("calibration", "pixel_scale_xy", "output_origin_xy_pixels")):
+                    shape = metadata.get("canvas_shape", [result["height"], result["width"]])
+                    resize = np.asarray(shape[:2][::-1], dtype=float) / [result["width"], result["height"]]
+                    stage_transform = self.position_helper.registered_session_mosaic(
+                        metadata, objective=4, downsample_factor=resize)
+                    self._session_position_transform = transform @ np.linalg.inv(stage_transform)
             state = self.position_helper.snapshot(transform, objective=self._objective)
             self._layers[role] = dict(width=result["width"], height=result["height"],
                                      transform=self._matrix(state["scan_pixel_to_world_mm"], role))
@@ -476,6 +492,34 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         else:
             self._receive_atlas_position(key, values)
 
+    def _registered_position_state(self, state):
+        """Reanchor display XY through the fitted session; never change device state."""
+        transform = self._session_position_transform
+        if transform is None:
+            return state
+        result = dict(state)
+        linear, shift = transform[:2, :2], transform[:2, 2] / 1000.
+        def point(value):
+            value = np.asarray(value, dtype=float).copy()
+            value[..., :2] = value[..., :2] @ linear.T + shift
+            return value
+        for name in ("objective_xyz_mm", "pipette_xyz_mm", "fov_corners_mm"):
+            if state.get(name) is not None:
+                result[name] = point(state[name])
+        for name in ("pipette_marker_direction_xyz", "pipette_direction_xyz"):
+            if state.get(name) is not None:
+                value = np.asarray(state[name], dtype=float).copy()
+                value[:2] = linear @ value[:2]
+                result[name] = value
+        if state.get("named_anchors_mm") is not None:
+            result["named_anchors_mm"] = {name: point(value) if name in
+                ("home", "safe", "cleaning_bath", "pipette") else value
+                for name, value in state["named_anchors_mm"].items()}
+        if result.get("fov_corners_mm") is not None:
+            corners = np.asarray(result["fov_corners_mm"])
+            result["fov_size_mm"] = np.linalg.norm(corners[[1, 3]] - corners[0], axis=1)
+        return result
+
     def _receive_snapshot(self, generation, state, stage_xy):
         self._snapshot_busy = False
         registered_views = getattr(self.scan_viewer, "registered_views", None)
@@ -484,6 +528,21 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         if (self._closed or generation != self._snapshot_generation
                 or not (self.isVisible() or any(visible for _, visible in view_visibility))):
             return
+        state = self._registered_position_state(state)
+        if (getattr(self.scan_viewer, "active_role", "reference") == "reference"
+                and getattr(self, "_reference_trace_generation", None) != generation
+                and "reference" in self._layers):
+            self._reference_trace_generation = generation
+            layer = self._layers["reference"]
+            centre = np.asarray(state["objective_xyz_mm"])
+            projected = np.linalg.lstsq(layer["transform"][:3, :2],
+                centre - layer["transform"][:3, 3], rcond=None)[0]
+            logging.getLogger(__name__).info(
+                "Reference indicator trace: stage_xy_um=%s; field_center_mm=%s; "
+                "reference_center_px=%s; reference_size_px=%s; session_correction=%s",
+                np.asarray(stage_xy).tolist(), centre.tolist(), projected.tolist(),
+                [layer["width"], layer["height"]],
+                None if self._session_position_transform is None else self._session_position_transform.tolist())
         self._refresh_atlas_position(state)
         fields = ("scan_pixel_to_world_mm", "objective_xyz_mm", "fov_size_mm", "fov_corners_mm",
                   "pipette_xyz_mm", "pipette_direction_xyz", "objective_transform", "chamber_transform", "stage_bottom_xyz_mm",

@@ -89,7 +89,12 @@ class PatchConfig(Config):
     auto_clean_pipette = Boolean(True, doc='Automatically clean pipette after attempt')
     lamp = Selector(default= '2', objects = ['1', '2', '3','4','5','6'], doc='default fluorescence cube slot')
     auto_capture_fluo = Boolean(False, doc='Capture fluorescence image on cell selection')
+    cell_duplicate_radius_um = NumberWithUnit(5, bounds=(0.1, 1000), unit='\u03bcm',
+        doc='Maximum XY distance for suppressing duplicate cells during screening and promotion')
+    cell_duplicate_z_tolerance_um = NumberWithUnit(5, bounds=(0.1, 1000), unit='\u03bcm',
+        doc='Maximum Z-plane difference for suppressing duplicate cells during screening and promotion')
     categories = [
+        ('Cell Selection', ['cell_duplicate_radius_um', 'cell_duplicate_z_tolerance_um']),
         ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
                       'max_locate_speed', 'search_speed', 'search_z_radius_um', 'search_xy_radius_um',
                       'scan_z_radius_um', 'scan_confirm_defocus_um', 'approach_cell_max_shift', 'approach_pipette_speed',

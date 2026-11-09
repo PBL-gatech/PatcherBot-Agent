@@ -945,6 +945,19 @@ class CalibratedStage(CalibratedUnit):
     def detect_cells(self):
         return self.cellDetectHelper.detect_cells()
 
+    def screen_cells(self, result):
+        """Keep inference pixels and their stage anchor together for review."""
+        frame = self.camera.last_raw_frame_data()
+        if frame is None or frame[2] is None:
+            raise RuntimeError('No camera frame available for screening')
+        frame = (frame[0], frame[1], np.array(frame[2], copy=True))
+        result['stage_pixels'] = np.array(self.reference_position(), copy=True)
+        result['stage_um'] = np.array(self.position(), copy=True)
+        result['z_um'] = self.microscope.position() / result['z_scale']
+        result['image'] = frame[2]
+        result['detections'] = self.cellDetectHelper.detect_cells(frame)
+        result['completed'](result)
+
     def _ensure_cell_track_helper(self):
         if not self.config.use_ai_features:
             raise NotImplementedError(

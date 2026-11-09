@@ -6,52 +6,130 @@ from PyQt5.QtCore import Qt
 
 class CellListWindow(QtWidgets.QDialog):
     closed = QtCore.pyqtSignal()
+    action_requested = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None, thumbnail_size=96):
         super().__init__(parent=parent)
-        self.setWindowTitle("Selected Cells")
+        self.setWindowTitle("Show Cells")
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
 
         self.thumbnail_size = thumbnail_size
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels([
+        self._cells = {"selected": [], "proposed": []}
+        self.table = self._make_table()
+        self.candidate_table = self._make_table()
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self.table, "Cells to Patch (0/20)")
+        self.tabs.addTab(self.candidate_table, "Proposed Candidates (0)")
+        self.tabs.currentChanged.connect(self._update_actions)
+        self.table.itemSelectionChanged.connect(self._update_actions)
+        self.candidate_table.itemSelectionChanged.connect(self._update_actions)
+
+        self.buttons = {}
+        actions = QtWidgets.QHBoxLayout()
+        for action, label in (("promote", "Promote"), ("demote", "Demote"),
+                              ("up", "Move Up"), ("down", "Move Down"),
+                              ("delete", "Delete")):
+            button = QtWidgets.QPushButton(label)
+            button.clicked.connect(lambda checked=False, action=action: self._request_action(action))
+            self.buttons[action] = button
+            actions.addWidget(button)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(self.tabs)
+        layout.addLayout(actions)
+        self.setLayout(layout)
+        self.resize(800, 600)
+        self._update_actions()
+
+    def _make_table(self):
+        table = QtWidgets.QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels([
             "Image",
             "Fluo Image",
             "Cell",
             "Stage (px)",
             "Stage (um)",
         ])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.setWordWrap(False)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.table.verticalHeader().setDefaultSectionSize(self.thumbnail_size + 12)
-
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.table)
-        self.setLayout(layout)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setWordWrap(False)
+        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        table.verticalHeader().setDefaultSectionSize(self.thumbnail_size + 12)
+        return table
 
     def closeEvent(self, event):
         self.closed.emit()
         super().closeEvent(event)
 
     def update_cells(self, cells, stage_reference=None, full_refresh=True):
-        if self.table.rowCount() != len(cells):
-            self.table.setRowCount(len(cells))
-            full_refresh = True
+        self._update_table(self.table, "selected", cells, full_refresh)
+        self.tabs.setTabText(0, f"Cells to Patch ({len(cells)}/20)")
+        self._update_actions()
 
-        for row, cell in enumerate(cells):
-            stage_px, img, stage_um, img_fluo = self._unpack_cell(cell)
+    def update_candidates(self, cells, full_refresh=True):
+        self._update_table(self.candidate_table, "proposed", cells, full_refresh)
+        self.tabs.setTabText(1, f"Proposed Candidates ({len(cells)})")
+        self._update_actions()
 
-            if full_refresh:
-                self._set_image_cell(row, 0, img)
-                self._set_image_cell(row, 1, img_fluo, empty_text="N/A")
-                self._set_item(row, 2, str(row + 1))
-                self._set_item(row, 3, self._format_vec(stage_px))
-                self._set_item(row, 4, self._format_vec(stage_um))
+    def show_candidates(self):
+        self.tabs.setCurrentIndex(1)
+
+    def _update_table(self, table, source, cells, full_refresh):
+        previous = self._cells[source]
+        selected_ids = {id(previous[index.row()]) for index in table.selectionModel().selectedRows()
+                        if index.row() < len(previous)}
+        full_refresh = full_refresh or tuple(map(id, previous)) != tuple(map(id, cells))
+        self._cells[source] = list(cells)
+        if not full_refresh:
+            return
+        table.blockSignals(True)
+        try:
+            table.clearSelection()
+            table.setRowCount(len(cells))
+            for row, cell in enumerate(cells):
+                stage_px, img, stage_um, img_fluo = self._unpack_cell(cell)
+                self._set_image_cell(row, 0, img, table=table)
+                self._set_image_cell(row, 1, img_fluo, empty_text="N/A", table=table)
+                self._set_item(row, 2, str(row + 1), table=table)
+                self._set_item(row, 3, self._format_vec(stage_px), table=table)
+                self._set_item(row, 4, self._format_vec(stage_um), table=table)
+                if id(cell) in selected_ids:
+                    table.selectionModel().select(
+                        table.model().index(row, 0),
+                        QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+        finally:
+            table.blockSignals(False)
+
+    def _active_list(self):
+        if self.tabs.currentIndex() == 0:
+            return self.table, "selected"
+        return self.candidate_table, "proposed"
+
+    def _request_action(self, action):
+        table, source = self._active_list()
+        rows = sorted(index.row() for index in table.selectionModel().selectedRows())
+        cells = [self._cells[source][row] for row in rows if row < len(self._cells[source])]
+        if cells:
+            self.action_requested.emit({"action": action, "source": source, "cells": cells})
+
+    def _update_actions(self, *_args):
+        table, source = self._active_list()
+        rows = {index.row() for index in table.selectionModel().selectedRows()}
+        selected = bool(rows)
+        capacity = max(0, 20 - len(self._cells["selected"]))
+        self.buttons["promote"].setVisible(source == "proposed")
+        self.buttons["demote"].setVisible(source == "selected")
+        self.buttons["promote"].setEnabled(selected and capacity > 0)
+        self.buttons["promote"].setToolTip(f"Add to Cells to Patch ({capacity} spaces available)")
+        self.buttons["demote"].setEnabled(selected)
+        self.buttons["delete"].setEnabled(selected)
+        self.buttons["up"].setEnabled(any(row > 0 and row - 1 not in rows for row in rows))
+        self.buttons["down"].setEnabled(any(row < table.rowCount() - 1 and row + 1 not in rows
+                                            for row in rows))
 
     def _unpack_cell(self, cell):
         if cell is None:
@@ -62,20 +140,22 @@ class CellListWindow(QtWidgets.QDialog):
             return cell[0], cell[1], cell[2], None
         return None, None, None, None
 
-    def _set_item(self, row, col, text):
-        item = self.table.item(row, col)
+    def _set_item(self, row, col, text, table=None):
+        table = self.table if table is None else table
+        item = table.item(row, col)
         if item is None:
             item = QtWidgets.QTableWidgetItem()
             item.setFlags(item.flags() ^ Qt.ItemIsEditable)
-            self.table.setItem(row, col, item)
+            table.setItem(row, col, item)
         item.setText(text)
 
-    def _set_image_cell(self, row, col, image, empty_text=""):
+    def _set_image_cell(self, row, col, image, empty_text="", table=None):
+        table = self.table if table is None else table
         if image is None:
-            self.table.removeCellWidget(row, col)
+            table.removeCellWidget(row, col)
             item = QtWidgets.QTableWidgetItem(empty_text)
             item.setFlags(item.flags() ^ Qt.ItemIsEditable)
-            self.table.setItem(row, col, item)
+            table.setItem(row, col, item)
             return
 
         pixmap = self._image_to_pixmap(image)
@@ -90,7 +170,7 @@ class CellListWindow(QtWidgets.QDialog):
                     Qt.SmoothTransformation,
                 )
             )
-        self.table.setCellWidget(row, col, label)
+        table.setCellWidget(row, col, label)
 
     def _image_to_pixmap(self, image):
         if image is None:

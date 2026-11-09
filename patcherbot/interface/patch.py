@@ -28,6 +28,9 @@ class AutoPatchInterface(TaskInterface):
     state_press_tally_changed = QtCore.pyqtSignal(object)
     origin_saved = QtCore.pyqtSignal(object, object)
     scan_stitched = QtCore.pyqtSignal(object)
+    cells_changed = QtCore.pyqtSignal()
+    screening_finished = QtCore.pyqtSignal()
+    MAX_SELECTED_CELLS = 20
 
     def __init__(
         self,
@@ -71,6 +74,7 @@ class AutoPatchInterface(TaskInterface):
         self.is_selecting_cells = False
         self.is_selecting_corners = False
         self.cells_to_patch = []
+        self.proposed_cells = []
         self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
 
@@ -169,6 +173,150 @@ class AutoPatchInterface(TaskInterface):
     def detect_cells(self):
         self.execute(self.pipette_controller.calibrated_stage.detect_cells)
 
+    @blocking_command(category='Patch', description='Screen cells',
+                      task_description='Screening cells')
+    def screen_cells(self):
+        stage = self.pipette_controller.calibrated_stage
+        result = {'z_scale': self.current_autopatcher.calibrated_unit.config.microscope_units_per_um,
+                  'completed': self._accept_screened_cells}
+        self.execute(stage.screen_cells, argument=result)
+
+    def _same_cell_position(self, position, other):
+        """Compare saved anchors in calibrated micrometres, including focus drift."""
+        delta = np.asarray(position, dtype=float) - np.asarray(other, dtype=float)
+        stage = self.pipette_controller.calibrated_stage
+        distance_um = np.linalg.norm(stage.pixels_to_um_relative(delta[:2])[:2])
+        return (distance_um <= self.config.cell_duplicate_radius_um
+                and abs(delta[2]) <= self.config.cell_duplicate_z_tolerance_um)
+
+    def _prune_proposed_duplicates(self):
+        retained = []
+        for cell in self.proposed_cells:
+            if not any(self._same_cell_position(cell[0], existing[0])
+                       for existing in self.cells_to_patch + retained):
+                retained.append(cell)
+        removed = len(self.proposed_cells) - len(retained)
+        self.proposed_cells[:] = retained
+        return removed
+
+    def _prune_cell_duplicates(self):
+        """Keep primary entries first and make both pools mutually exclusive."""
+        retained = []
+        for cell in self.cells_to_patch:
+            if any(self._same_cell_position(cell[0], existing[0]) for existing in retained):
+                if not any(cell[0] is existing[0] for existing in retained):
+                    self._invalidate_cell_reference(cell[0])
+            else:
+                retained.append(cell)
+        removed = len(self.cells_to_patch) - len(retained)
+        self.cells_to_patch[:] = retained
+        return removed + self._prune_proposed_duplicates()
+
+    def _admit_cell(self, cell, target):
+        """Check both pools before insertion; selecting a proposal transfers it."""
+        if target not in ('selected', 'proposed'):
+            raise ValueError('Unknown cell list')
+        if any(self._same_cell_position(cell[0], existing[0]) for existing in self.cells_to_patch):
+            return False
+        if target == 'selected':
+            if len(self.cells_to_patch) >= self.MAX_SELECTED_CELLS:
+                return False
+            # Remove matching proposals before inserting into the primary pool.
+            self.proposed_cells[:] = [existing for existing in self.proposed_cells
+                                      if not self._same_cell_position(cell[0], existing[0])]
+            self.cells_to_patch.append(cell)
+        else:
+            if any(self._same_cell_position(cell[0], existing[0]) for existing in self.proposed_cells):
+                return False
+            self.proposed_cells.append(cell)
+        return True
+
+    def _accept_screened_cells(self, result):
+        image = result['image']
+        fluo_image = None
+        if self.config.auto_capture_fluo and result['detections']:
+            fluo_slot = int(self.config.lamp)
+            current_slot = self.current_autopatcher.lamp.get_filter()
+            did_toggle = current_slot != fluo_slot
+            if did_toggle:
+                self.current_autopatcher.toggle_fluorescence()
+                self._wait_for_filter_slot(fluo_slot)
+            try:
+                fluo_image = self.current_autopatcher.calibrated_unit.camera.get_16bit_image()
+                if fluo_image is None:
+                    raise RuntimeError('No fluorescence image available for screening')
+            finally:
+                if did_toggle:
+                    self.current_autopatcher.toggle_fluorescence()
+                    if current_slot is not None:
+                        self._wait_for_filter_slot(current_slot)
+        skipped = 0
+        added = 0
+        duplicates = self._prune_cell_duplicates()
+        for x, y, confidence in sorted(result['detections'], key=lambda detection: detection[2], reverse=True):
+            if x < 256 or y < 256 or x + 256 > image.shape[1] or y + 256 > image.shape[0]:
+                skipped += 1
+                continue
+            position = np.array([result['stage_pixels'][0] - x,
+                                 result['stage_pixels'][1] - y, result['z_um']])
+            crop = image[y-256:y+256, x-256:x+256].copy()
+            fluo = None if fluo_image is None else fluo_image[y-256:y+256, x-256:x+256].copy()
+            if crop.shape != (512, 512) or (fluo is not None and fluo.shape != (512, 512)):
+                skipped += 1
+                continue
+            stage_um = np.array([result['stage_um'][0], result['stage_um'][1], result['z_um']])
+            if self._admit_cell((position, crop, stage_um, fluo), 'proposed'):
+                added += 1
+            else:
+                duplicates += 1
+        self.info(f'Screening added {added} proposed cells; suppressed {duplicates} duplicates; '
+                  f'skipped {skipped} cells without a full 512x512 crop')
+        self.cells_changed.emit()
+        self.screening_finished.emit()
+
+    @command(category='Patch', description='Manage selected and proposed cells')
+    def manage_cells(self, request):
+        action = request.get('action')
+        source_name = request.get('source')
+        if source_name not in ('selected', 'proposed'):
+            raise ValueError('Unknown cell list')
+        source = self.cells_to_patch if source_name == 'selected' else self.proposed_cells
+        identities = {id(cell) for cell in request.get('cells', [])}
+        chosen = [cell for cell in source if id(cell) in identities]
+        self._prune_cell_duplicates()
+        if action == 'promote' and source_name == 'proposed':
+            overflow = False
+            for cell in chosen:
+                if not self._admit_cell(cell, 'selected') and len(self.cells_to_patch) >= self.MAX_SELECTED_CELLS:
+                    overflow = True
+            if overflow:
+                self.warning('Selected cells are limited to 20; remaining cells stay proposed')
+        elif action == 'demote' and source_name == 'selected':
+            for cell in chosen:
+                self._invalidate_cell_reference(cell[0])
+                source[:] = [existing for existing in source if existing is not cell]
+                self._admit_cell(cell, 'proposed')
+        elif action == 'delete':
+            identities.update(id(cell) for cell in self.cells_to_patch + self.proposed_cells
+                              if any(self._same_cell_position(cell[0], removed[0])
+                                     for removed in chosen))
+            for cell in self.cells_to_patch + self.proposed_cells:
+                if id(cell) in identities:
+                    self._invalidate_cell_reference(cell[0])
+            self.cells_to_patch[:] = [cell for cell in self.cells_to_patch if id(cell) not in identities]
+            self.proposed_cells[:] = [cell for cell in self.proposed_cells if id(cell) not in identities]
+        elif action in ('up', 'down'):
+            indices = range(1, len(source)) if action == 'up' else range(len(source)-2, -1, -1)
+            step = -1 if action == 'up' else 1
+            for index in indices:
+                adjacent = index + step
+                if id(source[index]) in identities and id(source[adjacent]) not in identities:
+                    source[index], source[adjacent] = source[adjacent], source[index]
+        else:
+            raise ValueError('Unsupported cell list action')
+        self.update_camera_cell_list()
+        self.cells_changed.emit()
+
     @blocking_command(category='Stage', description='Calibrate scanner',
                       task_description='Calibrating scanner')
     def calibrate_stage_4x(self):
@@ -263,6 +411,7 @@ class AutoPatchInterface(TaskInterface):
             )
             self.cells_to_patch = self.cells_to_patch[:-1]
             self.update_camera_cell_list()
+            self.cells_changed.emit()
         else:
             self.info("remove_last_cell called but there are no cells to remove")
 
@@ -275,6 +424,7 @@ class AutoPatchInterface(TaskInterface):
             self.info(f"Removing first queued cell {first_cell}")
             self.cells_to_patch = self.cells_to_patch[1:]
             self.update_camera_cell_list()
+            self.cells_changed.emit()
         else:
             self.info("_remove_first_cell called but there are no cells to remove")
 
@@ -382,8 +532,15 @@ class AutoPatchInterface(TaskInterface):
                         if current_slot is not None:
                             self._wait_for_filter_slot(current_slot)
 
-            self.cells_to_patch.append((np.array(stage_pos_pixels), img, stage_pos_um, img_fluo))
+            self._prune_cell_duplicates()
+            target = 'selected' if len(self.cells_to_patch) < self.MAX_SELECTED_CELLS else 'proposed'
+            added = self._admit_cell((np.array(stage_pos_pixels), img, stage_pos_um, img_fluo), target)
+            if not added:
+                self.info('Cell already exists in Cells to Patch or Proposed Candidates; skipped duplicate')
+            elif target == 'proposed':
+                self.info('Selected cells are limited to 20; added manual cell to proposed candidates')
             self.is_selecting_cells = False
+            self.cells_changed.emit()
 
     def update_camera_cell_list(self):
         """Choose display evidence and project its saved anchors into camera pixels.
