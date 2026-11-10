@@ -200,6 +200,7 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         self._atlas_query_busy = False
         self._atlas_query_key = self._current_atlas_key = None
         self._atlas_position_text = self._position_text = ""
+        self._last_registration_status = None
         from collections import deque
         import threading
         self._producer_stop = threading.Event()
@@ -329,9 +330,16 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
     def _layer_loaded(self, role, result):
         if role not in ("reference", "session", "atlas") or self.position_helper is None:
             return
+        if role == "session":
+            self._snapshot_generation += 1
+            self._last_position_key = None
         if result is None:
             if role == "session":
                 self._session_position_transform = None
+                registration = self.position_helper.session_registration
+                if registration is not None:
+                    registration.invalidate("Session alignment is pending or unavailable")
+                    self._anchor = None
             self._layers.pop(role, None)
             self._atlas_scan_info.pop(role, None)
             self._atlas_changed(role, None)
@@ -351,12 +359,21 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                     resize = np.asarray(shape[:2][::-1], dtype=float) / [result["width"], result["height"]]
                     stage_transform = self.position_helper.registered_session_mosaic(
                         metadata, objective=4, downsample_factor=resize)
-                    self._session_position_transform = transform @ np.linalg.inv(stage_transform)
+                    registration = self.position_helper.session_registration
+                    if registration is None:
+                        self._session_position_transform = transform @ np.linalg.inv(stage_transform)
+                    else:
+                        registration.accept_registration(result["reference_registration"], metadata,
+                            self.position_helper.registrar.reference_pixel_to_global_um, stage_transform)
+                elif self.position_helper.session_registration is not None:
+                    raise ValueError("Session image has no compatible stage-to-scan metadata")
             state = self.position_helper.snapshot(transform, objective=self._objective)
             self._layers[role] = dict(width=result["width"], height=result["height"],
                                      transform=self._matrix(state["scan_pixel_to_world_mm"], role))
             self._layer_errors.pop(role, None)
         except (OSError, ValueError, KeyError, TypeError, np.linalg.LinAlgError) as error:
+            if role == "session" and self.position_helper.session_registration is not None:
+                self.position_helper.session_registration.invalidate(str(error))
             self._layers.pop(role, None)
             self._layer_errors[role] = str(error)
         self._atlas_changed(role, self._atlas_states.get(role))
@@ -388,6 +405,11 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
     def _refresh_atlas_position(self, state):
         role = getattr(self.scan_viewer, "active_role", "reference")
         helper = self.position_helper
+        registration = getattr(helper, "session_registration", None)
+        if registration is not None and (registration.transform is None
+                or not state.get("map_position_confirmed", False)):
+            self._current_atlas_key = None
+            return
         atlas_view = getattr(self.scan_viewer, "atlas_view", None)
         if atlas_view is not None and atlas_view.isVisible():
             role = "atlas"
@@ -406,6 +428,9 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
 
     def _receive_atlas_position(self, key, values):
         self._atlas_query_busy = False
+        registration = getattr(self.position_helper, "session_registration", None)
+        if registration is not None and registration.transform is None:
+            return
         if self._closed or key != self._current_atlas_key or key[0] != self._snapshot_generation:
             return
         labels = []
@@ -424,6 +449,15 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
 
     def _update_overlay(self):
         registered_views = getattr(self.scan_viewer, "registered_views", None)
+        registration = getattr(self.position_helper, "session_registration", None)
+        if registration is not None and (registration.transform is None
+                or self._anchor is None or not self._anchor.get("map_position_confirmed", False)
+                or self._anchor.get("map_registration_generation") != registration.generation):
+            views = (registered_views() if registered_views is not None
+                     else (("scan", self.scan_viewer),))
+            for _, view in views:
+                view.set_global_overlay(None)
+            return
         if registered_views is not None:
             for role, view in registered_views():
                 if not view.isVisible():
@@ -467,6 +501,7 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                                            None if tip is None else project([tip])[0], direction)
 
     def refresh_position(self):
+        self._show_registration_status()
         registered_views = getattr(self.scan_viewer, "registered_views", None)
         scans_visible = (any(view.isVisible() for _, view in registered_views())
                          if registered_views is not None else self.scan_viewer.isVisible())
@@ -492,8 +527,51 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         else:
             self._receive_atlas_position(key, values)
 
+    def _show_registration_status(self):
+        helper = self.position_helper
+        registration = getattr(helper, "session_registration", None)
+        if registration is None:
+            return
+        ready = {}
+        parts = [f"Session: {registration.state}. {registration.reason}"]
+        for name in ("home", "safe"):
+            try:
+                registration.require_positions("pipette", name)
+            except ValueError as error:
+                ready[name] = False
+                parts.append(f"Map {name}: unconfirmed ({error})")
+            else:
+                ready[name] = True
+                parts.append(f"Map {name}: confirmed")
+        transform = registration.transform
+        anchor = getattr(helper, "_pipette_home_anchor", None)
+        if ready["home"] and transform is not None and anchor is not None:
+            home = np.asarray(anchor["global_home"], dtype=float)[:2]
+            correction = transform[:2, :2] @ home + transform[:2, 2] - home
+            parts.append(f"Home correction: X {correction[0]:.2f}, Y {correction[1]:.2f} µm")
+        text = " | ".join(parts)
+        if text == self._last_registration_status:
+            return
+        self._last_registration_status = text
+        self._last_position_key = None
+        if transform is None:
+            self._current_atlas_key = None
+            self._atlas_position_text = ""
+            for _, view in getattr(self.scan_viewer, "registered_views", lambda: ())():
+                label = getattr(view, "atlas_position_status", None)
+                if label is not None:
+                    label.setText("Atlas position: map alignment unconfirmed.")
+            self._update_overlay()
+        label = getattr(self.scan_viewer, "coordinate_status", None)
+        if label is not None:
+            label.setText(text)
+        logging.getLogger(__name__).info("Coordinate reference state: %s", text)
+
     def _registered_position_state(self, state):
         """Reanchor display XY through the fitted session; never change device state."""
+        helper = getattr(self, "position_helper", None)
+        if getattr(helper, "session_registration", None) is not None:
+            return state  # Shared helper snapshots already apply the correction.
         transform = self._session_position_transform
         if transform is None:
             return state
@@ -527,6 +605,10 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                            if registered_views is not None else (("scan", self.scan_viewer.isVisible()),))
         if (self._closed or generation != self._snapshot_generation
                 or not (self.isVisible() or any(visible for _, visible in view_visibility))):
+            return
+        registration = getattr(self.position_helper, "session_registration", None)
+        if registration is not None and (state.get("map_registration_generation")
+                != registration.generation):
             return
         state = self._registered_position_state(state)
         if (getattr(self.scan_viewer, "active_role", "reference") == "reference"
@@ -562,8 +644,9 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
         self.set_anchor_state(state)
         self._last_position_key = key
         x, y, z = np.asarray(state["objective_xyz_mm"]) * 1000
-        text = (f"Global X {x:.2f}, Y {y:.2f} µm | reference-plane Z {z:.2f} µm\n"
-                f"Stage X {stage_xy[0]:.2f}, Y {stage_xy[1]:.2f} µm")
+        text = ((f"Global X {x:.2f}, Y {y:.2f} µm | reference-plane Z {z:.2f} µm\n"
+                 if state.get("map_position_confirmed", True) else "Map position: unconfirmed\n")
+                + f"Stage X {stage_xy[0]:.2f}, Y {stage_xy[1]:.2f} µm")
         if state.get("pipette_xyz_mm") is not None:
             px, py, pz = np.asarray(state["pipette_xyz_mm"]) * 1000
             text += f" | Pipette X {px:.2f}, Y {py:.2f}, Z {pz:.2f} µm"

@@ -70,6 +70,8 @@ class AutoPatchInterface(TaskInterface):
                                     config=self.config,
                                     protocol_config=self.protocol_config)
         self.current_autopatcher = autopatcher
+        self.session_registration = pipette_interface.session_registration
+        self.session_registration.add_listener(self._publish_registered_coordinates)
 
         self.is_selecting_cells = False
         self.is_selecting_corners = False
@@ -78,6 +80,46 @@ class AutoPatchInterface(TaskInterface):
         self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
 
+
+    def _publish_registered_coordinates(self):
+        """Registration callbacks update map overlays only."""
+        self.pipette_controller._publish_registered_coordinates()
+
+    def _sync_raw_coordinates(self):
+        """Copy raw positions only after an explicit capture or calibration load."""
+        pipette = self.pipette_controller
+        controller = self.current_autopatcher
+        for name in ("home_position", "safe_position", "home_stage_position",
+                     "safe_stage_position", "cleaning_bath_position", "rinsing_bath_position"):
+            value = getattr(pipette, name, None)
+            setattr(controller, name, None if value is None else np.asarray(value).copy())
+        config = pipette.calibration_config
+        for source, target in (("home_position", "home_position"),
+                               ("safe_position", "safe_position"),
+                               ("home_stage_position", "home_position_stage"),
+                               ("safe_stage_position", "safe_position_stage"),
+                               ("cleaning_bath_position", "bath_position")):
+            value = getattr(controller, source)
+            # Preserve the existing raw calibration values for ordinary controls.
+            setattr(config, target, tuple(value) if value is not None else (0., 0., 0.))
+
+    def _record_current_positions(self, *names):
+        controller = self.current_autopatcher
+        positions = {}
+        for name in names:
+            if name in ("home", "safe"):
+                value = getattr(controller, name + "_position")
+                stage = getattr(controller, name + "_stage_position")
+                if value is not None and stage is not None:
+                    positions[name] = np.r_[value, stage].tolist()
+            elif name in ("floor_Z", "stage_floor"):
+                positions[name] = getattr(self.pipette_controller.microscope, name, None)
+            else:
+                attr = {"bath": "cleaning_bath_position", "rinsing_bath": "rinsing_bath_position"}[name]
+                value = getattr(controller, attr)
+                positions[name] = None if value is None else np.asarray(value).tolist()
+        self.pipette_controller.record_coordinate_positions(positions)
+        self._sync_raw_coordinates()
 
     @blocking_command(category='Calibration', description='Save X origin',
                       task_description='Saving X origin and microscope image')
@@ -330,7 +372,11 @@ class AutoPatchInterface(TaskInterface):
         controller = self.current_autopatcher
         controller.scan_stage = controller.calibrated_stage
         controller.scan_stitch_helper.stage = controller.scan_stage
-        self.execute(controller.calibrated_stage.calibrate)
+        controller.scan_stitch_helper.objective = 40
+        try:
+            self.execute(controller.calibrated_stage.calibrate)
+        finally:
+            self.pipette_controller.refresh_coordinate_calibration(clear_tip=True)
 
     def start_selecting_corners(self):
         stage = self.current_autopatcher.scan_stage
@@ -856,7 +902,8 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.cleaning_bath_position = self.pipette_controller.calibrated_unit.position()
         self.current_autopatcher.calibrated_unit.config.bath_position = tuple(self.current_autopatcher.cleaning_bath_position)
         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position.copy()
-        # Persist the physical position before updating the optional display.
+        self._record_current_positions("bath")
+        # Persist the recorded position and its registration binding.
         self.pipette_controller.write_calibration()
         self._update_position_display(
             "set_pipette_cleaning_bath_position", self.current_autopatcher.cleaning_bath_position)
@@ -874,6 +921,7 @@ class AutoPatchInterface(TaskInterface):
         self.current_autopatcher.calibrated_stage.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
         self._update_position_display("set_pipette_safe_position",
                                       self.current_autopatcher.safe_position)
+        self._record_current_positions('safe')
         self.info(f'safe space position stored: {self.current_autopatcher.safe_position} and {self.current_autopatcher.safe_stage_position}')
 
     @command(category='Patch',
@@ -892,6 +940,7 @@ class AutoPatchInterface(TaskInterface):
             self.current_autopatcher.home_position, self.current_autopatcher.home_stage_position,
             home_z_um=0.0, safe_pipette_xyz=self.current_autopatcher.safe_position,
             cleaning_bath_xyz=self.current_autopatcher.cleaning_bath_position)
+        self._record_current_positions('home')
         self.info(f'safe home position stored: {self.current_autopatcher.home_position} and {self.current_autopatcher.home_stage_position}')
 
 
@@ -925,13 +974,14 @@ class AutoPatchInterface(TaskInterface):
         self.pipette_controller.home_stage_position = self.current_autopatcher.home_stage_position
         self.pipette_controller.safe_stage_position = self.current_autopatcher.safe_stage_position
         self.pipette_controller.cleaning_bath_position = self.current_autopatcher.cleaning_bath_position
-        self.pipette_controller.write_calibration()
         # This workflow just centered/focused the tip: home defines the current
         # 40x focal reference plane, independently of the stored cell floor.
         self._update_position_display("set_pipette_home_anchor",
             self.current_autopatcher.home_position, self.current_autopatcher.home_stage_position,
             home_z_um=0.0, safe_pipette_xyz=self.current_autopatcher.safe_position,
             cleaning_bath_xyz=self.current_autopatcher.cleaning_bath_position)
+        self._record_current_positions("home", "safe", "bath", "floor_Z", "stage_floor")
+        self.pipette_controller.write_calibration()
 
     
 
@@ -959,47 +1009,26 @@ class AutoPatchInterface(TaskInterface):
                     raise ValueError(f'Invalid {key} calibration matrix in {config_filename}')
                 configuration['M'] = matrix
                 configurations.append((key, device, configuration))
-            for key, device, configuration in configurations:
-                device.load_configuration(configuration)
-                if key == 'stage':
-                    self.is_selecting_corners = False
-                    self.current_autopatcher.scan_stage = device
-                    self.current_autopatcher.scan_stitch_helper.stage = device
-                if key == 'manip':
-                    device._tip_reference = None
-                    device._trusted_tip_reference = None
+            try:
+                for key, device, configuration in configurations:
+                    device.load_configuration(configuration)
+                    if key == 'stage':
+                        self.is_selecting_corners = False
+                        self.current_autopatcher.scan_stage = device
+                        self.current_autopatcher.scan_stitch_helper.stage = device
+                        self.current_autopatcher.scan_stitch_helper.objective = (4 if saved.get('objective') == '4x' else 40)
+                    if key == 'manip':
+                        device._tip_reference = None
+                        device._trusted_tip_reference = None
+            finally:
+                if saved.get('objective') == '4x' and 'stage' in saved:
+                    self.session_registration.invalidate('Scanner calibration loaded; repeat session alignment')
+                self.pipette_controller.refresh_coordinate_calibration(clear_tip=True)
             return
         self.pipette_controller.read_calibration(config_filename)
-        self.current_autopatcher.scan_stage = self.pipette_controller.calibrated_stage
-        self.current_autopatcher.scan_stitch_helper.stage = self.current_autopatcher.scan_stage
-        self.current_autopatcher.home_position = self.pipette_controller.home_position.copy()
-        self.current_autopatcher.safe_position = self.pipette_controller.safe_position.copy()
-        self.current_autopatcher.home_stage_position = self.pipette_controller.home_stage_position.copy()
-        self.current_autopatcher.safe_stage_position = self.pipette_controller.safe_stage_position.copy()
-        self.current_autopatcher.cleaning_bath_position = self.pipette_controller.cleaning_bath_position
-        self.current_autopatcher.rinsing_bath_position = self.pipette_controller.rinsing_bath_position
-        config = self.pipette_controller.calibration_config
-        config.home_position = tuple(self.current_autopatcher.home_position)
-        config.safe_position = tuple(self.current_autopatcher.safe_position)
-        config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
-        config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
-        config.bath_position = (tuple(self.current_autopatcher.cleaning_bath_position)
-                                if self.current_autopatcher.cleaning_bath_position is not None
-                                else (0.0, 0.0, 0.0))
-        helper = getattr(self.pipette_controller.calibrated_unit, 'global_position_helper', None)
-        if helper is not None:
-            display = getattr(self.pipette_controller, '_loaded_display_anchor', None)
-            if display is None:
-                helper.clear_pipette_home_anchor()
-            else:
-                try:
-                    helper.restore_pipette_home_anchor(
-                        self.current_autopatcher.home_position, self.current_autopatcher.home_stage_position,
-                        tip_xy=display['tip_xy'], safe_pipette_xyz=self.current_autopatcher.safe_position,
-                        cleaning_bath_xyz=self.current_autopatcher.cleaning_bath_position)
-                except (ValueError, RuntimeError, OSError, KeyError) as error:
-                    helper.clear_pipette_home_anchor()
-                    self.info(f'Calibration loaded; global pipette display unavailable: {error}')
+        # Loading a 40x home calibration must preserve the selected scanner.
+        self._sync_raw_coordinates()
+        self._publish_registered_coordinates()
         self.info(f'Calibration values read from file: {self.current_autopatcher.home_position}, {self.current_autopatcher.safe_position}, {self.current_autopatcher.home_stage_position}, {self.current_autopatcher.safe_stage_position}, {self.current_autopatcher.cleaning_bath_position}, {self.current_autopatcher.rinsing_bath_position}')
 
 
@@ -1008,11 +1037,14 @@ class AutoPatchInterface(TaskInterface):
              success_message='Rinsing bath position stored')
     def store_rinsing_position(self) -> None:
         self.current_autopatcher.rinsing_bath_position = self.pipette_controller.calibrated_unit.position()
+        self._record_current_positions("rinsing_bath")
 
     @command(category='Patch',
              description='clear all stored positions',
                 success_message='All positions cleared')
     def clear_positions(self) -> None:
+        self.pipette_controller._store_raw_coordinates(dict(home=None, safe=None, bath=None, rinsing_bath=None))
+        self.session_registration.clear_coordinates("pipette")
         self.pipette_controller.calibrated_unit.global_position_helper.clear_pipette_home_anchor()
         self.current_autopatcher.cleaning_bath_position = None
         self.current_autopatcher.rinsing_bath_position = None

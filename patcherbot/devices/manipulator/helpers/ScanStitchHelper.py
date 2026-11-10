@@ -10,6 +10,8 @@ class ScanStitchHelper:
         self.stage = stage
         self.record = None
         self.scan_role = "session"
+        self.session_registration = None
+        self.objective = None
 
     def begin(self):
         if not self.stage.calibrated:
@@ -19,6 +21,10 @@ class ScanStitchHelper:
         if self.scan_role not in ("session", "atlas"):
             raise ValueError("Scan role must be session or atlas")
         self.record = {
+            "scan_id": uuid4().hex,
+            "capture_frame_id": (None if self.session_registration is None
+                                 else self.session_registration.capture_frame_id),
+            "objective": self.objective,
             "start": time.time(), "end": None,
             "registration_role": self.scan_role,
             "scan_bounds_pixels": [c["stage_pixels"].tolist() for c in self.stage.scan_corner_positions],
@@ -61,6 +67,9 @@ class ScanStitchHelper:
                                      config=FastStitchConfig(refine_images=True))
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         metadata.update(registration_role=self.record["registration_role"],
-                        scan_bounds_pixels=self.record["scan_bounds_pixels"])
+                        scan_bounds_pixels=self.record["scan_bounds_pixels"],
+                        scan_id=self.record["scan_id"],
+                        capture_frame_id=self.record["capture_frame_id"],
+                        objective=self.record["objective"])
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         return output

@@ -57,6 +57,7 @@ class AutoPatcher(TaskController):
         self.pressure = pressure
         self.calibrated_unit = calibrated_unit
         self.calibrated_stage = calibrated_stage
+        self.session_registration = getattr(calibrated_unit, 'session_registration', None)
         # Share hardware and measurement helpers, but retain separate objective state.
         self.calibrated_stage_4x = copy(calibrated_stage)
         for name in ('debug', 'info', 'warning'):
@@ -69,6 +70,7 @@ class AutoPatcher(TaskController):
         self.calibrated_stage_4x.stageScanHelper = StageScanHelper(calibrated_stage.camera, calibrated_stage.config)
         self.scan_stage = calibrated_stage
         self.scan_stitch_helper = ScanStitchHelper(calibrated_stage)
+        self.scan_stitch_helper.session_registration = self.session_registration
         self.last_stitched_scan = None
         self.microscope = microscope
         self.lamp = lamp
@@ -1380,10 +1382,13 @@ class AutoPatcher(TaskController):
     def calibrate_stage_4x(self):
         self.abort_if_requested()
         self.calibrated_stage_4x.calibrate()
+        if getattr(self, 'session_registration', None) is not None:
+            self.session_registration.invalidate('Scanner calibration changed; repeat session alignment')
         self.abort_if_requested()
         self.calibrated_stage_4x.reset_scan_corners()
         self.scan_stage = self.calibrated_stage_4x
         self.scan_stitch_helper.stage = self.scan_stage
+        self.scan_stitch_helper.objective = 4
 
     @record_state("scan_area")
     def scan_area(self, speed=None):
@@ -1415,7 +1420,10 @@ class AutoPatcher(TaskController):
             raise AutopatchError("Stage not calibrated")
 
         cell_pos = None
-        cell_array = np.asarray(cell)
+        try:
+            cell_array = np.asarray(cell, dtype=float)
+        except (ValueError, TypeError):
+            cell_array = np.empty(0)
         if cell_array.shape == (3,) and np.issubdtype(cell_array.dtype, np.number):
             cell_pos = cell_array
         elif isinstance(cell, (tuple, list)) and len(cell) > 0:
@@ -1423,6 +1431,7 @@ class AutoPatcher(TaskController):
 
         if cell_pos is None or cell_pos.size < 2:
             raise AutopatchError("Cell position missing XY coordinates")
+
 
         self.info(f" Moving to Cell position: {cell_pos}")
         cell_pos_planar = np.array([cell_pos[0], cell_pos[1], 0])

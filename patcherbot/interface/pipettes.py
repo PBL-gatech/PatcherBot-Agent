@@ -10,6 +10,7 @@ from datetime import datetime
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
 from patcherbot.configs.CalibrationConfig import CalibrationConfig
+from patcherbot.utils.sessionRegistration import SessionRegistration, calibration_identity, validate_coordinates_bundle
 from patcherbot.devices.cellsorter import CalibratedCellSorter
 import time
 
@@ -52,6 +53,10 @@ class PipetteInterface(TaskInterface):
                                                 microscope,
                                                 camera,
                                                 config=self.calibration_config)
+        self.session_registration = SessionRegistration()
+        self.calibrated_unit.session_registration = self.session_registration
+        self._loaded_coordinate_names = set()
+        self.session_registration.add_listener(self._publish_registered_coordinates)
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
         self.observer = Observer(self)
         self.time_truth = datetime.now()
@@ -90,6 +95,85 @@ class PipetteInterface(TaskInterface):
         self.tare_pipette = np.array([None, None, None])
         self.tare_stage = np.array([None, None, None])
 
+    def _coordinate_calibration_identity(self):
+        return calibration_identity(self.calibrated_unit.save_configuration(),
+                                    self.calibrated_stage.save_configuration())
+
+    def refresh_coordinate_calibration(self, clear_tip=False):
+        identity = self._coordinate_calibration_identity()
+        previous = self.session_registration.export_coordinates("pipette").get("calibration_identity")
+        if clear_tip and previous != identity:
+            self.calibrated_unit._tip_reference = None
+            self.calibrated_unit._trusted_tip_reference = None
+            self._loaded_display_anchor = None
+        self.session_registration.update_calibration("pipette", identity)
+
+    def _measured_home_anchor(self, home):
+        trusted = getattr(self.calibrated_unit, "_trusted_tip_reference", None)
+        if trusted is None:
+            saved = getattr(self, "_loaded_display_anchor", None)
+            return saved if saved is not None and np.array_equal(saved["home"], home) else None
+        tip, pipette_at_tip, stage_at_tip = trusted
+        tip_xy = (np.asarray(tip, dtype=float)
+                  + (self.calibrated_unit.M @ (home[:3] - pipette_at_tip))[:2]
+                  + self.calibrated_stage.M @ (home[3:5] - stage_at_tip))
+        if tip_xy.shape != (2,) or not np.isfinite(tip_xy).all():
+            raise ValueError("Measured home tip must contain finite image XY")
+        return dict(version=1, objective=40, home=home.tolist(),
+                    tip_xy=tip_xy.tolist(), source="measured_tip")
+
+    def record_coordinate_positions(self, positions):
+        """Record raw values even when optional map metadata is unavailable."""
+        self._store_raw_coordinates(positions)
+        self._loaded_coordinate_names.difference_update(positions)
+        try:
+            home = positions.get("home")
+            display = (self._measured_home_anchor(np.asarray(home, dtype=float))
+                       if home is not None else getattr(self, "_loaded_display_anchor", None))
+            self._loaded_display_anchor = display
+            self.session_registration.record_positions(
+                "pipette", positions, calibration_identity=self._coordinate_calibration_identity(),
+                display_anchor=display)
+        except (ValueError, TypeError, KeyError) as error:
+            self._loaded_display_anchor = None
+            self.session_registration.clear_coordinates("pipette")
+            self.calibrated_unit.global_position_helper.clear_pipette_home_anchor()
+            self.info(f"Raw coordinates stored without map reference: {error}")
+
+    def _store_raw_coordinates(self, positions):
+        """Restore raw calibration coordinates independently of map registration."""
+        validate_coordinates_bundle(dict(version=1, positions=positions))
+        for name in ("home", "safe"):
+            if name in positions:
+                value = positions[name]
+                value = None if value is None else np.asarray(value, dtype=float)
+                setattr(self, name + "_position", None if value is None else value[:3].copy())
+                setattr(self, name + "_stage_position", None if value is None else value[3:].copy())
+        for name, attr in (("bath", "cleaning_bath_position"), ("rinsing_bath", "rinsing_bath_position")):
+            if name in positions:
+                value = positions[name]
+                setattr(self, attr, None if value is None else np.asarray(value, dtype=float).copy())
+        for name in ("floor_Z", "stage_floor"):
+            if name in positions:
+                setattr(self.microscope, name, positions[name])
+
+    def _publish_registered_coordinates(self):
+        """Update the map anchor only; registration never changes raw controls."""
+        bundle = self.session_registration.export_coordinates("pipette") or {}
+        helper = self.calibrated_unit.global_position_helper
+        display = bundle.get("display_anchor")
+        if (self.home_position is None or display is None
+                or not self.session_registration.positions_ready("pipette", "home")):
+            helper.clear_pipette_home_anchor()
+        else:
+            try:
+                helper.restore_pipette_home_anchor(
+                    self.home_position, self.home_stage_position, tip_xy=display["tip_xy"],
+                    safe_pipette_xyz=self.safe_position, cleaning_bath_xyz=self.cleaning_bath_position)
+            except (ValueError, RuntimeError, OSError, KeyError) as error:
+                helper.clear_pipette_home_anchor()
+                self.info(f"Raw coordinates retained; pipette map display unavailable: {error}")
+
     def connect(self, main_gui):
         pass #TODO: unused?
 
@@ -111,6 +195,7 @@ class PipetteInterface(TaskInterface):
              default_arg=10)
     def finish_calibration(self, none):
         self.calibrated_unit.finish_calibration()
+        self.refresh_coordinate_calibration(clear_tip=True)
 
     @command(category='Manipulators',
              description='Move pipette in x direction by {:.0f}μm',
@@ -139,19 +224,26 @@ class PipetteInterface(TaskInterface):
                 raise ValueError('Stage floor must be a finite coordinate or unset')
             stage_floor = float(stage_floor)
         
-        # concatenate home position and home stage position
-        if self.home_position is None or self.home_stage_position is None:
-            raise RuntimeError('Home position not set')   
-        if self.safe_position is None or self.safe_stage_position is None:
-            raise RuntimeError('Safe position not set')
-        
-        self.home_position = np.array(self.home_position)
-        self.home_stage_position = np.array(self.home_stage_position)   
-        self.safe_position = np.array(self.safe_position)
-        self.safe_stage_position = np.array(self.safe_stage_position)
-        self.home = np.concatenate((self.home_position, self.home_stage_position))
-        self.safe = np.concatenate((self.safe_position, self.safe_stage_position))
-    
+        if (self.home_position is None or self.home_stage_position is None
+                or self.safe_position is None or self.safe_stage_position is None):
+            raise RuntimeError("Home and safe positions must be recorded before saving")
+        self.home = np.r_[self.home_position, self.home_stage_position].astype(float)
+        self.safe = np.r_[self.safe_position, self.safe_stage_position].astype(float)
+        bath = None if self.cleaning_bath_position is None else np.asarray(self.cleaning_bath_position).tolist()
+        positions = dict(home=self.home.tolist(), safe=self.safe.tolist(), bath=bath,
+                         floor_Z=floor_z, stage_floor=stage_floor)
+        validate_coordinates_bundle(dict(version=1, positions=positions))
+        try:
+            display = self._measured_home_anchor(self.home)
+            bundle = self.session_registration.export_coordinates("pipette") or {}
+            bundle['positions'] = positions
+            bundle['display_anchor'] = display
+            validate_coordinates_bundle(bundle)
+        except (ValueError, TypeError, KeyError) as error:
+            self.info(f"Saving raw calibration without map reference: {error}")
+            display = None
+            bundle = dict(version=1, positions=positions, display_anchor=None)
+
         try:
             # Build the complete file path for 'calibration.pickle'
             file_path = os.path.join(self.folder_path, 'calibration.pickle')
@@ -165,18 +257,25 @@ class PipetteInterface(TaskInterface):
                 'stage': self.calibrated_stage.save_configuration(),
                 'home': self.home,
                 'safe': self.safe,
-                'bath': self.cleaning_bath_position,
+                'bath': bath,
                 'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
                 'stage_floor': stage_floor,
-                'display_anchor': (getattr(self, '_loaded_display_anchor', None)
-                    if getattr(self.calibrated_unit, 'must_be_recalibrated', False)
-                    and getattr(self, '_loaded_display_anchor', None) is not None
-                    and np.array_equal(self._loaded_display_anchor['home'], self.home) else None),
+                'display_anchor': display,
+                'coordinate_reference': bundle,
                 'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
             }
             snapshot = deepcopy(calibration)
-            with open(file_path, 'wb') as f:
-                pickle.dump(calibration, f)
+            import tempfile
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='wb', dir=self.folder_path,
+                                                 prefix='calibration.', suffix='.tmp', delete=False) as f:
+                    temporary = f.name
+                    pickle.dump(calibration, f)
+                os.replace(temporary, file_path)
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    os.unlink(temporary)
             self._calibration_snapshot = snapshot
             self.info('Calibration written to file')
         except Exception as e:
@@ -228,42 +327,35 @@ class PipetteInterface(TaskInterface):
                     bath = np.asarray(bath, dtype=float)
                     if bath.shape != (3,) or not np.isfinite(bath).all():
                         raise ValueError('Saved bath position must contain three finite coordinates')
-                # Keep saved image geometry separate from the runtime offsets,
-                # which load_configuration intentionally invalidates for motion.
-                display_tip = None
+                raw_positions = dict(home=home.tolist(), safe=safe.tolist(),
+                                     bath=None if bath is None else bath.tolist(),
+                                     floor_Z=floor_z, stage_floor=stage_floor)
+                # Map metadata is optional and cannot prevent loading valid raw calibration.
                 display = cal.get('display_anchor')
-                if display is not None:
-                    if (not isinstance(display, dict) or display.get('version') != 1
-                            or display.get('objective') != 40):
-                        raise ValueError('Unsupported saved pipette display anchor')
-                    saved_home = np.asarray(display.get('home'), dtype=float)
-                    display_tip = np.asarray(display.get('tip_xy'), dtype=float)
-                    if (saved_home.shape != (6,) or not np.array_equal(saved_home, home)
-                            or display_tip.shape != (2,) or not np.isfinite(display_tip).all()):
-                        raise ValueError('Saved pipette display anchor does not match home')
-                elif all('r0' in cal[key] for key in ('manip', 'stage')):
-                    manip_offset = np.asarray(cal['manip']['r0'], dtype=float)
-                    stage_offset = np.asarray(cal['stage']['r0'], dtype=float)
-                    if (manip_offset.shape != (3,) or stage_offset.shape not in ((2,), (3,))
-                            or not np.isfinite(manip_offset).all() or not np.isfinite(stage_offset).all()):
-                        raise ValueError('Saved calibration offsets must contain finite image coordinates')
-                    display_tip = ((cal['manip']['M'] @ home[:3] + manip_offset)[:2]
-                                   + cal['stage']['M'] @ home[3:5] + stage_offset[:2])
-                    if not np.isfinite(display_tip).all():
-                        raise ValueError('Saved pipette home projection is not finite')
+                try:
+                    if display is not None:
+                        validate_coordinates_bundle(dict(version=1, positions=raw_positions,
+                                                         display_anchor=display))
+                    bundle = cal.get("coordinate_reference") or dict(
+                        version=1, binding=None, positions=raw_positions, display_anchor=display)
+                    validate_coordinates_bundle(bundle)
+                    if any(bundle["positions"].get(name) != value for name, value in raw_positions.items()):
+                        raise ValueError("Saved map reference does not match raw calibration positions")
+                except (ValueError, TypeError, KeyError) as error:
+                    self.info(f"Raw calibration loaded without map reference: {error}")
+                    display = None
+                    bundle = dict(version=1, binding=None, positions=raw_positions, display_anchor=None)
                 self.calibrated_unit.load_configuration(cal['manip'])
                 self.calibrated_stage.load_configuration(cal['stage'])
                 self.calibrated_unit._tip_reference = None
                 self.calibrated_unit._trusted_tip_reference = None
-                self.home_position = home[:3].copy()
-                self.home_stage_position = home[3:].copy()
-                self.safe_position = safe[:3].copy()
-                self.safe_stage_position = safe[3:].copy()
-                self.cleaning_bath_position = bath
-                self.microscope.floor_Z = floor_z
-                self.microscope.stage_floor = stage_floor
-                self._loaded_display_anchor = (None if display_tip is None else
-                    dict(version=1, objective=40, home=home.tolist(), tip_xy=display_tip.tolist()))
+                self._loaded_display_anchor = deepcopy(display) if display is not None else None
+                self._loaded_coordinate_names = set(raw_positions)
+                self._store_raw_coordinates(raw_positions)
+                self.session_registration.stage_coordinates(
+                    "pipette", bundle,
+                    calibration_identity=calibration_identity(cal['manip'], cal['stage']))
+                self._publish_registered_coordinates()
 
                 source_saved_at = cal.get('saved_at')
                 try:
@@ -358,6 +450,7 @@ class PipetteInterface(TaskInterface):
     def set_floor(self):
         z_scale = self.calibrated_unit.config.microscope_units_per_um
         self.microscope.floor_Z = self.microscope.position() / z_scale
+        self.record_coordinate_positions({'floor_Z': self.microscope.floor_Z})
         self.info(f'Cell plane position set to {self.microscope.floor_Z}')
 
     def _persist_stage_floor(self, stage_floor):
@@ -378,6 +471,9 @@ class PipetteInterface(TaskInterface):
         if not isinstance(calibration, dict):
             raise ValueError('Calibration file must contain a calibration dictionary')
         calibration['stage_floor'] = float(stage_floor)
+        registration = getattr(self, 'session_registration', None)
+        if registration is not None:
+            calibration['coordinate_reference'] = registration.export_coordinates('pipette')
         calibration['saved_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
         os.makedirs(self.folder_path, exist_ok=True)
         temporary = None
@@ -401,7 +497,17 @@ class PipetteInterface(TaskInterface):
         stage_floor = self.microscope.position() / z_scale
         if isinstance(stage_floor, bool) or not isinstance(stage_floor, Real) or not math.isfinite(stage_floor):
             raise ValueError('Stage floor must be a finite coordinate')
-        persisted = self._persist_stage_floor(stage_floor)
+        previous = self.session_registration.export_coordinates("pipette")
+        previous_loaded = self._loaded_coordinate_names.copy()
+        previous_floor = self.microscope.stage_floor
+        try:
+            self.record_coordinate_positions({'stage_floor': float(stage_floor)})
+            persisted = self._persist_stage_floor(stage_floor)
+        except Exception:
+            self.session_registration.restore_coordinates("pipette", previous)
+            self._loaded_coordinate_names = previous_loaded
+            self.microscope.stage_floor = previous_floor
+            raise
         self.microscope.stage_floor = float(stage_floor)
         state = 'saved to session calibration' if persisted else 'will save with the first calibration'
         self.info(f'Stage floor position set to {self.microscope.stage_floor}; {state}')
@@ -426,13 +532,19 @@ class PipetteInterface(TaskInterface):
                       description='Calibrate stage only',
                       task_description='Calibrating stage')
     def calibrate_stage(self):
-        self.execute([self.calibrated_stage.calibrate])
+        try:
+            self.execute([self.calibrated_stage.calibrate])
+        finally:
+            self.refresh_coordinate_calibration(clear_tip=True)
 
     @blocking_command(category='Manipulators',
                       description='Calibrate manipulator',
                       task_description='Calibrating manipulator')
     def calibrate_manipulator(self):
-        self.execute([self.calibrated_unit.calibrate_pipette])
+        try:
+            self.execute([self.calibrated_unit.calibrate_pipette])
+        finally:
+            self.refresh_coordinate_calibration()
 
     @blocking_command(category='Manipulators',
                       description='Detect the pipette',

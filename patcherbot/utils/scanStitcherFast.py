@@ -560,8 +560,20 @@ def _refine_scan_positions(timestamps, coords, paths, selected):
 
     started = time.perf_counter()
     frame_ids = np.unique(np.r_[selected, 0, len(paths) - 1]).astype(int)
+
+    def reject(reason, **diagnostics):
+        reason = f"{reason} Retaining recorded stage positions."
+        print(f"[ScanStitcher] {reason}")
+        return coords, {
+            "method": "Recorded stage positions; image refinement rejected",
+            "applied": False, "reason": reason,
+            "registration_keyframe_indices": frame_ids.tolist(),
+            "elapsed_seconds": time.perf_counter() - started,
+            **diagnostics,
+        }
+
     if len(frame_ids) < 2:
-        raise ValueError("Image refinement requires overlapping frames.")
+        return reject("Image refinement requires overlapping frames.")
     offsets = np.rint(coords[frame_ids] - coords[0]).astype(int)
     with ThreadPoolExecutor(max_workers=6) as pool:
         images = list(pool.map(lambda i: cv2.imread(str(paths[i]), cv2.IMREAD_GRAYSCALE), frame_ids))
@@ -583,10 +595,14 @@ def _refine_scan_positions(timestamps, coords, paths, selected):
         edges = [edge for edge in pool.map(
             lambda pair: _register_pair(pair, images, offsets), pairs) if edge is not None]
     if len(edges) < 20:
-        raise RuntimeError(f"Only {len(edges)} reliable overlaps; image refinement stopped.")
+        return reject(f"Only {len(edges)} reliable overlaps; image refinement rejected.",
+                      attempted_pairs=len(pairs), accepted_pairs=len(edges))
     holdout = edges[::5]
     training = [edge for k, edge in enumerate(edges) if k % 5]
     probe = _solve_scan_positions(training, len(frame_ids))
+    if not np.isfinite(probe).all():
+        return reject("Image refinement validation produced non-finite corrections.",
+                      attempted_pairs=len(pairs), accepted_pairs=len(edges))
     before = np.array([np.linalg.norm(edge["shift"]) for edge in holdout])
     after = np.array([np.linalg.norm(probe[edge["j"]] - probe[edge["i"]] + edge["shift"])
                       for edge in holdout])
@@ -595,19 +611,18 @@ def _refine_scan_positions(timestamps, coords, paths, selected):
                   "median_error_after": float(np.median(after)),
                   "fraction_improved": float(np.mean(after < before))}
     if np.median(after) >= np.median(before):
-        reason = "Held-out overlaps did not improve; retaining recorded stage positions."
-        print(f"[ScanStitcher] {reason} {validation}")
-        return coords, {
-            "method": "Recorded stage positions; image refinement rejected",
-            "applied": False, "reason": reason,
-            "registration_keyframe_indices": frame_ids.tolist(),
-            "attempted_pairs": len(pairs), "accepted_pairs": len(edges),
-            "validation": validation,
-            "elapsed_seconds": time.perf_counter() - started,
-        }
+        return reject("Held-out overlaps did not improve.", attempted_pairs=len(pairs),
+                      accepted_pairs=len(edges), validation=validation)
     corrections = _solve_scan_positions(edges, len(frame_ids))
-    if not np.isfinite(corrections).all() or np.max(np.linalg.norm(corrections, axis=1)) > 128:
-        raise RuntimeError("Global registration corrections exceed conservative bounds.")
+    finite = bool(np.isfinite(corrections).all())
+    maximum_correction = float(np.max(np.linalg.norm(corrections, axis=1))) if finite else None
+    if not finite or maximum_correction > 128:
+        reason = (f"Image refinement requested a {maximum_correction:.2f}-pixel correction "
+                  "above the 128-pixel limit." if finite
+                  else "Image refinement produced non-finite corrections.")
+        return reject(reason, attempted_pairs=len(pairs), accepted_pairs=len(edges),
+                      validation=validation, max_correction_pixels=maximum_correction,
+                      correction_limit_pixels=128.)
     all_corrections = np.column_stack([
         np.interp(timestamps, timestamps[frame_ids], corrections[:, axis]) for axis in range(2)])
     return coords + all_corrections, {
@@ -839,6 +854,9 @@ def stitch_fast(stitcher, output_path=None, metadata_path=None, config=None, fra
             "registration": registration,
             "canvas_shape": [height, width, 3], "num_frames": len(selected),
             "source_frame_count": source_count, "eligible_frame_count": len(paths),
+            "source_frames": [dict(name=Path(path).name, timestamp=float(timestamp),
+                                   stage_xy_um=np.asarray(stage).tolist())
+                              for path, timestamp, stage in zip(paths, timestamps, raw_coords)],
             "selected_frame_count": len(selected), "decoded_frame_count": len(selected),
             "selected_indices": selected.tolist(), "draw_order": draw_order,
             "base_selected_indices": base_selected.tolist(),

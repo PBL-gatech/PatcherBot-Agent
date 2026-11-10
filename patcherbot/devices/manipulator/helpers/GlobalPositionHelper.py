@@ -24,6 +24,11 @@ class GlobalPositionHelper:
         self._atlas_locator_lock = Lock()
 
     @property
+    def session_registration(self):
+        """Shared session state; raw motor conversions remain independent."""
+        return getattr(self.unit, "session_registration", None)
+
+    @property
     def registrar(self):
         if self._registrar is None:
             from patcherbot.deepLearning.ObjectiveRegistrar import ObjectiveRegistrar
@@ -562,7 +567,7 @@ class GlobalPositionHelper:
                                   + scope_up * (stage_floor - anchor["home_scope_z_um"]))
                 if pipette is not None:
                     pipette_height = float(pipette[2]) * 1000 - floor_global_z
-        return dict(scan_pixel_to_world_mm=viewer_transform.tolist(),
+        result = dict(scan_pixel_to_world_mm=viewer_transform.tolist(),
                     objective_xyz_mm=[float(center[0]) / 1000, float(center[1]) / 1000, float(z_um) / 1000],
                     fov_size_mm=(fov / 1000).tolist(),
                     fov_corners_mm=(np.column_stack([corners_xy, np.full(4, z_um)]) / 1000).tolist(),
@@ -582,3 +587,17 @@ class GlobalPositionHelper:
                     named_anchors_mm=named_anchors,
                     stage_bottom_xyz_mm=self.stage_bottom_xyz_mm,
                     objective=objective, position_source="recorded_reference" if stage_xy is None else "supplied_stage")
+        registration = self.session_registration
+        if registration is None:
+            return result
+        result["map_registration_generation"] = getattr(registration, "generation", None)
+        result["map_position_confirmed"] = registration.transform is not None
+        if registration.transform is None:
+            # Images remain viewable while the current position has no accepted
+            # relationship to them. Do not paint unreferenced coordinates.
+            result["fov_corners_mm"] = None
+            result["pipette_xyz_mm"] = None
+            result["named_anchors_mm"] = {name: value for name, value in named_anchors.items()
+                if name not in ("home", "safe", "cleaning_bath", "pipette")}
+            return result
+        return registration.transform_state(result)

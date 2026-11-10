@@ -1,5 +1,6 @@
 """Saved scan display with rotation and registration sidecars beside each scan."""
 from pathlib import Path
+from copy import deepcopy
 import json
 import logging
 
@@ -16,6 +17,56 @@ MAX_DECODE_BYTES = 512 * 1024 ** 2
 OVERVIEW_EDGE = 2048
 
 
+def _reference_fit_metric_lines(registration):
+    """Keep image-fit quality and timing visible in both the UI and terminal."""
+    labels = {"source_features": "Session features", "reference_features": "Reference features",
+              "matches": "Matched features", "inliers": "Consistent matches",
+              "heldout_inliers": "Held-out consistent matches",
+              "median_error_overview_px": "Median error (overview pixels)",
+              "rotation_degrees": "Rotation (degrees)", "overview_scale": "Overview scale",
+              "frames_searched": "Native frames searched", "source_frames": "Native frames searched",
+              "matched_frames": "Matched native frames", "anchor_observations": "Verified native anchor observations",
+              "verified_observations": "Verified native anchor observations",
+              "current_zero_xy_um": "Current stage at reference zero (µm)",
+              "reference_correction_xy_um": "Map correction (µm)",
+              "zero_mad_xy_um": "Anchor observation MAD (µm)",
+              "median_absolute_deviation_xy_um": "Anchor observation MAD (µm)",
+              "peak_to_peak_xy_um": "Anchor observation range (µm)",
+              "validation_training_frames": "Validation training frames",
+              "heldout_frames": "Held-out frames",
+              "heldout_median_deviation_um": "Held-out median deviation (µm)",
+              "heldout_median_error_um": "Held-out median error (µm)"}
+    labels.update(elapsed_seconds="Image fitting time (seconds)",
+        total_elapsed_seconds="Total fitting time (seconds)",
+        validation_ncc="Image validation correlation", overlap_fraction="Image overlap fraction",
+        quality="Image fit quality", method="Fit method")
+    metrics = dict(registration.get("metrics", {}))
+    for key in ("method", "quality"):
+        if registration.get(key) is not None:
+            metrics[key] = registration[key]
+    for key in ("current_zero_xy_um", "reference_correction_xy_um"):
+        if key in registration:
+            metrics[key] = registration[key]
+    uncertainty = registration.get("uncertainty", {})
+    for key in ("median_absolute_deviation_xy_um", "peak_to_peak_xy_um",
+                "validation_training_frames", "heldout_frames", "heldout_median_deviation_um"):
+        if uncertainty.get(key) is not None:
+            metrics[key] = uncertainty[key]
+    lines = []
+    for key, value in metrics.items():
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2 or not all(isinstance(item, (int, float)) for item in value):
+                continue  # Full observation arrays belong in the saved evidence.
+            value = f"X {value[0]:.2f}, Y {value[1]:.2f}"
+        elif isinstance(value, float):
+            value = f"{value:.4g}"
+        elif not isinstance(value, (str, int, bool)):
+            continue
+        label = labels.get(key, key)
+        lines.append(f"{label}: {str(value)[:250]}")
+    return lines
+
+
 def _log_reference_fit_result(role, scan, registration):
     """Send fit evidence to the application's console and file log handlers."""
     state = "Error" if registration.get("error") else (
@@ -26,13 +77,7 @@ def _log_reference_fit_result(role, scan, registration):
     details = [f"Scan ({role}): {scan.get('path', 'Unavailable')}",
                "Reference: " + registration.get("reference_identity", {}).get("path", "Unavailable"),
                f"Result: {state}. {reason}"]
-    labels = {"source_features": "Session features", "reference_features": "Reference features",
-              "matches": "Matched features", "inliers": "Consistent matches",
-              "heldout_inliers": "Held-out consistent matches",
-              "median_error_overview_px": "Median error (overview pixels)",
-              "rotation_degrees": "Rotation (degrees)", "overview_scale": "Overview scale"}
-    for key, value in registration.get("metrics", {}).items():
-        details.append(f"{labels.get(key, key)}: {value}")
+    details.extend(_reference_fit_metric_lines(registration))
     if registration.get("save_error"):
         details.append("Result could not be saved: " + registration["save_error"])
     level = logging.ERROR if registration.get("error") else (
@@ -915,21 +960,42 @@ class _ReferenceRegistrationWorker(QtCore.QThread):
         super().__init__(parent)
         self.role, self.generation, self.scan = role, generation, scan
         self.force = False
+        self.session_scan = None
 
     def run(self):
         try:
             from patcherbot.deepLearning.ObjectiveRegistrar import ObjectiveRegistrar
             from patcherbot.utils.scanReferenceRegistration import (
-                register_scan_to_reference, load_registration, save_registration)
+                register_scan_to_reference, load_registration, save_registration, reference_image_metadata)
             scan = read_scan_image(self.scan["path"])
+            scan['metadata'] = dict(self.scan.get('metadata', {}), registration_role=self.role)
             if scan["source_identity"] != self.scan.get("source_identity", scan["source_identity"]):
                 raise ValueError("Scan changed after display; reopen it.")
-            reference = read_scan_image(ObjectiveRegistrar.shared().reference_image_path)
-            registration = None if self.force else load_registration(scan, reference)
-            fresh = registration is None
-            if fresh:
-                registration = register_scan_to_reference(scan, reference)
-            for image in (scan, reference):
+            registrar = ObjectiveRegistrar.shared()
+            reference = read_scan_image(registrar.reference_image_path)
+            manifest_path = getattr(registrar, 'reference_manifest_path', None)
+            reference['metadata'] = reference_image_metadata(reference, manifest_path) if manifest_path else {}
+            images = [scan, reference]
+            if self.role == 'atlas':
+                from patcherbot.utils.scanReferenceRegistration import register_atlas_to_session, load_atlas_registration
+                if self.session_scan is None:
+                    raise ValueError('Atlas alignment is waiting for an aligned session scan.')
+                session = read_scan_image(self.session_scan['path'])
+                session['metadata'] = dict(self.session_scan.get('metadata', {}), registration_role='session')
+                if session['source_identity'] != self.session_scan.get('source_identity', session['source_identity']):
+                    raise ValueError('The active session image changed after display; reopen it.')
+                session_registration = self.session_scan['reference_registration']
+                registration = None if self.force else load_atlas_registration(scan, session, reference, session_registration)
+                fresh = registration is None
+                if fresh:
+                    registration = register_atlas_to_session(scan, session, reference, session_registration)
+                images.append(session)
+            else:
+                registration = None if self.force else load_registration(scan, reference)
+                fresh = registration is None
+                if fresh:
+                    registration = register_scan_to_reference(scan, reference)
+            for image in images:
                 stat = Path(image["path"]).stat()
                 if (stat.st_size, stat.st_mtime_ns) != tuple(image["source_identity"]):
                     raise ValueError("A source image changed during registration; reopen the scan.")
@@ -968,6 +1034,9 @@ class ScanWorkspace(ParamConfig):
         self.reference_fit_status = QtWidgets.QLabel("Reference alignment: no session scan loaded.")
         self.reference_fit_status.setWordWrap(True)
         layout.addWidget(self.reference_fit_status)
+        self.coordinate_status = QtWidgets.QLabel("Coordinates: awaiting accepted session alignment.")
+        self.coordinate_status.setWordWrap(True)
+        layout.addWidget(self.coordinate_status)
         self.reference_fit_controls = CollapsibleGroupBox("Session reference alignment", self)
         fit_layout = QtWidgets.QVBoxLayout()
         self.reference_fit_button = QtWidgets.QPushButton("Fit session to reference")
@@ -983,6 +1052,8 @@ class ScanWorkspace(ParamConfig):
         layout.addWidget(self.reference_fit_controls)
         layout.addWidget(self.tabs, 1)
         self._session_scan_result = None
+        self._atlas_scan_result = None
+        self._atlas_waiting_for_session = False
         self._results = {}
         self._session_loaded = False
         self._atlas_results = {}
@@ -1001,7 +1072,7 @@ class ScanWorkspace(ParamConfig):
     def attach_atlas_view(self, view):
         """Route a separate no-harp Atlas view through the shared scan roles."""
         self.atlas_view = view
-        view.imageLoadStarted.connect(lambda: self._invalidate_reference_registration("atlas"))
+        view.imageLoadStarted.connect(self._atlas_load_started)
         view.scanLoaded.connect(lambda result: self._loaded("atlas", result))
         view.atlasOverlayChanged.connect(lambda result: self._atlas_changed("atlas", result))
 
@@ -1049,8 +1120,16 @@ class ScanWorkspace(ParamConfig):
                         and previous.get("source_identity") == result["source_identity"]):
                     return  # Zoom/detail refreshes preserve the last fit and its results.
                 self.tabs.setCurrentWidget(self.session_view)
+            elif role == 'atlas':
+                self._atlas_scan_result = result
             self._start_reference_fit(role, result)
             return
+        previous_reference = self._results.get("reference")
+        if (previous_reference is not None
+                and (previous_reference.get("path"), previous_reference.get("source_identity"))
+                != (result.get("path"), result.get("source_identity"))):
+            self._invalidate_reference_registration("session")
+            self.reference_fit_status.setText("Reference changed; fit the session again.")
         self._results[role] = result
         self.layerLoaded.emit(role, result)
         if role == self.active_role:
@@ -1062,13 +1141,25 @@ class ScanWorkspace(ParamConfig):
             "fresh fit requested" if force else "checking saved fit or matching images")
         self._invalidate_reference_registration(role)
         generation = self._registration_generations[role]
-        getattr(self, role + "_view").status.setText("Matching scan to reference...")
+        session_target = None
+        if role == 'atlas':
+            session_target = self._results.get('session')
+            if session_target is None or not session_target.get('reference_registration', {}).get('accepted'):
+                self._atlas_waiting_for_session = True
+                self.atlas_view.status.setText('Atlas image loaded; waiting for the active session alignment.')
+                return
+            self._atlas_waiting_for_session = False
+        getattr(self, role + "_view").status.setText(
+            'Matching atlas scan to the active session...' if role == 'atlas' else 'Matching scan to reference...')
         if role == "session":
             self.reference_fit_button.setEnabled(False)
             self.reference_fit_status.setText("Reference alignment: fitting session scan...")
             self.reference_fit_details.setPlainText("Session: " + result["path"])
         worker = _ReferenceRegistrationWorker(role, generation, result, self)
         worker.force = force
+        if session_target is not None:
+            worker.session_scan = dict(session_target,
+                reference_registration=deepcopy(session_target['reference_registration']))
         self._registration_workers.append(worker)
         worker.completed.connect(self._reference_registered)
         worker.finished.connect(lambda worker=worker: self._registration_finished(worker))
@@ -1088,15 +1179,7 @@ class ScanWorkspace(ParamConfig):
         details = ["Session: " + result.get("path", ""),
                    "Reference: " + registration.get("reference_identity", {}).get("path", "Unavailable"),
                    "Result: " + state + ". " + reason]
-        labels = {"source_features": "Session features", "reference_features": "Reference features",
-                  "matches": "Matched features", "inliers": "Consistent matches",
-                  "heldout_inliers": "Held-out consistent matches",
-                  "median_error_overview_px": "Median error (overview pixels)",
-                  "rotation_degrees": "Rotation (degrees)", "overview_scale": "Overview scale"}
-        for key, value in registration.get("metrics", {}).items():
-            if key in labels:
-                details.append(f"{labels[key]}: {value:.4g}" if isinstance(value, float)
-                               else f"{labels[key]}: {value}")
+        details.extend(_reference_fit_metric_lines(registration))
         if registration.get("save_error"):
             details.append("Result could not be saved: " + registration["save_error"])
         self.reference_fit_details.setPlainText("\n".join(details))
@@ -1116,7 +1199,17 @@ class ScanWorkspace(ParamConfig):
         self._session_loaded = False
         self._invalidate_reference_registration("session")
 
+    def _atlas_load_started(self):
+        self._atlas_scan_result = None
+        self._atlas_waiting_for_session = False
+        self._invalidate_reference_registration('atlas')
+
     def _invalidate_reference_registration(self, role):
+        if role == 'session' and hasattr(self, 'atlas_view'):
+            self._invalidate_reference_registration('atlas')
+            self._atlas_waiting_for_session = self._atlas_scan_result is not None
+            if self._atlas_waiting_for_session:
+                self.atlas_view.status.setText('Atlas image loaded; waiting for the active session alignment.')
         self._registration_generations[role] = self._registration_generations.get(role, 0) + 1
         self._results.pop(role, None)
         self.layerLoaded.emit(role, None)
@@ -1142,11 +1235,15 @@ class ScanWorkspace(ParamConfig):
         self._results[role] = result
         self.layerLoaded.emit(role, result)
         self.atlasOverlayChanged.emit(role, self._atlas_results.get(role))
-        view.status.setText("Reference image match accepted; stage calibration unchanged" + ("; sidecar could not be saved" if registration.get("save_error") else ""))
+        view.status.setText(("Atlas to session to reference: " + registration.get('reason', 'Image alignment applied')
+            if role == 'atlas' else "Reference image match accepted; stage calibration unchanged")
+            + ("; sidecar could not be saved" if registration.get("save_error") else ""))
         if role == "session" and self.active_role != "session":
             self.tabs.setCurrentWidget(self.session_view)
         elif role == self.active_role:
             self.scanLoaded.emit(result)
+        if role == 'session' and self._atlas_scan_result is not None:
+            self._start_reference_fit('atlas', self._atlas_scan_result)
 
     def _registration_finished(self, worker):
         if worker in self._registration_workers:

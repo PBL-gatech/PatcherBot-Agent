@@ -95,3 +95,4 @@ experiments/Datasets/temp_dataset.hdf5
 /patcherbot/deepLearning/globalModel/chamber_cad
 /patcherbot/deepLearning/globalModel/40_objective_cad
 *.zip
+/patcherbot/utils/registration_experiments
