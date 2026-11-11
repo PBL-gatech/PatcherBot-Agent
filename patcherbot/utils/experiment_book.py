@@ -179,6 +179,83 @@ class ExperimentBookLogger:
                             json.dumps(normalized, allow_nan=False))
         return normalized
 
+    def write_scan(self, image_path, role):
+        """Keep completed scans linked to their existing image and sidecars."""
+        if role not in ("session", "atlas"):
+            raise ValueError("Scan role must be session or atlas")
+        image = Path(image_path).expanduser().resolve()
+        if not image.is_file():
+            raise ValueError("Completed scan image is missing: " + str(image))
+        self._write_to_file(self._entry_header("SCAN") + "\n" +
+                            json.dumps(dict(role=role, image_path=str(image))))
+
+    @staticmethod
+    def _saved_scans(source, records, legacy=True):
+        """Use book references, or the nearest earlier scan session on that day."""
+        scans = {}
+        try:
+            book_time = datetime.strptime(source.parent.name, "%Y_%m_%d-%H_%M")
+        except ValueError:
+            logging.getLogger(__name__).warning("Cannot match scans to book session timestamp: %s", source)
+            return scans
+        recorded_roles = set()
+        for record in records:
+            if not isinstance(record, dict) or record.get("role") not in ("session", "atlas"):
+                continue
+            role = record["role"]
+            recorded_roles.add(role)
+            scans.pop(role, None)
+            raw_path = record.get("image_path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            image = Path(raw_path)
+            if not image.is_absolute():
+                image = source.parent / image
+            image = image.resolve()
+            try:
+                scan_time = datetime.strptime(image.parent.name, "%Y_%m_%d-%H_%M")
+            except ValueError:
+                logging.getLogger(__name__).warning("Cannot match recorded scan session timestamp: %s", image)
+                continue
+            if scan_time.date() == book_time.date() and scan_time <= book_time and image.is_file():
+                scans[role] = str(image)
+        if not legacy:
+            return scans
+        folders = []
+        scan_root = source.parent.parent.parent / "scan_stitch_data"
+        for folder in scan_root.glob("*"):
+            if not folder.is_dir():
+                continue
+            try:
+                scan_time = datetime.strptime(folder.name, "%Y_%m_%d-%H_%M")
+            except ValueError:
+                continue
+            if scan_time.date() == book_time.date() and scan_time <= book_time:
+                folders.append((scan_time, folder))
+        remaining = {"session", "atlas"} - recorded_roles
+        for _, folder in sorted(folders, reverse=True):
+            if not remaining:
+                break
+            candidates = {role: [] for role in remaining}
+            for metadata_path in folder.glob("*_meta.json"):
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                    image = metadata_path.with_name(metadata_path.name[:-len("_meta.json")] + ".tif")
+                    role = metadata.get("registration_role")
+                    if role in ("session", "atlas") and role in remaining and image.is_file():
+                        candidates[role].append(str(image.resolve()))
+                except (OSError, ValueError, AttributeError):
+                    logging.getLogger(__name__).warning("Unable to read saved scan metadata: %s", metadata_path)
+            for role, paths in candidates.items():
+                if paths:
+                    remaining.remove(role)
+                    if len(paths) == 1:
+                        scans[role] = paths[0]
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "Multiple %s scans match book %s in %s; skipping ambiguous match", role, source, folder)
+        return scans
+
     @staticmethod
     def read_details(source_path):
         """Read reusable details without changing a source book or live hardware."""
@@ -214,9 +291,13 @@ class ExperimentBookLogger:
         origins = {"x": None, "y": None}
         notes = []
         atlases = []
+        scans = []
+        legacy_scans = True
         for kind, saved_at, body in sections:
             if kind == "IMPORT":
                 origins, tares = {"x": None, "y": None}, None
+                scans = []
+                legacy_scans = False
             elif kind == "DETAILS":
                 details_saved_at = saved_at
                 details = {key: line[len(prefix):] for line in body
@@ -237,6 +318,11 @@ class ExperimentBookLogger:
                                     image_path=lines[-1][len("Saved: "):].strip(), saved_at=saved_at))
             elif kind == "ATLAS IMPORT":
                 atlases.append(json.loads("\n".join(body)))
+            elif kind == "SCAN":
+                try:
+                    scans.append(json.loads("\n".join(body)))
+                except ValueError:
+                    logging.getLogger(__name__).warning("Ignoring invalid saved scan in %s", source)
             elif kind == "NOTE":
                 text = "\n".join(body).strip()
                 if text:
@@ -303,7 +389,8 @@ class ExperimentBookLogger:
             atlas.setdefault("source_image_path", str(resolved))
             atlas["image_path"] = str(resolved)
         return dict(details=details, origins=origins, tares=tares, notes=notes,
-                    atlases=atlases, source_path=str(source),
+                    atlases=atlases, scans=ExperimentBookLogger._saved_scans(source, scans, legacy_scans),
+                    source_path=str(source),
                     source_started_at=source_started_at, details_saved_at=details_saved_at)
 
     def import_details(self, source_path, tares=None):
@@ -353,6 +440,9 @@ class ExperimentBookLogger:
         for atlas in payload["atlases"]:
             entries.append(self._entry_header("ATLAS IMPORT", datetime.fromisoformat(atlas["saved_at"])) +
                            "\n" + json.dumps(atlas, allow_nan=False))
+        for role, image_path in payload["scans"].items():
+            entries.append(self._entry_header("SCAN") + "\n" +
+                           json.dumps(dict(role=role, image_path=image_path)))
         entries.append(self._entry_header("TARES") + "\n" + json.dumps(payload["tares"], allow_nan=False))
         self._write_to_file("\n\n".join(entries))
         return payload

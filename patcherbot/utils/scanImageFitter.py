@@ -154,3 +154,78 @@ def register_scan_images(scan,reference,*,config=None):
     except (ValueError,TypeError,KeyError,cv2.error) as error:result['reason']=f'Image fitting unavailable: {error}'
     result['metrics']['elapsed_seconds']=time.perf_counter()-started
     return result
+
+
+def _dense_inputs(scan, reference, expected_native_scale, max_dimension):
+    """Common optical sampling with exact native pixel-center transforms."""
+    scale=float(expected_native_scale)
+    if not np.isfinite(scale) or scale<=0 or not 128<=max_dimension<=1280:
+        raise ValueError('Dense scoring requires positive optical scale and bounded previews.')
+    sample=max(1.,max(float(scan['width'])*scale,float(scan['height'])*scale,
+               float(reference['width']),float(reference['height']))/max_dimension)
+    common=np.diag([sample,sample,1.]);common[:2,2]=(sample-1)/2
+    optical=np.diag([scale,scale,1.]);optical[:2,2]=(scale-1)/2
+    prepared=[]
+    for image,physical in ((scan,optical),(reference,np.eye(3))):
+        gray,native=_preview(image,max_dimension)
+        shape=np.maximum(16,np.rint(np.array([image['width'],image['height']])*physical[0,0]/sample).astype(int))
+        transform=np.linalg.inv(common)@physical@native
+        gray=cv2.warpAffine(gray,transform[:2],tuple(shape),flags=cv2.INTER_LINEAR)
+        mask=cv2.erode((gray>3).astype(np.float32),np.ones((5,5),np.uint8))
+        values=gray.astype(np.float32)
+        signal=(cv2.GaussianBlur(values,(0,0),1)-cv2.GaussianBlur(values,(0,0),8))*mask
+        prepared.append((signal,mask,np.linalg.inv(physical)@common))
+    return prepared
+
+
+def _dense_score(prepared, matrix):
+    (a,ma,na),(b,mb,nb)=prepared
+    matrix=np.asarray(matrix,dtype=float)
+    if matrix.shape!=(3,3) or not np.isfinite(matrix).all() or abs(np.linalg.det(matrix))<1e-12:
+        return dict(defined=False,reason='No finite invertible image transform.')
+    transform=np.linalg.inv(nb)@matrix@na
+    warped=cv2.warpAffine(a,transform[:2],b.shape[::-1])
+    mask=cv2.warpAffine(ma,transform[:2],b.shape[::-1])>.99
+    valid=mask&(mb>0)
+    pixels=int(valid.sum())
+    # Account for the transformed source area, so different scales share one score.
+    area=min(float(ma.sum())*abs(np.linalg.det(transform[:2,:2])),float(mb.sum()))
+    overlap=min(1.,pixels/max(area,1.))
+    if pixels<64 or min(float(warped[valid].std()),float(b[valid].std()))<1e-5:
+        return dict(defined=False,reason='No overlapping textured image support.',dense_overlap_pixels=pixels)
+    ncc=_ncc(warped[valid],b[valid])
+    return dict(defined=True,dense_ncc=ncc,dense_overlap_fraction=overlap,
+                dense_overlap_pixels=pixels,dense_ranking_score=ncc*np.sqrt(overlap))
+
+
+def score_image_transform(scan, reference, matrix, max_dimension=600, expected_native_scale=1.):
+    """Rank image proposals on identical masked bandpass pixels; no quality veto."""
+    return _dense_score(_dense_inputs(scan,reference,expected_native_scale,max_dimension),matrix)
+
+
+def propose_dense_translation(scan, reference, expected_native_scale, max_dimension=600):
+    """Bounded all-translation FFT search at the known optical scale, without rotation."""
+    from scipy.signal import fftconvolve
+    started=time.perf_counter()
+    prepared=_dense_inputs(scan,reference,expected_native_scale,max_dimension)
+    (a,ma,na),(b,mb,nb)=prepared
+    correlate=lambda x,y:fftconvolve(x,y[::-1,::-1],mode='full')
+    n=np.maximum(correlate(mb,ma),0.);safe=np.maximum(n,1.)
+    sa,sb=correlate(mb,a),correlate(b,ma)
+    va=np.maximum(correlate(mb,a*a)-sa*sa/safe,0.)
+    vb=np.maximum(correlate(b*b,ma)-sb*sb/safe,0.)
+    covariance=correlate(b,a)-sa*sb/safe
+    variance=va*vb;support=min(float(ma.sum()),float(mb.sum()))
+    valid=(n>=max(64.,support*.25))&(variance>1e-5)
+    if not valid.any():
+        return dict(available=False,reason='No overlapping textured image support.',metrics={})
+    ncc=np.clip(covariance/np.sqrt(np.maximum(variance,1e-5)),-1.,1.)
+    ranks=np.where(valid,ncc*np.sqrt(np.minimum(n/max(support,1.),1.)),-np.inf)
+    y,x=np.unravel_index(np.argmax(ranks),ranks.shape)
+    translation=np.eye(3);translation[:2,2]=[x-a.shape[1]+1,y-a.shape[0]+1]
+    matrix=nb@translation@np.linalg.inv(na)
+    metrics=_dense_score(prepared,matrix)
+    metrics.update(dense_elapsed_seconds=time.perf_counter()-started,dense_max_dimension=max_dimension,
+                   expected_native_scale=float(expected_native_scale))
+    return dict(available=metrics['defined'],method='image_dense_translation',
+                scan_to_reference_native=matrix.tolist(),metrics=metrics)

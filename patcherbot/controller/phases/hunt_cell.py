@@ -9,6 +9,8 @@ from .approach_cell import ApproachCellPhase
 
 class HuntCellPhase(ApproachCellPhase):
     phase_name = "Hunt"
+    NEAR_CELL_UM = 3.0
+    NEAR_SEARCH_MIN_RISE_MOHM = 0.100  # 100 kOhm above the starting resistance.
 
     def run(self, cell=None):
         helper = self.controller.calibrated_unit.pipetteCalHelper
@@ -28,6 +30,7 @@ class HuntCellPhase(ApproachCellPhase):
     def prepare(self, cell=None):
         """Prepare the selected mode, near pressure, and initial position and resistance."""
         self.finished = False
+        self._microscope_bounds_warned = False
         self.mode = self.controller.config.mode
         self._reset_position_fallbacks()
         self.focus_reference_unavailable = False
@@ -41,6 +44,7 @@ class HuntCellPhase(ApproachCellPhase):
         self.cell_selection_locked = True
         self.started = False
         self.last_velocity = None
+        self.near_hunt = False
         self.cell_detected = False
         self.contact_checking = False
         self.contact_advancing = False
@@ -174,9 +178,17 @@ class HuntCellPhase(ApproachCellPhase):
         position = self.controller.calibrated_unit.position()
         self.failure_gate(position=position)
         if self.mode == "Adaptive":
-            _, z_um = self.calibrated_contact_separation(position)
-            monitor = self.contact_checking or z_um <= 5.0
-            detectors = (["deep_learning"] if self.operation == self.scan
+            xy_um, z_um = self.calibrated_contact_separation(position)
+            if (not self.near_hunt and z_um <= self.NEAR_CELL_UM
+                    and xy_um <= self.controller.config.hunt_contact_distance):
+                self._enter_near_hunt(position)
+                position = self.controller.calibrated_unit.position()
+            if self.near_hunt:
+                self.pipette_z += position[2] - self.near_position_z
+                self.near_position_z = position[2]
+                self._sample_near_resistance(self.controller.daq.resistance())
+            monitor = self.near_hunt or self.contact_checking or z_um <= 5.0
+            detectors = (["deep_learning"] if self.near_hunt or self.operation == self.scan
                          or (self.operation == self.spear and monitor) else ["cell_detections"])
             if kwargs.get("evidence") is None:
                 kwargs["evidence"] = self.controller.observer.infer_frame(detectors, self.frame_context,
@@ -193,9 +205,202 @@ class HuntCellPhase(ApproachCellPhase):
         self.observation = super().observe(**kwargs)
         if "resistance" in self.observation:
             self.resistance = self.observation["resistance"]
+            if self.mode == "Adaptive" and self.near_hunt:
+                self._sample_near_resistance(self.resistance)
         if self.mode == "Adaptive":
             self.failure_gate(position=self.manipulator_position)
         return self.observation
+
+    def _enter_near_hunt(self, position):
+        """Transfer Z ownership while retaining the original Hunt travel origin."""
+        self.stop_motions(all_devices=True)
+        position = self.controller.calibrated_unit.position()
+        if self.operation == self.spear and self.spear_start_z is not None:
+            self.pipette_z += position[2] - self.spear_start_z
+        self.spear_start_z = self.spear_motion = self.spear_done = None
+        self._return_near_focus_to_cell()
+        self.near_hunt = True
+        self.near_position_z = position[2]
+        self.near_goal_hold = self.near_survey_pending = self.near_survey_done = False
+        self.near_survey = None
+        self.near_survey_armed = True
+        self.near_correction_pending = False
+        self.near_cell_verified = False
+        self.near_resistances = collections.deque(maxlen=5)
+        self.near_sample_at = -float('inf')
+        self.operation = None
+        self.last_velocity = None
+        self.controller.info('Hunt within 3 um: resistance gates motion and Search/Scan')
+
+    def _return_near_focus_to_cell(self):
+        """Settle inside the saved cell bounds before releasing the sweep record."""
+        stage = self.controller.calibrated_stage
+        focus = stage.focusHelper
+        focus.cancel_search()
+        focus.relocate(self.cell_focus_z)
+        self.stage_position = np.r_[np.asarray(stage.position(), dtype=float)[:2],
+            self.controller.microscope.position() / self.controller.calibrated_unit.config.microscope_units_per_um]
+        self.vision_fresh = False
+        focus.reset_search()
+
+    def _sample_near_resistance(self, reading):
+        """Stop immediately at the goal; authorize surveys from paced stable readings."""
+        if reading is None or not np.isfinite(reading):
+            raise AutopatchError('Hunt requires a finite resistance measurement')
+        config = self.controller.config
+        if reading - self.controller.first_res >= config.cell_R_increase and not self.near_goal_hold:
+            self.stop_motions(all_devices=True)
+            self._return_near_focus_to_cell()
+            self.last_velocity = None
+            self.near_goal_hold = True
+            self.near_survey_pending = True
+            self.near_survey_done = False
+            self.near_survey = self.operation = None
+            self.near_resistances.clear()
+        now = time.monotonic()
+        if now - self.near_sample_at < 0.04:
+            return
+        self.near_sample_at = now
+        self.near_resistances.append(float(reading))
+        if len(self.near_resistances) < 5:
+            return
+        average = float(np.mean(self.near_resistances))
+        spread = max(self.near_resistances) - min(self.near_resistances)
+        stable_rise = (average - self.controller.first_res >= self.NEAR_SEARCH_MIN_RISE_MOHM - 1e-12 and spread
+            <= config.cell_R_increase * config.hunt_resistance_band_percent / 100.0)
+        if not stable_rise:
+            self.near_survey_armed = True
+        elif self.near_survey_armed and not self.near_goal_hold:
+            self.near_survey_pending = True
+            self.near_survey_armed = False
+
+    def _calculate_near_hunt(self):
+        """Complete a resistance-authorized survey without requiring pipette focus."""
+        focus = self.controller.calibrated_stage.focusHelper
+        cell_visible = self.vision_fresh and self.cell_detection is not None
+        if cell_visible:
+            self.near_cell_verified = True
+        if self.near_survey == 'search':
+            self.calculate_search()
+            if self._position_ready('search') and cell_visible:
+                if self.search_confirmed:
+                    self.cell_focus_z = self.stage_position[2]
+                focus.reset_search()
+                self.near_survey = 'scan'
+                self.operation = self.scan
+                self._clear_position_cycle('scan')
+                self.scan_confirmed = False
+        elif self.near_survey == 'scan':
+            self.calculate_scan()
+            if self._position_ready('scan'):
+                self._return_near_focus_to_cell()
+                self.near_survey = self.operation = None
+                self.near_survey_done = True
+                self.near_correction_pending = True
+        cell_visible = self.vision_fresh and self.cell_detection is not None
+        self.cell_detected = bool(self.near_goal_hold and self.near_survey_done
+            and cell_visible and len(self.near_resistances) == 5
+            and np.mean(self.near_resistances) - self.controller.first_res
+                >= self.controller.config.cell_R_increase - 1e-12)
+        if (self.near_goal_hold and self.near_survey_done and cell_visible
+                and len(self.near_resistances) == 5 and not self.cell_detected):
+            config = self.controller.config
+            spread = max(self.near_resistances) - min(self.near_resistances)
+            if spread <= config.cell_R_increase * config.hunt_resistance_band_percent / 100.0:
+                self.near_goal_hold = False
+                self.near_survey_armed = False
+
+    def _near_motion_stop_requested(self):
+        self.controller.abort_if_requested()
+        self._sample_near_resistance(self.controller.daq.resistance())
+        return self.near_goal_hold
+
+    def _correct_near_xy(self, tip, target):
+        """Monitor Hunt's XY correction with resistance and travel checks."""
+        unit = self.controller.calibrated_unit
+        displacement = np.asarray(unit.pixels_to_um_relative(np.r_[target - tip, 0.0]), dtype=float)
+        speed = float(self.controller.config.approach_pipette_speed)
+        if not np.isfinite(displacement).all() or not np.isfinite(speed) or speed <= 0:
+            raise AutopatchError('Hunt XY correction requires finite displacement and positive speed')
+        distance = float(np.linalg.norm(displacement))
+        if distance <= unit.actionHelper.MOTION_ENDPOINT_TOLERANCE_UM:
+            return
+        if self._near_motion_stop_requested():
+            return
+        origin = np.asarray(unit.position(), dtype=float)
+        if not np.isfinite(origin).all():
+            raise AutopatchError('Hunt XY correction has no finite motor position')
+        self.failure_gate(position=origin)
+        direction = displacement / distance
+        velocity = (-np.asarray(unit.velocity_position_control(displacement, speed), dtype=float)).tolist()
+        tolerance = min(0.1, distance * 0.1)
+        expected_time = distance / speed
+        started_at = time.perf_counter()
+
+        def sample(expired):
+            position = np.asarray(unit.position(), dtype=float)
+            if not np.isfinite(position).all():
+                raise AutopatchError('Hunt XY correction has no finite motor position')
+            self.failure_gate(position=position)
+            progress = float(np.dot(position - origin, direction))
+            return progress, progress, time.perf_counter()
+
+        try:
+            unit.absolute_move_group_velocity(velocity)
+            result = unit.actionHelper.monitor(sample, endpoint=distance - tolerance,
+                tolerance=tolerance, start_time=started_at, deadline=max(10.0, expected_time * 20.0),
+                cancelled=self._near_motion_stop_requested, pause=lambda: self.controller.sleep(0.01),
+                reversed=lambda progress: progress <= -distance,
+                report_drift=lambda progress: self.controller.warning('Hunt XY correction moving away from target'),
+                progress_timeout=max(2.0, expected_time * 5.0))
+        finally:
+            unit.stop()
+            unit.wait_until_still()
+            self.last_velocity = None
+        if not result.reached and not self.near_goal_hold:
+            raise AutopatchError(f'Hunt pipette alignment failed: {result.failure or "movement interrupted"}')
+
+    def _act_near_hunt(self):
+        """Own axial velocity separately from objective sweeps and warranted XY shifts."""
+        self.failure_gate(position=self.controller.calibrated_unit.position())
+        self.success_gate()
+        focus = self.controller.calibrated_stage.focusHelper
+        cell_visible = self.vision_fresh and self.cell_detection is not None
+        if self.near_correction_pending and cell_visible:
+            self.near_correction_pending = False
+            if not self.near_goal_hold:
+                tip = self._position_target_xy('scan')
+                target = np.asarray(self.cell_detection[:2], dtype=float)
+                separation = np.linalg.norm(self.controller.calibrated_stage.pixels_to_um_relative(
+                    np.r_[target - tip, 0.0])[:2])
+                if separation > self.controller.config.hunt_contact_distance:
+                    self.controller.calibrated_unit.stop()
+                    self.last_velocity = None
+                    self._correct_near_xy(tip, target)
+        cell_available = cell_visible or (self.near_survey is not None and self.near_cell_verified)
+        velocity = (None if self.near_goal_hold or not cell_available
+                    else (0.0, 0.0, -abs(self.controller.config.max_descent_speed)))
+        if velocity != self.last_velocity:
+            if velocity is None:
+                self.controller.calibrated_unit.stop()
+            else:
+                if not np.isfinite(velocity[2]) or velocity[2] == 0:
+                    raise AutopatchError('Hunt requires a finite nonzero descent speed')
+                self.controller.calibrated_unit.absolute_move_group_velocity(list(velocity))
+            self.last_velocity = velocity
+        if self.near_survey_pending and self.near_survey is None:
+            focus.reset_search()
+            self.near_survey_pending = False
+            self.near_survey_done = False
+            self.near_survey = 'search'
+            self.operation = self.search
+            self._clear_position_cycle('search')
+            self.search_confirmed = self.scan_confirmed = False
+        if self.near_survey == 'search':
+            ApproachCellPhase.search(self)
+        elif self.near_survey == 'scan':
+            ApproachCellPhase.scan(self)
+        self.started = True
 
     def enrich_observation(self, observation):
         """Retain accepted detector evidence and update the cell reference during Spear."""
@@ -249,6 +454,9 @@ class HuntCellPhase(ApproachCellPhase):
     def calculate(self):
         """Give resistance confirmation priority over focus searches and steering."""
         if self.mode != "Adaptive":
+            return
+        if getattr(self, 'near_hunt', False):
+            self._calculate_near_hunt()
             return
         if getattr(self, 'contact_advancing', False):
             self.cell_detected = False
@@ -378,6 +586,8 @@ class HuntCellPhase(ApproachCellPhase):
     def decide(self):
         """Select an action from the active operation's result."""
         self.next_action = None
+        if getattr(self, 'near_hunt', False):
+            return
         if self.controller.config.mode == "Adaptive":
             if self.cell_detected:
                 return
@@ -434,6 +644,8 @@ class HuntCellPhase(ApproachCellPhase):
 
     def act(self):
         """Execute the permitted action, or stop a disallowed velocity command."""
+        if getattr(self, 'near_hunt', False):
+            return self._act_near_hunt()
         if not self.action_gate():
             if self.last_velocity is not None:
                 self.controller.calibrated_unit.stop()
@@ -485,7 +697,8 @@ class HuntCellPhase(ApproachCellPhase):
         if step <= actions.MOTION_ENDPOINT_TOLERANCE_UM:
             return self.search()
         target = position[2] + step
-        if not np.isfinite(target) or abs(target - self.start_position[2]) >= config.max_distance:
+        if not np.isfinite(target) or (self.mode != "Adaptive"
+                and abs(target - self.start_position[2]) >= config.max_distance):
             raise AutopatchError('Contact advance exceeds Hunt travel bounds')
         self.manipulator_position = position
         self.spear_target, self.spear_speed = target, abs(config.max_descent_speed)
@@ -565,13 +778,19 @@ class HuntCellPhase(ApproachCellPhase):
                     np.asarray(self.vision["source_positions"]["pipette_xyz"]).copy(),
                     np.asarray(self.source_stage_xy).copy())
             if not self.contact_aligned and self.confirmed_readings < 5:
-                if self.controller.calibrated_unit.center_pipette(
+                unit = self.controller.calibrated_unit
+                target_xy = self._position_target_xy('scan') if fallback else self.projected_confirmed_tip()
+                center_xy = np.array([unit.camera.width, unit.camera.height], dtype=float) / 2.0
+                correction_um = float(np.linalg.norm(unit.pixels_to_um_relative(
+                    np.r_[center_xy - target_xy, 0.0])))
+                if not np.isfinite(correction_um):
+                    raise AutopatchError('Hunt pipette centering requires a finite correction')
+                if correction_um > unit.actionHelper.MOTION_ENDPOINT_TOLERANCE_UM and unit.center_pipette(
                         speed=self.controller.config.approach_pipette_speed,
-                        detected_px=self._position_target_xy('scan') if fallback else self.projected_confirmed_tip(),
+                        detected_px=target_xy,
                         expected_px=self.frame_context["pipette_expected_xy"](),
                         max_deviation_um=self.controller.calibrated_unit.config.pipette_detection_radius_um) is False:
                     raise AutopatchError("Hunt pipette centering failed")
-                self.start_position = self.controller.calibrated_unit.position()
         self.failure_gate()
         self.controller.calibrated_stage.focusHelper.reset_search()
         self.search_confirmed = False
@@ -635,8 +854,7 @@ class HuntCellPhase(ApproachCellPhase):
             permitted = (self.spear_start_z is None
                          and np.isfinite([self.spear_target, self.spear_speed]).all()
                          and self.spear_speed > 0
-                         and self.spear_target - self.manipulator_position[2] > 1.0
-                         and abs(self.spear_target - self.start_position[2]) < self.controller.config.max_distance)
+                         and self.spear_target - self.manipulator_position[2] > 1.0)
         else:
             permitted = False
         if not permitted:
@@ -673,6 +891,11 @@ class HuntCellPhase(ApproachCellPhase):
                             self.pipette_z - self.controller.config.scan_z_radius_um)
                 upper = max(self.cell_focus_z + self.controller.config.search_z_radius_um,
                             self.pipette_z + self.controller.config.scan_z_radius_um)
+                if getattr(self, 'near_hunt', False) and self.near_survey is not None:
+                    sweep = getattr(self.controller.calibrated_stage.focusHelper, '_search', None)
+                    if sweep is not None:
+                        lower = min(lower, sweep['low'])
+                        upper = max(upper, sweep['high'])
                 if self.cell_search_bounds is not None:
                     lower = min(lower, self.cell_search_bounds[0])
                     upper = max(upper, self.cell_search_bounds[1])
@@ -681,8 +904,15 @@ class HuntCellPhase(ApproachCellPhase):
                              or self.operation in (self.search, self.scan)
                              or getattr(self, 'contact_checking', False) else 0.0)
                 if not lower - tolerance <= self.stage_position[2] <= upper + tolerance:
-                    raise AutopatchError("Adaptive Hunt exceeded microscope search bounds")
-        if position is None or not self.started or self.controller.config.mode == "Training":
+                    if not self._microscope_bounds_warned:
+                        self.controller.warning('Adaptive Hunt exceeded microscope search bounds; continuing; '
+                            f'z_um={self.stage_position[2]:.3f}; '
+                            f'bounds_um=({lower - tolerance:.3f}, {upper + tolerance:.3f})')
+                        self._microscope_bounds_warned = True
+                else:
+                    self._microscope_bounds_warned = False
+        # The fixed distance limit from Hunt's starting position excludes Adaptive mode.
+        if position is None or not self.started or self.controller.config.mode in ("Training", "Adaptive"):
             return
         travel = abs(position[2] - self.start_position[2])
         if travel >= int(self.controller.config.max_distance):

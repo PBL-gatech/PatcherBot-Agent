@@ -13,7 +13,7 @@ from time import perf_counter
 import cv2
 import numpy as np
 
-VERSION = 2
+VERSION = 3
 
 
 @lru_cache(maxsize=32)
@@ -216,8 +216,12 @@ def register_scan_to_reference(scan, reference):
         scale = expected_native_image_scale(scan, reference)
         config = None if scale is None else ImageFitConfig(expected_native_scale=scale)
         fitted = register_scan_images(scan, reference, config=config)
+        candidates = [fitted]
         if fitted.get('accepted') is not True:
             fitted = _register_bounded_learned(scan, reference, fitted)
+            candidates.append(fitted)
+        if scale is not None:
+            fitted = _select_image_candidate(scan, reference, candidates, scale)
         if fitted.get('scan_to_reference_native') is None and fitted.get('candidate_scan_to_reference_native') is not None:
             fitted['scan_to_reference_native']=fitted['candidate_scan_to_reference_native']
             fitted['method']=fitted.get('candidate_method',fitted.get('method','image_candidate'))
@@ -239,6 +243,40 @@ def register_scan_to_reference(scan, reference):
         result.pop('scan_to_reference_native', None)
     result.setdefault('metrics', {})['total_elapsed_seconds'] = perf_counter() - started
     return result
+
+
+def _select_image_candidate(scan, reference, candidates, scale):
+    """Compare whole-image agreement instead of preferring the last matcher."""
+    from patcherbot.utils.scanImageFitter import propose_dense_translation, score_image_transform
+    dense = propose_dense_translation(scan, reference, scale)
+    choices = list(candidates)
+    if dense.get('available'):
+        choices.append(dict(dense, accepted=True, quality='unverified',
+            reason='Best available alignment selected by whole-image agreement at the recorded image scale.',
+            image_fit=dict(available=True, acceptance_policy='best_available'),
+            image_validation=dict(accepted=False, method='bounded_scan_image_validation',
+                raw_frames_used=False, hardware_coordinates_changed=False)))
+    ranked, reports, seen = [], [], set()
+    for choice in choices:
+        matrix = choice.get('scan_to_reference_native', choice.get('candidate_scan_to_reference_native'))
+        if matrix is None:
+            continue
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.shape != (3, 3) or not np.isfinite(matrix).all() or np.linalg.det(matrix[:2, :2]) <= 1e-12:
+            continue
+        key = matrix.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        score = score_image_transform(scan, reference, matrix, expected_native_scale=scale)
+        reports.append(dict(method=choice.get('candidate_method', choice.get('method')), **score))
+        if score.get('defined'):
+            selected = dict(choice, scan_to_reference_native=matrix.tolist(),
+                metrics=dict(choice.get('metrics', {}), **score))
+            ranked.append((float(score['dense_ranking_score']), selected))
+    selected = max(ranked, key=lambda item: item[0])[1] if ranked else dict(candidates[-1])
+    selected['metrics'] = dict(selected.get('metrics', {}), candidate_image_scores=reports)
+    return selected
 
 
 def _validated_image_result(result):

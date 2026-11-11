@@ -163,6 +163,11 @@ class PatchGui(ManipulatorGui):
             self.scan_viewer.load_image(path)
         else:
             logging.error("Unknown completed scan role: %s", role)
+            return
+        try:
+            self.experiment_book_tab.logger.write_scan(path, role)
+        except Exception:
+            logging.exception("Completed scan displayed but could not be saved to the experiment book")
 
     def close(self):
         self.global_viewer._stop_refresh()
@@ -283,7 +288,25 @@ class PatchGui(ManipulatorGui):
         if not source:
             return
         try:
-            payload = book.logger.read_details(source)
+            destination = getattr(book.logger, "filename", None)
+            if (destination and os.path.isfile(source) and os.path.isfile(destination)
+                    and os.path.samefile(source, destination)):
+                message = (f"The selected book is the active book for this session:\n{source}\n\n"
+                           "Choose an earlier saved book with experiment details to reload.")
+                book._set_status(message, error=True)
+                QMessageBox.warning(self, "Cannot reload experiment book", message)
+                return
+            try:
+                payload = book.logger.read_details(source)
+            except ValueError as error:
+                if str(error) != "The source book has no complete experiment details.":
+                    raise
+                message = (f"The selected book has no saved experiment details:\n{source}\n\n"
+                           "Loading calibration can create a book containing only calibration notes. "
+                           "Choose an earlier saved book with experiment details to reload.")
+                book._set_status(message, error=True)
+                QMessageBox.warning(self, "Cannot reload experiment book", message)
+                return
             tares = payload["tares"]
             if tares is None:
                 tare_path, _ = QFileDialog.getOpenFileName(
@@ -335,7 +358,24 @@ class PatchGui(ManipulatorGui):
                 self.patch_interface.origins[axis] = float(record["origins_um"][axis])
                 book.add_origin_entry(record, frames[axis])
                 self.classic_patching_tab.set_origin_complete(axis)
+            for role in ("session", "atlas"):
+                path = payload.get("scans", {}).get(role)
+                if path is None:
+                    continue
+                if role == "session":
+                    self.scan_viewer.load_image(path)
+                else:
+                    self.atlas_window.scan_viewer.load_image(path)
+                    self.atlas_window.show_scan()
             message = "Book details, notes, atlas images, and available origins reloaded."
+            if payload.get("scans"):
+                message += " Saved atlas/session scans are loading."
+            missing_scans = [role for role in ("session", "atlas")
+                             if role not in payload.get("scans", {})]
+            if missing_scans:
+                warning = "No saved " + " or ".join(missing_scans) + " scan found; continuing without it."
+                logging.warning(warning)
+                message += " Warning: " + warning
             if payload["tares"] is None:
                 message += " No saved tares selected; current tares retained."
             book._set_status(message)
