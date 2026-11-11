@@ -244,6 +244,95 @@ class ObjectiveRegistrar:
             footprint40_in_pixel4=self._transform(corners,transform).tolist(), physical_accuracy_verified=False,
             anchor_sha256=hashlib.sha256(json.dumps(self.anchor,sort_keys=True).encode()).hexdigest())
 
+    def register_session_anchor(self, image40, session_scan_path, session_metadata, calibration40):
+        """Locate a fresh 40x field in a session mosaic without changing calibration.
+
+        Fixed measured optics, a bounded whole-image search, then native-pixel
+        refinement. The best textured candidate is returned with alternatives;
+        correlation is diagnostic, not an automatic acceptance threshold.
+        """
+        import time
+        started = time.perf_counter()
+        source = self._image(image40)
+        scan = cv2.imread(str(session_scan_path), cv2.IMREAD_GRAYSCALE)
+        if scan is None:
+            raise ValueError("The session scan image could not be read")
+        m4 = np.asarray(session_metadata["calibration"]["stage"]["M"], dtype=float)
+        m40 = np.asarray(calibration40, dtype=float)
+        if any(m.shape != (2, 2) or not np.isfinite(m).all()
+               or abs(np.linalg.det(m)) < 1e-12 for m in (m4, m40)):
+            raise ValueError("Both objective calibrations must be finite invertible XY matrices")
+        full = np.asarray(session_metadata.get("canvas_shape", scan.shape)[:2], dtype=float)[::-1]
+        sampling = np.asarray(session_metadata["pixel_scale_xy"], dtype=float) * full / scan.shape[::-1]
+        if sampling.shape != (2,) or not np.isfinite(sampling).all() or np.any(sampling <= 0):
+            raise ValueError("Session sampling must contain positive XY scales")
+        optics = np.diag(1. / sampling) @ m4 @ np.linalg.inv(m40)
+        h, w = source.shape
+        corners = np.array([[0, 0], [w-1, 0], [0, h-1], [w-1, h-1]]) @ optics.T
+        lower = np.floor(corners.min(0))
+        shape = (np.ceil(corners.max(0)) - lower + 1).astype(int)
+        border = max(2, int(np.ceil(max(abs(optics[0, 1])*h, abs(optics[1, 0])*w))) + 1)
+        if np.any(shape - 2*border < 16) or np.any(shape > np.array(scan.shape[::-1])):
+            raise ValueError("The calibrated 40x field does not fit inside this session scan")
+        template = cv2.warpAffine(source, np.column_stack([optics, -lower]), tuple(shape),
+            flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REFLECT)[border:-border, border:-border]
+        center = optics @ ((np.array([w, h])-1)/2) - lower - border
+        if float(np.std(template)) < 1e-6:
+            raise ValueError("The captured image has no intensity variation to match")
+
+        def prepare(value, method):
+            value = value.astype(np.float32)
+            if method == "highpass":
+                return cv2.GaussianBlur(value, (0, 0), 1) - cv2.GaussianBlur(value, (0, 0), 8)
+            value = cv2.GaussianBlur(value, (0, 0), 1.5)
+            return cv2.magnitude(cv2.Sobel(value, cv2.CV_32F, 1, 0),
+                                 cv2.Sobel(value, cv2.CV_32F, 0, 1))
+
+        reports = []
+        factor = min(.5, 2400. / max(scan.shape))
+        for method in ("gradient", "highpass"):
+            target, needle = prepare(scan, method), prepare(template, method)
+            small = cv2.resize(target, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+            tiny = cv2.resize(needle, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+            response = cv2.matchTemplate(small, tiny, cv2.TM_CCOEFF_NORMED)
+            # Constant regions and empty mosaic borders cannot locate a template.
+            mean = cv2.boxFilter(small, cv2.CV_32F, tiny.shape[::-1], anchor=(0, 0), normalize=True)
+            mean2 = cv2.boxFilter(small*small, cv2.CV_32F, tiny.shape[::-1], anchor=(0, 0), normalize=True)
+            variance = mean2[:response.shape[0], :response.shape[1]] - mean[:response.shape[0], :response.shape[1]]**2
+            response[(variance < 1e-6) | ~np.isfinite(response)] = -2
+            radius = max(8, int(round(200 * factor)))
+            reach = max(12, int(np.ceil(3/factor)))
+            candidates = []
+            for _ in range(12):
+                _, score, _, (x, y) = cv2.minMaxLoc(response)
+                if score <= -1:
+                    break
+                x0, y0 = max(0, int(x/factor)-reach), max(0, int(y/factor)-reach)
+                x1 = min(target.shape[1], int(x/factor)+reach+needle.shape[1])
+                y1 = min(target.shape[0], int(y/factor)+reach+needle.shape[0])
+                roi = target[y0:y1, x0:x1]
+                local = cv2.matchTemplate(roi, needle, cv2.TM_CCOEFF_NORMED)
+                local[~np.isfinite(local)] = -2
+                _, score, _, (dx, dy) = cv2.minMaxLoc(local)
+                point = np.array([x0+dx, y0+dy]) + center
+                candidates.append(dict(score=float(score), center_session_native_px=point.tolist()))
+                response[max(0, y-radius):y+radius+1, max(0, x-radius):x+radius+1] = -2
+            if not candidates:
+                raise ValueError("No textured session image support is available for matching")
+            candidates.sort(key=lambda value: -value["score"])
+            reports.append(dict(method=method, candidates=candidates))
+        selected = reports[0]["candidates"][0]
+        point = np.array(selected["center_session_native_px"])
+        x, y = np.rint(point-center).astype(int)
+        crop = scan[y:y+template.shape[0], x:x+template.shape[1]].copy()
+        agreement = np.array(reports[1]["candidates"][0]["center_session_native_px"]) - point
+        return dict(center_session_native_px=point.tolist(), score=selected["score"],
+            method="fixed_optics_gradient_native_refinement", candidates=reports,
+            fixed_camera40_to_camera4=optics.tolist(),
+            highpass_disagreement_native_px=agreement.tolist(),
+            image40_preview=template.copy(), match_preview=crop,
+            elapsed_seconds=time.perf_counter()-started, physical_accuracy_verified=False)
+
     def save(self, folder):
         """Write a portable geometry/template bundle only to the explicit folder."""
         folder = Path(folder).resolve()

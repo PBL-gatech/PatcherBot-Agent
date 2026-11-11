@@ -2,6 +2,9 @@
 from copy import deepcopy
 from hashlib import sha256
 import json
+import logging
+import os
+from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
@@ -86,6 +89,7 @@ class SessionRegistration:
         self.generation = 0
         self._transform = None
         self._binding = None
+        self._image_anchor = None
         self._owners = {}
         self._listeners = []
         self._lock = RLock()
@@ -100,6 +104,78 @@ class SessionRegistration:
         with self._lock:
             return deepcopy(self._binding)
 
+    @property
+    def image_anchor(self):
+        with self._lock:
+            return deepcopy(self._image_anchor)
+
+    def set_image_anchor(self, record):
+        """Replace the measured 40x display correction; never change rig coordinates."""
+        candidate = deepcopy(record)
+        if (not isinstance(candidate, dict) or candidate.get('version') != 1
+                or candidate.get('objective') != 40):
+            raise CoordinateReferenceError('Unsupported session image anchor')
+        for name in ('correction_um', 'matched_session_xy', 'stage_xy_um'):
+            value = np.asarray(candidate.get(name), dtype=float)
+            if value.shape != (2,) or not np.isfinite(value).all():
+                raise CoordinateReferenceError(f'Invalid image anchor {name}')
+            candidate[name] = value.tolist()
+        with self._lock:
+            if (self._binding is None or self._transform is None
+                    or candidate.get('binding_registration_id') != self._binding['registration_id']):
+                raise CoordinateReferenceError('Image anchor belongs to a different session alignment')
+            self._image_anchor = candidate
+            self.generation += 1
+        self._notify()
+
+    def clear_image_anchor(self):
+        with self._lock:
+            if self._image_anchor is None:
+                return
+            self._image_anchor = None
+            self.generation += 1
+        self._notify()
+
+    @staticmethod
+    def image_anchor_path(scan_path):
+        path = Path(scan_path)
+        return path.with_name(path.stem + '_40x_anchor.json')
+
+    def save_image_anchor(self, scan_path):
+        path = self.image_anchor_path(scan_path)
+        temporary = path.with_name(path.name + '.' + uuid4().hex + '.tmp')
+        payload = dict(version=1, anchor=self.image_anchor)
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding='utf-8')
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return str(path)
+
+    def load_image_anchor(self, scan_path, calibration40=None):
+        path = self.image_anchor_path(scan_path)
+        if not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            if payload.get('version') != 1:
+                raise ValueError('Unsupported saved image anchor')
+            record = payload.get('anchor')
+            if record is None:
+                self.clear_image_anchor()
+                return False
+            if calibration40 is not None and record.get('calibration40') is not None:
+                saved = np.asarray(record['calibration40'], dtype=float)
+                current = np.asarray(calibration40, dtype=float)
+                if saved.shape != current.shape or not np.allclose(saved, current, rtol=1e-9, atol=1e-9):
+                    raise ValueError('40x calibration differs from the saved image anchor')
+            self.set_image_anchor(record)
+            return True
+        except (OSError, ValueError, TypeError, KeyError):
+            self.clear_image_anchor()
+            logging.getLogger(__name__).warning('Saved 40x anchor was not restored: %s', path, exc_info=True)
+            return False
+
     def add_listener(self, callback):
         if callback not in self._listeners:
             self._listeners.append(callback)
@@ -112,6 +188,7 @@ class SessionRegistration:
         with self._lock:
             self.generation += 1
             self._transform = self._binding = None
+            self._image_anchor = None
             self.state, self.reason = 'invalid', str(reason)
         self._notify()
 
@@ -147,6 +224,10 @@ class SessionRegistration:
                        metadata_identity=fingerprint(metadata))
         binding['registration_id'] = fingerprint(binding)
         with self._lock:
+            if (self._image_anchor is not None
+                    and self._image_anchor.get('binding_registration_id') != binding['registration_id']):
+                self._image_anchor = None
+                self.generation += 1
             self._transform, self._binding = transform, binding
             self.state, self.reason = 'accepted', result.get('reason', 'Session alignment accepted')
             frame = metadata.get('capture_frame_id')
@@ -262,7 +343,9 @@ class SessionRegistration:
             return False
 
     def transform_state(self, state):
-        transform = self.transform
+        with self._lock:
+            transform = None if self._transform is None else self._transform.copy()
+            anchor = deepcopy(self._image_anchor)
         if transform is None:
             return state
         result = deepcopy(state)
@@ -286,4 +369,20 @@ class SessionRegistration:
         if result.get('fov_corners_mm') is not None:
             corners = np.asarray(result['fov_corners_mm'])
             result['fov_size_mm'] = np.linalg.norm(corners[[1, 3]] - corners[0], axis=1)
+        if anchor is not None:
+            correction = np.asarray(anchor['correction_um'], dtype=float) / 1000.
+            def anchored(value):
+                value = np.asarray(value, dtype=float).copy()
+                value[..., :2] += correction
+                return value
+            names = ['pipette_xyz_mm']
+            if state.get('objective') == 40:
+                names += ['objective_xyz_mm', 'fov_corners_mm']
+            for name in names:
+                if result.get(name) is not None:
+                    result[name] = anchored(result[name])
+            for name in ('home', 'safe', 'cleaning_bath', 'pipette'):
+                if name in result.get('named_anchors_mm', {}):
+                    result['named_anchors_mm'][name] = anchored(result['named_anchors_mm'][name])
+            result['image_anchor_correction_um'] = anchor['correction_um']
         return result

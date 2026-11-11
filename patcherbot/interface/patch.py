@@ -27,6 +27,7 @@ class AutoPatchInterface(TaskInterface):
     '''
     state_press_tally_changed = QtCore.pyqtSignal(object)
     origin_saved = QtCore.pyqtSignal(object, object)
+    anchor_set = QtCore.pyqtSignal(object)
     scan_stitched = QtCore.pyqtSignal(object)
     cells_changed = QtCore.pyqtSignal()
     screening_finished = QtCore.pyqtSignal()
@@ -141,6 +142,25 @@ class AutoPatchInterface(TaskInterface):
             movement_busy=lambda: self.pipette_controller._current_controller is not None,
             completed=self.origin_saved.emit)
         self.execute(self.current_autopatcher.save_origin, argument=capture)
+
+    @blocking_command(category='Calibration', description='Set Anchor',
+                      task_description='Matching 40x image to the Session scan')
+    def set_anchor(self, request):
+        self._anchor_command(request, self.current_autopatcher.set_anchor)
+
+    @blocking_command(category='Calibration', description='Undo Anchor',
+                      task_description='Removing the session image anchor')
+    def clear_anchor(self, request):
+        self._anchor_command(request, self.current_autopatcher.clear_anchor)
+
+    def _anchor_command(self, request, operation):
+        if (self._current_controller is not None
+                or self.pipette_controller._current_controller is not None):
+            raise ValueError("Wait for the current movement/task to finish.")
+        capture = dict(request)
+        capture.update(movement_busy=lambda: self.pipette_controller._current_controller is not None,
+                       completed=self.anchor_set.emit)
+        self.execute(operation, argument=capture)
 
     def accept_origin(self, record):
         """Commit a successful save after the GUI confirms its experiment."""

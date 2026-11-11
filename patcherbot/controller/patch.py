@@ -123,8 +123,8 @@ class AutoPatcher(TaskController):
             raise ValueError("Stage position is unavailable.")
         return position
 
-    def save_origin(self, request):
-        """Validate and save a stationary microscope frame using the snapshot recorder."""
+    def _capture_anchor_frame(self, request):
+        """Capture a fresh settled frame and its unchanged raw stage coordinates."""
         position = self._origin_position()
         stable_since = time.monotonic()
         while time.monotonic() - stable_since < 0.5:
@@ -151,6 +151,12 @@ class AutoPatcher(TaskController):
                 or not np.allclose(position, self._origin_position(), rtol=0, atol=0.1)):
             raise ValueError("Stage moved during capture; try again when stationary.")
         self.abort_if_requested()
+        return position, number, captured_at, frame, now
+
+    def save_origin(self, request):
+        """Validate and save a stationary microscope frame using the snapshot recorder."""
+        position, number, captured_at, frame, now = self._capture_anchor_frame(request)
+        camera_interface = request["camera_interface"]
         axis = request["axis"]
         origins = dict(request["origins_um"])
         origins[axis] = float(position[0 if axis == "x" else 1])
@@ -164,6 +170,78 @@ class AutoPatcher(TaskController):
             image_path=snapshot["image_path"])
         record = request["logger"].write_origin(record)
         request["completed"](record, frame)
+
+    def set_anchor(self, request):
+        """Match a settled 40x image and store a display-only session correction."""
+        helper = request["position_helper"]
+        registration = helper.session_registration
+        binding = None if registration is None else registration.binding
+        scan = request["scan"]
+        if binding is None or registration.transform is None:
+            raise ValueError("Load and align a Session scan before setting its anchor.")
+        if not self.calibrated_stage.calibrated:
+            raise ValueError("Calibrate or load the 40x stage calibration first.")
+        position, number, captured_at, frame, now = self._capture_anchor_frame(request)
+        snapshot = request["camera_interface"].save_snapshot(number, captured_at, frame, wait=True)
+        matched = helper.registrar.register_session_anchor(
+            frame, scan["path"], scan["metadata"], self.calibrated_stage.M)
+        self.abort_if_requested()
+        if registration.binding != binding:
+            raise ValueError("Session alignment changed during matching; set the anchor again.")
+        import cv2
+        previews = [matched.pop("image40_preview"), matched.pop("match_preview")]
+        tiles = []
+        for image, title in zip(previews, ("Captured 40x at 4x scale", "Matched Session crop")):
+            image = np.asarray(image)
+            low, high = np.percentile(image, [2, 98])
+            display = np.clip((image.astype(float)-low)*255/max(high-low, 1), 0, 255).astype(np.uint8)
+            display = cv2.cvtColor(cv2.resize(display, (320, 320)), cv2.COLOR_GRAY2BGR)
+            tile = np.full((350, 320, 3), 255, dtype=np.uint8)
+            tile[30:] = display
+            cv2.putText(tile, title, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, .49, (0, 0, 0), 1)
+            tiles.append(tile)
+        source = Path(snapshot["image_path"])
+        preview_path = source.with_name(source.stem + "_anchor_match.png")
+        if not cv2.imwrite(str(preview_path), np.concatenate(tiles, axis=1)):
+            raise OSError("Could not save the anchor match preview.")
+        matched["preview_path"] = str(preview_path)
+        pixel = np.asarray(matched["center_session_native_px"], dtype=float)
+        image_map = np.asarray(binding["reference_geometry"]) @ np.asarray(binding["scan_to_reference_native"])
+        target = image_map[:2, :2] @ pixel + image_map[:2, 2]
+        transform = registration.transform
+        uncorrected = helper.stage_to_global(position[:2], objective=40)
+        predicted = transform[:2, :2] @ uncorrected + transform[:2, 2]
+        record = dict(version=1, objective=40, correction_um=(target-predicted).tolist(),
+            binding_registration_id=binding["registration_id"], matched_session_xy=pixel.tolist(),
+            stage_xy_um=position[:2].tolist(), calibration40=np.asarray(self.calibrated_stage.M).tolist(),
+            captured_at=captured_at.isoformat(), saved_at=now.isoformat(), frame_number=int(number),
+            image_path=snapshot["image_path"], session_path=scan["path"], match=matched)
+        previous_anchor = registration.image_anchor
+        registration.set_image_anchor(record)
+        try:
+            registration.save_image_anchor(scan["path"])
+        except Exception:
+            if previous_anchor is None:
+                registration.clear_image_anchor()
+            else:
+                registration.set_image_anchor(previous_anchor)
+            raise
+        self.info("Session 40x anchor: correction X %.2f um, Y %.2f um; match %s" %
+                  (*record["correction_um"], matched))
+        request["completed"](record)
+
+    def clear_anchor(self, request):
+        """Undo the session image anchor without changing calibration or motion."""
+        registration = request["position_helper"].session_registration
+        previous_anchor = registration.image_anchor
+        registration.clear_image_anchor()
+        try:
+            registration.save_image_anchor(request["scan"]["path"])
+        except Exception:
+            if previous_anchor is not None:
+                registration.set_image_anchor(previous_anchor)
+            raise
+        request["completed"]({"cleared": True})
 
     def _get_state_recorder(self) -> StateMachineLogger:
         if self._state_recorder is None:

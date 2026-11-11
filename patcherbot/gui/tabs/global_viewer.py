@@ -365,6 +365,8 @@ class RegisteredGlobalViewerTab(GlobalViewerTab):
                     else:
                         registration.accept_registration(result["reference_registration"], metadata,
                             self.position_helper.registrar.reference_pixel_to_global_um, stage_transform)
+                        registration.load_image_anchor(result["path"],
+                            calibration40=getattr(self.position_helper.stage, "M", None))
                 elif self.position_helper.session_registration is not None:
                     raise ValueError("Session image has no compatible stage-to-scan metadata")
             state = self.position_helper.snapshot(transform, objective=self._objective)

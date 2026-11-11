@@ -126,6 +126,9 @@ class PatchGui(ManipulatorGui):
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
         self.atlas_window.atlas_widget.saveRequested.connect(self._save_atlas_image)
         self._origin_busy = False
+        self._anchor_busy = False
+        self.patch_interface.anchor_set.connect(self._anchor_set)
+        self.patch_interface.task_finished.connect(self._anchor_task_finished)
         self.patch_interface.origin_saved.connect(self._origin_saved)
         self.patch_interface.task_finished.connect(self._origin_task_finished)
         logging.debug("Added config GUI.")
@@ -135,6 +138,7 @@ class PatchGui(ManipulatorGui):
             camera_recorder=self.main_video.recorder if self.main_video is not None else None)
         self.classic_patching_tab = classic_patching_tab
         classic_patching_tab.origin_requested.connect(self._request_origin)
+        classic_patching_tab.anchor_requested.connect(self._request_anchor)
         self.experiment_book_tab.reload_requested.connect(self._reload_book_details)
         self._last_book_tares = None
         self.pipette_interface.task_finished.connect(self._tare_task_finished)
@@ -185,6 +189,72 @@ class PatchGui(ManipulatorGui):
         return {key: str(getattr(book.config, key, "")) for key in
                 ("experiment_name", "strain_culture", "gender", "age")}
 
+    @QtCore.pyqtSlot()
+    def _request_anchor(self):
+        self._run_anchor_command(self.patch_interface.set_anchor)
+
+    def _run_anchor_command(self, command):
+        if self._anchor_busy or self._setup_reload_busy():
+            self.classic_patching_tab.set_origin_status("Wait for the current movement/task to finish.", error=True)
+            return
+        helper = self.global_viewer.position_helper
+        scan = self.global_viewer._atlas_scan_info.get("session")
+        if (helper is None or scan is None or helper.session_registration is None
+                or helper.session_registration.transform is None):
+            self.classic_patching_tab.set_origin_status("Load and align a Session scan first.", error=True)
+            return
+        self._anchor_busy = True
+        self.classic_patching_tab.set_origin_busy(True)
+        self.classic_patching_tab.set_origin_status("Matching current 40x image to the Session scan...", error=True)
+        request = dict(position_helper=helper, scan=dict(scan), camera_interface=self.main_interface)
+        self.start_task(command.task_description, self.patch_interface)
+        self.patch_command_signal.emit(command, request)
+
+    @QtCore.pyqtSlot(object)
+    def _anchor_set(self, record):
+        self._anchor_busy = False
+        self.classic_patching_tab.set_origin_busy(False)
+        if record.get("cleared"):
+            self.classic_patching_tab.set_origin_status("Session image anchor removed.", error=True)
+            return
+        dx, dy = record["correction_um"]
+        message = f"40x session anchor set: X {dx:+.1f}, Y {dy:+.1f} um."
+        self.classic_patching_tab.set_origin_status(message, error=True)
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle("Session anchor")
+        dialog.setText(message)
+        dialog.setInformativeText("The captured 40x image was matched automatically. Reference calibration and motor coordinates are unchanged.")
+        preview = record.get("match", {}).get("preview_path", record["image_path"])
+        pixmap = QtGui.QPixmap(preview)
+        if not pixmap.isNull():
+            dialog.setIconPixmap(pixmap.scaled(700, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        undo = dialog.addButton("Undo anchor", QtWidgets.QMessageBox.ActionRole)
+        dialog.addButton(QtWidgets.QMessageBox.Close)
+        # Task completion can arrive after this result signal; defer undo until it does.
+        dialog.buttonClicked.connect(lambda button: QtCore.QTimer.singleShot(
+            0, lambda: self._undo_anchor(record)) if button is undo else None)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.open()
+        self._anchor_dialog = dialog
+
+    def _undo_anchor(self, record):
+        helper = self.global_viewer.position_helper
+        active = None if helper is None else helper.session_registration.image_anchor
+        if active is None or any(active.get(key) != record.get(key) for key in
+                                 ("binding_registration_id", "frame_number", "image_path")):
+            self.classic_patching_tab.set_origin_status("That anchor is no longer active.", error=True)
+            return
+        self._run_anchor_command(self.patch_interface.clear_anchor)
+
+    @QtCore.pyqtSlot(int, object)
+    def _anchor_task_finished(self, exit_code, result):
+        if not self._anchor_busy:
+            return
+        self._anchor_busy = False
+        self.classic_patching_tab.set_origin_busy(False)
+        if exit_code:
+            self.classic_patching_tab.set_origin_status("Anchor not set; see the task error for details.", error=True)
+
     @QtCore.pyqtSlot(str)
     def _request_origin(self, axis):
         if self._origin_busy:
@@ -231,7 +301,7 @@ class PatchGui(ManipulatorGui):
                 "Origin not saved; see the task error for details.", error=True)
 
     def _setup_reload_busy(self):
-        return (self.running_task is not None or self._origin_busy
+        return (self.running_task is not None or self._origin_busy or self._anchor_busy
                 or self.patch_interface._current_controller is not None
                 or self.pipette_interface._current_controller is not None)
 
@@ -822,6 +892,7 @@ class FileSelector(QWidget):
             self.fileSelected.emit(file_name)
 class ClassicPatchButtons(ButtonTabWidget):
     origin_requested = QtCore.pyqtSignal(str)
+    anchor_requested = QtCore.pyqtSignal()
 
     def __init__(self, patch_interface: AutoPatchInterface, pipette_interface: PipetteInterface, start_task, interface_signals, recording_state_manager: RecordingStateManager, camera_recorder=None):
         super().__init__()
@@ -886,6 +957,11 @@ class ClassicPatchButtons(ButtonTabWidget):
             self.origin_buttons[axis] = button
             origin_row.addWidget(button)
         origin_layout.addLayout(origin_row)
+        self.set_anchor_button = QtWidgets.QPushButton("Set Anchor")
+        self.set_anchor_button.setMinimumHeight(50)
+        self.set_anchor_button.setToolTip("Select and focus 40x, then capture and match its image to the loaded Session scan.")
+        self.set_anchor_button.clicked.connect(lambda checked=False: self.anchor_requested.emit())
+        origin_layout.addWidget(self.set_anchor_button)
         self.origin_status = QtWidgets.QLabel()
         self.origin_status.setWordWrap(True)
         self.origin_status.hide()
@@ -1001,6 +1077,7 @@ class ClassicPatchButtons(ButtonTabWidget):
                  (self.recorder.folder_path, (self.recorder, camera_recorder)))]
 
     def set_origin_busy(self, busy):
+        self.set_anchor_button.setEnabled(not busy)
         for button in self.origin_buttons.values():
             button.setEnabled(not busy)
 
