@@ -1,7 +1,7 @@
 pressure_near: 45
 pressure_sealing: -20
 pressure_ramp_increment: -5
-pressure_ramp_max: -45.0
+pressure_ramp_max: -60.0
 pressure_ramp_duration: 1.15
 pulse_pressure_break_in: -345
 pulse_pressure_duration: 1
@@ -43,13 +43,13 @@ max_R_increase: 1000000.0
 cell_R_increase: 0.3
 gigaseal_R: 1000
 gigaseal_min_delta_R: 15
-hold_switch: 20.0
+hold_switch: 40.0
 increase_slope_gate: 3000
 constant_slope_gate: 10
 decrease_slope_gate: 5
 measurement_speed: 0.2
 seal_min_time: 15
-seal_deadline: 150
+seal_deadline: 300.0
 Vramp_duration: 10
 Vramp_amplitude: -0.07
 zap: false
@@ -59,3 +59,5 @@ mode: Adaptive
 auto_clean_pipette: true
 lamp: '3'
 auto_capture_fluo: false
+cell_duplicate_radius_um: 5
+cell_duplicate_z_tolerance_um: 5

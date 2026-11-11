@@ -232,8 +232,8 @@ class ExperimentBookTab(ParamConfig):
         self._set_status("Note saved.")
         return True
 
-    def handle_snapshot(self, payload):
-        if not self.book_active:
+    def handle_snapshot(self, payload, persist=True, force=False):
+        if not self.book_active and not force:
             return False
         if not isinstance(payload, Mapping):
             return False
@@ -252,12 +252,13 @@ class ExperimentBookTab(ParamConfig):
         ):
             return False
 
-        try:
-            self.logger.write_snapshot(image_path, camera_role, captured_at)
-        except OSError:
-            logging.getLogger(__name__).exception("Unable to log experiment snapshot")
-            self._set_status("The snapshot could not be added to the experiment log.", error=True)
-            return False
+        if persist:
+            try:
+                self.logger.write_snapshot(image_path, camera_role, captured_at)
+            except OSError:
+                logging.getLogger(__name__).exception("Unable to log experiment snapshot")
+                self._set_status("The snapshot could not be added to the experiment log.", error=True)
+                return False
 
         self._add_snapshot_card(frame, camera_role, captured_at)
         self._set_status("Snapshot added to the experiment timeline.")

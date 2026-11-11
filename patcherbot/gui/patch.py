@@ -139,6 +139,13 @@ class PatchGui(ManipulatorGui):
         self.classic_patching_tab = classic_patching_tab
         classic_patching_tab.origin_requested.connect(self._request_origin)
         classic_patching_tab.anchor_requested.connect(self._request_anchor)
+        self.scan_viewer.layerLoaded.connect(classic_patching_tab.sync_registration_state)
+        self.patch_interface.task_finished.connect(
+            lambda *_: classic_patching_tab.sync_registration_state())
+        self.pipette_interface.task_finished.connect(
+            lambda *_: classic_patching_tab.sync_registration_state())
+        for role, result in self.scan_viewer._results.items():
+            classic_patching_tab.sync_registration_state(role, result)
         self.experiment_book_tab.reload_requested.connect(self._reload_book_details)
         self._last_book_tares = None
         self.pipette_interface.task_finished.connect(self._tare_task_finished)
@@ -215,11 +222,31 @@ class PatchGui(ManipulatorGui):
         self._anchor_busy = False
         self.classic_patching_tab.set_origin_busy(False)
         if record.get("cleared"):
-            self.classic_patching_tab.set_origin_status("Session image anchor removed.", error=True)
+            self.classic_patching_tab.set_anchor_complete(False)
+            self.classic_patching_tab.set_origin_status("Session image anchor removed.")
             return
         dx, dy = record["correction_um"]
         message = f"40x session anchor set: X {dx:+.1f}, Y {dy:+.1f} um."
-        self.classic_patching_tab.set_origin_status(message, error=True)
+        self.classic_patching_tab.set_anchor_complete(True)
+        self.classic_patching_tab.set_origin_status(message)
+        try:
+            import cv2
+            frame = cv2.imread(record["image_path"], cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                raise ValueError("The saved anchor image could not be read.")
+            captured_at = datetime.fromisoformat(record["captured_at"])
+            book = self.experiment_book_tab
+            if not book.handle_snapshot(dict(image_path=record["image_path"], camera_role="main",
+                    frame=frame, frame_number=record["frame_number"], captured_at=captured_at), force=True):
+                raise ValueError("The anchor image could not be added to the Experiment Book.")
+            note = (message + "\nSession scan: " + record["session_path"]
+                    + "\nCaptured image: " + record["image_path"])
+            book.logger.write_note(note, captured_at)
+            book._add_text_card("Session Anchor", note, captured_at)
+        except (OSError, ValueError, TypeError, KeyError):
+            logging.exception("Anchor set, but its Experiment Book entry could not be completed")
+            self.classic_patching_tab.set_origin_status(
+                "Anchor set; its Experiment Book entry could not be completed. See the log.", error=True)
         dialog = QtWidgets.QMessageBox(self)
         dialog.setWindowTitle("Session anchor")
         dialog.setText(message)
@@ -394,6 +421,12 @@ class PatchGui(ManipulatorGui):
                     if frame is None:
                         raise ValueError(f"Cannot read {axis.upper()} origin image")
                     frames[axis] = frame
+            snapshot_frames = []
+            for snapshot in payload.get("snapshots", []):
+                frame = cv2.imread(snapshot["image_path"], cv2.IMREAD_UNCHANGED)
+                if frame is None:
+                    raise ValueError("Cannot read saved snapshot: " + snapshot["image_path"])
+                snapshot_frames.append(frame)
             atlas_images = []
             for atlas in payload.get("atlases", []):
                 image = QtGui.QImage(atlas["image_path"])
@@ -421,6 +454,11 @@ class PatchGui(ManipulatorGui):
             for atlas, image in zip(payload.get("atlases", []), atlas_images):
                 book.add_atlas_entry(atlas["image_path"], image, atlas["caption"],
                                      datetime.fromisoformat(atlas["saved_at"]), persist=False)
+            for snapshot, frame in zip(payload.get("snapshots", []), snapshot_frames):
+                book.handle_snapshot(dict(image_path=snapshot["image_path"],
+                    camera_role=snapshot["camera_role"], frame=frame,
+                    frame_number=snapshot.get("frame_number", 0),
+                    captured_at=datetime.fromisoformat(snapshot["saved_at"])), persist=False)
             self.classic_patching_tab.restore_tares(payload["tares"])
             for axis, record in payload["origins"].items():
                 if record is None:
@@ -1091,6 +1129,48 @@ class ClassicPatchButtons(ButtonTabWidget):
         self._set_button_completion_style(
             self.origin_buttons[axis], self.section_colors['registration'])
 
+    def set_anchor_complete(self, complete=True):
+        if complete:
+            self._set_button_completion_style(self.set_anchor_button,
+                                              self.section_colors['registration'])
+        else:
+            self.set_anchor_button.setStyleSheet('')
+
+    def sync_registration_state(self, role=None, result=None):
+        """Show completed registration steps represented by loaded scans and state."""
+        scans = getattr(self, '_loaded_registration_scans', {})
+        if role in ('session', 'atlas'):
+            if result is None:
+                scans.pop(role, None)
+            else:
+                scans[role] = result
+        self._loaded_registration_scans = scans
+        controller = self.patch_interface.current_autopatcher
+        scanner = controller.calibrated_stage_4x
+        scanner_ready = bool(scanner.calibrated)
+        corners_ready = len(scanner.scan_corner_positions) == 2
+        for scan in scans.values():
+            metadata = scan.get('metadata', {})
+            try:
+                matrix = np.asarray(metadata.get('calibration', {}).get('stage', {}).get('M'), dtype=float)
+                scanner_ready |= matrix.shape == (2, 2) and bool(np.isfinite(matrix).all())
+                corners = np.asarray(metadata.get('scan_bounds_pixels'), dtype=float)
+                corners_ready |= corners.shape == (2, 2) and bool(np.isfinite(corners).all())
+            except (TypeError, ValueError):
+                pass
+        floor = getattr(self.pipette_interface.microscope, 'stage_floor', None)
+        floor_ready = floor is not None and not isinstance(floor, bool) and bool(np.isfinite(floor))
+        completed = {'Atlas Scan': 'atlas' in scans, 'Session Scan': 'session' in scans,
+                     'Calibrate Scanner': scanner_ready, 'Store Corners': corners_ready,
+                     'Set Stage Floor': floor_ready}
+        for name, ready in completed.items():
+            button = self.get_section_button('registration', name)
+            if ready:
+                self._set_button_completion_style(button, self.section_colors['registration'])
+            elif button is not None:
+                button.setStyleSheet('')
+        self.set_anchor_complete(self.patch_interface.session_registration.image_anchor is not None)
+
     def restore_tares(self, tares):
         if tares is None:
             return
@@ -1154,6 +1234,7 @@ class ClassicPatchButtons(ButtonTabWidget):
         else:
             cleaning_button.setStyleSheet('')
         gui._record_calibration_reload()
+        self.sync_registration_state()
         # Refresh only the displayed tip anchor; this command does not move hardware.
         self.execute_command(self.pipette_interface.detect_pipette)
 

@@ -291,6 +291,7 @@ class ExperimentBookLogger:
         origins = {"x": None, "y": None}
         notes = []
         atlases = []
+        snapshots = []
         scans = []
         legacy_scans = True
         for kind, saved_at, body in sections:
@@ -318,6 +319,13 @@ class ExperimentBookLogger:
                                     image_path=lines[-1][len("Saved: "):].strip(), saved_at=saved_at))
             elif kind == "ATLAS IMPORT":
                 atlases.append(json.loads("\n".join(body)))
+            elif kind == "SNAPSHOT":
+                values = dict(line.split(": ", 1) for line in body if ": " in line)
+                snapshots.append(dict(image_path=values.get("Saved", ""),
+                                      camera_role=values.get("Camera", ""), saved_at=saved_at,
+                                      frame_number=0))
+            elif kind == "SNAPSHOT IMPORT":
+                snapshots.append(json.loads("\n".join(body)))
             elif kind == "SCAN":
                 try:
                     scans.append(json.loads("\n".join(body)))
@@ -388,8 +396,24 @@ class ExperimentBookLogger:
             atlas.setdefault("source_book", str(source))
             atlas.setdefault("source_image_path", str(resolved))
             atlas["image_path"] = str(resolved)
+        for snapshot in snapshots:
+            if (not isinstance(snapshot, dict) or snapshot.get("camera_role") not in ("main", "aux")
+                    or not isinstance(snapshot.get("image_path"), str)
+                    or not snapshot["image_path"].strip()):
+                raise ValueError("Invalid saved snapshot metadata.")
+            datetime.fromisoformat(snapshot["saved_at"])
+            snapshot.setdefault("frame_number", 0)
+            image = Path(snapshot["image_path"])
+            candidates = [image] if image.is_absolute() else [source.parent / image, Path.cwd() / image]
+            resolved = next((item.resolve() for item in candidates if item.is_file()), None)
+            if resolved is None:
+                raise ValueError("Snapshot image is missing: " + snapshot["image_path"])
+            snapshot.setdefault("source_book", str(source))
+            snapshot.setdefault("source_image_path", str(resolved))
+            snapshot["image_path"] = str(resolved)
         return dict(details=details, origins=origins, tares=tares, notes=notes,
-                    atlases=atlases, scans=ExperimentBookLogger._saved_scans(source, scans, legacy_scans),
+                    atlases=atlases, snapshots=snapshots,
+                    scans=ExperimentBookLogger._saved_scans(source, scans, legacy_scans),
                     source_path=str(source),
                     source_started_at=source_started_at, details_saved_at=details_saved_at)
 
@@ -420,6 +444,11 @@ class ExperimentBookLogger:
             copied = imported / ("atlas_" + str(index + 1) + image.suffix)
             shutil.copy2(image, copied)
             atlas["image_path"] = str(copied)
+        for index, snapshot in enumerate(payload["snapshots"]):
+            image = Path(snapshot["image_path"])
+            copied = imported / ("snapshot_" + str(index + 1) + image.suffix)
+            shutil.copy2(image, copied)
+            snapshot["image_path"] = str(copied)
         reference = dict(source_book=str(source), source_copy=str(imported / "experiment_book.log"),
                          imported_at=self._timestamp(),
                          source_started_at=payload["source_started_at"],
@@ -440,6 +469,9 @@ class ExperimentBookLogger:
         for atlas in payload["atlases"]:
             entries.append(self._entry_header("ATLAS IMPORT", datetime.fromisoformat(atlas["saved_at"])) +
                            "\n" + json.dumps(atlas, allow_nan=False))
+        for snapshot in payload["snapshots"]:
+            entries.append(self._entry_header("SNAPSHOT IMPORT", datetime.fromisoformat(snapshot["saved_at"])) +
+                           "\n" + json.dumps(snapshot, allow_nan=False))
         for role, image_path in payload["scans"].items():
             entries.append(self._entry_header("SCAN") + "\n" +
                            json.dumps(dict(role=role, image_path=image_path)))

@@ -26,6 +26,7 @@ import logging
 import re
 from pathlib import Path
 import inspect
+from time import perf_counter
 from typing import Any, Dict, List, Tuple
 import yaml
 
@@ -470,30 +471,44 @@ class RigConfigManager:
         return all_devices
 
     def _instantiate_slot(self, slot: str, cfg: Dict[str, Any], instances: Dict[str, Any]) -> Any:
+        started = perf_counter()
         class_path = cfg.get("class") or cfg.get("class_path")
+        LOGGER.info("Startup: initializing slot %s with %s", slot, class_path)
         if not class_path or "." not in class_path:
             raise RigConfigError(f"Invalid class for slot '{slot}'.")
         module_name, class_name = class_path.rsplit(".", 1)
+        LOGGER.info("Startup: importing class for slot %s", slot)
         try:
             module = importlib.import_module(module_name)
             cls = getattr(module, class_name)
         except Exception as exc:
+            LOGGER.exception("Startup: import failed for slot %s after %.3f s", slot, perf_counter() - started)
             raise RigConfigError(f"Failed to import {class_path} for slot '{slot}': {exc}") from exc
 
         params_cfg = cfg.get("params", {}) or {}
-        ctor_kwargs, post_attrs = self._split_ctor_params(cls, params_cfg, instances)
+        LOGGER.info("Startup: resolving parameters for slot %s", slot)
+        try:
+            ctor_kwargs, post_attrs = self._split_ctor_params(cls, params_cfg, instances)
+        except Exception:
+            LOGGER.exception("Startup: parameter resolution failed for slot %s after %.3f s", slot, perf_counter() - started)
+            raise
+        LOGGER.info("Startup: constructing slot %s", slot)
         try:
             instance = cls(**ctor_kwargs)
         except Exception as exc:
+            LOGGER.exception("Startup: construction failed for slot %s after %.3f s", slot, perf_counter() - started)
             raise RigConfigError(f"Failed to instantiate {class_path} for slot '{slot}': {exc}") from exc
 
+        LOGGER.info("Startup: applying attributes for slot %s", slot)
         for attr, value in post_attrs.items():
             try:
                 setattr(instance, attr, value)
             except Exception as exc:
+                LOGGER.exception("Startup: setting attribute %s failed for slot %s", attr, slot)
                 raise RigConfigError(f"Failed to set attribute '{attr}' for slot '{slot}': {exc}") from exc
 
         LOGGER.info("Initialized slot %s with %s", slot, class_path)
+        LOGGER.info("Startup: slot %s ready after %.3f s", slot, perf_counter() - started)
         return instance
 
     def _split_ctor_params(self, cls: Any, params_cfg: Dict[str, Any], instances: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -542,8 +557,17 @@ class RigConfigManager:
                 try:
                     import serial  # type: ignore
                     serial_kwargs = {k: v for k, v in value.items()}
-                    return serial.Serial(**serial_kwargs)
+                    started = perf_counter()
+                    LOGGER.info(
+                        "Startup: opening serial port %s (baudrate=%s, timeout=%s, write_timeout=%s)",
+                        value.get("port"), value.get("baudrate", value.get("baud")),
+                        value.get("timeout"), value.get("write_timeout"),
+                    )
+                    connection = serial.Serial(**serial_kwargs)
+                    LOGGER.info("Startup: serial port %s open after %.3f s", value.get("port"), perf_counter() - started)
+                    return connection
                 except Exception as exc:  # pragma: no cover
+                    LOGGER.exception("Startup: serial port %s initialization failed", value.get("port"))
                     raise RigConfigError(f"pyserial is required for serial configs: {exc}") from exc
             return {k: self._resolve_value(v, instances) for k, v in value.items()}
         return value

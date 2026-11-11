@@ -53,7 +53,7 @@
     "amplifier": {
       "class": "patcherbot.devices.amplifier.multiclamp.MultiClampChannel",
       "params": {
-        "channel": 1
+        "channel": 2
       }
     },
     "pressure": {
