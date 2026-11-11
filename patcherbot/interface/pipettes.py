@@ -6,6 +6,7 @@ from numbers import Real
 
 import numpy as np
 from datetime import datetime
+from PyQt5 import QtCore
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
@@ -21,6 +22,8 @@ class PipetteInterface(TaskInterface):
     '''
     Controller for the stage, the microscope, a pipette, and the cell sorter.
     '''
+    pipette_recorded = QtCore.pyqtSignal(object)
+
     def __init__(
         self,
         stage,
@@ -53,6 +56,12 @@ class PipetteInterface(TaskInterface):
                                                 microscope,
                                                 camera,
                                                 config=self.calibration_config)
+        self.pipette_counter = 0
+        self.calibrated_unit.pipette_id = None
+        self.calibrated_unit.pipette_timestamp = None
+        self.calibrated_unit.pipette_resistance = None
+        self.calibrated_unit.pipette_image = None
+        self.calibrated_unit.pipette_resistance_reader = lambda: None
         self.session_registration = SessionRegistration()
         self.calibrated_unit.session_registration = self.session_registration
         self._loaded_coordinate_names = set()
@@ -94,6 +103,43 @@ class PipetteInterface(TaskInterface):
         self.safe_stage_position = None
         self.tare_pipette = np.array([None, None, None])
         self.tare_stage = np.array([None, None, None])
+
+    def _record_pipette(self, loaded=False):
+        """Add calibration resistance and its image through existing book snapshots."""
+        import cv2
+        unit = self.calibrated_unit
+        now = datetime.now().astimezone()
+        try:
+            resistance = unit.pipette_resistance_reader()
+            resistance = float(resistance) if resistance is not None else None
+            if resistance is not None and (not math.isfinite(resistance) or resistance < 0):
+                resistance = None
+        except Exception:
+            resistance = None
+        self.pipette_counter += 1
+        unit.pipette_id = self.pipette_counter
+        unit.pipette_timestamp = now.isoformat()
+        unit.pipette_resistance = resistance
+        if not loaded:
+            unit.pipette_image = None
+        frame, number, captured_at = None, 0, now
+        try:
+            if loaded:
+                frame = cv2.imread(unit.pipette_image, cv2.IMREAD_UNCHANGED) if unit.pipette_image else None
+            else:
+                number, captured_at, _, frame = self.camera.raw_frame_queue[0]
+                captured_at = captured_at or now
+                os.makedirs(self.folder_path, exist_ok=True)
+                image = os.path.abspath(os.path.join(self.folder_path, "pipette_" + now.strftime("%Y%m%d_%H%M%S_%f") + ".png"))
+                if frame is not None and cv2.imwrite(image, frame):
+                    unit.pipette_image = image
+        except Exception as error:
+            self.warning("Pipette calibration image unavailable: %s", error)
+        note = (f"Pipette {unit.pipette_id}: calibration {'loaded' if loaded else 'completed'} at {now.isoformat()}; "
+                f"resistance_ohm={resistance}; calibration_resistance_ohm={unit.pipette_resistance}")
+        self.info(note)
+        self.pipette_recorded.emit(dict(note=note, image_path=unit.pipette_image,
+            frame=frame, frame_number=number, captured_at=captured_at, camera_role="main"))
 
     def _coordinate_calibration_identity(self):
         return calibration_identity(self.calibrated_unit.save_configuration(),
@@ -196,6 +242,7 @@ class PipetteInterface(TaskInterface):
     def finish_calibration(self, none):
         self.calibrated_unit.finish_calibration()
         self.refresh_coordinate_calibration(clear_tip=True)
+        self._record_pipette()
 
     @command(category='Manipulators',
              description='Move pipette in x direction by {:.0f}μm',
@@ -263,6 +310,10 @@ class PipetteInterface(TaskInterface):
                 'display_anchor': display,
                 'coordinate_reference': bundle,
                 'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+                'pipette_id': getattr(self.calibrated_unit, 'pipette_id', None),
+                'pipette_timestamp': getattr(self.calibrated_unit, 'pipette_timestamp', None),
+                'pipette_resistance': getattr(self.calibrated_unit, 'pipette_resistance', None),
+                'pipette_image': getattr(self.calibrated_unit, 'pipette_image', None),
             }
             snapshot = deepcopy(calibration)
             import tempfile
@@ -373,6 +424,19 @@ class PipetteInterface(TaskInterface):
                     'reloaded_at': datetime.now().astimezone().isoformat(timespec='seconds'),
                 }
                 self._calibration_snapshot = deepcopy(cal)
+                if hasattr(self, '_record_pipette'):
+                    self.info("Saved calibration pipette reference: id=%s; timestamp=%s",
+                              cal.get('pipette_id'), cal.get('pipette_timestamp'))
+                    image = cal.get('pipette_image')
+                    if image and not os.path.isabs(image):
+                        image = os.path.join(os.path.dirname(source_file), image)
+                    self.calibrated_unit.pipette_image = image
+                    self._record_pipette(loaded=True)
+                    self._calibration_snapshot.update(
+                        pipette_id=self.calibrated_unit.pipette_id,
+                        pipette_timestamp=self.calibrated_unit.pipette_timestamp,
+                        pipette_resistance=self.calibrated_unit.pipette_resistance,
+                        pipette_image=self.calibrated_unit.pipette_image)
                 self.info(
                     f"Calibration reloaded from {source_file}; "
                     f"file saved at: {source_saved_at or 'unknown'}; "
@@ -415,6 +479,7 @@ class PipetteInterface(TaskInterface):
                 description='recalibrate manipulator offset while preserving matrix')
     def recalibrate_manipulator(self):
         self.calibrated_unit.recalibrate_pipette()
+        self._record_pipette()
             
     @command(category='Manipulators',
              description='Move pipette in y direction by {:.0f}μm',
@@ -542,7 +607,8 @@ class PipetteInterface(TaskInterface):
                       task_description='Calibrating manipulator')
     def calibrate_manipulator(self):
         try:
-            self.execute([self.calibrated_unit.calibrate_pipette])
+            if self.execute([self.calibrated_unit.calibrate_pipette]):
+                self._record_pipette()
         finally:
             self.refresh_coordinate_calibration()
 

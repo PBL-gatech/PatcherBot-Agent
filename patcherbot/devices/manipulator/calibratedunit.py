@@ -266,9 +266,28 @@ class CalibratedUnit(ManipulatorUnit):
 
 
 
+    def log_pipette_resistance(self, operation, boundary):
+        """Print the current resistance alongside this calibration's baseline."""
+        try:
+            resistance = getattr(self, "pipette_resistance_reader", lambda: None)()
+            if isinstance(resistance, bool):
+                resistance = None
+            resistance = float(resistance) if resistance is not None else None
+            if resistance is not None and (not math.isfinite(resistance) or resistance < 0):
+                resistance = None
+        except Exception:
+            resistance = None
+        baseline = getattr(self, "pipette_resistance", None)
+        delta = resistance - baseline if resistance is not None and baseline is not None else None
+        self.info("Pipette %s (%s) | %s %s | resistance=%s Ohm | calibration=%s Ohm | difference=%s Ohm",
+                  getattr(self, "pipette_id", "uncalibrated"), getattr(self, "pipette_timestamp", None), operation, boundary,
+                  resistance, baseline, delta)
+        return resistance
+
     def autofocus_pipette(self):
         '''Use the microscope image to put the pipette in focus
         '''
+        self.log_pipette_resistance("focus_pipette", "before")
         if not self.config.pipette_focus_crop_feature:
             self.info('Autofocusing pipette without cropping')
             self.abort_if_requested()
@@ -277,6 +296,7 @@ class CalibratedUnit(ManipulatorUnit):
             self.info('Autofocusing pipette with cropping')
             self.abort_if_requested()
             self.autofocus_cropped_pipette()
+        self.log_pipette_resistance("focus_pipette", "after")
 
     def autofocus_cropped_pipette(self,crop_size=256):
         ''' use pipette detector to crop ROI of pipette tip, then feed directly into focushelpers focuser'''
@@ -380,10 +400,13 @@ class CalibratedUnit(ManipulatorUnit):
         """
         Moves the pipette so that its detected position in the camera image is centered.
         """
+        self.log_pipette_resistance("center_pipette", "before")
         options = {} if detected_px is None else {"detected_px": detected_px}
         if max_deviation_um is not None:
             options.update(expected_px=expected_px, max_deviation_um=max_deviation_um)
-        return self.direct_pipette(speed=speed, **options)
+        result = self.direct_pipette(speed=speed, **options)
+        self.log_pipette_resistance("center_pipette", "after")
+        return result
 
     def direct_pipette(self, desired_px=None, speed=None, detected_px=None, expected_px=None, max_deviation_um=None):
         """

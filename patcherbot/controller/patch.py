@@ -425,17 +425,29 @@ class AutoPatcher(TaskController):
     # region Phase entry points
     @record_state("find_pipette")
     def find_pipette(self):
-        return self.find_pipette_phase.run()
+        self.calibrated_unit.log_pipette_resistance("find_pipette", "before")
+        try:
+            return self.find_pipette_phase.run()
+        finally:
+            self.calibrated_unit.log_pipette_resistance("find_pipette", "after")
 
     @record_state("approach_cell")
     def approach_cell(self, cell):
         """Approach the cell from the common localization distance."""
-        return self.approach_cell_phase.run(cell)
+        self.calibrated_unit.log_pipette_resistance("approach_cell", "before")
+        try:
+            return self.approach_cell_phase.run(cell)
+        finally:
+            self.calibrated_unit.log_pipette_resistance("approach_cell", "after")
 
     @record_state("hunt_cell")
     def hunt_cell(self, cell=None):
         """Move the pipette toward the cell plane and detect contact by resistance."""
-        return self.hunt_cell_phase.run(cell)
+        self.calibrated_unit.log_pipette_resistance("hunt_cell", "before")
+        try:
+            return self.hunt_cell_phase.run(cell)
+        finally:
+            self.calibrated_unit.log_pipette_resistance("hunt_cell", "after")
 
     @record_state("gigaseal")
     def gigaseal(self):
@@ -443,7 +455,11 @@ class AutoPatcher(TaskController):
         averaged-resistance windows ≥ target to declare success, reducing
         false positives from transient spikes.
         """
-        return self.gigaseal_phase.run()
+        self.calibrated_unit.log_pipette_resistance("gigaseal", "before")
+        try:
+            return self.gigaseal_phase.run()
+        finally:
+            self.calibrated_unit.log_pipette_resistance("gigaseal", "after")
    
     @record_state("break_in")
     def break_in(self):
@@ -459,7 +475,11 @@ class AutoPatcher(TaskController):
         * The moment a reading is above threshold, reset the streak and fall back
         to the full pressure/zap/ramp cycle.
         """
-        return self.break_in_phase.run()
+        self.calibrated_unit.log_pipette_resistance("break_in", "before")
+        try:
+            return self.break_in_phase.run()
+        finally:
+            self.calibrated_unit.log_pipette_resistance("break_in", "after")
 
     # endregion
     
@@ -869,6 +889,7 @@ class AutoPatcher(TaskController):
 
     @record_state("escape")
     def escape(self):
+            self.calibrated_unit.log_pipette_resistance("escape", "before")
             self.amplifier.stop_patch()
             self.calibrated_unit.stop()
             self.microscope.stop()
@@ -893,10 +914,12 @@ class AutoPatcher(TaskController):
             self.move_to_safe_space()
             self.sleep(5)
             self.microscope.move_to_floor()
+            self.calibrated_unit.log_pipette_resistance("escape", "after")
             self.success_requested = True
             self.success_if_requested()
 
     def clean_pipette(self):
+        self.calibrated_unit.log_pipette_resistance("clean_pipette", "before")
         if self.cleaning_bath_position is None:
             raise ValueError('Cleaning bath position has not been set')
 
@@ -957,12 +980,13 @@ class AutoPatcher(TaskController):
             self.calibrated_unit.absolute_move(start_y, axis=1)
             self.calibrated_unit.wait_until_still() # Ensure movement completes
         finally:
-            pass
+            self.calibrated_unit.log_pipette_resistance("clean_pipette", "after")
 
     def clean_pipette_no_move(self):
         '''
         Cleans the pipette without moving to cleaning bath position
         '''
+        self.calibrated_unit.log_pipette_resistance("clean_pipette_no_move", "before")
         try:
             # Cleaning
             # Fill up with the Alconox
@@ -979,7 +1003,7 @@ class AutoPatcher(TaskController):
             self.pressure.set_pressure(50)
   
         finally:
-            pass
+            self.calibrated_unit.log_pipette_resistance("clean_pipette_no_move", "after")
     # endregion
 
     # region Recording protocols
@@ -1389,6 +1413,7 @@ class AutoPatcher(TaskController):
     @record_state("locate_cell")
     def locate_cell(self, cell):
         """Localize the pipette at slice_start_distance above the cell."""
+        self.calibrated_unit.log_pipette_resistance("locate_cell", "before")
         # move stage and pipette to safe space
         self.info("Moving to safe space")
         self.move_to_safe_space()
@@ -1454,6 +1479,7 @@ class AutoPatcher(TaskController):
                 source = evidence["source_positions"]
                 unit.set_tip_reference(evidence["confirmed_tip_xy"], source["pipette_xyz"], source["stage_xy"])
         self.info("Located Cell")
+        self.calibrated_unit.log_pipette_resistance("locate_cell", "after")
         self.success_requested = True
         self.success_if_requested()
 

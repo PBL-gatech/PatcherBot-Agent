@@ -124,6 +124,8 @@ class PatchGui(ManipulatorGui):
             self.experiment_book_tab.handle_state_press_tally
         )
         self.snapshot_captured.connect(self.experiment_book_tab.handle_snapshot)
+        self.pipette_interface.pipette_recorded.connect(
+            lambda payload: self.experiment_book_tab.handle_snapshot(payload, force=True))
         self.atlas_window.atlas_widget.saveRequested.connect(self._save_atlas_image)
         self._origin_busy = False
         self._anchor_busy = False

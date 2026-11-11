@@ -237,6 +237,9 @@ class ExperimentBookTab(ParamConfig):
             return False
         if not isinstance(payload, Mapping):
             return False
+        if persist and payload.get("note"):
+            self.logger.write_note(payload["note"], payload["captured_at"])
+            self._add_text_card("Pipette calibration", payload["note"], payload["captured_at"])
 
         image_path = payload.get("image_path")
         camera_role = payload.get("camera_role")

@@ -59,6 +59,7 @@ class AutoPatchInterface(TaskInterface):
         self.daq = daq
         self.pressure = pressure
         self.pipette_controller = pipette_interface
+        self.pipette_controller.calibrated_unit.pipette_resistance_reader = self.daq.resistance
         self.recording_state_manager = recording_state_manager
         self.lamp = lamp
         self.laser = laser
