@@ -12,6 +12,7 @@ talk to their hardware:
 * the DAQ channel model (``PipetteChannels``, ``build_channel_map``)
 * DAQ method tags (``multi_pipette_protocol``, ``per_pipette``) and
   ``PipetteDAQView``, one pipette's handle on the shared DAQ
+* ``PipetteConfigView``, one pipette's view of the shared calibration config
 
 Nothing here imports device modules; devices are used duck-typed.
 """
@@ -28,6 +29,7 @@ __all__ = [
     "MultiPipetteDevice",
     "PipetteChannels", "build_channel_map", "enumerated_channels",
     "multi_pipette_protocol", "takes_pipettes", "per_pipette", "PipetteDAQView",
+    "PipetteConfigView",
 ]
 
 
@@ -366,3 +368,56 @@ class PipetteDAQView:
 
     def __repr__(self):
         return f"PipetteDAQView({type(self.daq).__name__}, {self.pipette_key!r})"
+
+
+# ========================================================
+#  Per-pipette view of a shared config
+# ========================================================
+class PipetteConfigView:
+    """One pipette's view of the rig's shared config object.
+
+    ``fields`` names the values each pipette may override. Their overrides
+    live in ``base.<overrides_attr>[index]`` (a list of ``None``/dicts, as
+    loaded from the calibration YAML). Reading a field returns the
+    override if one is set, else the shared value; writing a field stores
+    it as this pipette's override, so pipettes never overwrite each other's
+    geometry or saved positions. Every other attribute is the shared
+    config's, read and written directly.
+
+    Pipette 0 with no entry behaves exactly like the shared config, except
+    that writes to its fields still go to the shared (top-level) value, so
+    the config editor keeps showing pipette 0's numbers.
+    """
+
+    def __init__(self, base, index, fields, overrides_attr="pipettes"):
+        object.__setattr__(self, "base", base)
+        object.__setattr__(self, "index", int(index))
+        object.__setattr__(self, "fields", frozenset(fields))
+        object.__setattr__(self, "overrides_attr", overrides_attr)
+
+    def overrides(self, create=False):
+        """This pipette's override dict (``{}``-like None if absent and not ``create``)."""
+        entries = getattr(self.base, self.overrides_attr, None)
+        entries = list(entries) if entries else []
+        entry = entries[self.index] if self.index < len(entries) else None
+        if entry is None and create:
+            entries.extend([None] * (self.index + 1 - len(entries)))
+            entry = entries[self.index] = {}
+            setattr(self.base, self.overrides_attr, entries)
+        return entry
+
+    def __getattr__(self, name):
+        if name in self.fields:
+            entry = self.overrides()
+            if entry and entry.get(name) is not None:
+                return entry[name]
+        return getattr(self.base, name)
+
+    def __setattr__(self, name, value):
+        if name in self.fields and (self.index != 0 or self.overrides()):
+            self.overrides(create=True)[name] = value
+        else:
+            setattr(self.base, name, value)
+
+    def __repr__(self):
+        return f"PipetteConfigView({type(self.base).__name__}, pipette {self.index})"

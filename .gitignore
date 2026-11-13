@@ -99,3 +99,4 @@ experiments/Datasets/temp_dataset.hdf5
 !/tests/test_shared_amplifier.py
 !/tests/test_nidaq_signal_path.py
 !/tests/test_multipipette_helper.py
+!/tests/test_multipipette_motion.py

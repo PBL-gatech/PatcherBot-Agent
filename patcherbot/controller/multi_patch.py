@@ -36,13 +36,15 @@ class MultiPipettePatcher(TaskController):
 
     @classmethod
     def from_devices(cls, daq, amplifiers, pressures, calibrated_units, calibrated_stage,
-                     lamp, laser=None, config=None, protocol_config=None):
+                     lamp, laser=None, config=None, protocol_config=None,
+                     collision_guard=None):
         """Build one AutoPatcher per calibrated unit (keyed ``pipette_<n>``).
 
         ``amplifiers`` / ``pressures`` are ``{pipette_key: device}``; a single
         device serves every pipette, and a device with ``for_pipette`` (e.g.
         MultiClampAmplifier) hands each pipette its own part. Each pipette
-        gets its own view onto the one DAQ.
+        gets its own view onto the one DAQ. ``collision_guard`` (e.g. a
+        PrimaryPipetteGuard) is checked before a pipette starts on a cell.
         """
         autopatchers = {}
         for key, calibrated_unit in calibrated_units.items():
@@ -57,6 +59,8 @@ class MultiPipettePatcher(TaskController):
                 laser=laser,
                 config=config,
                 protocol_config=protocol_config,
+                pipette_key=key,
+                collision_guard=collision_guard,
             )
         return cls(autopatchers, daq)
 

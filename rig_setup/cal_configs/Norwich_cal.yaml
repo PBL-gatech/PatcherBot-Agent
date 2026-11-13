@@ -18,3 +18,10 @@ stage_y_axis_flip: false
 pipette_z_rotation: -20.0105
 microscope_units_per_um: 1.0
 safe_position_delta_um: -18000
+# Per-pipette overrides of the values above (entry i = pipette_i; missing
+# values use the top-level ones, which are pipette_0's). pipette_1's
+# manipulator is mirrored in x and y (not z), i.e. rotated 180 deg about z.
+# Initial guess -- verify on the rig by jogging pipette_1 before calibrating.
+pipettes:
+- {}
+- pipette_z_rotation: 159.9895

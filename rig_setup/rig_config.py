@@ -992,7 +992,7 @@ class RigConfigManager:
         calibration = None
         calibration_fallback: Dict[str, Any] = {}
         try:
-            from patcherbot.devices.manipulator.CalibrationConfig import CalibrationConfig
+            from patcherbot.configs.CalibrationConfig import CalibrationConfig
             calibration = CalibrationConfig(name="Calibration")
         except Exception as exc:
             LOGGER.warning("CalibrationConfig import failed; using YAML fallback: %s", exc)

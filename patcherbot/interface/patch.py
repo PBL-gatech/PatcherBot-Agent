@@ -5,7 +5,7 @@ Control of automatic patch clamp algorithm
 import numpy as np
 
 from patcherbot.interface import TaskInterface, command, blocking_command
-from patcherbot.controller import MultiPipettePatcher
+from patcherbot.controller import MultiPipettePatcher, CollisionError
 from patcherbot.utils import EPhysLogger, RecordingStateManager
 from patcherbot.utils.multipipette_helper import pipette_key_for
 from patcherbot.devices.pressurecontroller.BasePressureController import PressureController
@@ -74,9 +74,12 @@ class AutoPatchInterface(TaskInterface):
             laser=self.laser,
             config=self.config,
             protocol_config=self.protocol_config,
+            collision_guard=self.pipette_controller.collision_guard,
         )
         self.autopatchers = self.multi_patcher.autopatchers
-        self.current_autopatcher = next(iter(self.autopatchers.values()))
+        # Commands act on the pipette selected in the PipetteInterface; don't
+        # let it switch pipettes while a patch task is running.
+        self.pipette_controller.busy_checks.append(lambda: self._current_controller is not None)
         self.protocol_selections = {
             pipette_key: {
                 protocol_name: bool(getattr(self.protocol_config, protocol_name))
@@ -87,9 +90,28 @@ class AutoPatchInterface(TaskInterface):
 
         self.is_selecting_cells = False
         self.is_selecting_corners = False
-        self.cells_to_patch = []
+        # One queue of cells per pipette; ``cells_to_patch`` is the active one.
+        self.cell_queues = {pipette_key: [] for pipette_key in self.autopatchers}
         self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
+
+    @property
+    def active_pipette(self):
+        return self.pipette_controller.active_pipette
+
+    @property
+    def current_autopatcher(self):
+        """The active pipette's AutoPatcher."""
+        return self.autopatchers[self.active_pipette]
+
+    @property
+    def cells_to_patch(self):
+        """The active pipette's cell queue."""
+        return self.cell_queues[self.active_pipette]
+
+    @cells_to_patch.setter
+    def cells_to_patch(self, cells):
+        self.cell_queues[self.active_pipette] = list(cells)
 
     def set_protocol_selection(self, pipette_key, protocol_name, selected):
         self.protocol_selections[pipette_key][protocol_name] = bool(selected)
@@ -329,6 +351,13 @@ class AutoPatchInterface(TaskInterface):
             # add the z_pos to the stage position as a third dimension in the np array
 
             stage_pos_pixels = np.array([stage_pos_pixels[0], stage_pos_pixels[1], z_pos])
+            # Secondary pipettes may not take cells on the primary's side.
+            try:
+                self.current_autopatcher.check_cell_allowed(stage_pos_pixels)
+            except CollisionError as error:
+                self.is_selecting_cells = False
+                self.error(f'Cell not queued for {self.active_pipette}: {error}')
+                return
             # get raw currnent stage position in pixels
             stage_pos_plane = self.current_autopatcher.calibrated_stage.position()
             stage_pos_um = np.array([stage_pos_plane[0], stage_pos_plane[1], z_pos])
@@ -684,7 +713,8 @@ class AutoPatchInterface(TaskInterface):
         z_scale = self.pipette_controller.calibrated_unit.config.microscope_units_per_um
         z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.safe_stage_position = [x,y,z]
-        self.current_autopatcher.calibrated_stage.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
+        self.current_autopatcher.calibrated_unit.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
+        self._share_positions_with_pipette_interface()
         self.info(f'safe space position stored: {self.current_autopatcher.safe_position} and {self.current_autopatcher.safe_stage_position}')
 
     @command(category='Patch',
@@ -698,9 +728,21 @@ class AutoPatchInterface(TaskInterface):
         z_scale = self.pipette_controller.calibrated_unit.config.microscope_units_per_um
         z = float(self.pipette_controller.calibrated_unit.microscope.position() / z_scale)
         self.current_autopatcher.home_stage_position = [x,y,z]
-        self.current_autopatcher.calibrated_stage.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
+        self.current_autopatcher.calibrated_unit.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
+        self._share_positions_with_pipette_interface()
         self.info(f'safe home position stored: {self.current_autopatcher.home_position} and {self.current_autopatcher.home_stage_position}')
 
+    _POSITION_NAMES = {  # AutoPatcher attribute -> PipetteInterface saved-position name
+        "home_position": "home", "home_stage_position": "home_stage",
+        "safe_position": "safe", "safe_stage_position": "safe_stage",
+        "cleaning_bath_position": "bath", "rinsing_bath_position": "rinse",
+    }
+
+    def _share_positions_with_pipette_interface(self):
+        """Copy the active AutoPatcher's saved positions to the PipetteInterface
+        (which writes them to the calibration file)."""
+        for attribute in self._POSITION_NAMES:
+            setattr(self.pipette_controller, attribute, getattr(self.current_autopatcher, attribute))
 
     @command(category='Patch',
                 description='Store the position of the home and safe spaces',
@@ -722,8 +764,8 @@ class AutoPatchInterface(TaskInterface):
         # save all positions to the config
         self.current_autopatcher.calibrated_unit.config.home_position = tuple(self.current_autopatcher.home_position)
         self.current_autopatcher.calibrated_unit.config.safe_position = tuple(self.current_autopatcher.safe_position)
-        self.current_autopatcher.calibrated_stage.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
-        self.current_autopatcher.calibrated_stage.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
+        self.current_autopatcher.calibrated_unit.config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
+        self.current_autopatcher.calibrated_unit.config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
         self.info(f'safe home position stored: {self.current_autopatcher.home_position} and {self.current_autopatcher.home_stage_position}')
         self.info(f'safe space position stored: {self.current_autopatcher.safe_position} and {self.current_autopatcher.safe_stage_position}')
         # send all positions to the pipette controller
@@ -739,22 +781,25 @@ class AutoPatchInterface(TaskInterface):
              description='Read calibration and saved positions from file',
              success_message='Calibration and saved positions loaded')
     def read_calibration(self, config_filename='calibration.pickle') -> None:
-        self.pipette_controller.read_calibration(config_filename)
-        self.current_autopatcher.home_position = self.pipette_controller.home_position.copy()
-        self.current_autopatcher.safe_position = self.pipette_controller.safe_position.copy()
-        self.current_autopatcher.home_stage_position = self.pipette_controller.home_stage_position.copy()
-        self.current_autopatcher.safe_stage_position = self.pipette_controller.safe_stage_position.copy()
-        self.current_autopatcher.cleaning_bath_position = self.pipette_controller.cleaning_bath_position
-        self.current_autopatcher.rinsing_bath_position = self.pipette_controller.rinsing_bath_position
-        config = self.pipette_controller.calibration_config
-        config.home_position = tuple(self.current_autopatcher.home_position)
-        config.safe_position = tuple(self.current_autopatcher.safe_position)
-        config.home_position_stage = tuple(self.current_autopatcher.home_stage_position)
-        config.safe_position_stage = tuple(self.current_autopatcher.safe_stage_position)
-        config.bath_position = (tuple(self.current_autopatcher.cleaning_bath_position)
-                                if self.current_autopatcher.cleaning_bath_position is not None
-                                else (0.0, 0.0, 0.0))
-        self.info(f'Calibration values read from file: {self.current_autopatcher.home_position}, {self.current_autopatcher.safe_position}, {self.current_autopatcher.home_stage_position}, {self.current_autopatcher.safe_stage_position}, {self.current_autopatcher.cleaning_bath_position}, {self.current_autopatcher.rinsing_bath_position}')
+        loaded = self.pipette_controller.read_calibration(config_filename)
+        # Every pipette in the file gets its own positions.
+        for pipette_key in loaded:
+            autopatcher = self.autopatchers[pipette_key]
+            positions = self.pipette_controller.saved_positions(pipette_key)
+            for attribute, name in self._POSITION_NAMES.items():
+                value = positions[name]
+                setattr(autopatcher, attribute, None if value is None else np.array(value, dtype=float))
+            config = autopatcher.calibrated_unit.config  # this pipette's view
+            config.home_position = tuple(autopatcher.home_position)
+            config.safe_position = tuple(autopatcher.safe_position)
+            config.home_position_stage = tuple(autopatcher.home_stage_position)
+            config.safe_position_stage = tuple(autopatcher.safe_stage_position)
+            config.bath_position = (tuple(autopatcher.cleaning_bath_position)
+                                    if autopatcher.cleaning_bath_position is not None
+                                    else (0.0, 0.0, 0.0))
+            self.info(f'{pipette_key} calibration values read from file: home {autopatcher.home_position}, '
+                      f'safe {autopatcher.safe_position}, home stage {autopatcher.home_stage_position}, '
+                      f'safe stage {autopatcher.safe_stage_position}, bath {autopatcher.cleaning_bath_position}')
 
 
     @command(category='Patch',
@@ -762,6 +807,7 @@ class AutoPatchInterface(TaskInterface):
              success_message='Rinsing bath position stored')
     def store_rinsing_position(self) -> None:
         self.current_autopatcher.rinsing_bath_position = self.pipette_controller.calibrated_unit.position()
+        self._share_positions_with_pipette_interface()
 
     @command(category='Patch',
              description='clear all stored positions',
@@ -776,11 +822,12 @@ class AutoPatchInterface(TaskInterface):
         # set tuple to None in the config
         self.current_autopatcher.calibrated_unit.config.home_position = (0., 0., 0.)
         self.current_autopatcher.calibrated_unit.config.safe_position = (0., 0., 0.)
-        self.current_autopatcher.calibrated_stage.config.home_position_stage = (0., 0., 0.)
-        self.current_autopatcher.calibrated_stage.config.safe_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.home_position_stage = (0., 0., 0.)
+        self.current_autopatcher.calibrated_unit.config.safe_position_stage = (0., 0., 0.)
         self.current_autopatcher.calibrated_unit.config.bath_position = (0., 0., 0.)
         # self.current_autopatcher.calibrated_unit.config.rinsing_bath_position = None    
-        self.info('All positions cleared')
+        self._share_positions_with_pipette_interface()
+        self.info(f'All positions cleared for {self.active_pipette}')
 
 
     @blocking_command(category='Patch',
@@ -854,7 +901,7 @@ class AutoPatchInterface(TaskInterface):
     def set_pressure_near(self) -> None:
         '''puts the pipette under positive pressure to prevent blockages
         '''
-        self.pressure.set_pressure(self.config.pressure_near)
+        self.current_autopatcher.pressure.set_pressure(self.config.pressure_near)
 
     @blocking_command(category='Lamp', 
              description='Open or close the shutter',

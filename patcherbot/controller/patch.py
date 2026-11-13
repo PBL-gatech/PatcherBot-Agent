@@ -26,6 +26,7 @@ from .phases.hunt_cell import HuntCellPhase
 from .phases.gigaseal import GigasealPhase
 from .phases.break_in import BreakInPhase
 import threading
+import itertools
 # import locking package
 
 
@@ -45,8 +46,14 @@ class AutoPatcher(TaskController):
         laser=None,
         config: PatchConfig | None = None,
         protocol_config: ProtocolConfig | None = None,
+        pipette_key: str = "pipette_0",
+        collision_guard=None,
     ):
         super().__init__()
+        # Which pipette this controller drives, and the rule keeping
+        # secondary pipettes off the primary's side (None = no check).
+        self.pipette_key = pipette_key
+        self.collision_guard = collision_guard
         self.config = config if config is not None else PatchConfig(name="Patch")
         self.protocol_config = protocol_config if protocol_config is not None else ProtocolConfig(name="Protocols")
         self.amplifier = amplifier
@@ -147,9 +154,21 @@ class AutoPatcher(TaskController):
         record = request["logger"].write_origin(record)
         request["completed"](record, frame)
 
+    # One attempt counter for every AutoPatcher, so attempt folders of
+    # different pipettes never collide.
+    _shared_attempt_counter = itertools.count(1)
+
+    def check_cell_allowed(self, cell):
+        """Raise CollisionError if this pipette may not patch ``cell`` right now."""
+        if self.collision_guard is None or cell is None:
+            return
+        position = cell[0] if isinstance(cell, (tuple, list)) else cell
+        self.collision_guard.check_cell(self.pipette_key, position)
+
     def _get_state_recorder(self) -> StateMachineLogger:
         if self._state_recorder is None:
-            self.attempt_counter += 1
+            self.attempt_counter = next(AutoPatcher._shared_attempt_counter)
+            self.info(f"Attempt {self.attempt_counter}: {self.pipette_key}")
             self.observer = Observer(self, attempt_id=self.attempt_counter)
             self._state_recorder = StateMachineLogger(
                 base_path="experiments/Data/state_recorder_data/",
@@ -184,6 +203,8 @@ class AutoPatcher(TaskController):
     @record_state("patch")
     def patch(self, cell=None):
         """Runs the automatic patch-clamp algorithm, including manipulator movements."""
+        # Before the try: a refused cell must not trigger the escape cleanup.
+        self.check_cell_allowed(cell)
         self._in_patch = True
         self._get_state_recorder()
 
@@ -263,6 +284,8 @@ class AutoPatcher(TaskController):
     def whole_cell(self, cell=None):
         """ method similar to patch, but starts from gigaseal stage
         """
+        # Before the try: a refused cell must not trigger the escape cleanup.
+        self.check_cell_allowed(cell)
         self._in_patch = True
         self._get_state_recorder()
 
@@ -334,11 +357,13 @@ class AutoPatcher(TaskController):
     @record_state("approach_cell")
     def approach_cell(self, cell):
         """Approach the cell from the common localization distance."""
+        self.check_cell_allowed(cell)
         return self.approach_cell_phase.run(cell)
 
     @record_state("hunt_cell")
     def hunt_cell(self, cell=None):
         """Move the pipette toward the cell plane and detect contact by resistance."""
+        self.check_cell_allowed(cell)
         return self.hunt_cell_phase.run(cell)
 
     @record_state("gigaseal")
@@ -1356,6 +1381,7 @@ class AutoPatcher(TaskController):
     @record_state("locate_cell")
     def locate_cell(self, cell):
         """Localize the pipette at slice_start_distance above the cell."""
+        self.check_cell_allowed(cell)
         # move stage and pipette to safe space
         self.info("Moving to safe space")
         self.move_to_safe_space()

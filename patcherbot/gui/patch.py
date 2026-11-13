@@ -845,7 +845,10 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.stage_xy = [0, 0]
         self.stage_z = 0
         self.pipette_xyz = [0, 0, 0]
-        self.tare_pipette_pos = [0, 0, 0]
+        # Display tare per pipette; ``tare_pipette_pos`` is the active one's.
+        self._tare_pipette_by_key = {}
+
+        self._add_active_pipette_selector(layout)
 
         self.currx_stage_pos = [0, 0, 0]
         self.curry_stage_pos = [0, 0, 0]
@@ -1161,6 +1164,49 @@ class ClassicPatchButtons(ButtonTabWidget):
         self.recorder.close()
         super(ClassicPatchButtons, self).closeEvent(event)
 
+    @property
+    def tare_pipette_pos(self):
+        return self._tare_pipette_by_key.setdefault(self.pipette_interface.active_pipette, [0, 0, 0])
+
+    @tare_pipette_pos.setter
+    def tare_pipette_pos(self, value):
+        self._tare_pipette_by_key[self.pipette_interface.active_pipette] = value
+
+    def _add_active_pipette_selector(self, layout):
+        """'Active pipette' picker (only with more than one pipette): every
+        manipulator, calibration and patch command acts on that pipette."""
+        keys = list(self.pipette_interface.calibrated_units)
+        self.active_pipette_combo = None
+        if len(keys) < 2:
+            return
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Active pipette:"))
+        combo = QtWidgets.QComboBox()
+        for key in keys:
+            combo.addItem(pipette_label(key), key)
+        combo.setCurrentIndex(keys.index(self.pipette_interface.active_pipette))
+        combo.currentIndexChanged.connect(self._request_active_pipette)
+        row.addWidget(combo)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.active_pipette_combo = combo
+        self.pipette_interface.active_pipette_changed.connect(self._show_active_pipette)
+
+    def _request_active_pipette(self, index):
+        key = self.active_pipette_combo.itemData(index)
+        command_signal = self.interface_signals[self.pipette_interface][0]
+        command_signal.emit(self.pipette_interface.set_active_pipette, key)
+
+    @QtCore.pyqtSlot(str)
+    def _show_active_pipette(self, key):
+        """Reflect the interface's active pipette (e.g. revert a refused switch)."""
+        combo = self.active_pipette_combo
+        index = combo.findData(key)
+        if index >= 0 and index != combo.currentIndex():
+            combo.blockSignals(True)
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+
     def tare_pipette(self):
         currPos = self.pipette_interface.calibrated_unit.unit.position()
         self.tare_pipette_pos = currPos
@@ -1175,6 +1221,11 @@ class ClassicPatchButtons(ButtonTabWidget):
         recPos  = self.pipette_interface.calibrated_unit.unit.position()
         currPos = recPos - self.tare_pipette_pos
         if self.recording_state_manager.is_recording_enabled():
+            # The movement file always records the primary pipette (fixed
+            # schema); the labels show the active pipette.
+            primary = self.pipette_interface.primary_calibrated_unit
+            if primary is not self.pipette_interface.calibrated_unit:
+                recPos = primary.unit.position()
             self.recorder.setBatchMoves(True)
             timestamp = datetime.now().timestamp()
             # logging.info(f"the current time is {timestamp}")

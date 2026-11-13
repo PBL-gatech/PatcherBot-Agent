@@ -25,6 +25,7 @@ from datetime import datetime
 # new import
 
 from patcherbot.interface.graph import GraphInterface
+from patcherbot.utils.multipipette_helper import pipette_label
 
 __all__ = [
     "EPhysGraph",
@@ -1022,6 +1023,12 @@ class EPhysGraph(QWidget):
 
         self.show()
         self.raise_()
+
+    @pyqtSlot(str)
+    def select_pipette_key(self, pipette_key):
+        """Point the bottom bar at pipette ``pipette_key`` (e.g. the active pipette)."""
+        if self.pipettePicker is not None:
+            self.pipettePicker.setCurrentText(pipette_label(pipette_key))
 
     def _select_pipette(self, label):
         """Point the bottom bar at another pipette.

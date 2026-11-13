@@ -5,7 +5,23 @@ Calibration configuration parameters for manipulator units.
 import param
 from .Config import Config, NumberWithUnit, Number, Boolean, Tuple, List
 
-__all__ = ["CalibrationConfig"]
+__all__ = ["CalibrationConfig", "PER_PIPETTE_CALIBRATION_FIELDS"]
+
+# Values each pipette may override through ``CalibrationConfig.pipettes[i]``
+# (read and written through multipipette_helper.PipetteConfigView). Every
+# other value is shared by the whole rig (stage, microscope, detectors...).
+PER_PIPETTE_CALIBRATION_FIELDS = (
+    "pipette_z_rotation",
+    "pipette_y_rotation",
+    "pipette_k_scale",
+    "clean_move_order",
+    "safe_position_delta_um",
+    "home_position",
+    "safe_position",
+    "home_position_stage",
+    "safe_position_stage",
+    "bath_position",
+)
 
 
 class CalibrationConfig(Config):
@@ -79,6 +95,12 @@ class CalibrationConfig(Config):
     # reader_scale, and applies to the rig's pressure[i] controller.
     pressure_calibrations = List(default=[],
                                  doc="Per-pipette pressure calibration overrides")
+    # Optional per-pipette geometry/position overrides. Entry i is None or a
+    # dict whose keys are in PER_PIPETTE_CALIBRATION_FIELDS and applies to
+    # pipette_i; missing values fall back to the top-level ones. Pipette 0
+    # normally has no entry, so the top-level values are pipette 0's.
+    pipettes = List(default=[],
+                    doc="Per-pipette calibration overrides (pipette_z_rotation, ...)")
     pipette_detector_type = param.Selector(default="v5", objects=["v5", "yolo1"],
                                            doc="Pipette detector type (restart required)")
     pipette_detector_device = param.String(default="auto",

@@ -404,7 +404,7 @@ These are display effects. None of them means the samples themselves are out of 
 - **P3. Unit conversion is per protocol, not per pipette.** Gains are class constants ([L1293–L1296](../patcherbot/devices/amplifier/DAQ.py#L1293)), the same for every headstage, and every row of a protocol is scaled as one mode. Mixed I-clamp/V-clamp pairs, different feedback resistors, or different Commander gains per channel come out scaled wrongly. Nothing is read back from Commander.
 - **P4. Board aggregate rate unverified.** The 2-pipette current protocol needs 400 kS/s aggregate (§3.4). Record the board model in the rig config or this doc.
 - **P5. The automated patching flow ignores the checkbox grid.** [`AutoPatcher.run_protocols`](../patcherbot/controller/patch.py#L897), called from the hunt → gigaseal → break-in flow, reads `protocol_config.*_protocol` flags. Those are hidden from the editor and only seeded from YAML. Only the "Run Protocols" button uses the grid. That path also runs a single pipette through its view.
-- **P6. Only pipette 0 can be patched.** `current_autopatcher` is fixed ([L85](../patcherbot/interface/patch.py#L85)). Hunt/gigaseal/break-in, the standalone opto command ([L482](../patcherbot/interface/patch.py#L482)), Observer/movement recording and cell metadata all act on pipette 0. Other pipettes take part only in the matrix and the live display.
+- ~~**P6. Only pipette 0 can be patched.**~~ Resolved for sequential patching in §12: an "Active pipette" selector routes manipulator, calibration and patch commands to any pipette. Still pipette 0 only: movement recording. The automated flow still reads the protocol flags (P5).
 - **P7. Live display and recorder desync** (§2.2): panels fetch separately; the recorder writes stale packets with fresh timestamps during protocols; traces are cut at each pipette's own detected edge.
 - **P8. Parallel prepare on one MultiClamp.** Since `2214d8f`, headstages 1 and 2 prepare in two threads. Each DLL call is atomic, but Commander auto routines (fast/slow comp, bridge balance) may still be running when the other channel is selected. Verify on the rig, or go back to grouping by `shared_amplifier` (the pre-`2214d8f` behaviour, which ran one headstage after the other).
 - **P9. `set_bridge_balance` lacks `@needs_select`** ([multiclamp.py L662](../patcherbot/devices/amplifier/multiclamp.py#L662)). It acts on whichever headstage was selected last. With parallel prepare that can be the other pipette's.
@@ -743,4 +743,64 @@ Ordered roughly by when you will hit them.
 | Headless `fake_rig.json` stack, 2 pipettes (offscreen Qt, wired like `patch_gui.py`) | AutoPatchers get views; cell-mode toggle on Pipette 1 affects only Pipette 1; "Run Protocols" (voltage + current) runs as a `MultiPipettePatcher` task with one DAQ call per protocol covering both pipettes |
 
 `test_cell_queue_coordinator.py` (missing module), `test_pipette_calibration_per_pipette.py` (pre-existing circular import when `patcherbot.devices` is imported first) and `test_norwich_pipette_detector.py` (2 errors, missing `BoRigCombo.pt`) fail identically on clean `2214d8f`. Not yet run on the Norwich rig.
+
+---
+
+## 12. Driving and patching the secondary pipette
+
+**Goal.** Every manipulator, calibration and patch command can act on any pipette, one task at a time. Typical run: patch with pipette_0 with auto-clean off, so it stays whole-cell; switch to pipette_1 and patch it; then Run Protocols on both.
+
+**Display coordinates aren't mixed by calibration.**
+- The GUI position labels show `calibrated_unit.unit.position()` minus the tare, i.e. the raw encoder axes.
+- The WASD/QE jog keys are raw single-axis moves.
+- `CalibratedUnit` adds the pixel↔µm maps (M, r0) only for click-to-move, overlays and the patch phases. It doesn't override `position()`.
+
+### 12.1 Active pipette
+- [`PipetteInterface`](../patcherbot/interface/pipettes.py):
+  - `active_pipette` and `set_active_pipette(key)`. The switch is refused while either interface runs a task, through `busy_checks`.
+  - `calibrated_unit` is now a property returning the active pipette's unit, so every existing command follows the selection.
+  - Saved positions (home, safe, stage at home/safe, bath, rinse), `pos_before_raise` and the display tare are stored per pipette. The old attribute names are properties for the active pipette.
+  - `active_pipette_changed(str)` signal.
+- [`AutoPatchInterface`](../patcherbot/interface/patch.py):
+  - `current_autopatcher` is the active pipette's AutoPatcher.
+  - `cells_to_patch` is the active pipette's queue (`cell_queues[key]`).
+  - The store-position and clear commands write the active pipette's entries.
+  - `read_calibration` fills every pipette found in the file.
+- GUI:
+  - "Active pipette" combo at the top of the PatcherBot Agent tab (shown only with more than one pipette). It reverts if the switch is refused.
+  - The live window's "Control:" picker follows it, one way.
+  - The movement recorder still records pipette_0, to keep the CSV schema fixed.
+
+### 12.2 Per-pipette calibration
+- **Config:** [`CalibrationConfig.pipettes`](../patcherbot/configs/CalibrationConfig.py) is a hidden list; entry *i* overrides `PER_PIPETTE_CALIBRATION_FIELDS` for pipette *i* (angles, `pipette_k_scale`, `clean_move_order`, `safe_position_delta_um`, saved positions).
+  - Each `CalibratedUnit` gets a [`PipetteConfigView`](../patcherbot/utils/multipipette_helper.py). Reads fall back to the top-level values; writes to those fields stay per pipette.
+  - `pipette_0` with no entry behaves exactly as before.
+- **Norwich:** [`Norwich_cal.yaml`](../rig_setup/cal_configs/Norwich_cal.yaml) gives pipette_1 `pipette_z_rotation: 159.9895`, i.e. pipette_0 + 180°, because a mirror in both x and y is a rotation about z. This is an initial guess; verify it by jogging.
+- **Calibration file v2:** `{'version': 2, 'pipettes': {key: {manip, home, safe, bath}}, 'stage', 'floor_Z', 'saved_at'}`. It also keeps the legacy `manip/home/safe/bath` keys, copied from pipette_0.
+  - Writing saves every calibrated pipette that has home and safe set. Only the active pipette is required. Entries for pipettes not selected this session are carried over.
+  - A legacy file loads into pipette_0 only.
+- **Calibrating with two tips in view:** `collect_cal_points` detects one tip with no expected position. Retract the other pipette out of view first; `calibrate_manipulator` warns if it predicts the other tip in the image.
+
+### 12.3 Collision rule (pipette_0 vs each secondary)
+[`PrimaryPipetteGuard`](../patcherbot/controller/collision.py):
+- **Rule:** a secondary pipette may not go to (or patch) a point whose x in **pipette_0's manipulator frame** is less than pipette_0's current x. −x is back along pipette_0, away from the centre.
+- **Frames:** points are compared in the stage frame (image px − stage reference). The manipulators ride the stage, so this frame doesn't change as the stage moves.
+  - Tips are placed in it the same way as the camera overlay: latest confirmed tip detection, then trusted detection, then "tip at image centre at home", then M/r0.
+  - The boundary is therefore where the overlay draws pipette_0. Only XY is used, since the calibration leaves Z separate.
+- **Checks:**
+  - `check_cell`: secondaries only. Requires both pipettes calibrated (fail-safe). Runs in `add_cell` (the cell isn't queued) and at the start of `patch`, `whole_cell` (before the `try`, so no escape is triggered), `locate_cell`, `approach_cell` and `hunt_cell`.
+  - `check_move`: `CalibratedUnit.move_guard`, set for secondaries. Runs before every discrete absolute/relative move.
+    - A move is refused only if its target is on pipette_0's side **and** deeper than the current position, so retreating is always allowed.
+    - It is inactive (with a warning) until both pipettes are calibrated, so pipette_1 can still be jogged and calibrated.
+- **Not covered:**
+  - velocity moves (hunt/approach descent, `find_pipette` velocity mode);
+  - the path between targets;
+  - checks between secondaries (3+ pipettes);
+  - other parts of pipette_0's body beyond its tip x.
+
+### 12.4 Other
+- `AutoPatcher` takes `pipette_key` and `collision_guard` (`MultiPipettePatcher.from_devices` passes both).
+- The state-recorder attempt counter is shared by all AutoPatchers, so `attempt_<n>` folders never collide.
+- Norwich pipette_1 still uses `FakePressureController`. It can be moved and calibrated, but it can't really seal until a pressure channel is configured.
+- Tests: [test_multipipette_motion.py](../tests/test_multipipette_motion.py) (21 tests: config view, guard maths, move hooks, routing, v2/legacy calibration files).
 

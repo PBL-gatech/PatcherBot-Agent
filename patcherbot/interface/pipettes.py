@@ -1,4 +1,5 @@
 # coding=utf-8
+import functools
 import pickle
 import os
 import math
@@ -6,20 +7,51 @@ from numbers import Real
 
 import numpy as np
 from datetime import datetime
+from PyQt5 import QtCore
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
-from patcherbot.configs.CalibrationConfig import CalibrationConfig
+from patcherbot.configs.CalibrationConfig import CalibrationConfig, PER_PIPETTE_CALIBRATION_FIELDS
+from patcherbot.controller.collision import PrimaryPipetteGuard
 from patcherbot.devices.cellsorter import CalibratedCellSorter
+from patcherbot.utils.multipipette_helper import PipetteConfigView, pipette_index, pipette_key_for
 import time
 
 from patcherbot.devices.manipulator.microscope import Microscope
 from patcherbot.devices.manipulator.helpers.Observer import Observer
 
+# Positions saved per pipette (manipulator XYZ, or stage XY + microscope Z for *_stage).
+_SAVED_POSITION_NAMES = ("home", "home_stage", "safe", "safe_stage", "bath", "rinse")
+
+
+def _active_position(name, doc):
+    """Property reading/writing the active pipette's saved position ``name``."""
+    def getter(self):
+        return self._saved_positions[self.active_pipette][name]
+
+    def setter(self, value):
+        self._saved_positions[self.active_pipette][name] = value
+    return property(getter, setter, doc=doc)
+
+
 class PipetteInterface(TaskInterface):
     '''
-    Controller for the stage, the microscope, a pipette, and the cell sorter.
+    Controller for the stage, the microscope, the pipettes, and the cell sorter.
+
+    Every pipette has its own CalibratedUnit (``calibrated_units[key]``),
+    its own view of the calibration config (per-pipette angles and saved
+    positions) and its own saved positions. Commands act on the *active*
+    pipette (``active_pipette``, default the first); ``calibrated_unit`` is
+    the active pipette's unit.
     '''
+    active_pipette_changed = QtCore.pyqtSignal(str)
+
+    home_position = _active_position("home", "Active pipette's home position (manipulator um)")
+    home_stage_position = _active_position("home_stage", "Stage XY + microscope Z at the active pipette's home")
+    safe_position = _active_position("safe", "Active pipette's safe position (manipulator um)")
+    safe_stage_position = _active_position("safe_stage", "Stage XY + microscope Z at the active pipette's safe position")
+    cleaning_bath_position = _active_position("bath", "Active pipette's cleaning bath position")
+    rinsing_bath_position = _active_position("rinse", "Active pipette's rinsing bath position")
     def __init__(
         self,
         stage,
@@ -35,13 +67,15 @@ class PipetteInterface(TaskInterface):
         self.microscope = microscope
         self.camera = camera
         self.display_positions = None
-        self.pipette_units = dict(unit) if isinstance(unit, dict) else {"pipette_0": unit}
+        self.pipette_units = dict(unit) if isinstance(unit, dict) else {pipette_key_for(0): unit}
         if not self.pipette_units:
             raise ValueError("At least one pipette unit must be selected")
-        # This interface currently drives one patch workflow at a time, but
-        # retain every selected unit so position queries and camera rendering
-        # can address all selected pipettes.
-        unit = next(iter(self.pipette_units.values()))
+        # One patch workflow runs at a time, on the active pipette.
+        self.primary_pipette = next(iter(self.pipette_units))
+        self.active_pipette = self.primary_pipette
+        # Extra "is something running?" checks (e.g. the patch interface's
+        # task); switching pipettes is refused while any returns True.
+        self.busy_checks = []
         # Create a common calibration configuration for all stages/manipulators
         self.calibration_config = CalibrationConfig(name='Calibration')
         if calibration_data:
@@ -54,24 +88,37 @@ class PipetteInterface(TaskInterface):
             self.microscope.dev.objective_lift_um = float(self.calibration_config.objective_lift_um)
         self.calibrated_stage = CalibratedStage(stage, None, microscope, camera,
                                                 config=self.calibration_config)
-        self.calibrated_unit = CalibratedUnit(unit,
-                                                self.calibrated_stage,
-                                                microscope,
-                                                camera,
-                                                config=self.calibration_config)
-        unit_items = self.pipette_units.items()
-        primary_key = next(iter(self.pipette_units))
-        self.calibrated_units = {primary_key: self.calibrated_unit}
-        for pipette_key, pipette_unit in unit_items:
-            if pipette_key == primary_key:
-                continue
+        # Each pipette sees the shared config through a view that applies its
+        # own overrides (calibration.pipettes[i]: angles, saved positions...).
+        self.calibrated_units = {}
+        for position, (pipette_key, pipette_unit) in enumerate(self.pipette_units.items()):
+            index = pipette_index(pipette_key)
+            config = PipetteConfigView(self.calibration_config,
+                                       position if index is None else index,
+                                       PER_PIPETTE_CALIBRATION_FIELDS)
             self.calibrated_units[pipette_key] = CalibratedUnit(
                 pipette_unit,
                 self.calibrated_stage,
                 microscope,
                 camera,
-                config=self.calibration_config,
+                config=config,
             )
+        self._saved_positions = {key: dict.fromkeys(_SAVED_POSITION_NAMES)
+                                 for key in self.calibrated_units}
+        self._pos_before_raise = dict.fromkeys(self.calibrated_units)
+        self._tare_pipettes = {key: np.array([None, None, None])
+                               for key in self.calibrated_units}
+        # Pipette calibrations read from file but not (re)made this session;
+        # kept so write_calibration doesn't drop pipettes that aren't selected.
+        self._loaded_pipette_calibrations = {}
+        # Collision rule: secondary pipettes stay on their side of the primary.
+        self.collision_guard = PrimaryPipetteGuard(
+            self.calibrated_units, self.calibrated_stage, self.primary_pipette,
+            home_anchor=self._home_anchor)
+        for pipette_key, calibrated_unit in self.calibrated_units.items():
+            if pipette_key != self.primary_pipette:
+                calibrated_unit.move_guard = functools.partial(
+                    self.collision_guard.check_move, pipette_key)
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
         self.observer = Observer(self)
         self.time_truth = datetime.now()
@@ -97,18 +144,71 @@ class PipetteInterface(TaskInterface):
         #         print('No calibration file found, need to calibrate before usage!')
 
 
-        self.cleaning_bath_position = None
         self.contact_position = None
-        self.rinsing_bath_position = None
         self.paramecium_tank_position = None
         self.timer_t0 = time.time()
-        self.pos_before_raise = None
-        self.home_position = None
-        self.home_stage_position = None
-        self.safe_position = None
-        self.safe_stage_position = None
-        self.tare_pipette = np.array([None, None, None])
         self.tare_stage = np.array([None, None, None])
+
+    # ------------------------------------------------------------------
+    # Active pipette
+    # ------------------------------------------------------------------
+    @property
+    def calibrated_unit(self):
+        """The active pipette's CalibratedUnit."""
+        return self.calibrated_units[self.active_pipette]
+
+    @property
+    def primary_calibrated_unit(self):
+        return self.calibrated_units[self.primary_pipette]
+
+    @property
+    def pos_before_raise(self):
+        return self._pos_before_raise[self.active_pipette]
+
+    @pos_before_raise.setter
+    def pos_before_raise(self, value):
+        self._pos_before_raise[self.active_pipette] = value
+
+    @property
+    def tare_pipette(self):
+        """Active pipette's display tare (raw manipulator XYZ, entries may be None)."""
+        return self._tare_pipettes[self.active_pipette]
+
+    @tare_pipette.setter
+    def tare_pipette(self, value):
+        self._tare_pipettes[self.active_pipette] = value
+
+    def is_busy(self):
+        return self._current_controller is not None or any(check() for check in self.busy_checks)
+
+    @command(category='Manipulators',
+             description='Select the pipette that commands act on')
+    def set_active_pipette(self, pipette_key):
+        if pipette_key not in self.calibrated_units:
+            raise KeyError(f"Unknown pipette {pipette_key!r}; known: {list(self.calibrated_units)}")
+        if pipette_key != self.active_pipette:
+            if self.is_busy():
+                self.active_pipette_changed.emit(self.active_pipette)
+                raise RuntimeError("Wait for the current task to finish before switching pipettes.")
+            self.active_pipette = pipette_key
+            # Observer caches the unit it was built with.
+            self.observer = Observer(self)
+            self.info(f"Active pipette: {pipette_key}")
+        self.active_pipette_changed.emit(self.active_pipette)
+
+    def saved_positions(self, pipette_key=None):
+        """Copy of one pipette's saved positions (default: the active pipette)."""
+        key = self.active_pipette if pipette_key is None else pipette_key
+        return dict(self._saved_positions[key])
+
+    def _home_anchor(self, pipette_key):
+        """Tip at the image centre when pipette and stage are at home (or None)."""
+        positions = self._saved_positions[pipette_key]
+        home, home_stage = positions["home"], positions["home_stage"]
+        if home is None or home_stage is None:
+            return None
+        centre = np.array([self.camera.width / 2., self.camera.height / 2.])
+        return centre, np.asarray(home, dtype=float), np.asarray(home_stage, dtype=float)[:2]
 
     def get_pipette_positions(self):
         """Return current XYZ positions for every selected pipette."""
@@ -151,28 +251,51 @@ class PipetteInterface(TaskInterface):
     def write_calibration(self):
         if not self.calibrated_stage.calibrated:
             raise RuntimeError('Stage not calibrated')
-        if not self.calibrated_unit.calibrated:
-            raise RuntimeError('Manipulator not calibrated')
 
         floor_z = self.microscope.floor_Z
         if floor_z is not None:
             if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
                 raise ValueError('Cell floor must be a finite coordinate or unset')
             floor_z = float(floor_z)
-        
-        # concatenate home position and home stage position
-        if self.home_position is None or self.home_stage_position is None:
-            raise RuntimeError('Home position not set')   
-        if self.safe_position is None or self.safe_stage_position is None:
-            raise RuntimeError('Safe position not set')
-        
-        self.home_position = np.array(self.home_position)
-        self.home_stage_position = np.array(self.home_stage_position)   
-        self.safe_position = np.array(self.safe_position)
-        self.safe_stage_position = np.array(self.safe_stage_position)
-        self.home = np.concatenate((self.home_position, self.home_stage_position))
-        self.safe = np.concatenate((self.safe_position, self.safe_stage_position))
-    
+
+        # Every calibrated pipette with home and safe positions is saved;
+        # pipettes loaded from file but not selected now are carried over.
+        pipettes = dict(self._loaded_pipette_calibrations)
+        missing = {}
+        for key, unit in self.calibrated_units.items():
+            positions = self._saved_positions[key]
+            if not unit.calibrated:
+                missing[key] = 'Manipulator not calibrated'
+            elif positions['home'] is None or positions['home_stage'] is None:
+                missing[key] = 'Home position not set'
+            elif positions['safe'] is None or positions['safe_stage'] is None:
+                missing[key] = 'Safe position not set'
+            else:
+                pipettes[key] = {
+                    'manip': unit.save_configuration(),
+                    'home': np.concatenate((np.asarray(positions['home'], dtype=float),
+                                            np.asarray(positions['home_stage'], dtype=float))),
+                    'safe': np.concatenate((np.asarray(positions['safe'], dtype=float),
+                                            np.asarray(positions['safe_stage'], dtype=float))),
+                    'bath': (None if positions['bath'] is None
+                             else np.asarray(positions['bath'], dtype=float)),
+                }
+        if self.active_pipette in missing:
+            raise RuntimeError(f'{missing[self.active_pipette]} ({self.active_pipette})')
+        for key, reason in missing.items():
+            self.warning(f'{key} not saved to the calibration file: {reason}')
+
+        record = {
+            'version': 2,
+            'pipettes': pipettes,
+            'stage': self.calibrated_stage.save_configuration(),
+            'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
+            'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        }
+        # Legacy single-pipette keys (manip/home/safe/bath) = the primary
+        # pipette, or the first saved one, so older readers still work.
+        record.update(pipettes.get(self.primary_pipette) or next(iter(pipettes.values())))
+
         try:
             # Build the complete file path for 'calibration.pickle'
             file_path = os.path.join(self.folder_path, 'calibration.pickle')
@@ -180,101 +303,123 @@ class PipetteInterface(TaskInterface):
                 os.makedirs(self.folder_path, exist_ok=True)
                 self.folder_created = True
 
-            
             # Write calibration data to the file in the specified folder
             with open(file_path, 'wb') as f:
-                pickle.dump({
-                    'manip': self.calibrated_unit.save_configuration(),
-                    'stage': self.calibrated_stage.save_configuration(),
-                    'home': self.home,
-                    'safe': self.safe,
-                    'bath': self.cleaning_bath_position,
-                    'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
-                    'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-                }, f)
-            self.info('Calibration written to file')
+                pickle.dump(record, f)
+            self.info(f'Calibration written to file for {", ".join(pipettes)}')
         except Exception as e:
             self.error(f'Error writing calibration to file: {e}')
             raise
+
+    @staticmethod
+    def _validated_matrix(config, expected_shape, name):
+        # Validate calibrated formats, not the stage's temporary 3x2 startup matrix.
+        matrix = np.asarray(config['M'], dtype=float)
+        if matrix.shape != expected_shape or not np.isfinite(matrix).all():
+            raise ValueError(
+                f'Saved {name} calibration matrix must be finite with shape '
+                f'{expected_shape}; got {matrix.shape}')
+        config = dict(config)
+        config['M'] = matrix
+        return config
+
+    @staticmethod
+    def _validated_pipette_entry(entry, key):
+        home = np.asarray(entry['home'], dtype=float).reshape(-1)
+        safe = np.asarray(entry['safe'], dtype=float).reshape(-1)
+        if home.shape != (6,) or safe.shape != (6,) or not np.isfinite(np.r_[home, safe]).all():
+            raise ValueError(f'Saved home and safe anchors of {key} must each contain six finite coordinates')
+        bath = entry.get('bath')
+        if bath is not None:
+            bath = np.asarray(bath, dtype=float)
+            if bath.shape != (3,) or not np.isfinite(bath).all():
+                raise ValueError(f'Saved bath position of {key} must contain three finite coordinates')
+        manip = PipetteInterface._validated_matrix(entry['manip'], (3, 3), f'{key} manip')
+        return dict(manip=manip, home=home, safe=safe, bath=bath)
 
     @command(category='Manipulators',
                 description='read most recent calibration from file')
     def read_calibration(self, config_filename='calibration.pickle'):
         '''
         Read calibration from file.
+
+        Version-2 files hold one entry per pipette; older files hold one
+        pipette, which is loaded as the primary pipette. Returns the keys of
+        the pipettes that were loaded.
         '''
-        if os.path.isfile(config_filename):
-            with open(config_filename, 'rb') as f:
-                cal = pickle.load(f)
-                floor_z = cal.get('floor_Z')
-                if floor_z is not None:
-                    if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
-                        raise ValueError('Saved cell floor must be a finite coordinate or unset')
-                    floor_z = float(floor_z)
-                home = np.asarray(cal['home'], dtype=float).reshape(-1)
-                safe = np.asarray(cal['safe'], dtype=float).reshape(-1)
-                if home.shape != (6,) or safe.shape != (6,) or not np.isfinite(np.r_[home, safe]).all():
-                    raise ValueError('Saved home and safe anchors must each contain six finite coordinates')
-                if floor_z is None:
-                    # Home contains pipette XYZ followed by stage XYZ, all in micrometres.
-                    delta = self.calibration_config.home_position_delta_um
-                    if isinstance(delta, bool) or not isinstance(delta, Real) or not math.isfinite(delta):
-                        raise ValueError('Home position offset must be finite')
-                    floor_z = float(home[5]) - float(delta)
-                    if not math.isfinite(floor_z):
-                        raise ValueError('Inferred cell floor must be finite')
-                # Validate calibrated formats, not the stage's temporary 3x2 startup matrix.
-                for key, expected_shape in (('manip', (3, 3)), ('stage', (2, 2))):
-                    matrix = np.asarray(cal[key]['M'], dtype=float)
-                    if matrix.shape != expected_shape or not np.isfinite(matrix).all():
-                        raise ValueError(
-                            f'Saved {key} calibration matrix must be finite with shape '
-                            f'{expected_shape}; got {matrix.shape}')
-                    cal[key]['M'] = matrix
-                bath = cal.get('bath')
-                if bath is not None:
-                    bath = np.asarray(bath, dtype=float)
-                    if bath.shape != (3,) or not np.isfinite(bath).all():
-                        raise ValueError('Saved bath position must contain three finite coordinates')
-                self.calibrated_unit.load_configuration(cal['manip'])
-                self.calibrated_stage.load_configuration(cal['stage'])
-                self.calibrated_unit._tip_reference = None
-                self.calibrated_unit._trusted_tip_reference = None
-                self.home_position = home[:3].copy()
-                self.home_stage_position = home[3:].copy()
-                self.safe_position = safe[:3].copy()
-                self.safe_stage_position = safe[3:].copy()
-                self.cleaning_bath_position = bath
-                self.microscope.floor_Z = floor_z
-
-                source_saved_at = cal.get('saved_at')
-                try:
-                    if not isinstance(source_saved_at, str):
-                        source_saved_at = None
-                    else:
-                        datetime.fromisoformat(source_saved_at)
-                except ValueError:
-                    source_saved_at = None
-                source_file = os.path.abspath(config_filename)
-                self.loaded_calibration_reference = {
-                    'source_file': source_file,
-                    'source_saved_at': source_saved_at,
-                    'source_session': os.path.basename(os.path.dirname(source_file)),
-                    'reloaded_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-                }
-                self.info(
-                    f"Calibration reloaded from {source_file}; "
-                    f"file saved at: {source_saved_at or 'unknown'}; "
-                    f"source session folder: {self.loaded_calibration_reference['source_session']}; "
-                    f"reloaded at: {self.loaded_calibration_reference['reloaded_at']}")
-
-                print('Loaded calibration from file!')
-                print('Manipulator calibration:')
-                print(cal['manip'])
-                print('Stage calibration:')
-                print(cal['stage'])
-        else:
+        if not os.path.isfile(config_filename):
             raise RuntimeError('No calibration file found, need to calibrate before usage!')
+        with open(config_filename, 'rb') as f:
+            cal = pickle.load(f)
+
+        # ---- validate everything before changing any state ----
+        floor_z = cal.get('floor_Z')
+        if floor_z is not None:
+            if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
+                raise ValueError('Saved cell floor must be a finite coordinate or unset')
+            floor_z = float(floor_z)
+        raw_entries = cal.get('pipettes') or {self.primary_pipette: cal}
+        entries = {key: self._validated_pipette_entry(entry, key)
+                   for key, entry in raw_entries.items()}
+        stage_config = self._validated_matrix(cal['stage'], (2, 2), 'stage')
+        if floor_z is None:
+            # Home contains pipette XYZ followed by stage XYZ, all in micrometres.
+            reference = entries.get(self.primary_pipette) or next(iter(entries.values()))
+            delta = self.calibration_config.home_position_delta_um
+            if isinstance(delta, bool) or not isinstance(delta, Real) or not math.isfinite(delta):
+                raise ValueError('Home position offset must be finite')
+            floor_z = float(reference['home'][5]) - float(delta)
+            if not math.isfinite(floor_z):
+                raise ValueError('Inferred cell floor must be finite')
+
+        # ---- apply ----
+        self.calibrated_stage.load_configuration(stage_config)
+        self.microscope.floor_Z = floor_z
+        loaded = []
+        self._loaded_pipette_calibrations = {}
+        for key, entry in entries.items():
+            unit = self.calibrated_units.get(key)
+            if unit is None:
+                # Not selected this session: keep it so the next write keeps it.
+                self._loaded_pipette_calibrations[key] = raw_entries[key]
+                continue
+            unit.load_configuration(entry['manip'])
+            unit._tip_reference = None
+            unit._trusted_tip_reference = None
+            positions = self._saved_positions[key]
+            positions['home'] = entry['home'][:3].copy()
+            positions['home_stage'] = entry['home'][3:].copy()
+            positions['safe'] = entry['safe'][:3].copy()
+            positions['safe_stage'] = entry['safe'][3:].copy()
+            positions['bath'] = entry['bath']
+            loaded.append(key)
+        not_loaded = [key for key in self.calibrated_units if key not in entries]
+        if not_loaded:
+            self.warning(f'Calibration file has no entry for {", ".join(not_loaded)}; '
+                         f'calibrate before using {"it" if len(not_loaded) == 1 else "them"}')
+
+        source_saved_at = cal.get('saved_at')
+        try:
+            if not isinstance(source_saved_at, str):
+                source_saved_at = None
+            else:
+                datetime.fromisoformat(source_saved_at)
+        except ValueError:
+            source_saved_at = None
+        source_file = os.path.abspath(config_filename)
+        self.loaded_calibration_reference = {
+            'source_file': source_file,
+            'source_saved_at': source_saved_at,
+            'source_session': os.path.basename(os.path.dirname(source_file)),
+            'reloaded_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'pipettes': list(loaded),
+        }
+        self.info(
+            f"Calibration reloaded from {source_file} for {', '.join(loaded) or 'no selected pipette'}; "
+            f"file saved at: {source_saved_at or 'unknown'}; "
+            f"source session folder: {self.loaded_calibration_reference['source_session']}; "
+            f"reloaded at: {self.loaded_calibration_reference['reloaded_at']}")
+        return loaded
 
     @command(category='Manipulators',
              description='write the current tared position to file',
@@ -289,17 +434,20 @@ class PipetteInterface(TaskInterface):
                 os.makedirs(self.folder_path, exist_ok=True)
                 self.folder_created = True
 
-            # Write tare data to the file in the specified folder
+            # Write tare data to the file in the specified folder.
+            # 'pipette' is the active pipette's tare (what the GUI restores);
+            # 'pipettes' holds every pipette's.
             with open(file_path, 'wb') as f:
                 pickle.dump({
                     'pipette': self.tare_pipette,
+                    'pipettes': dict(self._tare_pipettes),
                     'stage': self.tare_stage,
                 }, f)
             self.info('Tare position written to file')
         except Exception as e:
             self.error(f'Error writing tare position to file: {e}')
             raise
-    
+
     @command(category='Manipulators',
                 description='recalibrate manipulator offset while preserving matrix')
     def recalibrate_manipulator(self):
@@ -367,7 +515,29 @@ class PipetteInterface(TaskInterface):
                       description='Calibrate manipulator',
                       task_description='Calibrating manipulator')
     def calibrate_manipulator(self):
+        self._warn_other_tips_in_view()
         self.execute([self.calibrated_unit.calibrate_pipette])
+
+    def _warn_other_tips_in_view(self):
+        """Calibration detects one tip with no expected position, so another
+        pipette in the field of view can be picked up instead."""
+        for key, unit in self.calibrated_units.items():
+            if key == self.active_pipette:
+                continue
+            if not unit.calibrated:
+                self.warning(f'Calibrating {self.active_pipette}: make sure {key} is out of view '
+                             f'(its position is unknown).')
+                continue
+            try:
+                anchor = (getattr(unit, '_tip_reference', None)
+                          or getattr(unit, '_trusted_tip_reference', None)
+                          or self._home_anchor(key))
+                x, y = unit.reference_position(anchor=anchor)[:2]
+            except Exception:
+                continue
+            if 0 <= x < self.camera.width and 0 <= y < self.camera.height:
+                self.warning(f'Calibrating {self.active_pipette}: {key} looks to be in view '
+                             f'(~{x:.0f}, {y:.0f} px); move it out of view first.')
 
     @blocking_command(category='Manipulators',
                       description='Detect the pipette',

@@ -7,3 +7,4 @@ automatic patch clamp experiment.
 from .base import *
 from .patch import *
 from .multi_patch import *
+from .collision import *

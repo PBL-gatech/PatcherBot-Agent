@@ -121,6 +121,9 @@ def main():
     graphs = EPhysGraph(pipette_graph_interfaces, recording_state_manager)
     # graphs.location_on_the_screen()
     graphs.show()
+    # Selecting the active pipette also points the live window's bottom bar
+    # at it (one way: the bar's own picker doesn't change the active pipette).
+    pipette_controller.active_pipette_changed.connect(graphs.select_pipette_key)
 
     # One window per protocol showing every pipette (pipette 0 blue,
     # pipette 1 orange); data files are still written per pipette.
