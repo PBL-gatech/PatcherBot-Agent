@@ -32,7 +32,7 @@ import inspect
 from typing import Any, Dict, List, Tuple
 import yaml
 
-from patcherbot.utils.pipette_keys import pipette_key_for
+from patcherbot.utils.multipipette_helper import pipette_key_for
 
 LOGGER = logging.getLogger(__name__)
 

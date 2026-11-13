@@ -1,11 +1,8 @@
 import collections
-import contextlib
 import csv
-import functools
 import logging
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -17,145 +14,13 @@ import nidaqmx.constants
 import serial
 
 from patcherbot.controller.base import TaskController
-from patcherbot.utils.pipette_keys import pipette_key_for
+from patcherbot.utils.multipipette_helper import (
+    PER_PIPETTE_FIELDS, MultiPipetteDevice, PipetteDAQView, build_channel_map,
+    enumerated_channels, multi_pipette_protocol, per_pipette, pipette_key_for,
+    takes_pipettes,
+)
 
-__all__ = ['NiDAQ', 'ArduinoDAQ', 'FakeDAQ', 'PipetteChannels', 'PipetteDAQView',
-           'build_channel_map', 'enumerated_channels']
-
-
-# ========================================================
-#  Channel model
-# ========================================================
-@dataclass(frozen=True)
-class PipetteChannels:
-    """Channel names used by one pipette.
-
-    read: analog input carrying the amplifier's command monitor
-    resp: analog input carrying the amplifier's response
-    cmd:  analog output that drives the amplifier's command input
-    """
-    read: str
-    resp: str
-    cmd: str
-
-    @classmethod
-    def from_spec(cls, spec):
-        if isinstance(spec, cls):
-            return spec
-        if not isinstance(spec, dict):
-            raise TypeError(f"Channel spec must be a mapping with read/resp/cmd, got {spec!r}")
-        missing = {"read", "resp", "cmd"} - set(spec)
-        if missing:
-            raise ValueError(f"Channel spec {spec!r} is missing {sorted(missing)}")
-        return cls(read=str(spec["read"]), resp=str(spec["resp"]), cmd=str(spec["cmd"]))
-
-
-def build_channel_map(pipette_keys=None, channels=None, default_channels=None):
-    """Return an ordered ``{pipette_key: PipetteChannels}`` mapping.
-
-    pipette_keys: pipette names in rig order (defaults to ``["pipette_0"]``).
-    channels: optional list of ``{"read", "resp", "cmd"}`` specs, one per pipette.
-    default_channels: ``f(index) -> PipetteChannels`` used when ``channels`` is None.
-    """
-    keys = [str(key) for key in pipette_keys] if pipette_keys else [pipette_key_for(0)]
-    if len(set(keys)) != len(keys):
-        raise ValueError(f"Duplicate pipette keys: {keys}")
-    if channels is not None:
-        specs = list(channels)
-        if len(specs) < len(keys):
-            raise ValueError(
-                f"{len(keys)} pipettes selected but only {len(specs)} channel sets configured"
-            )
-        specs = [PipetteChannels.from_spec(spec) for spec in specs[:len(keys)]]
-    elif default_channels is not None:
-        specs = [default_channels(index) for index in range(len(keys))]
-    else:
-        raise ValueError("Either channels or default_channels must be provided")
-
-    channel_map = collections.OrderedDict(zip(keys, specs))
-    names = [name for spec in specs for name in (spec.read, spec.resp, spec.cmd)]
-    duplicates = sorted(name for name, count in collections.Counter(names).items() if count > 1)
-    if duplicates:
-        raise ValueError(f"Channels assigned to more than one role/pipette: {duplicates}")
-    return channel_map
-
-
-def enumerated_channels(index):
-    """Default channel names for pipette ``index``: ai{2i} (read), ai{2i+1} (resp), ao{i} (cmd)."""
-    return PipetteChannels(f"ai{2 * index}", f"ai{2 * index + 1}", f"ao{index}")
-
-
-# State the DAQ keeps separately for each pipette. Reading or writing one of
-# these attributes on a DAQ goes to the "active" pipette (see DAQ.for_pipette),
-# so protocol code written for one pipette works unchanged for each pipette.
-_PER_PIPETTE_FIELDS = {
-    "cellMode": False,
-    "totalResistance": None,
-    "latestAccessResistance": None,
-    "latestMembraneResistance": None,
-    "latestMembraneCapacitance": None,
-    "holding_current": None,
-    "holding_voltage": None,
-    "pulses": None,
-    "pulseRange": None,
-    "current_protocol_data": None,
-    "voltage_protocol_data": None,
-    "voltage_command_data": None,
-    "voltage_membrane_test": None,
-    "voltageTotalResistance": None,
-    "voltageMembraneResistance": None,
-    "voltageAccessResistance": None,
-    "voltageMembraneCapacitance": None,
-    "vclamp_steps": None,
-    "vclamp_hold_value": None,
-    "leak_subtraction_data": None,
-    "leak_subtraction_meta": None,
-    "holding_protocol_data": None,
-    "optogenetic_protocol_data": None,
-    "optogenetic_stim_data": None,
-    "optogenetic_protocol_type": None,
-    "optogenetic_pulses": None,
-    "optogenetic_pulseRange": None,
-    "optogenetic_protocol_queue": collections.deque,  # factory: one queue per pipette
-}
-
-
-def _new_pipette_state():
-    return {
-        name: (default() if callable(default) else default)
-        for name, default in _PER_PIPETTE_FIELDS.items()
-    }
-
-
-def multi_pipette_protocol(method):
-    """Protocol that acquires every requested pipette in the same reads.
-
-    The decorated method is written as ``method(self, keys, **kwargs)`` and
-    returns ``{pipette_key: result}``. Callers pass ``pipettes=[...]``
-    (default: the active pipette only). Protocols use the shared hardware one
-    at a time.
-    """
-    @functools.wraps(method)
-    def wrapper(self, *args, pipettes=None, **kwargs):
-        keys = self._resolve_pipettes(pipettes)
-        with self._protocol_lock:
-            return method(self, keys, *args, **kwargs)
-    return wrapper
-
-
-class _PerPipetteAttribute:
-    """Descriptor that stores a DAQ attribute per pipette."""
-
-    def __init__(self, name):
-        self.name = name
-
-    def __get__(self, obj, objtype=None):
-        if obj is None:
-            return self
-        return obj._pipette_state()[self.name]
-
-    def __set__(self, obj, value):
-        obj._pipette_state()[self.name] = value
+__all__ = ['NiDAQ', 'ArduinoDAQ', 'FakeDAQ']
 
 
 class DAQAcquisitionThread(threading.Thread):
@@ -254,11 +119,11 @@ class DAQAcquisitionThread(threading.Thread):
                     }
 
                     # update live attributes even if NaN
-                    state = self.daq._pipette_state(pipette_key)
-                    state["totalResistance"]           = totalR
-                    state["latestMembraneResistance"]  = memR
-                    state["latestAccessResistance"]    = accR
-                    state["latestMembraneCapacitance"] = memC
+                    state = self.daq.pipette_state(pipette_key)
+                    state.totalResistance           = totalR
+                    state.latestMembraneResistance  = memR
+                    state.latestAccessResistance    = accR
+                    state.latestMembraneCapacitance = memC
 
                     if self.callback:
                         self.callback(pipette_key, totalR, accR, memR, memC,
@@ -311,11 +176,16 @@ class DAQAcquisitionThread(threading.Thread):
         """Stop the acquisition thread."""
         self.running = False
 
-class DAQ(TaskController):
+class DAQ(MultiPipetteDevice, TaskController):
     """
     Base DAQ class with common methods for patch-clamp protocols.
     Subclasses must override the _readAnalogInput() and _sendSquareWave()
     methods to handle device-specific operations.
+
+    One DAQ serves every pipette. Which channels and which state belong to
+    a pipette is passed explicitly: protocols take ``pipettes=[...]``,
+    single-pipette methods take ``pipette_key=...`` (None = primary), and
+    state is ``self.pipette_state(key)`` (see multipipette_helper).
     """
     # Class-level constants (may be overwritten by subclasses)
     C_CLAMP_AMP_PER_VOLT = None
@@ -329,21 +199,18 @@ class DAQ(TaskController):
         build_channel_map (which validates it). One DAQ serves every pipette
         on the rig; defaults to a single pipette on ai0/ai1/ao0.
         """
-        super().__init__()
-        # Per-pipette state must exist before any per-pipette attribute is
-        # touched (see _PER_PIPETTE_FIELDS). cellMode, resistances, protocol
-        # results etc. all live here, one dict per pipette.
-        self._pipette_states = {}
-        self._active = threading.local()
+        TaskController.__init__(self)
         if channel_map is None:
             channel_map = build_channel_map(default_channels=enumerated_channels)
         self.channel_map = collections.OrderedDict(channel_map)
-        for key in self.channel_map:
-            self._pipette_state(key)
+        # One PipetteState per pipette: cellMode, resistances, protocol results...
+        MultiPipetteDevice.__init__(self, list(self.channel_map),
+                                    state_fields=PER_PIPETTE_FIELDS)
 
         self._optogenetic_queue_lock = threading.Lock()
         self._deviceLock = threading.Lock()
-        # Protocols use the shared hardware one at a time.
+        # One protocol call at a time; a call may record several pipettes
+        # simultaneously.
         self._protocol_lock = threading.RLock()
         self._pause_evt = threading.Event(); self._pause_evt.set()   # allow run
         self._idle_evt  = threading.Event(); self._idle_evt.set()    # initially idle
@@ -352,19 +219,6 @@ class DAQ(TaskController):
     # --------------------------
     # Channels and pipettes
     # --------------------------
-    @property
-    def pipette_keys(self):
-        return list(self.channel_map)
-
-    @property
-    def primary_pipette_key(self):
-        return next(iter(self.channel_map))
-
-    @property
-    def active_pipette_key(self):
-        """Pipette that per-pipette attributes refer to in the calling thread."""
-        return getattr(self._active, "pipette_key", None) or self.primary_pipette_key
-
     @property
     def ai_channels(self):
         """Every analog input name, in acquisition order (read, resp per pipette)."""
@@ -375,36 +229,25 @@ class DAQ(TaskController):
         """Every analog output name, one command channel per pipette."""
         return [spec.cmd for spec in self.channel_map.values()]
 
-    def channels_for(self, pipette_key=None):
-        """Return the PipetteChannels of one pipette (default: the active one)."""
-        key = self.active_pipette_key if pipette_key is None else pipette_key
+    def channels_for(self, pipette_key):
+        """Return the PipetteChannels of one pipette."""
         try:
-            return self.channel_map[key]
+            return self.channel_map[pipette_key]
         except KeyError:
-            raise KeyError(f"No DAQ channels configured for pipette {key!r}; "
+            raise KeyError(f"No DAQ channels configured for pipette {pipette_key!r}; "
                            f"known pipettes: {self.pipette_keys}") from None
 
-    @contextlib.contextmanager
     def for_pipette(self, pipette_key):
-        """Make ``pipette_key`` the active pipette for this thread.
+        """One pipette's handle on this DAQ (a PipetteDAQView).
 
-        Per-pipette attributes (cellMode, totalResistance, protocol results…)
-        read and write that pipette's state inside the block.
+        A DAQ wired for fewer pipettes than were selected shares its first
+        channel set with the extra pipettes (with a warning).
         """
-        self.channels_for(pipette_key)              # validate
-        previous = getattr(self._active, "pipette_key", None)
-        self._active.pipette_key = pipette_key
-        try:
-            yield pipette_key
-        finally:
-            self._active.pipette_key = previous
-
-    def _pipette_state(self, pipette_key=None):
-        key = self.active_pipette_key if pipette_key is None else pipette_key
-        state = self._pipette_states.get(key)
-        if state is None:
-            state = self._pipette_states.setdefault(key, _new_pipette_state())
-        return state
+        if pipette_key not in self.channel_map:
+            shared = self.primary_pipette_key
+            self.warning(f"DAQ has no channels for {pipette_key}; it will share {shared}'s channels")
+            pipette_key = shared
+        return PipetteDAQView(self, pipette_key)
 
     def _resolve_channels(self, channels=None):
         """Normalize a ``channels`` argument to a list of AI channel names.
@@ -419,16 +262,6 @@ class DAQ(TaskController):
         if unknown:
             raise ValueError(f"Unknown analog input channel(s) {unknown}; configured: {available}")
         return names
-
-    def _resolve_pipettes(self, pipettes=None):
-        """Normalize a ``pipettes`` argument to a validated list of pipette keys
-        (duplicates dropped, order kept). None means the active pipette only."""
-        if pipettes is None:
-            return [self.active_pipette_key]
-        keys = [pipettes] if isinstance(pipettes, str) else list(dict.fromkeys(pipettes))
-        for key in keys:
-            self.channels_for(key)
-        return keys
 
     @staticmethod
     def _rows_to_channel_dict(raw, channel_names):
@@ -452,12 +285,15 @@ class DAQ(TaskController):
             channels=[name for spec in specs for name in (spec.read, spec.resp)])
         return {key: (data[spec.read], data[spec.resp]) for key, spec in zip(keys, specs)}
 
-    def setCellMode(self, mode: bool) -> None:
-        self.cellMode = mode
-        self.info(f"Setting cell mode to {mode} ({self.active_pipette_key})")
+    @per_pipette
+    def setCellMode(self, mode: bool, pipette_key=None) -> None:
+        state = self.pipette_state(pipette_key)
+        state.cellMode = mode
+        self.info(f"Setting cell mode to {mode} ({pipette_key or self.primary_pipette_key})")
 
-    def getCellMode(self) -> bool:
-        return self.cellMode
+    @per_pipette
+    def getCellMode(self, pipette_key=None) -> bool:
+        return self.pipette_state(pipette_key).cellMode
 
     def _normalize_optogenetic_protocol_key(self, protocol_type):
         if protocol_type is None:
@@ -468,12 +304,14 @@ class DAQ(TaskController):
         text = str(protocol_type).strip().lower()
         return text if text else "unknown"
 
-    def pop_optogenetic_entry(self, protocol_key):
+    @per_pipette
+    def pop_optogenetic_entry(self, protocol_key, pipette_key=None):
         key = self._normalize_optogenetic_protocol_key(protocol_key)
+        queue = self.pipette_state(pipette_key).optogenetic_protocol_queue
         with self._optogenetic_queue_lock:
-            for entry in self.optogenetic_protocol_queue:
+            for entry in queue:
                 if entry.get("protocol_key") == key:
-                    self.optogenetic_protocol_queue.remove(entry)
+                    queue.remove(entry)
                     return entry
         return None
     # --------------------------
@@ -505,10 +343,11 @@ class DAQ(TaskController):
             )
             self._daq_acq_thread.start()
 
+    @per_pipette
     def get_last_acquisition(self, pipette_key=None):
         """
         Retrieve the most recent live test-pulse packet for one pipette
-        (default: the active pipette). The packet has keys:
+        (default: the primary pipette). The packet has keys:
           "timeData", "respData", "readData", "totalResistance",
           "membraneResistance", "accessResistance", "membraneCapacitance"
         Returns None if no data is available yet.
@@ -516,7 +355,7 @@ class DAQ(TaskController):
         thread = getattr(self, "_daq_acq_thread", None)
         if not thread:
             return None
-        key = self.active_pipette_key if pipette_key is None else pipette_key
+        key = self.primary_pipette_key if pipette_key is None else pipette_key
         return thread.get_last_data(key)
 
     def get_last_acquisition_all(self):
@@ -524,16 +363,18 @@ class DAQ(TaskController):
         thread = getattr(self, "_daq_acq_thread", None)
         return thread.get_last_data() if thread else None
 
+    @per_pipette
     def compute_noise_metrics(self, timeData=None, respData=None,
                               window_start=0.004, window_end=0.010,
-                              avg_p2p_window=0.001):
+                              avg_p2p_window=0.001, pipette_key=None):
         """
         Compute noise metrics from response data within a time window.
         Returns a dict with windowed data, p2p, std, avg_p2p, and FFT results,
-        or None if inputs are insufficient.
+        or None if inputs are insufficient. Missing data comes from
+        ``pipette_key``'s latest live packet.
         """
         if timeData is None or respData is None:
-            last = self.get_last_acquisition()
+            last = self.get_last_acquisition(pipette_key)
             if last is None:
                 return None
             if timeData is None:
@@ -642,6 +483,7 @@ class DAQ(TaskController):
             self._restartAcquisition()              # subclass implementation
             self._pause_evt.set()                   # let the thread continue
     
+    @takes_pipettes
     def getDataFromSquareWave(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime,
                               pipettes=None):
         """
@@ -650,21 +492,20 @@ class DAQ(TaskController):
         process each pipette.
 
         Returns ``{pipette_key: (time/resp, time/read, totalR, memR, accR, memC)}``.
-        ``pipettes`` defaults to the active pipette only.
+        ``pipettes`` defaults to the primary pipette only.
         """
-        keys = self._resolve_pipettes(pipettes)
+        keys = self.resolve_pipettes(pipettes)
         with self._deviceLock:
             # Device-specific wrappers (implemented in subclasses)
             self._sendSquareWave(wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime)
             traces = self._read_pipettes(keys, samplesPerSec, recordingTime)
 
-        results = {}
-        for key, (read, resp) in traces.items():
-            # cellMode and conversions are per pipette
-            with self.for_pipette(key):
-                results[key] = self._squareWaveProcessor(
-                    np.vstack([read, resp]), samplesPerSec, amplitude, sweep_clip=None)
-        return results
+        # cellMode and conversions are per pipette
+        return {
+            key: self._squareWaveProcessor(np.vstack([read, resp]), samplesPerSec, amplitude,
+                                           sweep_clip=None, pipette_key=key)
+            for key, (read, resp) in traces.items()
+        }
       
     # --------------------------
     # ABSTRACT (DEVICE-SPECIFIC)
@@ -749,7 +590,7 @@ class DAQ(TaskController):
         tasks keep streaming. Returns ``{key: mean capacitance (pF) or None}``.
         """
         for key in keys:
-            self._pipette_state(key)["voltage_membrane_test"] = None
+            self.pipette_state(key).voltage_membrane_test = None
         capacitances = {key: [] for key in keys}
         first_good = {}
         first_any = {}
@@ -786,31 +627,32 @@ class DAQ(TaskController):
             if len(capacitances[key]) < 5:
                 self.warning(f"Voltage protocol ({key}): {len(capacitances[key])} acceptable "
                              f"traces (expected 5) within {attempts} attempts")
-            with self.for_pipette(key):
-                # Show the first acceptable trace; fall back to the first one.
-                results[key] = self._store_membrane_test(
-                    first_good.get(key, first_any.get(key)), capacitances[key],
-                    membrane_hold, amplitude)
+            # Show the first acceptable trace; fall back to the first one.
+            results[key] = self._store_membrane_test(
+                key, first_good.get(key, first_any.get(key)), capacitances[key],
+                membrane_hold, amplitude)
         return results
 
     def _membrane_step_mV(self, command, amplitude):
         """Size of the membrane-test command step, in mV."""
         return float(amplitude * self.V_CLAMP_VOLT_PER_VOLT * 1e3)
 
-    def _store_membrane_test(self, first_result, capacitances, membrane_hold, amplitude):
-        """Store one pipette's membrane-test results (active pipette)."""
+    def _store_membrane_test(self, pipette_key, first_result, capacitances, membrane_hold,
+                             amplitude):
+        """Store one pipette's membrane-test results in its state."""
+        state = self.pipette_state(pipette_key)
         if first_result is None:
-            self.voltageMembraneCapacitance = None
+            state.voltageMembraneCapacitance = None
             return None
 
-        (self.voltage_protocol_data,
-         self.voltage_command_data,
-         self.voltageTotalResistance,
-         self.voltageMembraneResistance,
-         self.voltageAccessResistance,
+        (state.voltage_protocol_data,
+         state.voltage_command_data,
+         state.voltageTotalResistance,
+         state.voltageMembraneResistance,
+         state.voltageAccessResistance,
          _) = first_result
         protocol_data, command_data = first_result[:2]
-        self.voltage_membrane_test = {
+        state.voltage_membrane_test = {
             "time": protocol_data[0].copy(),
             "response": protocol_data[1].copy(),
             "command": command_data[1].copy(),
@@ -821,17 +663,17 @@ class DAQ(TaskController):
             # first (unfit) trace, shown so the window isn't empty.
             "fit_ok": bool(capacitances),
         }
-        self.voltageMembraneCapacitance = (
+        state.voltageMembraneCapacitance = (
             float(np.mean(capacitances)) if capacitances else None
         )
-        self.latestMembraneCapacitance = self.voltageMembraneCapacitance
-        if self.voltageTotalResistance is not None:
-            self.totalResistance = self.voltageTotalResistance
-        if self.voltageMembraneResistance is not None:
-            self.latestMembraneResistance = self.voltageMembraneResistance
-        if self.voltageAccessResistance is not None:
-            self.latestAccessResistance = self.voltageAccessResistance
-        return self.voltageMembraneCapacitance
+        state.latestMembraneCapacitance = state.voltageMembraneCapacitance
+        if state.voltageTotalResistance is not None:
+            state.totalResistance = state.voltageTotalResistance
+        if state.voltageMembraneResistance is not None:
+            state.latestMembraneResistance = state.voltageMembraneResistance
+        if state.voltageAccessResistance is not None:
+            state.latestAccessResistance = state.voltageAccessResistance
+        return state.voltageMembraneCapacitance
 
     def getVoltageClampSweep(self, *args, **kwargs):
         """Run the voltage-step protocol (V-clamp).
@@ -977,10 +819,12 @@ class DAQ(TaskController):
         return wave, rate, wave.size
 
 
-    def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude,sweep_clip=None):
+    def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude, sweep_clip=None,
+                             pipette_key=None):
         """
         Cut out the pulse, convert units, compute R & C.
-        Identical to our previous implementation, unchanged.
+        ``pipette_key`` selects whose cell mode (bath/cell) to use and whose
+        holding current to update. Otherwise unchanged.
         """
         read = raw_data[0]
         resp = raw_data[1]
@@ -1004,9 +848,9 @@ class DAQ(TaskController):
         cd = read[idx0:idx1] * self.V_CLAMP_VOLT_PER_VOLT
 
 
-        if self.getCellMode():
+        if self.getCellMode(pipette_key):
             accR, memR, memC = self._getParamsfromCurrent(
-                cd, rd, td, amplitude * self.V_CLAMP_VOLT_PER_VOLT
+                cd, rd, td, amplitude * self.V_CLAMP_VOLT_PER_VOLT, pipette_key=pipette_key
             )
             totalR = None
             if accR is not None and memR is not None:
@@ -1025,26 +869,29 @@ class DAQ(TaskController):
                 accR,
                 memC)
 
-    def capacitance(self):
+    @per_pipette
+    def capacitance(self, pipette_key=None):
         """
         Returns the latest membrane capacitance measurement.
         If no measurement is available, returns None.
         """
-        return self.latestMembraneCapacitance
+        return self.pipette_state(pipette_key).latestMembraneCapacitance
 
-    def resistance(self):
+    @per_pipette
+    def resistance(self, pipette_key=None):
         """
         Returns the latest total resistance measurement.
         If no measurement is available, returns None.
         """
-        return self.totalResistance
-    
-    def accessResistance(self):
+        return self.pipette_state(pipette_key).totalResistance
+
+    @per_pipette
+    def accessResistance(self, pipette_key=None):
         """
         Returns the latest access resistance measurement.
         If no measurement is available, returns None.
         """
-        return self.latestAccessResistance
+        return self.pipette_state(pipette_key).latestAccessResistance
 
     def _getResistancefromCurrent(self, data, cmdVoltage) -> float | None:
         try:
@@ -1173,7 +1020,8 @@ class DAQ(TaskController):
         return m_fit_nA * 1e3, t_fit, b_fit_nA * 1e3   # back to pA
 
 
-    def _getParamsfromCurrent(self, readData, respData, timeData, amplitude) -> tuple:
+    def _getParamsfromCurrent(self, readData, respData, timeData, amplitude,
+                              pipette_key=None) -> tuple:
         """
         Calculate access resistance, membrane resistance, and membrane capacitance
         from the response of a voltage protocol using NumPy arrays instead of pandas.
@@ -1190,7 +1038,7 @@ class DAQ(TaskController):
                 # Use the numpy-based filter_data function.
                 filtered_data, filtered_time, filtered_command, plot_params, I_prev_pA, I_post_pA = \
                     self.filter_data(T_ms, X_mV, Y_pA)
-                self.holding_current = I_prev_pA
+                self.pipette_state(pipette_key).holding_current = I_prev_pA
                 peak_time, peak_index, negative_peak_time, negative_peak_index = plot_params
                 if peak_index + 1 < len(Y_pA):
                     I_peak_pA = Y_pA[peak_index + 1]
@@ -1226,58 +1074,6 @@ class DAQ(TaskController):
         R_m_MOhms = (((mean_voltage * 1e-3) - R_a_MOhms * 1e6 * I_dss * 1e-12) / (I_dss * 1e-12)) * 1e-6
         C_m_pF = (tau * 1e-3) / (1 / (1 / (R_a_MOhms * 1e6) + 1 / (R_m_MOhms * 1e6))) * 1e12
         return R_a_MOhms, R_m_MOhms, C_m_pF
-
-# Per-pipette attributes are descriptors on DAQ so every subclass (NiDAQ,
-# FakeDAQ, ArduinoDAQ) stores them per pipette without code changes.
-for _field_name in _PER_PIPETTE_FIELDS:
-    setattr(DAQ, _field_name, _PerPipetteAttribute(_field_name))
-del _field_name
-
-
-class PipetteDAQView:
-    """One pipette's handle on the single shared DAQ.
-
-    Holds a reference (never a copy). Every call made through the view runs
-    with this pipette active, so ``view.resistance()``,
-    ``view.current_protocol_data``, ``view.setCellMode(...)`` and protocol
-    calls all use this pipette's channels and state. A protocol called through
-    a view covers only this pipette; call the DAQ itself with
-    ``pipettes=[...]`` to acquire several pipettes together.
-    """
-
-    def __init__(self, daq, pipette_key):
-        daq.channels_for(pipette_key)       # validate
-        object.__setattr__(self, "daq", daq)
-        object.__setattr__(self, "pipette_key", pipette_key)
-
-    def __getattr__(self, name):
-        daq = self.daq
-        if name in _PER_PIPETTE_FIELDS:
-            return daq._pipette_state(self.pipette_key)[name]
-        value = getattr(daq, name)
-        if not callable(value):
-            return value
-        key = self.pipette_key
-
-        def call_for_pipette(*args, **kwargs):
-            with daq.for_pipette(key):
-                return value(*args, **kwargs)
-
-        call_for_pipette.__name__ = name
-        # TaskInterface.execute() runs only methods of a TaskController and
-        # finds the owner through __self__, so expose the shared DAQ.
-        call_for_pipette.__self__ = daq
-        return call_for_pipette
-
-    def __setattr__(self, name, value):
-        if name in _PER_PIPETTE_FIELDS:
-            self.daq._pipette_state(self.pipette_key)[name] = value
-        else:
-            setattr(self.daq, name, value)
-
-    def __repr__(self):
-        return f"PipetteDAQView({type(self.daq).__name__}, {self.pipette_key!r})"
-
 
 # ========================================================
 #  NI-DAQ Subclass
@@ -1931,9 +1727,9 @@ class NiDAQ(DAQ):
         }
         if not leak_plan:
             for key in keys:
-                with self.for_pipette(key):
-                    self.leak_subtraction_data = []
-                    self.leak_subtraction_meta = dict(meta)
+                state = self.pipette_state(key)
+                state.leak_subtraction_data = []
+                state.leak_subtraction_meta = dict(meta)
             return {key: [] for key in keys}
 
         self.pause_acquisition()
@@ -1991,8 +1787,7 @@ class NiDAQ(DAQ):
                 trains = self._read_train(exp_samples)   # every pipette, one read
                 time_vec = np.linspace(0, total_duration, exp_samples, dtype=float)
                 for key, raw in trains.items():
-                    with self.for_pipette(key):
-                        self._squareWaveProcessor(raw, samplesPerSec, pulse["ao_amplitude"])
+                    self._squareWaveProcessor(raw, samplesPerSec, pulse["ao_amplitude"], pipette_key=key)
                     pulses_by_target[key][pulse["target_index"]].append({
                         "time": time_vec,
                         "response": raw[1] * self.V_CLAMP_VOLT_PER_AMP,
@@ -2024,9 +1819,9 @@ class NiDAQ(DAQ):
                     "leak_step_voltage": leak_step_values[idx],
                     "repeat_count": len(pulses),
                 })
-            with self.for_pipette(key):
-                self.leak_subtraction_data = leak_results
-                self.leak_subtraction_meta = dict(meta)
+            state = self.pipette_state(key)
+            state.leak_subtraction_data = leak_results
+            state.leak_subtraction_meta = dict(meta)
             results[key] = leak_results
         return results
 
@@ -2117,8 +1912,7 @@ class NiDAQ(DAQ):
                 step_amp_volts = (target - holding_voltage) / self.V_CLAMP_VOLT_PER_VOLT
                 time_vec = np.linspace(0, total_duration, exp_samples, dtype=float)
                 for key, raw in trains.items():
-                    with self.for_pipette(key):
-                        self._squareWaveProcessor(raw, samplesPerSec, step_amp_volts)
+                    self._squareWaveProcessor(raw, samplesPerSec, step_amp_volts, pipette_key=key)
                     sweeps[key].append([time_vec,
                                         raw[1] * self.V_CLAMP_VOLT_PER_AMP,
                                         raw[0] * self.V_CLAMP_VOLT_PER_VOLT])
@@ -2129,22 +1923,23 @@ class NiDAQ(DAQ):
             self.resume_acquisition()
 
         for key in keys:
-            with self.for_pipette(key):
-                self.vclamp_steps = targets
-                self.vclamp_hold_value = holding_voltage
-                self.voltage_protocol_data = sweeps[key]
-                if targets.size and self.voltage_membrane_test is not None:
-                    self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
+            state = self.pipette_state(key)
+            state.vclamp_steps = targets
+            state.vclamp_hold_value = holding_voltage
+            state.voltage_protocol_data = sweeps[key]
+            if targets.size and state.voltage_membrane_test is not None:
+                state.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
         return sweeps
 
-    def _current_pulses(self, custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp):
-        """Current steps (pA) for the active pipette.
+    def _current_pulses(self, pipette_key, custom, startCurrentPicoAmp, endCurrentPicoAmp,
+                        stepCurrentPicoAmp):
+        """Current steps (pA) for ``pipette_key``.
 
         The default (non-custom) range is −2 … +10 pA/pF in 1 pA/pF steps of
         that pipette's own membrane capacitance; raises if it has none.
         """
         if not custom:
-            capacitance = self.voltageMembraneCapacitance
+            capacitance = self.pipette_state(pipette_key).voltageMembraneCapacitance
             if capacitance is None or not np.isfinite(capacitance) or capacitance <= 0:
                 raise RuntimeError("Bad capacitance measurement")
             # Convert to absolute pF, round *down* to the nearest whole pF
@@ -2195,15 +1990,14 @@ class NiDAQ(DAQ):
         # ─ 1. build each pipette's pulse list ───────
         pulses_by_key = {}
         for key in keys:
-            with self.for_pipette(key):
-                try:
-                    pulses_by_key[key] = self._current_pulses(
-                        custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
-                except RuntimeError as exc:
-                    self.error(f"{key}: {exc} (run the voltage protocol first, or use "
-                               "custom current steps); skipping its I-clamp protocol.")
-                    continue
-                self.info(f"{key} I-clamp pulses (pA): {pulses_by_key[key]}")
+            try:
+                pulses_by_key[key] = self._current_pulses(
+                    key, custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
+            except RuntimeError as exc:
+                self.error(f"{key}: {exc} (run the voltage protocol first, or use "
+                           "custom current steps); skipping its I-clamp protocol.")
+                continue
+            self.info(f"{key} I-clamp pulses (pA): {pulses_by_key[key]}")
         active = [key for key in keys if key in pulses_by_key]
         traces = {key: [] for key in active}
 
@@ -2263,11 +2057,11 @@ class NiDAQ(DAQ):
         results = {}
         for key in keys:
             pulses = pulses_by_key.get(key, np.array([], dtype=float))
-            with self.for_pipette(key):
-                self.pulses = pulses
-                self.pulseRange = len(pulses)
-                self.current_protocol_data = traces.get(key, [])
-                results[key] = (self.current_protocol_data, pulses, len(pulses))
+            state = self.pipette_state(key)
+            state.pulses = pulses
+            state.pulseRange = len(pulses)
+            state.current_protocol_data = traces.get(key, [])
+            results[key] = (state.current_protocol_data, pulses, len(pulses))
         return results
 
     @multi_pipette_protocol
@@ -2312,13 +2106,13 @@ class NiDAQ(DAQ):
             results = {}
             for key, rows in self._split_rows(raw, keys).items():
                 # Keep unit conversions consistent with other V-clamp protocol paths.
-                with self.for_pipette(key):
-                    self.holding_protocol_data = np.array([
-                        t,
-                        rows[1] * self.V_CLAMP_VOLT_PER_AMP,
-                        rows[0] * self.V_CLAMP_VOLT_PER_VOLT,
-                    ])
-                    results[key] = self.holding_protocol_data
+                state = self.pipette_state(key)
+                state.holding_protocol_data = np.array([
+                    t,
+                    rows[1] * self.V_CLAMP_VOLT_PER_AMP,
+                    rows[0] * self.V_CLAMP_VOLT_PER_VOLT,
+                ])
+                results[key] = state.holding_protocol_data
             return results
 
         finally:
@@ -2463,21 +2257,21 @@ class NiDAQ(DAQ):
 
             results = {}
             for key in keys:
-                with self.for_pipette(key):
-                    self.optogenetic_protocol_data = aligned_traces[key]
-                    self.optogenetic_stim_data = stim_used
-                    self.optogenetic_protocol_type = protocol_type
-                    self.optogenetic_pulses = list(aligned_pulses)
-                    self.optogenetic_pulseRange = len(aligned_pulses)
-                    with self._optogenetic_queue_lock:
-                        self.optogenetic_protocol_queue.append({
-                            "data": aligned_traces[key],
-                            "pulses": list(aligned_pulses),
-                            "pulse_range": len(aligned_pulses),
-                            "stim_data": stim_used,
-                            "protocol_type": protocol_type,
-                            "protocol_key": protocol_key,
-                        })
+                pstate = self.pipette_state(key)
+                pstate.optogenetic_protocol_data = aligned_traces[key]
+                pstate.optogenetic_stim_data = stim_used
+                pstate.optogenetic_protocol_type = protocol_type
+                pstate.optogenetic_pulses = list(aligned_pulses)
+                pstate.optogenetic_pulseRange = len(aligned_pulses)
+                with self._optogenetic_queue_lock:
+                    pstate.optogenetic_protocol_queue.append({
+                        "data": aligned_traces[key],
+                        "pulses": list(aligned_pulses),
+                        "pulse_range": len(aligned_pulses),
+                        "stim_data": stim_used,
+                        "protocol_type": protocol_type,
+                        "protocol_key": protocol_key,
+                    })
                 results[key] = (aligned_traces[key], stim_used)
             return results
 
@@ -2596,7 +2390,7 @@ class FakeDAQ(DAQ):
             default_channels=enumerated_channels,
         ))
         for key in self.pipette_keys:
-            self._pipette_state(key)["totalResistance"] = 6 * 10 ** 6  # baseline fake resistance
+            self.pipette_state(key).totalResistance = 6 * 10 ** 6  # baseline fake resistance
         self._last_wave_params = None
         self._last_command = None
         self._recorded_traces = self._load_recorded_data(self.default_recorded_data)
@@ -2698,13 +2492,15 @@ class FakeDAQ(DAQ):
         length = min((values.size for values in rows.values()), default=0)
         return {name: values[:length].copy() for name, values in rows.items()}
 
-    def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude, sweep_clip=None):
+    def _squareWaveProcessor(self, raw_data, samplesPerSec, amplitude, sweep_clip=None,
+                             pipette_key=None):
         """Measure the recorded command amplitude before processing the trace."""
         command = np.asarray(raw_data[0], dtype=float)
         if command.size:
             low, high = np.percentile(command, [5, 95])
             amplitude = (high - low) / self.V_CLAMP_VOLT_PER_VOLT
-        return super()._squareWaveProcessor(raw_data, samplesPerSec, amplitude, sweep_clip)
+        return super()._squareWaveProcessor(raw_data, samplesPerSec, amplitude, sweep_clip,
+                                            pipette_key=pipette_key)
 
 
     def _sendSquareWave(self, wave_freq, samplesPerSec, dutyCycle, amplitude, recordingTime):
@@ -2853,17 +2649,17 @@ class FakeDAQ(DAQ):
 
         results = {}
         for key in keys:
-            with self.for_pipette(key):
-                self.leak_subtraction_data = data_by_key[key]
-                self.leak_subtraction_meta = {
-                    "holding_voltage": holding_voltage,
-                    "targets": targets,
-                    "leak_target_voltages": np.asarray(leak_targets, dtype=float),
-                    "leak_step_values": np.asarray(leak_steps, dtype=float),
-                    "repeats": repeats,
-                    "wave_freq": wave_freq,
-                    "pulse_recording_time": pulse_recording_time,
-                }
+            state = self.pipette_state(key)
+            state.leak_subtraction_data = data_by_key[key]
+            state.leak_subtraction_meta = {
+                "holding_voltage": holding_voltage,
+                "targets": targets,
+                "leak_target_voltages": np.asarray(leak_targets, dtype=float),
+                "leak_step_values": np.asarray(leak_steps, dtype=float),
+                "repeats": repeats,
+                "wave_freq": wave_freq,
+                "pulse_recording_time": pulse_recording_time,
+            }
             results[key] = data_by_key[key]
         return results
 
@@ -2893,20 +2689,21 @@ class FakeDAQ(DAQ):
 
         results = {}
         for key in keys:
-            with self.for_pipette(key):
-                self.vclamp_steps = targets
-                self.vclamp_hold_value = holding_voltage
-                self.voltage_protocol_data = sweeps[key]
-                if targets.size and self.voltage_membrane_test is not None:
-                    self.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
+            state = self.pipette_state(key)
+            state.vclamp_steps = targets
+            state.vclamp_hold_value = holding_voltage
+            state.voltage_protocol_data = sweeps[key]
+            if targets.size and state.voltage_membrane_test is not None:
+                state.voltage_membrane_test["sweep_hold_mV"] = holding_voltage * 1e3
             results[key] = sweeps[key]
         return results
 
-    def _current_pulses(self, custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp):
-        """Current steps (pA) for the active pipette. The default range scales
+    def _current_pulses(self, pipette_key, custom, startCurrentPicoAmp, endCurrentPicoAmp,
+                        stepCurrentPicoAmp):
+        """Current steps (pA) for ``pipette_key``. The default range scales
         with that pipette's own membrane capacitance."""
         if not custom:
-            capacitance = self.latestMembraneCapacitance
+            capacitance = self.pipette_state(pipette_key).latestMembraneCapacitance
             if capacitance is None or not np.isfinite(capacitance) or capacitance <= 0:
                 cap_pf = max(1, int(abs(stepCurrentPicoAmp)))
             else:
@@ -2953,9 +2750,8 @@ class FakeDAQ(DAQ):
             raise ValueError("recordingTimeMs must be positive")
         pulses_by_key = {}
         for key in keys:
-            with self.for_pipette(key):
-                pulses_by_key[key] = self._current_pulses(
-                    custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
+            pulses_by_key[key] = self._current_pulses(
+                key, custom, startCurrentPicoAmp, endCurrentPicoAmp, stepCurrentPicoAmp)
 
         sweeps = {key: [] for key in keys}
         sweep_count = max(len(pulses) for pulses in pulses_by_key.values())
@@ -2978,10 +2774,10 @@ class FakeDAQ(DAQ):
         results = {}
         for key in keys:
             pulses = pulses_by_key[key]
-            with self.for_pipette(key):
-                self.pulses = pulses
-                self.pulseRange = len(pulses)
-                self.current_protocol_data = sweeps[key]
+            state = self.pipette_state(key)
+            state.pulses = pulses
+            state.pulseRange = len(pulses)
+            state.current_protocol_data = sweeps[key]
             results[key] = (sweeps[key], pulses, len(pulses))
         return results
 
@@ -2990,17 +2786,17 @@ class FakeDAQ(DAQ):
         results = {}
         for key, (command, response) in self._read_pipettes(keys, rate_hz, duration_s).items():
             sample_count = command.size
-            with self.for_pipette(key):
-                hold_voltage = self.holding_voltage
-                if hold_voltage is None:
-                    hold_voltage = float(np.mean(command)) if sample_count else 0.0
-                command = np.full(sample_count, hold_voltage, dtype=float)
-                self.holding_protocol_data = np.array([
-                    self._recorded_time(sample_count, rate_hz),
-                    response,
-                    command,
-                ])
-                results[key] = self.holding_protocol_data
+            state = self.pipette_state(key)
+            hold_voltage = state.holding_voltage
+            if hold_voltage is None:
+                hold_voltage = float(np.mean(command)) if sample_count else 0.0
+            command = np.full(sample_count, hold_voltage, dtype=float)
+            state.holding_protocol_data = np.array([
+                self._recorded_time(sample_count, rate_hz),
+                response,
+                command,
+            ])
+            results[key] = state.holding_protocol_data
         return results
 
     def _membrane_step_mV(self, command, amplitude):

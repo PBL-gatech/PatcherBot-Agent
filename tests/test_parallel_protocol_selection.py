@@ -2,7 +2,7 @@ import threading
 from types import SimpleNamespace
 
 import patcherbot.interface
-from patcherbot.interface.patch import AutoPatchInterface
+from patcherbot.controller.multi_patch import MultiPipettePatcher
 
 
 class _RecordingDAQ:
@@ -23,7 +23,8 @@ class _RecordingDAQ:
 class _ProtocolWorker:
     def __init__(self, pipette_key, barriers, events, event_lock):
         self.pipette_key = pipette_key
-        self.amplifier = object()
+        self.amplifier_group = object()
+        self.daq = SimpleNamespace(pipette_key=pipette_key)
         self.barriers = barriers
         self.events = events
         self.event_lock = event_lock
@@ -54,22 +55,23 @@ class _ProtocolWorker:
 
 
 class _ProtocolRunner:
-    _PROTOCOL_RUNNERS = AutoPatchInterface._PROTOCOL_RUNNERS
-    _prepare_protocol = AutoPatchInterface._prepare_protocol
-    _finish_protocol = AutoPatchInterface._finish_protocol
-    _merge_protocol_steps = AutoPatchInterface._merge_protocol_steps
-    _run_amplifier_workers = AutoPatchInterface._run_amplifier_workers
-    _run_protocol_matrix = AutoPatchInterface._run_protocol_matrix
+    PROTOCOL_NAMES = MultiPipettePatcher.PROTOCOL_NAMES
+    _prepare_protocol = MultiPipettePatcher._prepare_protocol
+    _finish_protocol = MultiPipettePatcher._finish_protocol
+    _merge_protocol_steps = MultiPipettePatcher._merge_protocol_steps
+    _run_amplifier_workers = MultiPipettePatcher._run_amplifier_workers
+    run_protocol_matrix = MultiPipettePatcher.run_protocol_matrix
 
     def warning(self, message):
         pass
 
-
-class _ProtocolTaskController:
     def abort_if_requested(self):
         pass
 
     def success_if_requested(self):
+        pass
+
+    def sleep(self, seconds):
         pass
 
 
@@ -85,9 +87,8 @@ def test_selected_pipettes_share_one_daq_acquisition_per_protocol():
     runner.autopatchers = {
         key: _ProtocolWorker(key, barriers, events, event_lock) for key in keys
     }
-    runner.protocol_daQs = {key: SimpleNamespace(pipette_key=key) for key in keys}
     runner.daq = _RecordingDAQ(events, event_lock)
-    runner.protocol_selections = {
+    selections = {
         key: {
             "voltage_protocol": True,
             "current_protocol": True,
@@ -99,7 +100,7 @@ def test_selected_pipettes_share_one_daq_acquisition_per_protocol():
         for key in keys
     }
 
-    runner._run_protocol_matrix(_ProtocolTaskController())
+    runner.run_protocol_matrix(selections)
 
     daq_calls = [event for event in events if event[0] == "daq"]
     assert daq_calls == [

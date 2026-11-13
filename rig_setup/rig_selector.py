@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
 )
 
-from patcherbot.utils.pipette_keys import pipette_key_for, pipette_label
+from patcherbot.utils.multipipette_helper import pipette_key_for, pipette_label
 from .rig_config import (
     DEVICE_SLOTS,
     SHARED_DEVICE_SLOTS,

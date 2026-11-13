@@ -3,16 +3,15 @@
 Control of automatic patch clamp algorithm
 '''
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 
 from patcherbot.interface import TaskInterface, command, blocking_command
-from patcherbot.controller import AutoPatcher
+from patcherbot.controller import MultiPipettePatcher
 from patcherbot.utils import EPhysLogger, RecordingStateManager
-from patcherbot.utils.pipette_keys import pipette_key_for
+from patcherbot.utils.multipipette_helper import pipette_key_for
 from patcherbot.devices.pressurecontroller.BasePressureController import PressureController
 from patcherbot.devices.amplifier.amplifier import Amplifier
 from patcherbot.interface.pipettes import PipetteInterface
-from patcherbot.devices.amplifier.DAQ import DAQ, PipetteDAQView
+from patcherbot.devices.amplifier.DAQ import DAQ
 from patcherbot.devices.lamp import Lamp
 from patcherbot.configs.PatchConfig import PatchConfig
 from patcherbot.configs.ExperimentBookConfig import ExperimentBookConfig
@@ -52,41 +51,36 @@ class AutoPatchInterface(TaskInterface):
             self.protocol_config.from_dict(cleaned)
         self.experiment_book_config = ExperimentBookConfig(name='Experiment Book')
         # Per-pipette devices are keyed pipette_<n>; a single device serves pipette_0.
-        self.amplifiers = amplifier if isinstance(amplifier, dict) else {pipette_key_for(0): amplifier}
-        self.amplifier = next(iter(self.amplifiers.values()))
+        amplifiers = amplifier if isinstance(amplifier, dict) else {pipette_key_for(0): amplifier}
+        pressures = pressure if isinstance(pressure, dict) else {pipette_key_for(0): pressure}
+        self.amplifier = next(iter(amplifiers.values()))
         self.daq = daq
-        self.pressures = pressure if isinstance(pressure, dict) else {pipette_key_for(0): pressure}
-        self.pressure = next(iter(self.pressures.values()))
+        self.pressure = next(iter(pressures.values()))
         self.pipette_controller = pipette_interface
         self.recording_state_manager = recording_state_manager
         self.lamp = lamp
         self.laser = laser
         self.ephys_logger = EPhysLogger(recording_state_manager=self.recording_state_manager, ephys_filename="CellMetadata")
-        # One DAQ for the whole rig; each pipette gets a view onto it (no copies).
-        self.protocol_daQs = {}
-        self.autopatchers = {}
-        for key, calibrated_unit in self.pipette_controller.calibrated_units.items():
-            pipette_amplifier = self._device_for_pipette(self.amplifiers, key)
-            pipette_pressure = self._device_for_pipette(self.pressures, key)
-            protocol_daq = PipetteDAQView(daq, self._daq_key_for_pipette(daq, key))
-            self.protocol_daQs[key] = protocol_daq
-            self.autopatchers[key] = AutoPatcher(
-                pipette_amplifier,
-                protocol_daq,
-                pipette_pressure,
-                calibrated_unit,
-                calibrated_unit.microscope,
-                calibrated_stage=self.pipette_controller.calibrated_stage,
-                lamp=self.lamp,
-                laser=self.laser,
-                config=self.config,
-                protocol_config=self.protocol_config,
-            )
+        # The controller pairs each pipette with its devices (one AutoPatcher
+        # per pipette, each with a view onto the one DAQ) and runs the
+        # multi-pipette protocol matrix.
+        self.multi_patcher = MultiPipettePatcher.from_devices(
+            daq,
+            amplifiers,
+            pressures,
+            self.pipette_controller.calibrated_units,
+            self.pipette_controller.calibrated_stage,
+            lamp=self.lamp,
+            laser=self.laser,
+            config=self.config,
+            protocol_config=self.protocol_config,
+        )
+        self.autopatchers = self.multi_patcher.autopatchers
         self.current_autopatcher = next(iter(self.autopatchers.values()))
         self.protocol_selections = {
             pipette_key: {
                 protocol_name: bool(getattr(self.protocol_config, protocol_name))
-                for protocol_name in self._PROTOCOL_RUNNERS
+                for protocol_name in MultiPipettePatcher.PROTOCOL_NAMES
             }
             for pipette_key in self.autopatchers
         }
@@ -97,175 +91,8 @@ class AutoPatchInterface(TaskInterface):
         self.origins = {"x": None, "y": None}
         self.movement_file_path = ''
 
-    # Protocol selection names, in run order -> AutoPatcher prepare_/finish_ suffix
-    _PROTOCOL_RUNNERS = {
-        "voltage_protocol": "voltage_protocol",
-        "current_protocol": "current_protocol",
-        "voltage_sweep_protocol": "voltage_sweep_protocol",
-        "holding_protocol": "holding_protocol",
-        "opto_random_wavelength_protocol": "optogenetic_protocol",
-        "opto_random_power_protocol": "optogenetic_protocol",
-    }
-
-    def _daq_key_for_pipette(self, daq, pipette_key):
-        """Match a pipette to its DAQ channel set.
-
-        The rig builder gives the DAQ the same pipette keys, so this is
-        normally ``pipette_key``. A DAQ wired for fewer pipettes than were
-        selected shares its first channel set.
-        """
-        if pipette_key in daq.channel_map:
-            return pipette_key
-        shared = daq.primary_pipette_key
-        self.warning(f"DAQ has no channels for {pipette_key}; it will share {shared}'s channels")
-        return shared
-
-    @staticmethod
-    def _device_for_pipette(devices, key):
-        """The device for pipette ``key``; a single device serves every pipette.
-
-        A device that serves several pipettes through separate parts (e.g. a
-        MultiClampAmplifier with one channel per headstage) provides
-        ``for_pipette(key)``, which returns this pipette's part.
-        """
-        if key in devices:
-            device = devices[key]
-        elif len(devices) == 1:
-            device = next(iter(devices.values()))
-        else:
-            raise KeyError(f"No device configured for {key}; available: {list(devices)}")
-        for_pipette = getattr(device, "for_pipette", None)
-        return for_pipette(key) if callable(for_pipette) else device
-
     def set_protocol_selection(self, pipette_key, protocol_name, selected):
         self.protocol_selections[pipette_key][protocol_name] = bool(selected)
-
-    @staticmethod
-    def _opto_params(protocol_name, config):
-        if protocol_name == "opto_random_wavelength_protocol":
-            opto_params = {
-                "randomize_target": "wavelength",
-                "wavelengths": ["red", "green", "cyan", "uv", "blue", "infrared"],
-                "powers": [float(config.opto_wavelength_power)],
-            }
-        else:
-            opto_params = {
-                "randomize_target": "power",
-                "wavelengths": [config.opto_power_wavelength],
-                "powers": list(range(0, 101, 20)),
-            }
-        opto_params.update({
-            "stabilize_time": float(config.opto_stabilize_time),
-            "off_time": float(config.opto_off_time),
-            "on_time": float(config.opto_on_time),
-            "replicates": int(config.opto_replicates),
-            "randomize": True,
-        })
-        return opto_params
-
-    def _prepare_protocol(self, pipette_key, protocol_name):
-        """Amplifier setup for one pipette; returns its DAQ steps."""
-        autopatcher = self.autopatchers[pipette_key]
-        runner = self._PROTOCOL_RUNNERS[protocol_name]
-        if protocol_name == "current_protocol":
-            autopatcher.iholding = autopatcher.getHolding()
-        if runner == "optogenetic_protocol":
-            return autopatcher.prepare_optogenetic_protocol(
-                self._opto_params(protocol_name, autopatcher.protocol_config))
-        return getattr(autopatcher, f"prepare_{runner}")()
-
-    def _finish_protocol(self, pipette_key, protocol_name):
-        runner = self._PROTOCOL_RUNNERS[protocol_name]
-        getattr(self.autopatchers[pipette_key], f"finish_{runner}")()
-
-    def _merge_protocol_steps(self, protocol_name, steps_by_pipette):
-        """One list of DAQ steps for all pipettes.
-
-        Settings come from the shared protocol config, so the pipettes should
-        agree; if not, the first pipette's settings are used. Opto sequences
-        are randomized per pipette, but the laser is shared, so the first
-        pipette's sequence drives one stimulus run recorded on every pipette.
-        """
-        reference_key, reference = next(iter(steps_by_pipette.items()))
-        methods = [method for method, _ in reference]
-        for pipette_key, steps in steps_by_pipette.items():
-            if [method for method, _ in steps] != methods:
-                raise ValueError(
-                    f"{protocol_name}: {pipette_key} needs different DAQ steps than {reference_key}"
-                )
-            if self._PROTOCOL_RUNNERS[protocol_name] != "optogenetic_protocol" and steps != reference:
-                self.warning(f"{protocol_name}: {pipette_key} settings differ from {reference_key}; "
-                             f"using {reference_key}'s for the shared acquisition")
-        return reference
-
-    def _run_amplifier_workers(self, selected, operation):
-        """Run separate headstages in parallel, sharing a channel sequentially.
-
-        MultiClamp's existing DLL lock protects each channel-selection/call;
-        settling waits for different headstages can overlap.
-
-        Returns ``({key: result}, {key: exception})`` for the pipettes that
-        succeeded / failed; one failure doesn't stop the others.
-        """
-        groups = {}
-        for key in selected:
-            amplifier = self.autopatchers[key].amplifier
-            groups.setdefault(id(amplifier), []).append(key)
-        if not groups:
-            return {}, {}
-
-        def run_group(keys):
-            outcome = {}
-            for key in keys:
-                try:
-                    outcome[key] = (True, operation(key))
-                except Exception as exc:
-                    outcome[key] = (False, exc)
-            return outcome
-
-        outcomes = {}
-        with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-            for group_outcome in executor.map(run_group, groups.values()):
-                outcomes.update(group_outcome)
-        results = {key: outcomes[key][1] for key in selected if outcomes[key][0]}
-        errors = {key: outcomes[key][1] for key in selected if not outcomes[key][0]}
-        return results, errors
-
-    def _run_protocol_matrix(self, task_controller):
-        """Run each selected protocol for all its pipettes at once:
-        prepare their amplifiers, ONE DAQ acquisition per step covering
-        all of them, then finish without overlapping shared amplifier calls."""
-        for protocol_name in self._PROTOCOL_RUNNERS:
-            task_controller.abort_if_requested()
-            task_controller.success_if_requested()
-            selected = [
-                pipette_key for pipette_key, selections in self.protocol_selections.items()
-                if selections.get(protocol_name, False)
-            ]
-            if not selected:
-                continue
-
-            prepared, prepare_errors = self._run_amplifier_workers(
-                selected, lambda key: self._prepare_protocol(key, protocol_name))
-            try:
-                if prepare_errors:
-                    key, error = next(iter(prepare_errors.items()))
-                    raise RuntimeError(f"{protocol_name}: amplifier setup failed for {key}") from error
-                steps = self._merge_protocol_steps(protocol_name, prepared)
-                daq_keys = list(dict.fromkeys(
-                    self.protocol_daQs[key].pipette_key for key in selected))
-                for index, (method_name, kwargs) in enumerate(steps):
-                    if index:
-                        time.sleep(0.25)
-                    getattr(self.daq, method_name)(pipettes=daq_keys, **kwargs)
-            finally:
-                # Every selected pipette is cleaned up, including one whose
-                # setup failed partway (it may already be in the protocol's mode).
-                _, finish_errors = self._run_amplifier_workers(
-                    selected, lambda key: self._finish_protocol(key, protocol_name))
-                for key, error in finish_errors.items():
-                    self.error(f"{protocol_name}: amplifier cleanup failed for {key}: {error}")
-
 
     @blocking_command(category='Calibration', description='Save X origin',
                       task_description='Saving X origin and microscope image')
@@ -471,10 +298,8 @@ class AutoPatchInterface(TaskInterface):
                 voltage_hold=voltage_hold,
                 current_hold=current_hold,
             )
-        self.execute(
-            self.current_autopatcher.run_protocol_matrix,
-            argument=self._run_protocol_matrix,
-        )
+        selections = {key: dict(chosen) for key, chosen in self.protocol_selections.items()}
+        self.execute(self.multi_patcher.run_protocol_matrix, argument=selections)
 
     @blocking_command(category='DAQ',
             description='Run Optogenetic Protocol',

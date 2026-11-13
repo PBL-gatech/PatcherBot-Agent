@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 import patcherbot.interface
-from patcherbot.devices.amplifier.DAQ import DAQ, NiDAQ, build_channel_map
+from patcherbot.devices.amplifier.DAQ import DAQ, NiDAQ
+from patcherbot.utils.multipipette_helper import build_channel_map
 
 daq_module = importlib.import_module("patcherbot.devices.amplifier.DAQ")
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,8 +135,7 @@ class NIDaqSignalPathTests(unittest.TestCase):
         self.daq.createSquareWave(40, 50_000, .5, .5, .025)
         self.daq._setupAcquisition()
         for key in self.daq.pipette_keys:
-            with self.daq.for_pipette(key):
-                self.daq.setCellMode(True)
+            self.daq.setCellMode(True, pipette_key=key)
 
     def test_live_physical_inputs_recover_known_model_cell_on_both_headstages(self):
         results = self.daq.getDataFromSquareWave(40, 50_000, .5, .5, .025,
@@ -161,14 +161,14 @@ class NIDaqSignalPathTests(unittest.TestCase):
         self.assertEqual(ao.outputs, ['Dev1/ao0', 'Dev1/ao3'])
         for key, cap in result.items():
             self.assertAlmostEqual(cap, 30., delta=3.)
-            trace = self.daq._pipette_state(key)['voltage_membrane_test']
+            trace = self.daq.pipette_state(key).voltage_membrane_test
             self.assertAlmostEqual(trace['command'].max(), .010)
             self.assertGreater(trace['response'].max(), 900e-12)
         self.assertTrue(self.daq._pause_evt.is_set())
 
     def test_current_protocol_keeps_legacy_waveforms_in_shared_headstage_tasks(self):
         for key, cap in zip(self.daq.pipette_keys, (30., 45.)):
-            self.daq._pipette_state(key)['voltageMembraneCapacitance'] = cap
+            self.daq.pipette_state(key).voltageMembraneCapacitance = cap
         raw = {key: np.zeros((2, 400)) for key in self.daq.pipette_keys}
         with patch.object(self.daq, '_read_train', return_value=raw) as read:
             result = self.daq.getDataFromCurrentProtocol(

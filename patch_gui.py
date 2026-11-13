@@ -15,7 +15,7 @@ set_global_exception_hook()
 
 from patcherbot.utils.log_utils import setup_logging
 from patcherbot.utils.RecordingStateManager import RecordingStateManager
-from patcherbot.utils.pipette_keys import pipette_label
+from patcherbot.utils.multipipette_helper import pipette_label
 from patcherbot.interface import AutoPatchInterface
 from patcherbot.interface.pipettes import PipetteInterface
 from patcherbot.interface.graph import GraphInterface
@@ -105,11 +105,11 @@ def main():
         protocol_data=protocol_data,
     )
     # One GraphInterface per pipette: that pipette's DAQ view, amplifier and
-    # pressure controller (as already paired up by AutoPatchInterface).
+    # pressure controller (as already paired up by MultiPipettePatcher).
     pipette_graph_interfaces = {
         pipette_label(pipette_key): GraphInterface(
             autopatcher.amplifier,
-            patch_controller.protocol_daQs[pipette_key],
+            autopatcher.daq,
             autopatcher.pressure,
             recording_state_manager,
             laser=laser,

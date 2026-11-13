@@ -7,8 +7,8 @@ import unittest
 from unittest.mock import patch
 
 import patcherbot.interface
-from patcherbot.devices.amplifier.DAQ import build_channel_map
-from patcherbot.interface.patch import AutoPatchInterface
+from patcherbot.controller.multi_patch import MultiPipettePatcher
+from patcherbot.utils.multipipette_helper import build_channel_map, device_for_pipette
 from rig_setup.rig_config import RigConfigError, RigConfigManager
 
 
@@ -58,7 +58,7 @@ class SharedAmplifierTests(unittest.TestCase):
                 self.assertEqual(list(devices["daq"].channel_map), keys)
                 self.assertEqual(list(devices["pipette_unit"]), keys)
                 for key in keys:
-                    self.assertIs(AutoPatchInterface._device_for_pipette(
+                    self.assertIs(device_for_pipette(
                         {"pipette_0": devices["amplifier"]}, key
                     ), selected_amplifier)
                 if count == 2:
@@ -94,7 +94,7 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
         amplifier = object()
         keys = ["pipette_0", "pipette_1"]
         runner = SimpleNamespace(autopatchers={
-            key: SimpleNamespace(amplifier=amplifier) for key in keys
+            key: SimpleNamespace(amplifier_group=amplifier) for key in keys
         })
         second_started = threading.Event()
         events = []
@@ -108,7 +108,7 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
             events.append(("finish", key))
             return key
 
-        result, errors = AutoPatchInterface._run_amplifier_workers(runner, keys, operation)
+        result, errors = MultiPipettePatcher._run_amplifier_workers(runner, keys, operation)
         self.assertEqual(events, [("start", keys[0]), ("finish", keys[0]),
                                   ("start", keys[1]), ("finish", keys[1])])
         self.assertEqual(list(result), keys)
@@ -118,7 +118,7 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
     def test_separate_amplifiers_can_still_prepare_in_parallel(self):
         keys = ["pipette_0", "pipette_1"]
         runner = SimpleNamespace(autopatchers={
-            key: SimpleNamespace(amplifier=object()) for key in keys
+            key: SimpleNamespace(amplifier_group=object()) for key in keys
         })
         both_running = threading.Barrier(2)
 
@@ -126,7 +126,7 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
             both_running.wait(timeout=2)
             return key
 
-        result, errors = AutoPatchInterface._run_amplifier_workers(runner, keys, operation)
+        result, errors = MultiPipettePatcher._run_amplifier_workers(runner, keys, operation)
         self.assertEqual(result, dict(zip(keys, keys)))
         self.assertEqual(errors, {})
 
@@ -134,7 +134,7 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
         multiclamp = object()
         keys = ["pipette_0", "pipette_1"]
         runner = SimpleNamespace(autopatchers={
-            key: SimpleNamespace(amplifier=SimpleNamespace(shared_amplifier=multiclamp))
+            key: SimpleNamespace(amplifier_group=SimpleNamespace(shared_amplifier=multiclamp))
             for key in keys
         })
         both_running = threading.Barrier(2)
@@ -143,14 +143,14 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
             both_running.wait(timeout=2)
             return key
 
-        result, errors = AutoPatchInterface._run_amplifier_workers(runner, keys, operation)
+        result, errors = MultiPipettePatcher._run_amplifier_workers(runner, keys, operation)
         self.assertEqual(result, dict(zip(keys, keys)))
         self.assertEqual(errors, {})
 
     def test_one_failure_does_not_stop_the_other_pipette(self):
         keys = ["pipette_0", "pipette_1"]
         runner = SimpleNamespace(autopatchers={
-            key: SimpleNamespace(amplifier=object()) for key in keys
+            key: SimpleNamespace(amplifier_group=object()) for key in keys
         })
 
         def operation(key):
@@ -158,7 +158,7 @@ class AmplifierProtocolWorkersTests(unittest.TestCase):
                 raise ValueError("amplifier refused")
             return key
 
-        result, errors = AutoPatchInterface._run_amplifier_workers(runner, keys, operation)
+        result, errors = MultiPipettePatcher._run_amplifier_workers(runner, keys, operation)
         self.assertEqual(result, {keys[1]: keys[1]})
         self.assertIsInstance(errors[keys[0]], ValueError)
 
@@ -188,8 +188,8 @@ class MultiClampAmplifierTests(unittest.TestCase):
     def test_interface_pairs_each_pipette_with_its_headstage(self):
         amplifier = self._amplifier()
         devices = {"pipette_0": amplifier}        # one amplifier entry in the config
-        self.assertEqual(AutoPatchInterface._device_for_pipette(devices, "pipette_0").channel, 1)
-        self.assertEqual(AutoPatchInterface._device_for_pipette(devices, "pipette_1").channel, 2)
+        self.assertEqual(device_for_pipette(devices, "pipette_0").channel, 1)
+        self.assertEqual(device_for_pipette(devices, "pipette_1").channel, 2)
 
     def test_numpy_channel_array_is_accepted(self):
         import numpy as np
@@ -364,14 +364,17 @@ class ProtocolMatrixCleanupTests(unittest.TestCase):
         finished = []
         daq_calls = []
         runner = SimpleNamespace(
-            autopatchers={key: SimpleNamespace(amplifier=object()) for key in keys},
-            protocol_selections={key: {name: name == "voltage_protocol"
-                                       for name in AutoPatchInterface._PROTOCOL_RUNNERS}
-                                 for key in keys},
-            _PROTOCOL_RUNNERS=AutoPatchInterface._PROTOCOL_RUNNERS,
+            autopatchers={key: SimpleNamespace(amplifier_group=object()) for key in keys},
+            PROTOCOL_NAMES=MultiPipettePatcher.PROTOCOL_NAMES,
             daq=SimpleNamespace(getDataFromVoltageProtocol=lambda **kw: daq_calls.append(kw)),
             error=lambda message: None,
+            abort_if_requested=lambda: None,
+            success_if_requested=lambda: None,
+            sleep=lambda seconds: None,
         )
+        selections = {key: {name: name == "voltage_protocol"
+                            for name in MultiPipettePatcher.PROTOCOL_NAMES}
+                      for key in keys}
 
         def prepare(key, protocol_name):
             if key == keys[1]:
@@ -381,14 +384,45 @@ class ProtocolMatrixCleanupTests(unittest.TestCase):
         runner._prepare_protocol = prepare
         runner._finish_protocol = lambda key, protocol_name: finished.append(key)
         runner._run_amplifier_workers = lambda selected, operation: \
-            AutoPatchInterface._run_amplifier_workers(runner, selected, operation)
-        controller = SimpleNamespace(abort_if_requested=lambda: None,
-                                     success_if_requested=lambda: None)
+            MultiPipettePatcher._run_amplifier_workers(runner, selected, operation)
 
         with self.assertRaisesRegex(RuntimeError, "amplifier setup failed for pipette_1"):
-            AutoPatchInterface._run_protocol_matrix(runner, controller)
+            MultiPipettePatcher.run_protocol_matrix(runner, selections)
         self.assertEqual(sorted(finished), keys)       # both amplifiers put back
         self.assertEqual(daq_calls, [])                # no acquisition with a half-set-up rig
+
+    def test_abort_between_daq_steps_still_cleans_up_every_selected_pipette(self):
+        from patcherbot.controller.base import RequestedAbortException
+        keys = ["pipette_0", "pipette_1"]
+        finished, daq_calls = [], []
+
+        class Worker:
+            def __init__(self, key):
+                self.amplifier_group = object()
+                self.daq = SimpleNamespace(pipette_key=key)
+                self.key = key
+
+            def prepare_voltage_sweep_protocol(self):
+                return [("getLeakSubtraction", {}), ("getVoltageClampSweep", {})]
+
+            def finish_voltage_sweep_protocol(self):
+                finished.append(self.key)
+
+        patcher = MultiPipettePatcher({key: Worker(key) for key in keys}, daq=None)
+
+        def first_step(**kwargs):
+            daq_calls.append("leak")
+            patcher.abort_requested = True             # user presses Abort mid-protocol
+
+        patcher.daq = SimpleNamespace(getLeakSubtraction=first_step,
+                                      getVoltageClampSweep=lambda **kw: daq_calls.append("sweep"))
+        selections = {key: {name: name == "voltage_sweep_protocol"
+                            for name in MultiPipettePatcher.PROTOCOL_NAMES}
+                      for key in keys}
+        with self.assertRaises(RequestedAbortException):
+            patcher.run_protocol_matrix(selections)
+        self.assertEqual(daq_calls, ["leak"])           # stopped before the next DAQ step
+        self.assertEqual(sorted(finished), keys)       # every amplifier still put back
 
 
 if __name__ == "__main__":

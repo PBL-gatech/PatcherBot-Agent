@@ -11,7 +11,7 @@ import logging
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 
 from patcherbot.controller import TaskController
-from patcherbot.utils.pipette_keys import pipette_label
+from patcherbot.utils.multipipette_helper import pipette_label
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
 from patcherbot.gui.tabs.show_cells import CellListWindow

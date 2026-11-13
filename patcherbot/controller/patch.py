@@ -887,11 +887,14 @@ class AutoPatcher(TaskController):
     # endregion
 
     # region Recording protocols
-    def run_protocol_matrix(self, protocol_runner):
-        """Run the interface's per-pipette protocol matrix as a controller task."""
-        self.abort_if_requested()
-        protocol_runner(self)
-        self.success_if_requested()
+    @property
+    def amplifier_group(self):
+        """Object identifying this pipette's amplifier channel.
+
+        Pipettes with the same group share a channel and must be set up one
+        after the other; different groups (headstages) can run in parallel.
+        """
+        return self.amplifier
 
     @record_state("run_protocols")
     def run_protocols(self):
@@ -964,14 +967,14 @@ class AutoPatcher(TaskController):
     # one synchronous DAQ acquisition:
     #   prepare_<name>()  amplifier setup; returns the DAQ steps as a list of
     #                     (daq_method_name, kwargs)
-    #   DAQ steps         run once for every selected pipette by the interface
+    #   DAQ steps         run once for every selected pipette by MultiPipettePatcher
     #                     (or for this pipette alone by run_<name>)
     #   finish_<name>()   amplifier cleanup
     # run_<name>() runs all three for this pipette alone.
 
     def _run_daq_steps(self, steps):
         """Run DAQ steps for this pipette only; returns this pipette's results."""
-        pipette_key = getattr(self.daq, "pipette_key", None) or self.daq.active_pipette_key
+        pipette_key = getattr(self.daq, "pipette_key", None) or self.daq.primary_pipette_key
         results = []
         for index, (method_name, kwargs) in enumerate(steps):
             if index:

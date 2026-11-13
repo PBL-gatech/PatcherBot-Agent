@@ -26,6 +26,7 @@ import traceback
 import time
 
 from patcherbot.devices.amplifier.amplifier import Amplifier
+from patcherbot.utils.multipipette_helper import MultiPipetteDevice, pipette_key_for
 
 __all__ = ['MultiClampChannel', 'MultiClamp', 'MultiClampAmplifier']
 
@@ -658,7 +659,7 @@ class MultiClampChannel(Amplifier):
                                                     ctypes.byref(self.last_error)):
             self.check_error()
 
-
+    @needs_select
     def set_bridge_balance(self, state):
         if not self.dll.MCCMSG_SetBridgeBalEnable(self.msg_handler, ctypes.c_bool(state),
                                                  ctypes.byref(self.last_error)):
@@ -779,7 +780,7 @@ class MultiClampChannel(Amplifier):
                 MultiClampChannel.all_devices = None
 
 
-class MultiClampAmplifier(object):
+class MultiClampAmplifier(MultiPipetteDevice):
     """
     One MultiClamp amplifier serving several pipettes, one headstage each.
 
@@ -801,6 +802,9 @@ class MultiClampAmplifier(object):
         self.channels = [int(channel) for channel in channels]
         if not self.channels:
             raise ValueError("MultiClampAmplifier needs at least one channel")
+        # Entry n of ``channels`` drives pipette_n.
+        MultiPipetteDevice.__init__(
+            self, [pipette_key_for(index) for index in range(len(self.channels))])
         self.headstages = []
         for channel in self.channels:
             try:
@@ -814,12 +818,10 @@ class MultiClampAmplifier(object):
 
     def for_pipette(self, pipette_key):
         """The headstage (MultiClampChannel) that drives ``pipette_key``."""
-        from patcherbot.utils.pipette_keys import pipette_index
-        index = pipette_index(pipette_key)
-        if index is None or not 0 <= index < len(self.headstages):
+        if pipette_key not in self.pipette_keys:
             raise KeyError(f"No MultiClamp channel configured for {pipette_key!r}; "
                            f"channels per pipette: {self.channels}")
-        return self.headstages[index]
+        return self.headstages[self.pipette_keys.index(pipette_key)]
 
     def close(self):
         for headstage in self.headstages:
