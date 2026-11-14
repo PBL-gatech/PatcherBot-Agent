@@ -105,24 +105,12 @@ class CalibratedUnit(ManipulatorUnit):
             self._global_position_helper = GlobalPositionHelper(self)
         return self._global_position_helper
 
-    def detect_pipette(self, observer=None):
-        evidence = None
-        if observer is None:
-            frame = self.camera.last_raw_frame_data()
-            if frame is None or frame[2] is None:
-                self.camera.show_circles([])
-                return None
-            point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame[2])
-        else:
-            anchor = getattr(self, '_tip_reference', None)
-            evidence = observer.infer_frame(["pipette_image_xy"], frame_context={
-                "pipette_expected_xy": lambda: (self.reference_position(anchor=anchor)[:2] if anchor is not None
-                    else np.array([self.camera.width / 2., self.camera.height / 2.])),
-                "pipette_xyz": self.position, "stage_xy": self.stage.position},
-                confirmation={"confidence_threshold": lambda: 0.5})
-            point = evidence.get("confirmed_tip_xy")
-            if point is None:
-                point = evidence.get("pipette_position")
+    def detect_pipette(self):
+        frame = self.camera.last_raw_frame_data()
+        if frame is None or frame[2] is None:
+            self.camera.show_circles([])
+            return None
+        point = self.pipetteCalHelper.pipetteDetector.detect_pipette(frame[2])
         if point is None:
             self.camera.show_circles([])
             return None
@@ -131,9 +119,6 @@ class CalibratedUnit(ManipulatorUnit):
             self.camera.show_circles([])
             return None
         point = tuple(np.rint(point[:2]).astype(int))
-        if evidence is not None and evidence.get("confirmed_tip_xy") is not None:
-            source = evidence["source_positions"]
-            self.set_tip_reference(evidence["confirmed_tip_xy"], source["pipette_xyz"], source["stage_xy"])
         self.camera.show_circle(point)
         return point
 

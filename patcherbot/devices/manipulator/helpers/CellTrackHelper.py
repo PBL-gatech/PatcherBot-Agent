@@ -640,8 +640,26 @@ class CellTrackHelper:
         self.segmentor.load_image(image=prepped)
         self.segmentor.set_image()
 
-    def _segment_from_seed(self, seed_point: np.ndarray) -> Optional[np.ndarray]:
-        """Run SAM2 once and return its centroid."""
+    def segment_cells(self, image: np.ndarray, seed_points):
+        """Return masks and centroids in prompt order, encoding the image once."""
+        points = list(seed_points)
+        masks, centroids = [None] * len(points), [None] * len(points)
+        if not points:
+            return masks, centroids
+        try:
+            self._prime_segmentor(image)
+        except Exception as exc:
+            logging.error("CellTrackHelper: could not prepare cell masks: %s", exc)
+            return masks, centroids
+        for index, point in enumerate(points):
+            mask = self._segment_from_seed(point, return_mask=True)
+            if mask is not None:
+                masks[index] = mask
+                centroids[index] = self._compute_centroid(mask)
+        return masks, centroids
+
+    def _segment_from_seed(self, seed_point: np.ndarray, *, return_mask=False) -> Optional[np.ndarray]:
+        """Run SAM2 once and return its centroid, or the mask when requested."""
         point = np.asarray(seed_point, dtype=np.float32)
         if point.shape != (2,):
             point = point.reshape(2)
@@ -664,7 +682,7 @@ class CellTrackHelper:
             return None
 
 
-        return self._compute_centroid(mask)
+        return mask if return_mask else self._compute_centroid(mask)
 
     # ------------------------------------------------------------------ #
     @staticmethod

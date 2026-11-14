@@ -16,7 +16,6 @@ from patcherbot.devices.cellsorter import CalibratedCellSorter
 import time
 
 from patcherbot.devices.manipulator.microscope import Microscope
-from patcherbot.devices.manipulator.helpers.Observer import Observer
 
 class PipetteInterface(TaskInterface):
     '''
@@ -67,7 +66,6 @@ class PipetteInterface(TaskInterface):
         self._loaded_coordinate_names = set()
         self.session_registration.add_listener(self._publish_registered_coordinates)
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
-        self.observer = Observer(self)
         self.time_truth = datetime.now()
         self.folder_path = "experiments/Data/calibration_data/" + self.time_truth.strftime("%Y_%m_%d-%H_%M") + "/"
         self.folder_created = False  # Flag to track folder creation
@@ -616,7 +614,7 @@ class PipetteInterface(TaskInterface):
                       description='Detect the pipette',
                       task_description='Detecting the pipette')
     def detect_pipette(self):
-        self.execute(self.calibrated_unit.detect_pipette, argument=self.observer)
+        self.execute(self.calibrated_unit.detect_pipette)
     @blocking_command(category='Manipulators',
                         description='Home the manipulator',
                         task_description='Homing the manipulator')

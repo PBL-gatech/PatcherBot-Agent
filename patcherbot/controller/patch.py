@@ -1470,7 +1470,7 @@ class AutoPatcher(TaskController):
             unit = self.calibrated_unit
             anchor = (getattr(unit, '_trusted_tip_reference', None)
                       or (np.array([unit.camera.width / 2., unit.camera.height / 2.]), self.home_position, np.asarray(self.home_stage_position)[:2]))
-            evidence = self.observer.infer_frame(["pipette_image_xy"], frame_context={
+            evidence = self.observer.confirm_pipette(frame_context={
                 "pipette_expected_xy": lambda: unit.reference_position(anchor=anchor)[:2],
                 "pipette_xyz": unit.position, "stage_xy": self.calibrated_stage.position},
                 confirmation={"confidence_threshold": lambda: 0.5},

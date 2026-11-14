@@ -8,8 +8,7 @@ class FindPipettePhase(PhaseController):
         try:
             state = self.prepare(cell)
             while True:
-                observation = self.observe(fields=["manipulator_position", "pipette_image_xy",
-                    "pipette_defocus_um", "stage_positions", "camera_image", "resistance"])
+                observation = self.observe(pipette_inference=True)
                 calculated = self.calculate(observation, state)
                 command = self.decide(calculated, state)
                 self.act(command, state)
@@ -41,11 +40,11 @@ class FindPipettePhase(PhaseController):
             "tolerance_um": 2.0,
         }
 
-    def observe(self, *, fields=None, num_measurements=None, interval=None, evidence=None):
+    def observe(self, *, pipette_inference=True, num_measurements=None, interval=None):
         self.failure_gate()
         self.success_gate()
-        observation = super().observe(fields=fields, num_measurements=num_measurements,
-                                      interval=interval, evidence=evidence)
+        observation = super().observe(pipette_inference=pipette_inference, num_measurements=num_measurements,
+                                      interval=interval)
         self.failure_gate()
         self.success_gate()
         return observation

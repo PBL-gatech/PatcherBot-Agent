@@ -662,23 +662,34 @@ class PipetteDetector4(PipetteDetector):
         empty_prediction = dict(tip_xy=None, z_um=None, box_confidence=None, z_confidence=None,
                                 box_xyxy=None, candidate_count=0, accepted_candidate_count=0,
                                 radius_rejected_count=0, focus_score=None,
+                                focus_peak_score=None, focus_peak_xy=None, focus_peak_confidence=None,
                                 focus_score_supported=getattr(self, "model_version", None) == "X1")
         if img is None:
             return empty_prediction
         prediction = empty_prediction.copy()
         try:
             gray = self._to_uint8_grayscale(img)
-            if expected_tip_xy is None:
-                result = self.adapter.predict(gray, native_mask=False)
-                prediction["candidate_count"] = int(result.get("tip_xy") is not None)
-                prediction["accepted_candidate_count"] = prediction["candidate_count"]
-            else:
+            if expected_tip_xy is not None:
                 expected = np.asarray(expected_tip_xy, dtype=float)
                 if expected.shape != (2,) or not np.isfinite(expected).all() or not callable(pixels_to_um):
                     raise ValueError("A finite expected XY and calibrated pixel-to-micron converter are required")
                 if not np.isfinite(radius_um) or radius_um <= 0:
                     raise ValueError("Pipette candidate radius must be positive and finite")
-                decoded = self.adapter.predict(gray, native_mask=False, max_detections=100)
+            decoded = self.adapter.predict(gray, native_mask=False,
+                **({"max_detections": 100} if expected_tip_xy is not None else {}))
+            # Forward the adapter's existing raw result before anchor filtering; never select another candidate.
+            raw_score, raw_xy, raw_confidence = (decoded.get(key) for key in
+                                                ("focus_score", "tip_xy", "box_confidence"))
+            if (prediction["focus_score_supported"] and raw_xy is not None
+                    and isinstance(raw_score, (int, float, np.number)) and np.isfinite(raw_score) and 0 <= raw_score <= 1
+                    and isinstance(raw_confidence, (int, float, np.number)) and np.isfinite(raw_confidence)):
+                prediction.update(focus_peak_score=float(raw_score), focus_peak_xy=raw_xy,
+                                  focus_peak_confidence=float(raw_confidence))
+            if expected_tip_xy is None:
+                result = decoded
+                prediction["candidate_count"] = int(result.get("tip_xy") is not None)
+                prediction["accepted_candidate_count"] = prediction["candidate_count"]
+            else:
                 candidates = decoded.get("candidates", [])
                 prediction["candidate_count"] = len(candidates)
                 accepted = []
