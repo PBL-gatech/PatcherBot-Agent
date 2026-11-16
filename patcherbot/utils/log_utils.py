@@ -40,10 +40,17 @@ class CSVLogHandler(logging.Handler):
         super().close()
 
 class LoggingObject(object):
+    # Optional suffix appended to this object's logger name, e.g. "pipette_1"
+    # for a secondary pipette's controller, so log readers can tell pipettes
+    # apart ("<module>.<Class>.pipette_1"). Set it before the first log call.
+    log_name_suffix = None
+
     @property
     def logger(self):
         if getattr(self, '_logger', None) is None:
             logger_name = f"{self.__class__.__module__}.{self.__class__.__name__}"
+            if self.log_name_suffix:
+                logger_name = f"{logger_name}.{self.log_name_suffix}"
             self._logger = logging.getLogger(logger_name)
             self._logger.setLevel(logging.DEBUG)
         return self._logger

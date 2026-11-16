@@ -40,7 +40,8 @@ class StateMachineLogger:
     # ---------- constructor ---------- #
     def __init__(self,
                  base_path: str = "experiments/Data/state_recorder_data/",
-                 attempt_id: int = 1):
+                 attempt_id: int = 1,
+                 subfolder: str | None = None):
         """
         Parameters
         ----------
@@ -49,6 +50,10 @@ class StateMachineLogger:
             (YYYY_MM_DD-HH_MM) is created once under this root.
         attempt_id : int
             Numeric counter supplied by the caller (AutoPatcher).
+        subfolder  : str, optional
+            Put the attempt under ``<session>/<subfolder>/`` instead of
+            ``<session>/`` (used for secondary pipettes, so tools that read
+            ``<session>/attempt_*`` as pipette_0's attempts don't pick them up).
         """
         # Initialise the session folder only once
         if StateMachineLogger._session_folder is None:
@@ -59,8 +64,9 @@ class StateMachineLogger:
 
         self.session_folder = StateMachineLogger._session_folder
         self.attempt_id     = attempt_id
-        self.attempt_path   = os.path.join(self.session_folder,
-                                           f"attempt_{attempt_id}")
+        parent = (os.path.join(self.session_folder, subfolder)
+                  if subfolder else self.session_folder)
+        self.attempt_path   = os.path.join(parent, f"attempt_{attempt_id}")
         os.makedirs(self.attempt_path, exist_ok=True)
 
         self._states: Dict[str, Dict] = {}

@@ -5,23 +5,7 @@ Calibration configuration parameters for manipulator units.
 import param
 from .Config import Config, NumberWithUnit, Number, Boolean, Tuple, List
 
-__all__ = ["CalibrationConfig", "PER_PIPETTE_CALIBRATION_FIELDS"]
-
-# Values each pipette may override through ``CalibrationConfig.pipettes[i]``
-# (read and written through multipipette_helper.PipetteConfigView). Every
-# other value is shared by the whole rig (stage, microscope, detectors...).
-PER_PIPETTE_CALIBRATION_FIELDS = (
-    "pipette_z_rotation",
-    "pipette_y_rotation",
-    "pipette_k_scale",
-    "clean_move_order",
-    "safe_position_delta_um",
-    "home_position",
-    "safe_position",
-    "home_position_stage",
-    "safe_position_stage",
-    "bath_position",
-)
+__all__ = ["CalibrationConfig"]
 
 
 class CalibrationConfig(Config):
@@ -95,12 +79,19 @@ class CalibrationConfig(Config):
     # reader_scale, and applies to the rig's pressure[i] controller.
     pressure_calibrations = List(default=[],
                                  doc="Per-pipette pressure calibration overrides")
-    # Optional per-pipette geometry/position overrides. Entry i is None or a
-    # dict whose keys are in PER_PIPETTE_CALIBRATION_FIELDS and applies to
-    # pipette_i; missing values fall back to the top-level ones. Pipette 0
-    # normally has no entry, so the top-level values are pipette 0's.
-    pipettes = List(default=[],
-                    doc="Per-pipette calibration overrides (pipette_z_rotation, ...)")
+    # Per-pipette values, keyed by pipette: {"pipette_0": {...}, "pipette_1": {...}}.
+    # The allowed/required fields are multipipette_helper.PER_PIPETTE_CALIBRATION_FIELDS;
+    # read through multipipette_helper.PipetteConfigView. Empty = single-pipette
+    # file, whose top-level values below are pipette_0's. When present, the
+    # top-level geometry/position values are not used by any pipette.
+    pipettes = param.Dict(default={},
+                          doc="Per-pipette calibration values keyed by pipette (pipette_0, ...)")
+    collision_min_separation_um = NumberWithUnit(
+        100, unit="um", bounds=(0, 10000),
+        doc="Minimum XY distance kept between pipette tips by the collision guard")
+    collision_velocity_lookahead_s = NumberWithUnit(
+        0.5, unit="s", bounds=(0, 10),
+        doc="How far ahead the collision guard projects velocity commands")
     pipette_detector_type = param.Selector(default="v5", objects=["v5", "yolo1"],
                                            doc="Pipette detector type (restart required)")
     pipette_detector_device = param.String(default="auto",
@@ -162,4 +153,13 @@ class CalibrationConfig(Config):
         ("Display", ["position_update", "record_overlays"]),
         ("Pressure", ["native_zero", "native_per_mbar", "reader_offset", "reader_scale"]),
         ("Positions", ["home_position", "home_position_stage", "safe_position", "safe_position_stage", "bath_position", "safe_position_delta_um", "home_position_delta_um"]),
+        ("Collision", ["collision_min_separation_um", "collision_velocity_lookahead_s"]),
     ]
+
+    def hide_fields_from_editor(self, names):
+        """Leave ``names`` out of this instance's editor categories (e.g. the
+        top-level per-pipette values, which no pipette uses once the file has
+        a ``pipettes:`` section)."""
+        hidden = set(names)
+        self.categories = [(category, [name for name in fields if name not in hidden])
+                           for category, fields in type(self).categories]

@@ -11,7 +11,7 @@ import logging
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 
 from patcherbot.controller import TaskController
-from patcherbot.utils.multipipette_helper import pipette_label
+from patcherbot.utils.multipipette_helper import pipette_key_for, pipette_label
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
 from patcherbot.gui.tabs.show_cells import CellListWindow
@@ -207,8 +207,9 @@ class PatchGui(ManipulatorGui):
                 or self.pipette_interface._current_controller is not None)
 
     def _current_tares(self):
+        # The book's tares are pipette_0's (like tare.pickle and the movement recorder).
         return {name: [None if value is None else float(value) for value in values]
-                for name, values in (("pipette", self.pipette_interface.tare_pipette),
+                for name, values in (("pipette", self.pipette_interface.pipette_tare(pipette_key_for(0))),
                                      ("stage", self.pipette_interface.tare_stage))}
 
     @QtCore.pyqtSlot(int, object)
@@ -261,6 +262,7 @@ class PatchGui(ManipulatorGui):
         try:
             payload = book.logger.read_details(source)
             tares = payload["tares"]
+            pipette_tares = None
             if tares is None:
                 tare_path, _ = QFileDialog.getOpenFileName(
                     self, "Select saved tares (Cancel to keep current tares)",
@@ -268,6 +270,11 @@ class PatchGui(ManipulatorGui):
                 if tare_path:
                     with open(tare_path, "rb") as stream:
                         tares = pickle.load(stream)
+                    # Other pipettes' display tares are saved next to tare.pickle.
+                    sibling = os.path.join(os.path.dirname(tare_path), "tare_pipettes.pickle")
+                    if os.path.isfile(sibling):
+                        with open(sibling, "rb") as stream:
+                            pipette_tares = pickle.load(stream)
             # Decode images before committing any imported runtime state.
             import cv2
             frames = {}
@@ -304,7 +311,7 @@ class PatchGui(ManipulatorGui):
             for atlas, image in zip(payload.get("atlases", []), atlas_images):
                 book.add_atlas_entry(atlas["image_path"], image, atlas["caption"],
                                      datetime.fromisoformat(atlas["saved_at"]), persist=False)
-            self.classic_patching_tab.restore_tares(payload["tares"])
+            self.classic_patching_tab.restore_tares(payload["tares"], pipette_tares)
             for axis, record in payload["origins"].items():
                 if record is None:
                     continue
@@ -933,7 +940,8 @@ class ClassicPatchButtons(ButtonTabWidget):
             [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
             [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
         ]
-        self.addButtonList('movement', layout, buttonList, cmds, sequential=True)
+        self.addButtonList('movement', layout, buttonList, cmds, sequential=True,
+                           extra_widget=self._make_collision_guard_button())
 
         # Find Pipette path
         self.pipette_location = [self.pipette_interface.center_pipette,self.pipette_interface.focus_pipette,self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
@@ -1003,18 +1011,26 @@ class ClassicPatchButtons(ButtonTabWidget):
         self._set_button_completion_style(
             self.origin_buttons[axis], self.section_colors['calibration'])
 
-    def restore_tares(self, tares):
+    def restore_tares(self, tares, pipette_tares=None):
+        """Restore display tares. ``tares['pipette']`` is pipette_0's;
+        ``pipette_tares`` (from tare_pipettes.pickle) optionally holds every
+        pipette's."""
         if tares is None:
             return
-        pipette, stage = tares['pipette'], tares['stage']
+        stage = tares['stage']
         interface = self.pipette_interface
-        interface.tare_pipette = np.asarray(interface.tare_pipette, dtype=object).copy()
+        per_pipette = {pipette_key_for(0): tares['pipette']}
+        per_pipette.update(pipette_tares or {})
+        for key, values in per_pipette.items():
+            if key not in interface.calibrated_units or values is None:
+                continue
+            interface.set_pipette_tare(key, values)
+            display = list(self._tare_pipette_by_key.get(key, [0, 0, 0]))
+            for index, value in enumerate(values):
+                if value is not None:
+                    display[index] = value
+            self._tare_pipette_by_key[key] = display
         interface.tare_stage = np.asarray(interface.tare_stage, dtype=object).copy()
-        self.tare_pipette_pos = list(self.tare_pipette_pos)
-        for index, value in enumerate(pipette):
-            if value is not None:
-                interface.tare_pipette[index] = value
-                self.tare_pipette_pos[index] = value
         for index, value in enumerate(stage):
             if value is not None:
                 interface.tare_stage[index] = value
@@ -1191,6 +1207,76 @@ class ClassicPatchButtons(ButtonTabWidget):
         layout.addLayout(row)
         self.active_pipette_combo = combo
         self.pipette_interface.active_pipette_changed.connect(self._show_active_pipette)
+
+    # ---- collision guard toggle (movement box) ----
+    _GUARD_STYLES = {
+        "off": "background-color: rgb(200, 30, 30); color: white; font-weight: bold;",
+        "unlocated": "background-color: rgb(255, 165, 0); color: black;",
+        "on": "",
+    }
+
+    def _make_collision_guard_button(self):
+        """Toggle for the collision guard (only with 2+ pipettes): red when off,
+        orange while a pipette can't be located (so isn't protected)."""
+        self.collision_guard_button = None
+        if len(self.pipette_interface.calibrated_units) < 2:
+            return None
+        button = QtWidgets.QPushButton("Collision Guard: ON")
+        button.setCheckable(True)
+        button.setChecked(True)
+        button.setToolTip("Keeps every pipette inside its own workspace during automatic moves. "
+                          "Turn off only for debugging.")
+        button.clicked.connect(self._request_collision_guard)
+        self.collision_guard_button = button
+        self._guard_timer = QtCore.QTimer(self)
+        self._guard_timer.setInterval(500)
+        self._guard_timer.timeout.connect(self._refresh_collision_guard_button)
+        self._guard_timer.start()
+        self.pipette_interface.collision_blocked.connect(self._show_collision_blocked)
+        self._collision_box = None
+        self._refresh_collision_guard_button()
+        return button
+
+    def _request_collision_guard(self, checked):
+        command_signal = self.interface_signals[self.pipette_interface][0]
+        command_signal.emit(self.pipette_interface.set_collision_guard, bool(checked))
+        self._refresh_collision_guard_button()
+
+    def _refresh_collision_guard_button(self):
+        button = self.collision_guard_button
+        if button is None:
+            return
+        status = self.pipette_interface.collision_guard.status()  # no device access
+        if not status["enabled"]:
+            state, text = "off", "Collision Guard: OFF"
+            tooltip = "Automatic pipette moves are NOT checked for collisions."
+        elif status["unlocated"]:
+            state = "unlocated"
+            text = f"Collision Guard: ON ({', '.join(status['unlocated'])} not located)"
+            tooltip = "; ".join(f"{key} is not protected: {reason}"
+                                for key, reason in status["unlocated"].items())
+        else:
+            state, text = "on", "Collision Guard: ON"
+            tooltip = "Every pipette is kept inside its own workspace during automatic moves."
+        button.blockSignals(True)
+        button.setChecked(status["enabled"])
+        button.blockSignals(False)
+        if button.text() != text:
+            button.setText(text)
+        button.setStyleSheet(self._GUARD_STYLES[state])
+        button.setToolTip(tooltip)
+
+    @QtCore.pyqtSlot(str)
+    def _show_collision_blocked(self, message):
+        """Explain a refused move in a (non-blocking) dialog, one at a time."""
+        box = getattr(self, "_collision_box", None)
+        if box is not None and box.isVisible():
+            box.setText(message)
+            return
+        box = QMessageBox(QMessageBox.Warning, "Collision guard", message, QMessageBox.Ok, self)
+        box.setModal(False)
+        box.show()
+        self._collision_box = box
 
     def _request_active_pipette(self, index):
         key = self.active_pipette_combo.itemData(index)

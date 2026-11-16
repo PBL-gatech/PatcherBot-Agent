@@ -19,6 +19,19 @@ CENTERED_PIPETTE_STATES = CENTRAL_CELL_STATES | frozenset({
 })
 
 
+_SECONDARY_PIPETTE_LOGGER = re.compile(r"\.pipette_[1-9]\d*$")
+
+
+def is_secondary_pipette_log_row(row):
+    """True for a log CSV row written by a secondary pipette (pipette_1, ...).
+
+    Rows are ``date time,ms,level,message...,logger,thread``; in multi-pipette
+    sessions secondary pipettes log under ``<logger>.pipette_<n>``. The replay
+    reconstructs pipette_0 (whose movement is recorded), so it skips them.
+    """
+    return len(row) > 6 and bool(_SECONDARY_PIPETTE_LOGGER.search(str(row[-2]).strip()))
+
+
 def normalize_state_name(state):
     """Normalize recorded state names and human-readable labels consistently."""
     return re.sub(r"[^a-z0-9]+", "_", str(state or "").strip().lower()).strip("_")
@@ -38,6 +51,12 @@ def load_moscow_geometry(rig_config_path=None):
 
     Only the known top-level YAML scalar fields are needed, so this reader adds
     no YAML, numerical, Qt, or rig hardware dependency to replay geometry.
+
+    Note: multi-pipette calibration files (with a ``pipettes:`` section, e.g.
+    Norwich_cal.yaml) keep each pipette's rotations under
+    ``pipettes.pipette_<n>`` instead of at the top level; reading such a file
+    here would need ``pipettes.pipette_0`` (the pipette the recorder records).
+    moscow_cal.yaml is a single-pipette file, so this is unaffected.
     """
     repo_root = Path(__file__).resolve().parents[4]
     rig_path = Path(rig_config_path) if rig_config_path is not None else (

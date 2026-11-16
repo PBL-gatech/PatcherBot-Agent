@@ -771,36 +771,101 @@ Ordered roughly by when you will hit them.
   - The live window's "Control:" picker follows it, one way.
   - The movement recorder still records pipette_0, to keep the CSV schema fixed.
 
-### 12.2 Per-pipette calibration
-- **Config:** [`CalibrationConfig.pipettes`](../patcherbot/configs/CalibrationConfig.py) is a hidden list; entry *i* overrides `PER_PIPETTE_CALIBRATION_FIELDS` for pipette *i* (angles, `pipette_k_scale`, `clean_move_order`, `safe_position_delta_um`, saved positions).
-  - Each `CalibratedUnit` gets a [`PipetteConfigView`](../patcherbot/utils/multipipette_helper.py). Reads fall back to the top-level values; writes to those fields stay per pipette.
-  - `pipette_0` with no entry behaves exactly as before.
-- **Norwich:** [`Norwich_cal.yaml`](../rig_setup/cal_configs/Norwich_cal.yaml) gives pipette_1 `pipette_z_rotation: 159.9895`, i.e. pipette_0 + 180°, because a mirror in both x and y is a rotation about z. This is an initial guess; verify it by jogging.
-- **Calibration file v2:** `{'version': 2, 'pipettes': {key: {manip, home, safe, bath}}, 'stage', 'floor_Z', 'saved_at'}`. It also keeps the legacy `manip/home/safe/bath` keys, copied from pipette_0.
-  - Writing saves every calibrated pipette that has home and safe set. Only the active pipette is required. Entries for pipettes not selected this session are carried over.
-  - A legacy file loads into pipette_0 only.
-- **Calibrating with two tips in view:** `collect_cal_points` detects one tip with no expected position. Retract the other pipette out of view first; `calibrate_manipulator` warns if it predicts the other tip in the image.
+### 12.2 Per-pipette calibration and rig geometry
 
-### 12.3 Collision rule (pipette_0 vs each secondary)
-[`PrimaryPipetteGuard`](../patcherbot/controller/collision.py):
-- **Rule:** a secondary pipette may not go to (or patch) a point whose x in **pipette_0's manipulator frame** is less than pipette_0's current x. −x is back along pipette_0, away from the centre.
-- **Frames:** points are compared in the stage frame (image px − stage reference). The manipulators ride the stage, so this frame doesn't change as the stage moves.
-  - Tips are placed in it the same way as the camera overlay: latest confirmed tip detection, then trusted detection, then "tip at image centre at home", then M/r0.
-  - The boundary is therefore where the overlay draws pipette_0. Only XY is used, since the calibration leaves Z separate.
-- **Checks:**
-  - `check_cell`: secondaries only. Requires both pipettes calibrated (fail-safe). Runs in `add_cell` (the cell isn't queued) and at the start of `patch`, `whole_cell` (before the `try`, so no escape is triggered), `locate_cell`, `approach_cell` and `hunt_cell`.
-  - `check_move`: `CalibratedUnit.move_guard`, set for secondaries. Runs before every discrete absolute/relative move.
-    - A move is refused only if its target is on pipette_0's side **and** deeper than the current position, so retreating is always allowed.
-    - It is inactive (with a warning) until both pipettes are calibrated, so pipette_1 can still be jogged and calibrated.
+**Where the rig geometry goes.** In the rig's calibration file, `rig_setup/cal_configs/<rig>_cal.yaml`, under a `pipettes:` mapping keyed by pipette:
+
+```yaml
+# One entry per pipette, keyed like everywhere else in the code (pipette_0, pipette_1, ...).
+# Every entry needs all five geometry values; nothing is copied between pipettes.
+pipettes:
+  pipette_0:                      # left manipulator (COM8)
+    pipette_z_rotation: -20.0105
+    pipette_y_rotation: 25
+    pipette_k_scale: 0.79156
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -18000
+  pipette_1:                      # right manipulator (COM7), mirrored in x and y
+    pipette_z_rotation: 159.9895  # initial guess = pipette_0 + 180; verify by jogging
+    pipette_y_rotation: 25
+    pipette_k_scale: 0.79156
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -18000
+```
+
+- **`pipette_z_rotation`:** which way the manipulator's +x axis points in stage axes, i.e. which side of the stage the manipulator sits on. Mirrored in x and y = +180°. A y-aligned pipette would be roughly ±90° from pipette_0.
+- **`pipette_y_rotation`:** the pipette's descent angle.
+- **What uses them:**
+  - `locate_cell` moves a pipette by the stage displacement rotated by `pipette_z_rotation`; a wrong value sends that pipette the wrong way.
+  - The safe position is computed along `pipette_y_rotation`.
+  - Cleaning uses `clean_move_order`.
+- **Not needed for collisions:** the collision guard uses each pipette's measured calibration (§12.3), so no mount coordinates are needed.
+- **Allowed fields:** listed in [multipipette_helper.py](../patcherbot/utils/multipipette_helper.py). `PIPETTE_GEOMETRY_FIELDS` are required per pipette; `PIPETTE_POSITION_FIELDS` (home/safe/bath positions) are saved per pipette at runtime.
+
+**Two layouts:**
+- **No `pipettes:` section (single pipette):** the top-level `pipette_z_rotation` etc. are pipette_0's, exactly as before. Used by bo, ibb, moscow and setup_test; the Moscow rig replay reads these top-level values.
+- **`pipettes:` present:**
+  - Each pipette reads and writes only its own entry, through `PipetteConfigView`. Nothing falls back to another pipette or to the top level.
+  - The top-level geometry and position values are unused and hidden from the config editor.
+  - `Norwich_cal.yaml` (both Norwich rigs) and `fake_cal.yaml` use this layout.
+
+**Start-up check:** `validate_pipette_geometry` runs in `RigConfigManager.build_devices`, before any device is opened, and again in `PipetteInterface`. It stops start-up with an explanation in the "Rig configuration error" dialog when:
+- more pipettes are selected than the file defines (including a single-pipette file with 2+ pipettes selected);
+- an entry is missing geometry values (it names which);
+- an entry or value name is unknown (typos).
+
+Two pipettes with identical `pipette_z_rotation` only get a warning; the fake rig's do, since its manipulators share one orientation.
+- **Note:** `moscow_multiple_rig.json` with 2 pipettes now stops with this error until pipette_1's geometry is measured and added to `moscow_cal.yaml`.
+
+**Sanity check:** after calibrating a pipette or loading a calibration, `PipetteInterface.check_calibration_geometry` compares each secondary pipette's calibrated +x direction with pipette_0's.
+- If the angle disagrees with the difference of their `pipette_z_rotation` values by more than 30°, it warns and names the YAML key. The comparison is up to sign, which is enough to catch a wrong mirroring guess.
+
+**Calibration file (`calibration.pickle`, v2):** `{'version': 2, 'pipettes': {key: {manip, home, safe, bath}}, 'stage', 'floor_Z', 'saved_at'}`.
+- The legacy top-level `manip/home/safe/bath` keys are always **pipette_0's**, and are omitted when pipette_0 isn't in the file. The rig replay and dataset builders read those keys alongside pipette_0's movement recording.
+- A legacy file loads into pipette_0 only.
+
+### 12.3 Collision guard (all pipettes, Voronoi cells)
+[`WorkspaceGuard`](../patcherbot/controller/collision.py):
+- **Rule:** viewed from above (XY only), each pipette may only be moved *automatically* within its own Voronoi cell. That is the set of points closer to its own tip than to any other pipette's tip, shrunk by half of `collision_min_separation_um` (default 100 µm) on each side.
+  - All pipettes are treated the same: pipette_0 can't cross to pipette_1's side, pipette_1 can't cross to pipette_0's, and a y-aligned pipette can't be driven behind either of them.
+  - The gap stops creeping (repeated half-way moves converge at the gap).
+  - A pipette already too close (e.g. after a manual jog) may still move as long as the move doesn't bring it closer.
+- **Where pipettes are:** in stage-frame µm (camera pixels minus the stage reference, converted with the stage calibration). This doesn't change as the stage moves, because the manipulators ride on it.
+  - A tip is placed from an anchor (latest confirmed tip detection, then trusted detection, then "tip at the image centre at home") plus the pipette's calibration matrix, the same way the camera overlay draws it. The calibration offset `r0` isn't used.
+- **Enforcement:** every pipette's manipulator device is wrapped in a [`GuardedPipetteDevice`](../patcherbot/controller/collision.py), installed on both the raw unit and the calibrated unit.
+  - So every discrete and velocity move is checked, whoever issues it: interface commands, patch phases, `PipetteCalHelper`, cleaning, home/safe moves.
+  - **Group moves:** every corner of the XY box between start and target is checked, because the axes don't travel in a straight line.
+  - **Velocity commands:** projected `collision_velocity_lookahead_s` (default 0.5 s) ahead; a refused command stops the axes. The automatic loops re-issue velocity commands every cycle, so each cycle is checked.
+- **Manual moves are never checked:** the keyboard jogs (`move_pipette_x/y/z`) and raise/lower run inside `guard.manual()`.
+- **Unlocated pipettes:** a pipette that's not calibrated, or has no known tip position yet, is left out. Its own moves aren't checked and it doesn't restrict the others.
+  - The **Collision Guard** button in the Movement box turns orange and names it.
+  - At start-up nothing is calibrated: jog one pipette into view by hand, calibrate it (it returns to safe automatically), then calibrate the next.
+- **Cells:** `check_cell` refuses a cell inside another pipette's workspace, both when queueing it (`add_cell`) and when a phase starts (`patch`, `whole_cell`, `locate`, `approach`, `hunt`).
+- **Errors:** a refused move raises `CollisionError` with an explanation. Example:
+  > Collision guard stopped pipette_0: this move would take it 150 um too close to pipette_1, which is to its right in the camera image … Move pipette_1 away first, or switch off Collision Guard in the Movement box.
+
+  The same text appears in a non-blocking warning dialog (`PipetteInterface.collision_blocked`).
+- **Toggle:** the **Collision Guard** button in the Movement box (shown with 2+ pipettes) switches it off for debugging; the button is red while off. The guard is ON at every start.
 - **Not covered:**
-  - velocity moves (hunt/approach descent, `find_pipette` velocity mode);
-  - the path between targets;
-  - checks between secondaries (3+ pipettes);
-  - other parts of pipette_0's body beyond its tip x.
+  - pipette shafts (only tips are seeds);
+  - Z;
+  - single velocity commands that are never re-issued;
+  - a pipette that can't be located.
 
-### 12.4 Other
+### 12.4 Data compatibility
+Single-pipette sessions and pipette_0's data keep their formats. Secondary pipettes write where the existing analysis tools don't look, or are tagged so the tools skip them:
+- **State recorder:** secondary pipettes write attempts to `<session>/pipette_<n>/attempt_<k>`. `DatasetBuilder2`, `SimpleDatasetBuilder`, `rig_replay3D` and `scanStitcher` read `<session>/attempt_*` as pipette_0's attempts, so they don't see them.
+- **Rig-wide commands** run on pipette_0's AutoPatcher, so their records stay where the scan stitcher looks: scan, origins, lamp/filter, laser, movement playback.
+- **Logs:** secondary pipettes' controller, calibrated unit and calibration helper log under `<logger>.pipette_<n>`. `rig_replay3D` skips those rows (`recorder_geometry.is_secondary_pipette_log_row`).
+  - The `Calibration reloaded from <file>; file saved at:` line keeps its format, because the replay parses it.
+- **Tares:** `tare.pickle` keeps exactly `{'pipette', 'stage'}`, with `pipette` = pipette_0's tare, because the experiment book rejects anything else. Other pipettes' display tares go in `tare_pipettes.pickle` next to it. The book's TARES entries are pipette_0's.
+- **Known gap:** CellMetadata rows don't record which pipette patched the cell. The protocol files carry `_pipette_<n>`.
+
+### 12.5 Other
 - `AutoPatcher` takes `pipette_key` and `collision_guard` (`MultiPipettePatcher.from_devices` passes both).
-- The state-recorder attempt counter is shared by all AutoPatchers, so `attempt_<n>` folders never collide.
 - Norwich pipette_1 still uses `FakePressureController`. It can be moved and calibrated, but it can't really seal until a pressure channel is configured.
-- Tests: [test_multipipette_motion.py](../tests/test_multipipette_motion.py) (21 tests: config view, guard maths, move hooks, routing, v2/legacy calibration files).
-
+- Tests: [test_multipipette_motion.py](../tests/test_multipipette_motion.py), 39 tests:
+  - config views and the start-up check;
+  - the Voronoi rule, the guard and the guarded device;
+  - routing, calibration files and the sanity check;
+  - data compatibility.

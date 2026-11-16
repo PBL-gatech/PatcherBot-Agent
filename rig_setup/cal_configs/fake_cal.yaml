@@ -1,1 +1,23 @@
 use_ai_features: false
+# Per-pipette geometry (docs/multipipette_changes.md section 12.2). The fake
+# rig's manipulators all share one axis orientation, so their angles match
+# (the start-up check notes this; on a real rig they would differ).
+pipettes:
+  pipette_0:
+    pipette_z_rotation: -60.75
+    pipette_y_rotation: 25
+    pipette_k_scale: 1.0
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -8000
+  pipette_1:
+    pipette_z_rotation: -60.75
+    pipette_y_rotation: 25
+    pipette_k_scale: 1.0
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -8000
+  pipette_2:
+    pipette_z_rotation: -60.75
+    pipette_y_rotation: 25
+    pipette_k_scale: 1.0
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -8000

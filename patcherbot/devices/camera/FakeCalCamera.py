@@ -103,6 +103,8 @@ class FakeCalCamera(Camera):
             pipette = list(self.pipettes.values())[pipette_id]
         elif not isinstance(pipette_id, str):
             manipulator = getattr(pipette_id, "dev", pipette_id)
+            # A collision-guarded device wraps the raw manipulator.
+            manipulator = getattr(manipulator, "raw", manipulator)
             pipette = next(
                 fake_pipette for fake_pipette in self.pipettes.values()
                 if fake_pipette.manipulator is manipulator

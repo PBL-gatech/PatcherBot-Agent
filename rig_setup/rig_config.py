@@ -32,7 +32,7 @@ import inspect
 from typing import Any, Dict, List, Tuple
 import yaml
 
-from patcherbot.utils.multipipette_helper import pipette_key_for
+from patcherbot.utils.multipipette_helper import pipette_key_for, validate_pipette_geometry
 
 LOGGER = logging.getLogger(__name__)
 
@@ -612,6 +612,7 @@ class RigConfigManager:
                 f"Requested {active_pipette_count} pipettes, "
                 f"but this rig supports {max_pipette_count}."
             )
+        self._validate_pipette_geometry(config, active_pipette_count)
         devices_cfg = config.get("devices", {})
         self._apply_pressure_calibration(config, devices_cfg)
         base_instances: Dict[str, Any] = {}
@@ -1103,6 +1104,28 @@ class RigConfigManager:
             config["_resolved_protocol"] = protocol.to_dict()
         config.pop("ai_features", None)
         config["_has_pressure_calibration_overrides"] = has_pressure_overrides
+
+    @staticmethod
+    def _validate_pipette_geometry(config: Dict[str, Any], active_pipette_count: int) -> None:
+        """Every selected pipette needs its own geometry in the calibration file.
+
+        Runs before any device is opened, so a missing entry is reported in
+        the start-up dialog instead of after hardware initialisation.
+        """
+        calibration = config.get("_resolved_calibration")
+        if not isinstance(calibration, dict):
+            # Overlays weren't loaded (load_config(..., load_overlays=False)), so
+            # the calibration file hasn't been read; PipetteInterface checks later.
+            LOGGER.debug("Calibration file not loaded; per-pipette geometry check skipped")
+            return
+        source = config.get("calibration_file") or "the rig's calibration settings"
+        keys = [pipette_key_for(index) for index in range(active_pipette_count)]
+        try:
+            warnings = validate_pipette_geometry(calibration, keys, source)
+        except ValueError as exc:
+            raise RigConfigError(str(exc)) from exc
+        for warning in warnings:
+            LOGGER.warning(warning)
 
     _PRESSURE_CALIBRATION_KEYS = ("native_zero", "native_per_mbar", "reader_offset", "reader_scale")
 

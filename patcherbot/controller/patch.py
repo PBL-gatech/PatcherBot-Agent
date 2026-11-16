@@ -12,6 +12,7 @@ from patcherbot.devices.lamp import Lamp
 from patcherbot.devices.manipulator.helpers.AgentHelper import AgentHelper
 from patcherbot.devices.manipulator.helpers.Observer import Observer
 from patcherbot.utils.StateMachineLogger import StateMachineLogger, record_state
+from patcherbot.utils.multipipette_helper import pipette_index
 import logging
 from datetime import datetime
 from uuid import uuid4
@@ -26,7 +27,6 @@ from .phases.hunt_cell import HuntCellPhase
 from .phases.gigaseal import GigasealPhase
 from .phases.break_in import BreakInPhase
 import threading
-import itertools
 # import locking package
 
 
@@ -49,10 +49,16 @@ class AutoPatcher(TaskController):
         pipette_key: str = "pipette_0",
         collision_guard=None,
     ):
-        super().__init__()
-        # Which pipette this controller drives, and the rule keeping
-        # secondary pipettes off the primary's side (None = no check).
+        # Which pipette this controller drives. Secondary pipettes log under
+        # "<logger>.pipette_<n>" and record their attempts under
+        # "<session>/pipette_<n>/", so tools that read pipette_0's logs and
+        # attempts (rig replay, dataset builders) can tell them apart.
         self.pipette_key = pipette_key
+        self.is_secondary_pipette = pipette_index(pipette_key) not in (None, 0)
+        if self.is_secondary_pipette:
+            self.log_name_suffix = pipette_key
+        super().__init__()
+        # Collision guard (WorkspaceGuard) checking cells before phases start; None = no check.
         self.collision_guard = collision_guard
         self.config = config if config is not None else PatchConfig(name="Patch")
         self.protocol_config = protocol_config if protocol_config is not None else ProtocolConfig(name="Protocols")
@@ -154,12 +160,8 @@ class AutoPatcher(TaskController):
         record = request["logger"].write_origin(record)
         request["completed"](record, frame)
 
-    # One attempt counter for every AutoPatcher, so attempt folders of
-    # different pipettes never collide.
-    _shared_attempt_counter = itertools.count(1)
-
     def check_cell_allowed(self, cell):
-        """Raise CollisionError if this pipette may not patch ``cell`` right now."""
+        """Raise CollisionError if ``cell`` is in another pipette's workspace right now."""
         if self.collision_guard is None or cell is None:
             return
         position = cell[0] if isinstance(cell, (tuple, list)) else cell
@@ -167,12 +169,12 @@ class AutoPatcher(TaskController):
 
     def _get_state_recorder(self) -> StateMachineLogger:
         if self._state_recorder is None:
-            self.attempt_counter = next(AutoPatcher._shared_attempt_counter)
-            self.info(f"Attempt {self.attempt_counter}: {self.pipette_key}")
+            self.attempt_counter += 1
             self.observer = Observer(self, attempt_id=self.attempt_counter)
             self._state_recorder = StateMachineLogger(
                 base_path="experiments/Data/state_recorder_data/",
-                attempt_id=self.attempt_counter
+                attempt_id=self.attempt_counter,
+                subfolder=self.pipette_key if self.is_secondary_pipette else None,
             )
         return self._state_recorder
 

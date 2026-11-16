@@ -44,7 +44,7 @@ class MultiPipettePatcher(TaskController):
         device serves every pipette, and a device with ``for_pipette`` (e.g.
         MultiClampAmplifier) hands each pipette its own part. Each pipette
         gets its own view onto the one DAQ. ``collision_guard`` (e.g. a
-        PrimaryPipetteGuard) is checked before a pipette starts on a cell.
+        WorkspaceGuard) is checked before a pipette starts on a cell.
         """
         autopatchers = {}
         for key, calibrated_unit in calibrated_units.items():

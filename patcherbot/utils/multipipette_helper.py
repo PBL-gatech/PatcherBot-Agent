@@ -12,7 +12,9 @@ talk to their hardware:
 * the DAQ channel model (``PipetteChannels``, ``build_channel_map``)
 * DAQ method tags (``multi_pipette_protocol``, ``per_pipette``) and
   ``PipetteDAQView``, one pipette's handle on the shared DAQ
-* ``PipetteConfigView``, one pipette's view of the shared calibration config
+* per-pipette calibration values (``PER_PIPETTE_CALIBRATION_FIELDS``),
+  ``validate_pipette_geometry`` and ``PipetteConfigView``, one pipette's
+  view of the shared calibration config
 
 Nothing here imports device modules; devices are used duck-typed.
 """
@@ -29,7 +31,8 @@ __all__ = [
     "MultiPipetteDevice",
     "PipetteChannels", "build_channel_map", "enumerated_channels",
     "multi_pipette_protocol", "takes_pipettes", "per_pipette", "PipetteDAQView",
-    "PipetteConfigView",
+    "PIPETTE_GEOMETRY_FIELDS", "PIPETTE_POSITION_FIELDS", "PER_PIPETTE_CALIBRATION_FIELDS",
+    "keyed_pipette_entries", "validate_pipette_geometry", "PipetteConfigView",
 ]
 
 
@@ -371,53 +374,160 @@ class PipetteDAQView:
 
 
 # ========================================================
-#  Per-pipette view of a shared config
+#  Per-pipette calibration values
 # ========================================================
+# Geometry every pipette must define for itself (never shared or copied from
+# another pipette: a wrong angle sends that pipette the wrong way).
+PIPETTE_GEOMETRY_FIELDS = (
+    "pipette_z_rotation",      # direction of the manipulator's +x axis in stage axes (deg)
+    "pipette_y_rotation",      # descent angle of the pipette (deg)
+    "pipette_k_scale",
+    "clean_move_order",
+    "safe_position_delta_um",
+)
+# Positions saved at runtime, one set per pipette; unset until stored.
+PIPETTE_POSITION_FIELDS = (
+    "home_position",
+    "safe_position",
+    "home_position_stage",
+    "safe_position_stage",
+    "bath_position",
+)
+PER_PIPETTE_CALIBRATION_FIELDS = PIPETTE_GEOMETRY_FIELDS + PIPETTE_POSITION_FIELDS
+_UNSET_POSITION = (0.0, 0.0, 0.0)
+_CALIBRATION_FORMAT_HELP = "see the `pipettes:` section in docs/multipipette_changes.md section 12.2"
+
+
+def keyed_pipette_entries(calibration):
+    """The calibration's ``pipettes`` mapping (``{pipette_key: {field: value}}``), or None.
+
+    ``calibration`` is a config object or a plain dict. None means the file
+    uses the single-pipette (legacy) layout: top-level values = pipette_0.
+    """
+    entries = (calibration.get("pipettes") if isinstance(calibration, dict)
+               else getattr(calibration, "pipettes", None))
+    return entries if entries else None
+
+
+def validate_pipette_geometry(calibration, pipette_keys, source="the calibration file"):
+    """Check that the calibration describes every selected pipette.
+
+    Raises ValueError with an explanation the user can act on; returns a list
+    of warnings (strings) for suspicious-but-allowed values.
+    """
+    keys = validate_pipette_keys(pipette_keys)
+    entries = keyed_pipette_entries(calibration)
+    required = ", ".join(PIPETTE_GEOMETRY_FIELDS)
+    if entries is None:
+        if len(keys) > 1:
+            raise ValueError(
+                f"{source} has no `pipettes:` section, so its top-level pipette_z_rotation etc. "
+                f"describe one pipette, but {len(keys)} pipettes are selected ({', '.join(keys)}). "
+                f"Add a `pipettes:` section with an entry for each of {', '.join(keys)} "
+                f"({_CALIBRATION_FORMAT_HELP}). Each pipette needs its own measured geometry; "
+                f"reusing another pipette's values leads to wrong moves and collisions.")
+        return []
+    if not isinstance(entries, dict):
+        raise ValueError(
+            f"`pipettes:` in {source} must map pipette keys to their values "
+            f"(pipette_0:, pipette_1:, ...), got {type(entries).__name__} ({_CALIBRATION_FORMAT_HELP}).")
+    for key, entry in entries.items():
+        if pipette_index(key) is None:
+            raise ValueError(
+                f"`pipettes:` in {source} has an entry named {key!r}; entries must be named "
+                f"pipette_0, pipette_1, ... ({_CALIBRATION_FORMAT_HELP}).")
+        if not isinstance(entry, dict):
+            raise ValueError(f"pipettes.{key} in {source} must be a mapping of values, got {entry!r}.")
+        unknown = sorted(set(entry) - set(PER_PIPETTE_CALIBRATION_FIELDS))
+        if unknown:
+            raise ValueError(
+                f"pipettes.{key} in {source} has unknown value(s) {', '.join(unknown)}. "
+                f"Allowed per-pipette values: {', '.join(PER_PIPETTE_CALIBRATION_FIELDS)}.")
+    missing_keys = [key for key in keys if key not in entries]
+    if missing_keys:
+        defined = ", ".join(sorted(entries)) or "no pipettes"
+        raise ValueError(
+            f"{len(keys)} pipette(s) are selected but {source} only defines {defined} under "
+            f"`pipettes:`. Add {' and '.join(f'a `{key}:` entry' for key in missing_keys)} with "
+            f"{required}. Each pipette needs its own measured geometry; reusing another "
+            f"pipette's values leads to wrong moves and collisions.")
+    for key in keys:
+        missing = [name for name in PIPETTE_GEOMETRY_FIELDS if entries[key].get(name) is None]
+        if missing:
+            raise ValueError(f"pipettes.{key} in {source} is missing {', '.join(missing)}.")
+    warnings = []
+    rotations = {}
+    for key in keys:
+        rotations.setdefault(float(entries[key]["pipette_z_rotation"]), []).append(key)
+    for rotation, same in rotations.items():
+        if len(same) > 1:
+            warnings.append(
+                f"{' and '.join(same)} have the same pipette_z_rotation ({rotation}) in {source}; "
+                f"manipulators on different sides of the stage should differ. Is that intended?")
+    return warnings
+
+
 class PipetteConfigView:
-    """One pipette's view of the rig's shared config object.
+    """One pipette's view of the rig's shared calibration config.
 
-    ``fields`` names the values each pipette may override. Their overrides
-    live in ``base.<overrides_attr>[index]`` (a list of ``None``/dicts, as
-    loaded from the calibration YAML). Reading a field returns the
-    override if one is set, else the shared value; writing a field stores
-    it as this pipette's override, so pipettes never overwrite each other's
-    geometry or saved positions. Every other attribute is the shared
-    config's, read and written directly.
+    Keyed layout (``base.pipettes`` is ``{pipette_key: {...}}``): the
+    per-pipette ``fields`` are read from and written to this pipette's entry
+    only -- never another pipette's or the top-level values. Geometry must be
+    present (``validate_pipette_geometry`` checks this at start-up); unset
+    positions read as ``(0, 0, 0)``.
 
-    Pipette 0 with no entry behaves exactly like the shared config, except
-    that writes to its fields still go to the shared (top-level) value, so
-    the config editor keeps showing pipette 0's numbers.
+    Legacy layout (no ``pipettes``): only pipette_0 is allowed, and it uses
+    the top-level values, as single-pipette rigs always have.
+
+    Every other attribute is the shared config's, read and written directly.
     """
 
-    def __init__(self, base, index, fields, overrides_attr="pipettes"):
+    def __init__(self, base, pipette_key, fields=PER_PIPETTE_CALIBRATION_FIELDS,
+                 overrides_attr="pipettes"):
         object.__setattr__(self, "base", base)
-        object.__setattr__(self, "index", int(index))
+        object.__setattr__(self, "pipette_key", str(pipette_key))
         object.__setattr__(self, "fields", frozenset(fields))
         object.__setattr__(self, "overrides_attr", overrides_attr)
+        if self._entries() is None and pipette_index(pipette_key) != 0:
+            raise ValueError(
+                f"{pipette_key} has no calibration values: the calibration file has no "
+                f"`pipettes:` section ({_CALIBRATION_FORMAT_HELP}).")
 
-    def overrides(self, create=False):
-        """This pipette's override dict (``{}``-like None if absent and not ``create``)."""
+    def _entries(self):
         entries = getattr(self.base, self.overrides_attr, None)
-        entries = list(entries) if entries else []
-        entry = entries[self.index] if self.index < len(entries) else None
-        if entry is None and create:
-            entries.extend([None] * (self.index + 1 - len(entries)))
-            entry = entries[self.index] = {}
-            setattr(self.base, self.overrides_attr, entries)
-        return entry
+        return entries if entries else None
+
+    @property
+    def keyed(self):
+        return self._entries() is not None
 
     def __getattr__(self, name):
         if name in self.fields:
-            entry = self.overrides()
-            if entry and entry.get(name) is not None:
-                return entry[name]
+            entries = self._entries()
+            if entries is not None:
+                entry = entries.get(self.pipette_key) or {}
+                value = entry.get(name)
+                if value is None:
+                    if name in PIPETTE_POSITION_FIELDS:
+                        return _UNSET_POSITION
+                    raise AttributeError(
+                        f"pipettes.{self.pipette_key} has no {name} in the calibration file")
+                default = getattr(self.base, name, None)
+                if isinstance(default, tuple) and isinstance(value, list):
+                    return tuple(value)
+                return value
         return getattr(self.base, name)
 
     def __setattr__(self, name, value):
-        if name in self.fields and (self.index != 0 or self.overrides()):
-            self.overrides(create=True)[name] = value
+        entries = self._entries()
+        if name in self.fields and entries is not None:
+            entries = dict(entries)
+            entry = dict(entries.get(self.pipette_key) or {})
+            entry[name] = value
+            entries[self.pipette_key] = entry
+            setattr(self.base, self.overrides_attr, entries)
         else:
             setattr(self.base, name, value)
 
     def __repr__(self):
-        return f"PipetteConfigView({type(self.base).__name__}, pipette {self.index})"
+        return f"PipetteConfigView({type(self.base).__name__}, {self.pipette_key!r})"

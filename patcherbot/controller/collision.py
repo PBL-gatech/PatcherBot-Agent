@@ -1,87 +1,163 @@
-"""Minimal collision rule between the primary pipette and the others.
+"""Collision guard: every pipette stays inside its own Voronoi cell.
 
-Geometry (operator's view): pipette_0's manipulator is on the left, the
-others come from the right. In pipette_0's manipulator frame, -x points
-back along pipette_0, away from the centre, so the region with x smaller
-than pipette_0's current x is where pipette_0's body is. The rule is:
+The rule
+--------
+Each pipette's tip, seen from above (XY only, Z ignored), is a seed. A
+pipette may only be moved *automatically* to points that are closer to its
+own tip than to any other pipette's tip, keeping at least half of
+``collision_min_separation_um`` from each midpoint line. So all pipettes
+are treated the same: pipette_0 can't cross to pipette_1's side, pipette_1
+can't cross to pipette_0's, and a future y-aligned pipette can't be driven
+behind either of them.
 
-    a secondary pipette may not go to (or be sent to patch) a point whose
-    x, expressed in pipette_0's manipulator frame, is smaller than
-    pipette_0's current x.
+* The gap matters: without it a pipette could move halfway to its
+  neighbour, then halfway again, and so on, until they touch.
+* A pipette that is already too close (e.g. after a manual jog) may still
+  be moved as long as the move doesn't bring it closer; retreating always
+  works.
+* Manual moves (keyboard jogs, raise/lower) run inside ``guard.manual()``
+  and are never checked.
+* A pipette the guard can't place (not calibrated, or no known tip
+  position yet) is left out: its own moves aren't checked and it doesn't
+  restrict the others. ``status()`` lists such pipettes so the GUI can warn.
 
-How points move between frames
-------------------------------
-Everything is compared in the *stage frame*: camera pixels minus the stage
-reference position (``CalibratedStage.reference_position``). The pipettes
-and the slice ride on the stage, so a point fixed to the slice or to a
-manipulator position keeps its stage-frame coordinates wherever the stage
-goes.
+Where pipettes are
+------------------
+Positions are compared in the *stage frame*, in um: camera pixels minus the
+stage reference position, converted with the stage calibration. The
+manipulators ride on the stage, so a fixed tip keeps its coordinates when
+the stage moves. A tip is placed the same way the camera overlay places it:
+from an anchor (latest confirmed tip detection, then trusted detection,
+then "tip at the image centre when pipette and stage are at home") plus the
+pipette calibration matrix for the displacement since. The calibration
+offset ``r0`` is never used, because it is unreliable after calibration.
 
-A pipette's tip is placed in that frame the same way the camera overlay
-(``AutoPatchInterface.update_camera_cell_list``) and the patch phases place
-it: from an *anchor* ``(tip_px, manipulator_um, stage_um)`` plus the
-calibrated matrix ``M`` for the displacement since the anchor. The anchor
-is the latest confirmed tip detection (``_tip_reference``, then
-``_trusted_tip_reference``), else "tip at the image centre when the
-pipette and stage are at their home positions". The absolute calibration
-offset ``r0`` is used only when no anchor exists. So the guard draws the
-boundary where the overlay shows pipette_0.
-
-Only XY matters: the calibration maps encoder XY to image XY and leaves Z
-separate, so a pipette's x in pipette_0's frame doesn't depend on height.
-Only pipette_0 vs each secondary is checked; nothing is checked between
-secondaries, and velocity moves are not checked.
+Where it is enforced
+--------------------
+``GuardedPipetteDevice`` wraps each pipette's manipulator device; every
+discrete and velocity move command, from any code path (interface
+commands, patch phases, calibration helpers, cleaning, home/safe moves),
+passes through it.
 """
+import contextlib
 import logging
+import threading
 
 import numpy as np
 
 from .errors import AutopatchError
 
-__all__ = ["CollisionError", "PrimaryPipetteGuard"]
+__all__ = ["CollisionError", "WorkspaceGuard", "GuardedPipetteDevice", "voronoi_margin",
+           "move_allowed"]
 
 LOGGER = logging.getLogger(__name__)
 
 
 class CollisionError(AutopatchError):
-    """A secondary pipette was asked to enter pipette_0's side."""
+    """A pipette was asked to move into another pipette's workspace."""
+
+
+# ------------------------------------------------------------------
+# The rule (pure functions)
+# ------------------------------------------------------------------
+def voronoi_margin(seed, other, point, gap):
+    """How far ``point`` is inside ``seed``'s side of the line between ``seed``
+    and ``other``, after keeping ``gap / 2`` from the midpoint (um; negative =
+    too close to ``other``)."""
+    seed, other, point = (np.asarray(v, dtype=float)[:2] for v in (seed, other, point))
+    offset = other - seed
+    distance = float(np.linalg.norm(offset))
+    if distance < 1e-9:
+        # Coincident seeds: fall back to plain distance from the other tip.
+        return float(np.linalg.norm(point - other)) - gap
+    normal = offset / distance
+    return float(np.dot((seed + other) / 2.0 - point, normal)) - gap / 2.0
+
+
+def move_allowed(seed, target, other, gap):
+    """True if moving from ``seed`` to ``target`` keeps out of ``other``'s
+    workspace, or at least doesn't go further into it."""
+    target_margin = voronoi_margin(seed, other, target, gap)
+    if target_margin >= 0:
+        return True
+    start_margin = voronoi_margin(seed, other, seed, gap)
+    return start_margin < 0 and target_margin >= start_margin - 1e-9
 
 
 def _usable(unit):
     return bool(getattr(unit, "calibrated", False)) and not getattr(unit, "must_be_recalibrated", False)
 
 
-def _finite(*arrays):
-    return all(np.isfinite(np.asarray(a, dtype=float)).all() for a in arrays)
+class WorkspaceGuard:
+    """Keeps every pipette inside its Voronoi cell (see the module docstring).
 
-
-class PrimaryPipetteGuard:
-    """Keeps every secondary pipette on its side of pipette_0.
-
-    calibrated_units: ``{pipette_key: CalibratedUnit}``; the primary is
-        ``primary_key`` (default: the first key).
+    calibrated_units: ``{pipette_key: CalibratedUnit}``.
     calibrated_stage: the shared ``CalibratedStage``.
-    home_anchor: optional ``f(key) -> (image_xy, home_um, home_stage_xy)``
-        or None, the "tip at image centre at home" fallback anchor.
+    config: the shared calibration config (collision_min_separation_um,
+        collision_velocity_lookahead_s).
+    home_anchor: optional ``f(key) -> (image_xy, home_um, home_stage_xy) or None``.
+    camera: optional, only to word directions ("to its right") as displayed.
+    on_blocked: optional ``f(message)`` called before a CollisionError is raised.
     """
 
-    def __init__(self, calibrated_units, calibrated_stage, primary_key=None, home_anchor=None):
+    def __init__(self, calibrated_units, calibrated_stage, config, home_anchor=None,
+                 camera=None, on_blocked=None):
         self.units = calibrated_units
         self.stage = calibrated_stage
-        self.primary_key = primary_key if primary_key is not None else next(iter(calibrated_units))
+        self.config = config
         self.home_anchor = home_anchor
-        self._warned_uncalibrated = set()
+        self.camera = camera
+        self.on_blocked = on_blocked
+        self.enabled = True
+        self._local = threading.local()
+        self._warned = set()
+
+    # ---------------- settings ----------------
+    @property
+    def gap(self):
+        return float(getattr(self.config, "collision_min_separation_um", 100.0))
 
     @property
-    def primary(self):
-        return self.units[self.primary_key]
+    def lookahead_s(self):
+        return float(getattr(self.config, "collision_velocity_lookahead_s", 0.5))
 
-    # ---------------- frame mapping ----------------
+    def set_enabled(self, enabled):
+        self.enabled = bool(enabled)
+        self._warned.discard("disabled")
+        if not self.enabled:
+            LOGGER.warning("Collision guard switched OFF: automatic pipette moves are not checked")
+        else:
+            LOGGER.info("Collision guard switched ON")
+
+    @contextlib.contextmanager
+    def manual(self):
+        """Moves made inside this block (keyboard jogs etc.) are not checked."""
+        self._local.depth = getattr(self._local, "depth", 0) + 1
+        try:
+            yield
+        finally:
+            self._local.depth -= 1
+
+    def is_manual(self):
+        return getattr(self._local, "depth", 0) > 0
+
+    def should_check(self, key):
+        """Quick test (no device access) whether moves of ``key`` need checking."""
+        if len(self.units) < 2 or self.is_manual():
+            return False
+        if not self.enabled:
+            self._warn_once("disabled", "Collision guard is OFF; automatic pipette moves are not checked")
+            return False
+        return True
+
+    # ---------------- locating pipettes ----------------
+    def _stage_matrix(self):
+        return np.asarray(self.stage.M, dtype=float)[:2, :2]
+
     def _stage_pixels(self, stage_xy):
         """Stage reference position (pixels, XY) when the stage is at ``stage_xy`` um."""
         stage_xy = np.asarray(stage_xy, dtype=float).reshape(-1)[:2]
-        return np.dot(np.asarray(self.stage.M, dtype=float)[:2, :2], stage_xy) \
-            + np.asarray(self.stage.r0, dtype=float).reshape(-1)[:2]
+        return self._stage_matrix() @ stage_xy + np.asarray(self.stage.r0, dtype=float).reshape(-1)[:2]
 
     def _anchor(self, key):
         """``(stage-frame tip XY px, manipulator um)`` for one known tip position, or None."""
@@ -96,104 +172,283 @@ class PrimaryPipetteGuard:
             tip, position, stage_xy = anchor
             tip = np.asarray(tip, dtype=float).reshape(-1)[:2]
             position = np.asarray(position, dtype=float).reshape(-1)
-            if tip.shape == (2,) and position.size >= 2 and _finite(tip, position, stage_xy):
+            stage_xy = np.asarray(stage_xy, dtype=float).reshape(-1)
+            if (tip.shape == (2,) and position.size >= 2 and stage_xy.size >= 2
+                    and np.isfinite(tip).all() and np.isfinite(position).all()
+                    and np.isfinite(stage_xy[:2]).all()):
                 return tip - self._stage_pixels(stage_xy), position
         return None
 
-    def _matrix_xy(self, key):
-        return np.asarray(self.units[key].M, dtype=float)[:2, :2]
-
-    def stage_frame_xy(self, key, position_um):
-        """Tip of pipette ``key`` at manipulator ``position_um``, in stage-frame pixels (XY)."""
-        position_um = np.asarray(position_um, dtype=float).reshape(-1)
-        anchor = self._anchor(key)
-        if anchor is not None:
-            tip_px, anchor_um = anchor
-            return tip_px + self._matrix_xy(key) @ (position_um[:2] - anchor_um[:2])
+    def unlocated_reason(self, key):
+        """Why ``key`` can't be placed (None if it can). No device access."""
+        if not getattr(self.stage, "calibrated", False):
+            return "the stage is not calibrated"
         unit = self.units[key]
-        return (np.dot(np.asarray(unit.M, dtype=float), position_um)
-                + np.asarray(unit.r0, dtype=float))[:2]
+        if not getattr(unit, "calibrated", False):
+            return "it is not calibrated"
+        matrix = np.asarray(unit.M, dtype=float)
+        if matrix.shape[0] < 2 or matrix.shape[1] < 2 or not np.isfinite(matrix[:2, :2]).all():
+            return "its calibration matrix is invalid"
+        if self._anchor(key) is None:
+            return "its tip position is unknown (detect the pipette or store its home position)"
+        return None
 
-    def primary_xy_from_stage_frame(self, stage_xy_px):
-        """Pipette_0 manipulator XY (um) whose tip sits at stage-frame pixel ``stage_xy_px``."""
-        stage_xy_px = np.asarray(stage_xy_px, dtype=float).reshape(-1)[:2]
-        anchor = self._anchor(self.primary_key)
-        matrix = self._matrix_xy(self.primary_key)
-        if anchor is not None:
-            tip_px, anchor_um = anchor
-            return anchor_um[:2] + np.linalg.solve(matrix, stage_xy_px - tip_px)
-        unit = self.primary
-        r0 = np.asarray(unit.r0, dtype=float).reshape(-1)[:2]
-        return np.linalg.solve(matrix, stage_xy_px - r0)
+    def locate(self, key, position_um):
+        """Tip of ``key`` at manipulator ``position_um``, in stage-frame um (XY), or None."""
+        if self.unlocated_reason(key) is not None:
+            return None
+        tip_px, anchor_um = self._anchor(key)
+        position_um = np.asarray(position_um, dtype=float).reshape(-1)
+        matrix = np.asarray(self.units[key].M, dtype=float)[:2, :2]
+        stage_frame_px = tip_px + matrix @ (position_um[:2] - anchor_um[:2])
+        return np.linalg.solve(self._stage_matrix(), stage_frame_px)
 
-    def to_primary_frame(self, key, position_um):
-        """XY of pipette ``key`` at ``position_um`` in pipette_0's manipulator um."""
-        if key == self.primary_key:
-            return np.asarray(position_um, dtype=float).reshape(-1)[:2]
-        return self.primary_xy_from_stage_frame(self.stage_frame_xy(key, position_um))
-
-    def cell_in_primary_frame(self, cell):
-        """A queued cell's XY in pipette_0's manipulator um.
-
-        Cells are stored as ``stage_reference_px - image_px`` (XY) plus z: at
-        stage reference S the cell is at image pixel ``S - cell``, so its
-        stage-frame position is ``-cell``.
-        """
+    def cell_location(self, cell):
+        """A queued cell (``stage_reference_px - image_px``) in stage-frame um (XY)."""
         cell = np.asarray(cell, dtype=float).reshape(-1)
         if cell.size < 2 or not np.isfinite(cell[:2]).all():
             raise CollisionError(f"Cell position {cell} needs finite x and y")
-        return self.primary_xy_from_stage_frame(-cell[:2])
+        return np.linalg.solve(self._stage_matrix(), -cell[:2])
 
-    def primary_x(self):
-        return float(np.asarray(self.primary.position(), dtype=float).reshape(-1)[0])
+    def status(self):
+        """``{"enabled", "unlocated": {key: reason}}``; no device access."""
+        unlocated = {}
+        if len(self.units) > 1:
+            for key in self.units:
+                reason = self.unlocated_reason(key)
+                if reason is not None:
+                    unlocated[key] = reason
+        return {"enabled": self.enabled, "unlocated": unlocated}
+
+    def _seeds(self, mover):
+        """Current stage-frame XY of every located pipette except ``mover``."""
+        seeds = {}
+        for key, unit in self.units.items():
+            if key == mover or self.unlocated_reason(key) is not None:
+                continue
+            seeds[key] = self.locate(key, unit.position())
+        return seeds
 
     # ---------------- checks ----------------
-    def _require_calibrated(self, key):
-        for name in (self.primary_key, key):
-            if not _usable(self.units[name]):
-                raise CollisionError(
-                    f"Collision check for {key} needs {name} calibrated; "
-                    f"calibrate (or recalibrate) {name} first")
+    def _warn_once(self, tag, message):
+        if tag not in self._warned:
+            self._warned.add(tag)
+            LOGGER.warning(message)
 
-    def check_cell(self, key, cell):
-        """Raise CollisionError if pipette ``key`` may not patch ``cell``.
+    def _mover_seed(self, key, current_um):
+        reason = self.unlocated_reason(key)
+        if reason is not None:
+            self._warn_once(("unlocated", key, reason),
+                            f"Collision guard can't check {key}'s moves: {reason}")
+            return None
+        self._warned = {tag for tag in self._warned if not (isinstance(tag, tuple) and tag[1] == key)}
+        return self.locate(key, current_um)
 
-        Fail-safe: a secondary pipette needs both itself and pipette_0
-        calibrated, otherwise the cell is refused.
-        """
-        if key == self.primary_key:
+    def _direction_word(self, from_um, to_um):
+        """Where ``to_um`` is relative to ``from_um`` in the camera image."""
+        delta_px = self._stage_matrix() @ (np.asarray(to_um, dtype=float) - np.asarray(from_um, dtype=float))
+        dx, dy = float(delta_px[0]), float(delta_px[1])
+        if getattr(self.camera, "flipped", False):
+            dx = -dx
+        if abs(dx) >= abs(dy):
+            return "to its right" if dx > 0 else "to its left"
+        return "below it" if dy > 0 else "above it"
+
+    def _block(self, message):
+        LOGGER.error(message)
+        if self.on_blocked is not None:
+            try:
+                self.on_blocked(message)
+            except Exception:
+                LOGGER.exception("Collision guard could not report a blocked move")
+        raise CollisionError(message)
+
+    def _check_points(self, key, current_um, targets_um, what):
+        seed = self._mover_seed(key, current_um)
+        if seed is None:
             return
-        self._require_calibrated(key)
-        cell_x = float(self.cell_in_primary_frame(cell)[0])
-        primary_x = self.primary_x()
-        if cell_x < primary_x:
-            raise CollisionError(
-                f"{key} may not patch this cell: it is on {self.primary_key}'s side "
-                f"(cell x = {cell_x:.1f} um < {self.primary_key} x = {primary_x:.1f} um, "
-                f"in {self.primary_key}'s coordinates)")
+        gap = self.gap
+        worst = None
+        for target_um in targets_um:
+            target = self.locate(key, target_um)
+            for other_key, other in self._seeds(key).items():
+                if move_allowed(seed, target, other, gap):
+                    continue
+                overshoot = -voronoi_margin(seed, other, target, gap)
+                if worst is None or overshoot > worst[0]:
+                    worst = (overshoot, other_key, other, target)
+        if worst is None:
+            return
+        overshoot, other_key, other, target = worst
+        self._block(
+            f"Collision guard stopped {key}: {what} would take it {overshoot:.0f} um too close to "
+            f"{other_key}, which is {self._direction_word(target, other)} in the camera image. "
+            f"{key} must stay at least {gap / 2:.0f} um on its own side of the midpoint between the "
+            f"two tips (minimum separation {gap:.0f} um). Move {other_key} away first, or switch "
+            f"off Collision Guard in the Movement box (debugging only).")
 
     def check_move(self, key, current_um, target_um):
-        """Raise CollisionError if moving pipette ``key`` to ``target_um`` enters pipette_0's side.
+        """Check a discrete move of ``key`` from ``current_um`` to ``target_um``.
 
-        A move that doesn't go further into the forbidden side (e.g. a
-        retreat after pipette_0 moved) is always allowed. Without both
-        calibrations the move is allowed, so the secondary can still be
-        jogged and calibrated.
+        Manipulator axes don't move in a straight line, so every corner of the
+        XY box between start and target is checked (the path stays inside it).
         """
-        if key == self.primary_key:
+        if not self.should_check(key):
             return
-        if not (_usable(self.primary) and _usable(self.units[key])):
-            if key not in self._warned_uncalibrated:
-                self._warned_uncalibrated.add(key)
-                LOGGER.warning("Collision guard inactive for %s until %s and %s are calibrated",
-                               key, self.primary_key, key)
+        current = np.asarray(current_um, dtype=float).reshape(-1)
+        target = np.asarray(target_um, dtype=float).reshape(-1)
+        corners = [target]
+        for x, y in ((current[0], target[1]), (target[0], current[1])):
+            corner = target.copy()
+            corner[0], corner[1] = x, y
+            corners.append(corner)
+        self._check_points(key, current, corners, "this move")
+
+    def check_velocity(self, key, current_um, velocity_um_s):
+        """Check a velocity command by projecting it ``collision_velocity_lookahead_s`` ahead."""
+        if not self.should_check(key):
             return
-        self._warned_uncalibrated.discard(key)
-        target_x = float(self.to_primary_frame(key, target_um)[0])
-        current_x = float(self.to_primary_frame(key, current_um)[0])
-        primary_x = self.primary_x()
-        if target_x < primary_x and target_x < current_x:
-            raise CollisionError(
-                f"Refusing to move {key}: target x = {target_x:.1f} um is on "
-                f"{self.primary_key}'s side (x = {primary_x:.1f} um, "
-                f"in {self.primary_key}'s coordinates)")
+        velocity = np.asarray(velocity_um_s, dtype=float).reshape(-1)
+        if velocity.size < 2 or not np.any(velocity[:2]):
+            return  # stops and pure Z motion are always allowed
+        current = np.asarray(current_um, dtype=float).reshape(-1)
+        ahead = current.copy()
+        ahead[:2] = current[:2] + velocity[:2] * self.lookahead_s
+        self._check_points(key, current, [ahead], "this velocity command")
+
+    def check_cell(self, key, cell):
+        """Raise CollisionError if ``cell`` lies in another pipette's workspace."""
+        if not self.should_check(key):
+            return
+        seed = self._mover_seed(key, self.units[key].position())
+        if seed is None:
+            return
+        point = self.cell_location(cell)
+        gap = self.gap
+        for other_key, other in self._seeds(key).items():
+            margin = voronoi_margin(seed, other, point, gap)
+            if margin < 0:
+                self._block(
+                    f"{key} may not patch this cell: it is {-margin:.0f} um inside {other_key}'s "
+                    f"workspace ({other_key} is {self._direction_word(point, other)} in the camera "
+                    f"image; minimum separation {gap:.0f} um). Patch it with {other_key}, move "
+                    f"{other_key} away first, or switch off Collision Guard in the Movement box "
+                    f"(debugging only).")
+
+
+class GuardedPipetteDevice:
+    """A pipette's manipulator device with every move checked by a WorkspaceGuard.
+
+    Installed in place of ``unit.dev`` on both the raw ManipulatorUnit and the
+    CalibratedUnit of a pipette, so calibration helpers, phases and interface
+    commands all go through it. ``raw`` is the wrapped device; anything that
+    isn't a move command is passed straight to it.
+    """
+
+    def __init__(self, dev, pipette_key, axes, guard):
+        object.__setattr__(self, "raw", dev)
+        object.__setattr__(self, "pipette_key", pipette_key)
+        object.__setattr__(self, "axes", [int(axis) for axis in axes])
+        object.__setattr__(self, "guard", guard)
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.raw, name, value)
+
+    def __repr__(self):
+        return f"GuardedPipetteDevice({self.raw!r}, {self.pipette_key!r})"
+
+    # ---- helpers ----
+    def _current(self):
+        return np.asarray(self.raw.position_group(self.axes), dtype=float).reshape(-1)
+
+    def _index(self, axis):
+        try:
+            return self.axes.index(int(axis))
+        except (TypeError, ValueError):
+            return None
+
+    def _check(self, make_target):
+        if not self.guard.should_check(self.pipette_key):
+            return
+        current = self._current()
+        self.guard.check_move(self.pipette_key, current, make_target(current.copy()))
+
+    def _check_velocity(self, velocity, axes):
+        if not self.guard.should_check(self.pipette_key):
+            return
+        velocity = np.asarray(velocity, dtype=float).reshape(-1)
+        unit_velocity = np.zeros(len(self.axes))
+        if axes is None:
+            unit_velocity[:min(len(velocity), len(self.axes))] = velocity[:len(self.axes)]
+        else:
+            for value, axis in zip(velocity, np.atleast_1d(axes)):
+                index = self._index(axis)
+                if index is not None:
+                    unit_velocity[index] = value
+        try:
+            self.guard.check_velocity(self.pipette_key, self._current(), unit_velocity)
+        except CollisionError:
+            self._stop()
+            raise
+
+    def _stop(self):
+        """Stop this pipette's axes. Devices differ: Scientifica's ``stop()``
+        takes no axis, fake/base manipulators take one axis at a time."""
+        try:
+            self.raw.stop()
+        except TypeError:
+            for axis in self.axes:
+                self.raw.stop(axis)
+
+    # ---- discrete moves ----
+    def absolute_move(self, x, axis, *args, **kwargs):
+        def target(current):
+            index = self._index(axis)
+            if index is not None:
+                current[index] = float(x)
+            return current
+        self._check(target)
+        return self.raw.absolute_move(x, axis, *args, **kwargs)
+
+    def absolute_move_group(self, x, axes, *args, **kwargs):
+        def target(current):
+            for value, axis in zip(np.asarray(x, dtype=float).reshape(-1), np.atleast_1d(axes)):
+                index = self._index(axis)
+                if index is not None:
+                    current[index] = value
+            return current
+        self._check(target)
+        return self.raw.absolute_move_group(x, axes, *args, **kwargs)
+
+    def relative_move(self, x, axis, *args, **kwargs):
+        def target(current):
+            index = self._index(axis)
+            if index is not None:
+                current[index] += float(x)
+            return current
+        self._check(target)
+        return self.raw.relative_move(x, axis, *args, **kwargs)
+
+    def relative_move_group(self, x, axes, *args, **kwargs):
+        def target(current):
+            for value, axis in zip(np.asarray(x, dtype=float).reshape(-1), np.atleast_1d(axes)):
+                index = self._index(axis)
+                if index is not None:
+                    current[index] += value
+            return current
+        self._check(target)
+        return self.raw.relative_move_group(x, axes, *args, **kwargs)
+
+    # ---- velocity moves ----
+    def absolute_move_group_velocity(self, vel, *args, **kwargs):
+        axes = kwargs.get("axes", args[0] if args else None)
+        self._check_velocity(vel, axes)
+        return self.raw.absolute_move_group_velocity(vel, *args, **kwargs)
+
+    def relative_move_group_velocity(self, vel, *args, **kwargs):
+        axes = kwargs.get("axes", args[0] if args else None)
+        self._check_velocity(vel, axes)
+        return self.raw.relative_move_group_velocity(vel, *args, **kwargs)

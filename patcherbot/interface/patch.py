@@ -105,6 +105,13 @@ class AutoPatchInterface(TaskInterface):
         return self.autopatchers[self.active_pipette]
 
     @property
+    def rig_autopatcher(self):
+        """pipette_0's AutoPatcher, for rig-wide actions (scan, origins, lamp,
+        laser, movement playback). Their state records stay in pipette_0's
+        attempt folders, where the scan stitcher and dataset builders look."""
+        return self.autopatchers[self.pipette_controller.primary_pipette]
+
+    @property
     def cells_to_patch(self):
         """The active pipette's cell queue."""
         return self.cell_queues[self.active_pipette]
@@ -135,7 +142,7 @@ class AutoPatchInterface(TaskInterface):
             axis=axis, origins_um=dict(self.origins),
             movement_busy=lambda: self.pipette_controller._current_controller is not None,
             completed=self.origin_saved.emit)
-        self.execute(self.current_autopatcher.save_origin, argument=capture)
+        self.execute(self.rig_autopatcher.save_origin, argument=capture)
 
     def accept_origin(self, record):
         """Commit a successful save after the GUI confirms its experiment."""
@@ -179,7 +186,7 @@ class AutoPatchInterface(TaskInterface):
             return
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            current_slot = self.current_autopatcher.lamp.get_filter()
+            current_slot = self.rig_autopatcher.lamp.get_filter()
             if current_slot == target_slot:
                 return
             time.sleep(poll_interval_s)
@@ -227,7 +234,7 @@ class AutoPatchInterface(TaskInterface):
                       description='Scan the stored corner coordinates',
                       task_description='Scanning plate area')
     def start_scan(self):
-        self.execute(self.current_autopatcher.scan_area)
+        self.execute(self.rig_autopatcher.scan_area)
 
     @blocking_command(category='Stage',
                       description='Move stage to the stored scan start coordinate',
@@ -351,7 +358,7 @@ class AutoPatchInterface(TaskInterface):
             # add the z_pos to the stage position as a third dimension in the np array
 
             stage_pos_pixels = np.array([stage_pos_pixels[0], stage_pos_pixels[1], z_pos])
-            # Secondary pipettes may not take cells on the primary's side.
+            # A pipette may not take a cell inside another pipette's workspace.
             try:
                 self.current_autopatcher.check_cell_allowed(stage_pos_pixels)
             except CollisionError as error:
@@ -377,10 +384,10 @@ class AutoPatchInterface(TaskInterface):
             img_fluo = None
             if self.config.auto_capture_fluo:
                 fluo_slot = int(self.config.lamp)
-                current_slot = self.current_autopatcher.lamp.get_filter()
+                current_slot = self.rig_autopatcher.lamp.get_filter()
                 did_toggle = current_slot != fluo_slot
                 if did_toggle:
-                    self.current_autopatcher.toggle_fluorescence()
+                    self.rig_autopatcher.toggle_fluorescence()
                     self._wait_for_filter_slot(fluo_slot)
                 try:
                     img_fluo = self.current_autopatcher.calibrated_unit.camera.get_16bit_image()
@@ -389,7 +396,7 @@ class AutoPatchInterface(TaskInterface):
                         raise RuntimeError('Cell too Close to edge!')
                 finally:
                     if did_toggle:
-                        self.current_autopatcher.toggle_fluorescence()
+                        self.rig_autopatcher.toggle_fluorescence()
                         if current_slot is not None:
                             self._wait_for_filter_slot(current_slot)
 
@@ -532,7 +539,7 @@ class AutoPatchInterface(TaskInterface):
              description='Send movement file to the autopatcher', 
              success_message='Path sent')
     def send_movement_file(self, path):
-        self.current_autopatcher.test_movement(path)
+        self.rig_autopatcher.test_movement(path)
             # Append a tuple of (coordinates, image)
         self.info(f'Movement file path set to {path}')
 
@@ -907,37 +914,37 @@ class AutoPatchInterface(TaskInterface):
              description='Open or close the shutter',
              task_description='Toggling the shutter')
     def toggle_shutter(self):
-        self.execute(self.current_autopatcher.toggle_shutter)
+        self.execute(self.rig_autopatcher.toggle_shutter)
 
     @blocking_command(category='Lamp', description='Toggle between fluorescence and filterless',
              task_description='Toggling fluorescence')
     def toggle_fluorescence(self):
-        self.execute(self.current_autopatcher.toggle_fluorescence)
+        self.execute(self.rig_autopatcher.toggle_fluorescence)
     @blocking_command(category='Lamp', 
              description='Move filter cube one slot left',
              task_description='Moving filter cube left')
     def move_cube_left(self):
-        self.execute(self.current_autopatcher.move_cube_left)
+        self.execute(self.rig_autopatcher.move_cube_left)
 
     @blocking_command(category='Lamp', description='Move filter cube one slot right',
              task_description='Moving filter cube right')
     def move_cube_right(self):
-       self.execute(self.current_autopatcher.move_cube_right)
+       self.execute(self.rig_autopatcher.move_cube_right)
 
     @blocking_command(category='Laser',
                       description='Toggle laser output',
                       task_description='Toggling laser output')
     def toggle_laser_output(self):
-        self.execute(self.current_autopatcher.toggle_laser_output)
+        self.execute(self.rig_autopatcher.toggle_laser_output)
 
     @blocking_command(category='Laser',
                       description='Step wavelength down',
                       task_description='Stepping wavelength down')
     def wavelength_down(self):
-        self.execute(self.current_autopatcher.wavelength_down)
+        self.execute(self.rig_autopatcher.wavelength_down)
 
     @blocking_command(category='Laser',
                       description='Step wavelength up',
                       task_description='Stepping wavelength up')
     def wavelength_up(self):
-        self.execute(self.current_autopatcher.wavelength_up)
+        self.execute(self.rig_autopatcher.wavelength_up)

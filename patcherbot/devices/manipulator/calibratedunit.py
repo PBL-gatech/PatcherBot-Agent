@@ -38,12 +38,6 @@ class CalibrationError(Exception):
 
 
 class CalibratedUnit(ManipulatorUnit):
-    # Optional ``guard(current_um, target_um)`` called before every discrete
-    # move of this unit (absolute/relative, single axis or group); it raises
-    # to refuse the move. Velocity moves are not checked. Set by
-    # PipetteInterface for secondary pipettes (collision rule).
-    move_guard = None
-
     def __init__(self, unit, stage=None, microscope=None, camera=None,
                  config=None):
         '''
@@ -203,50 +197,6 @@ class CalibratedUnit(ManipulatorUnit):
         Converts um to pixel coordinates.
         '''
         return dot(self.M, pos_microns)
-
-    # ---- guarded discrete moves (see ``move_guard``) ----
-    def _check_move(self, make_target):
-        guard = self.move_guard
-        if guard is None:
-            return
-        current = np.asarray(self.position(), dtype=float).reshape(-1)
-        target = np.asarray(make_target(current.copy()), dtype=float).reshape(-1)
-        guard(current, target)
-
-    def absolute_move(self, x, axis=None, blocking=False, speed=None):
-        if self.move_guard is not None:
-            def target(current):
-                if axis is None:
-                    return np.asarray(x, dtype=float).reshape(-1)[:current.size]
-                current[axis] = x
-                return current
-            self._check_move(target)
-        return ManipulatorUnit.absolute_move(self, x, axis, blocking=blocking, speed=speed)
-
-    def absolute_move_group(self, x, axes, speed=None):
-        if self.move_guard is not None:
-            def target(current):
-                for value, axis in zip(np.asarray(x, dtype=float).reshape(-1), np.atleast_1d(axes)):
-                    current[int(axis)] = value
-                return current
-            self._check_move(target)
-        return ManipulatorUnit.absolute_move_group(self, x, axes, speed=speed)
-
-    def relative_move(self, x, axis=None, speed=None):
-        if self.move_guard is not None:
-            def target(current):
-                if axis is None:
-                    return current + np.asarray(x, dtype=float).reshape(-1)[:current.size]
-                current[axis] += x
-                return current
-            self._check_move(target)
-        return ManipulatorUnit.relative_move(self, x, axis, speed=speed)
-
-    def relative_move_group(self, x, axis=None, speed=None):
-        if self.move_guard is not None:
-            self._check_move(
-                lambda current: current + np.asarray(x, dtype=float).reshape(-1)[:current.size])
-        return ManipulatorUnit.relative_move_group(self, x, axis, speed=speed)
 
 
 

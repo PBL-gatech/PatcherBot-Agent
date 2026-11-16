@@ -11,17 +11,29 @@ position_update: 1000
 autofocus_dist: 50
 stage_diag_move: 500
 frame_lag: 4
-pipette_y_rotation: 25
-pipette_k_scale: 0.79156
 stage_x_axis_flip: false
 stage_y_axis_flip: false
-pipette_z_rotation: -20.0105
 microscope_units_per_um: 1.0
-safe_position_delta_um: -18000
-# Per-pipette overrides of the values above (entry i = pipette_i; missing
-# values use the top-level ones, which are pipette_0's). pipette_1's
-# manipulator is mirrored in x and y (not z), i.e. rotated 180 deg about z.
-# Initial guess -- verify on the rig by jogging pipette_1 before calibrating.
+# ---------------------------------------------------------------------------
+# Per-pipette geometry, one entry per pipette, keyed like the rest of the code
+# (pipette_0, pipette_1, ...). Every selected pipette needs its own entry with
+# all five values below; nothing is copied from another pipette, and the
+# top-level pipette_z_rotation/pipette_y_rotation/... are NOT used once this
+# section exists. Format and meaning: docs/multipipette_changes.md section 12.2.
+#   pipette_z_rotation: direction the manipulator's +x axis points, in stage
+#                       axes (deg) -- i.e. which side of the stage it sits on
+#   pipette_y_rotation: descent angle of the pipette (deg)
+# ---------------------------------------------------------------------------
 pipettes:
-- {}
-- pipette_z_rotation: 159.9895
+  pipette_0:                      # left manipulator (COM8)
+    pipette_z_rotation: -20.0105
+    pipette_y_rotation: 25
+    pipette_k_scale: 0.79156
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -18000
+  pipette_1:                      # right manipulator (COM7), mirrored in x and y
+    pipette_z_rotation: 159.9895  # initial guess = pipette_0 + 180; verify by jogging
+    pipette_y_rotation: 25
+    pipette_k_scale: 0.79156
+    clean_move_order: [y, x, z]
+    safe_position_delta_um: -18000

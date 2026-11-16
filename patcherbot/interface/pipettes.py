@@ -1,5 +1,4 @@
 # coding=utf-8
-import functools
 import pickle
 import os
 import math
@@ -11,10 +10,13 @@ from PyQt5 import QtCore
 
 from patcherbot.interface import TaskInterface, command, blocking_command
 from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit, CalibratedStage
-from patcherbot.configs.CalibrationConfig import CalibrationConfig, PER_PIPETTE_CALIBRATION_FIELDS
-from patcherbot.controller.collision import PrimaryPipetteGuard
+from patcherbot.configs.CalibrationConfig import CalibrationConfig
+from patcherbot.controller.collision import GuardedPipetteDevice, WorkspaceGuard
 from patcherbot.devices.cellsorter import CalibratedCellSorter
-from patcherbot.utils.multipipette_helper import PipetteConfigView, pipette_index, pipette_key_for
+from patcherbot.utils.multipipette_helper import (
+    PER_PIPETTE_CALIBRATION_FIELDS, PipetteConfigView, keyed_pipette_entries, pipette_index,
+    pipette_key_for, validate_pipette_geometry,
+)
 import time
 
 from patcherbot.devices.manipulator.microscope import Microscope
@@ -45,6 +47,8 @@ class PipetteInterface(TaskInterface):
     the active pipette's unit.
     '''
     active_pipette_changed = QtCore.pyqtSignal(str)
+    # A move refused by the collision guard (the readable explanation).
+    collision_blocked = QtCore.pyqtSignal(str)
 
     home_position = _active_position("home", "Active pipette's home position (manipulator um)")
     home_stage_position = _active_position("home_stage", "Stage XY + microscope Z at the active pipette's home")
@@ -88,14 +92,18 @@ class PipetteInterface(TaskInterface):
             self.microscope.dev.objective_lift_um = float(self.calibration_config.objective_lift_um)
         self.calibrated_stage = CalibratedStage(stage, None, microscope, camera,
                                                 config=self.calibration_config)
-        # Each pipette sees the shared config through a view that applies its
-        # own overrides (calibration.pipettes[i]: angles, saved positions...).
+        # Every selected pipette needs its own geometry in the calibration file.
+        # RigConfigManager already checked (and warned) before the hardware
+        # started; this repeats the check for other entry points.
+        validate_pipette_geometry(self.calibration_config, list(self.pipette_units))
+        if keyed_pipette_entries(self.calibration_config) is not None:
+            # The top-level per-pipette values are unused with a `pipettes:` section.
+            self.calibration_config.hide_fields_from_editor(PER_PIPETTE_CALIBRATION_FIELDS)
+        # Each pipette sees the shared config through a view of its own
+        # `pipettes.<key>` entry (angles, saved positions...).
         self.calibrated_units = {}
-        for position, (pipette_key, pipette_unit) in enumerate(self.pipette_units.items()):
-            index = pipette_index(pipette_key)
-            config = PipetteConfigView(self.calibration_config,
-                                       position if index is None else index,
-                                       PER_PIPETTE_CALIBRATION_FIELDS)
+        for pipette_key, pipette_unit in self.pipette_units.items():
+            config = PipetteConfigView(self.calibration_config, pipette_key)
             self.calibrated_units[pipette_key] = CalibratedUnit(
                 pipette_unit,
                 self.calibrated_stage,
@@ -111,14 +119,26 @@ class PipetteInterface(TaskInterface):
         # Pipette calibrations read from file but not (re)made this session;
         # kept so write_calibration doesn't drop pipettes that aren't selected.
         self._loaded_pipette_calibrations = {}
-        # Collision rule: secondary pipettes stay on their side of the primary.
-        self.collision_guard = PrimaryPipetteGuard(
-            self.calibrated_units, self.calibrated_stage, self.primary_pipette,
-            home_anchor=self._home_anchor)
+        # Collision guard: every pipette stays inside its Voronoi cell. Every
+        # move command reaches the motors through a guarded device, installed
+        # on both the raw unit (used by the calibration helpers) and the
+        # calibrated unit.
+        self.collision_guard = WorkspaceGuard(
+            self.calibrated_units, self.calibrated_stage, self.calibration_config,
+            home_anchor=self._home_anchor, camera=camera,
+            on_blocked=self.collision_blocked.emit)
         for pipette_key, calibrated_unit in self.calibrated_units.items():
-            if pipette_key != self.primary_pipette:
-                calibrated_unit.move_guard = functools.partial(
-                    self.collision_guard.check_move, pipette_key)
+            raw_unit = self.pipette_units[pipette_key]
+            guarded = GuardedPipetteDevice(raw_unit.dev, pipette_key, raw_unit.axes,
+                                           self.collision_guard)
+            raw_unit.dev = guarded
+            calibrated_unit.dev = guarded
+            if pipette_index(pipette_key) not in (None, 0):
+                # Secondary pipettes log under "<logger>.pipette_<n>" so log
+                # readers (rig replay) can tell them from pipette_0.
+                calibrated_unit.log_name_suffix = pipette_key
+                calibrated_unit._logger = None
+                calibrated_unit.pipetteCalHelper.log_name = f"patcherbot.PipetteCalibration.{pipette_key}"
         self.calibrated_cellsorter = CalibratedCellSorter(cellsorterManip, cellsorterController, self.calibrated_stage, microscope, camera)
         self.observer = Observer(self)
         self.time_truth = datetime.now()
@@ -177,6 +197,22 @@ class PipetteInterface(TaskInterface):
     @tare_pipette.setter
     def tare_pipette(self, value):
         self._tare_pipettes[self.active_pipette] = value
+
+    def pipette_tare(self, pipette_key):
+        """One pipette's display tare (raw manipulator XYZ, entries may be None)."""
+        return self._tare_pipettes[pipette_key]
+
+    def set_pipette_tare(self, pipette_key, values):
+        tare = np.asarray(self._tare_pipettes[pipette_key], dtype=object).copy()
+        for index, value in enumerate(values):
+            if value is not None:
+                tare[index] = value
+        self._tare_pipettes[pipette_key] = tare
+
+    @command(category='Manipulators',
+             description='Switch the collision guard on or off (debugging)')
+    def set_collision_guard(self, enabled):
+        self.collision_guard.set_enabled(bool(enabled))
 
     def is_busy(self):
         return self._current_controller is not None or any(check() for check in self.busy_checks)
@@ -243,7 +279,9 @@ class PipetteInterface(TaskInterface):
              description='Move pipette in x direction by {:.0f}μm',
              default_arg=10)
     def move_pipette_x(self, distance):
-        self.calibrated_unit.relative_move(distance, axis=0)
+        # Keyboard jog: manual, never blocked by the collision guard.
+        with self.collision_guard.manual():
+            self.calibrated_unit.relative_move(distance, axis=0)
 
 
     @command(category='Manipulators',
@@ -292,9 +330,13 @@ class PipetteInterface(TaskInterface):
             'floor_Z': floor_z,  # Same units as set_floor(); no hardware movement.
             'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
         }
-        # Legacy single-pipette keys (manip/home/safe/bath) = the primary
-        # pipette, or the first saved one, so older readers still work.
-        record.update(pipettes.get(self.primary_pipette) or next(iter(pipettes.values())))
+        # Legacy single-pipette keys (manip/home/safe/bath) are always
+        # pipette_0's: the rig replay and dataset builders pair them with
+        # pipette_0's movement recording. Without pipette_0 they are left out,
+        # so those readers fail loudly instead of using another pipette's matrix.
+        legacy_key = pipette_key_for(0)
+        if legacy_key in pipettes:
+            record.update(pipettes[legacy_key])
 
         try:
             # Build the complete file path for 'calibration.pickle'
@@ -358,7 +400,7 @@ class PipetteInterface(TaskInterface):
             if isinstance(floor_z, bool) or not isinstance(floor_z, Real) or not math.isfinite(floor_z):
                 raise ValueError('Saved cell floor must be a finite coordinate or unset')
             floor_z = float(floor_z)
-        raw_entries = cal.get('pipettes') or {self.primary_pipette: cal}
+        raw_entries = cal.get('pipettes') or {pipette_key_for(0): cal}  # legacy file = pipette_0
         entries = {key: self._validated_pipette_entry(entry, key)
                    for key, entry in raw_entries.items()}
         stage_config = self._validated_matrix(cal['stage'], (2, 2), 'stage')
@@ -414,11 +456,15 @@ class PipetteInterface(TaskInterface):
             'reloaded_at': datetime.now().astimezone().isoformat(timespec='seconds'),
             'pipettes': list(loaded),
         }
+        # Keep this line's format: the rig replay parses
+        # "Calibration reloaded from <file>; file saved at:" to find the file.
         self.info(
-            f"Calibration reloaded from {source_file} for {', '.join(loaded) or 'no selected pipette'}; "
+            f"Calibration reloaded from {source_file}; "
             f"file saved at: {source_saved_at or 'unknown'}; "
             f"source session folder: {self.loaded_calibration_reference['source_session']}; "
             f"reloaded at: {self.loaded_calibration_reference['reloaded_at']}")
+        self.info(f"Calibration loaded for: {', '.join(loaded) or 'no selected pipette'}")
+        self.check_calibration_geometry()
         return loaded
 
     @command(category='Manipulators',
@@ -434,15 +480,16 @@ class PipetteInterface(TaskInterface):
                 os.makedirs(self.folder_path, exist_ok=True)
                 self.folder_created = True
 
-            # Write tare data to the file in the specified folder.
-            # 'pipette' is the active pipette's tare (what the GUI restores);
-            # 'pipettes' holds every pipette's.
+            # tare.pickle keeps exactly {'pipette', 'stage'} (the experiment
+            # book only accepts that), with 'pipette' = pipette_0's tare. The
+            # other pipettes' display tares go to tare_pipettes.pickle.
             with open(file_path, 'wb') as f:
                 pickle.dump({
-                    'pipette': self.tare_pipette,
-                    'pipettes': dict(self._tare_pipettes),
+                    'pipette': self._tare_pipettes.get(pipette_key_for(0), np.array([None] * 3)),
                     'stage': self.tare_stage,
                 }, f)
+            with open(os.path.join(self.folder_path, 'tare_pipettes.pickle'), 'wb') as f:
+                pickle.dump(dict(self._tare_pipettes), f)
             self.info('Tare position written to file')
         except Exception as e:
             self.error(f'Error writing tare position to file: {e}')
@@ -457,13 +504,17 @@ class PipetteInterface(TaskInterface):
              description='Move pipette in y direction by {:.0f}μm',
              default_arg=10)
     def move_pipette_y(self, distance):
-        self.calibrated_unit.relative_move(distance, axis=1)
+        # Keyboard jog: manual, never blocked by the collision guard.
+        with self.collision_guard.manual():
+            self.calibrated_unit.relative_move(distance, axis=1)
 
     @command(category='Manipulators',
              description='Move pipette in z direction by {:.0f}μm',
              default_arg=-1000)
     def move_pipette_z(self, distance):
-        self.calibrated_unit.relative_move(distance, axis=2)
+        # Keyboard jog: manual, never blocked by the collision guard.
+        with self.collision_guard.manual():
+            self.calibrated_unit.relative_move(distance, axis=2)
 
     @command(category='Manipulators',
              description='Move pipette in xyz direction by {:.0f}μm',
@@ -517,6 +568,48 @@ class PipetteInterface(TaskInterface):
     def calibrate_manipulator(self):
         self._warn_other_tips_in_view()
         self.execute([self.calibrated_unit.calibrate_pipette])
+        self.check_calibration_geometry()
+
+    def check_calibration_geometry(self, tolerance_deg=30.0):
+        """Compare each secondary pipette's calibration with its configured angle.
+
+        The angle between a pipette's calibrated +x axis (in the image) and the
+        primary pipette's should match the difference of their
+        ``pipette_z_rotation`` values (compared up to sign, which is enough to
+        tell a mirrored manipulator from one that isn't). Returns the warnings.
+        """
+        primary = self.primary_calibrated_unit
+        if not primary.calibrated:
+            return []
+
+        def axis_angle(unit):
+            x_axis = np.asarray(unit.M, dtype=float)[:2, 0]
+            return math.degrees(math.atan2(x_axis[1], x_axis[0]))
+
+        def wrap(angle):
+            return (angle + 180.0) % 360.0 - 180.0
+
+        warnings = []
+        for key, unit in self.calibrated_units.items():
+            if key == self.primary_pipette or not unit.calibrated:
+                continue
+            try:
+                measured = wrap(axis_angle(unit) - axis_angle(primary))
+                configured = wrap(float(unit.config.pipette_z_rotation)
+                                  - float(primary.config.pipette_z_rotation))
+            except (AttributeError, TypeError, ValueError, IndexError):
+                continue
+            error = min(abs(wrap(measured - configured)), abs(wrap(measured + configured)))
+            if error > tolerance_deg:
+                message = (
+                    f"{key}'s calibration puts its +x axis {measured:.0f} deg from "
+                    f"{self.primary_pipette}'s, but the calibration file's pipette_z_rotation values "
+                    f"differ by {configured:.0f} deg (pipettes.{key}.pipette_z_rotation = "
+                    f"{unit.config.pipette_z_rotation}). locate_cell moves {key} using that angle, so "
+                    f"correct it in the calibration file if this calibration is right.")
+                self.warning(message)
+                warnings.append(message)
+        return warnings
 
     def _warn_other_tips_in_view(self):
         """Calibration detects one tip with no expected position, so another
@@ -606,6 +699,10 @@ class PipetteInterface(TaskInterface):
                     description='Raise the pipette high enough to insert the coverslip',
                     task_description='Raising the pipette high enough to insert the coverslip')
     def raise_pipette(self, raise_distance = 1000):
+        with self.collision_guard.manual():  # manual: never blocked by the collision guard
+            self._raise_pipette()
+
+    def _raise_pipette(self):
         if self.pos_before_raise is None:
             self.pos_before_raise = self.calibrated_unit.dev.position()
             position = np.array([self.pos_before_raise[0], self.pos_before_raise[1], 0])
@@ -617,6 +714,10 @@ class PipetteInterface(TaskInterface):
                 description='Lower the pipette after inserting the coverslip',
                 task_description='Lowering the pipette after inserting the coverslip')
     def lower_pipette(self):
+        with self.collision_guard.manual():  # manual: never blocked by the collision guard
+            self._lower_pipette()
+
+    def _lower_pipette(self):
         if self.pos_before_raise is not None:
             self.execute(self.calibrated_unit.absolute_move, argument=self.pos_before_raise)
             self.pos_before_raise = None

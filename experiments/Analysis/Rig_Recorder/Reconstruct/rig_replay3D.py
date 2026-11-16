@@ -58,7 +58,7 @@ from recorder_settings import RecorderSettingsDialog, load_settings, save_settin
 from recorder_geometry import (
     uses_central_cell, select_central_cell, cell_inference_parameters,
     reconstruction_positions,
-    load_moscow_geometry, phase_reference_for_timestamp,
+    load_moscow_geometry, phase_reference_for_timestamp, is_secondary_pipette_log_row,
 )
 
 
@@ -482,6 +482,11 @@ class RecordedGeometry:
         with path.open(encoding='utf-8-sig', errors='replace', newline='') as stream:
             for row in csv.reader(stream):
                 if len(row) < 4:
+                    continue
+                # Multi-pipette sessions: secondary pipettes log under
+                # "<logger>.pipette_<n>" (n >= 1). The replay reconstructs
+                # pipette_0 (the movement recording is pipette_0's), so skip them.
+                if is_secondary_pipette_log_row(row):
                     continue
                 # Older log format leaves commas inside messages unquoted.
                 message = ','.join(row[3:-2]) if len(row) > 6 else row[3]

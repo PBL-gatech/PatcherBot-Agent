@@ -136,6 +136,11 @@ class PipetteCalHelper():
     CAL_MAX_SPEED = 1000
     NORMAL_MAX_SPEED = 1000
 
+    # Logger for calibration messages; a secondary pipette's helper uses
+    # "patcherbot.PipetteCalibration.pipette_<n>" so log readers can tell
+    # pipettes apart (set by PipetteInterface).
+    log_name = "patcherbot.PipetteCalibration"
+
     def __init__(self, pipette: Manipulator, microscope: Microscope, camera: Camera, calibrated_stage, config=None):
         self.pipette: Manipulator = pipette
         self.microscope: Microscope = microscope
@@ -212,7 +217,7 @@ class PipetteCalHelper():
 
     def collect_cal_points(self, num_points=10, xy_step=5, max_retries=5):
         """Apply the stage-style calibration speed cap and restore the prior limit."""
-        log = logging.getLogger("patcherbot.PipetteCalibration")
+        log = logging.getLogger(self.log_name)
         previous_speed = self.pipette.get_max_speed()
         if previous_speed is None or not np.isfinite(previous_speed) or previous_speed <= 0:
             raise RuntimeError("Cannot read pipette speed; calibration was not started")
@@ -247,7 +252,7 @@ class PipetteCalHelper():
         self.calibration_samples = []
         self._flow_reference = None
         step = min(2.0 * abs(float(xy_step)), 10.0)
-        logging.getLogger("patcherbot.PipetteCalibration").info(
+        logging.getLogger(self.log_name).info(
             "Pipette calibration sampling: X then Y, %d points, %.1f um steps, Z unchanged",
             num_points, step)
         for i in range(num_points):
@@ -282,7 +287,7 @@ class PipetteCalHelper():
 
     def record_cal_point(self):
         """Record the median of five distinct newly retrieved stationary frames."""
-        log = logging.getLogger("patcherbot.PipetteCalibration")
+        log = logging.getLogger(self.log_name)
         started = time.monotonic()
         encoder_pos = np.asarray(self.pipette.position(), dtype=float).copy()
         seen, detections, observations = set(), [], []
@@ -776,7 +781,7 @@ class PipetteCalHelper():
 
     def _hybrid_position(self, detected, frame, mask):
         """Use validated foreground motion, with detection anchoring and fallback."""
-        log = logging.getLogger("patcherbot.PipetteCalibration")
+        log = logging.getLogger(self.log_name)
         previous = getattr(self, "_flow_reference", None)
         position, source = detected.copy(), "detection"
         if previous is not None and frame is not None and mask is not None and previous["mask"] is not None:
@@ -813,7 +818,7 @@ class PipetteCalHelper():
             timestamp_basis="camera_retrieval_not_sensor_exposure",
             inliers=None if inliers is None else inliers.ravel().tolist(),
             training_errors_px=errors.tolist(), training_rmse_px=rmse)
-        log = logging.getLogger("patcherbot.PipetteCalibration")
+        log = logging.getLogger(self.log_name)
         singular = np.linalg.svd(points[:, 2:4] - points[:, 2:4].mean(axis=0), compute_uv=False)
         condition = float(singular[0] / singular[-1]) if singular[-1] > 1e-9 else float("inf")
         flow_count = sum(sample.get("source") == "flow+detector" for sample in self.calibration_samples)
