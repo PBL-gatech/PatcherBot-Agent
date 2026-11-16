@@ -119,7 +119,7 @@ class PipetteInterface(TaskInterface):
         # Pipette calibrations read from file but not (re)made this session;
         # kept so write_calibration doesn't drop pipettes that aren't selected.
         self._loaded_pipette_calibrations = {}
-        # Collision guard: every pipette stays inside its Voronoi cell. Every
+        # Collision guard: a moving pipette stays on its side of every other tip. Every
         # move command reaches the motors through a guarded device, installed
         # on both the raw unit (used by the calibration helpers) and the
         # calibrated unit.

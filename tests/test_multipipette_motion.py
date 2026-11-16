@@ -1,5 +1,5 @@
 """Driving several pipettes: per-pipette calibration values, active-pipette
-routing, per-pipette calibration files, the Voronoi collision guard, and
+routing, per-pipette calibration files, the collision guard, and
 compatibility with tools that read pipette_0's data.
 
 No hardware, models or QApplication needed. Run with
@@ -19,7 +19,8 @@ import numpy as np
 
 from patcherbot.configs.CalibrationConfig import CalibrationConfig
 from patcherbot.controller.collision import (
-    CollisionError, GuardedPipetteDevice, WorkspaceGuard, move_allowed, voronoi_margin,
+    CollisionError, GuardedPipetteDevice, WorkspaceGuard, boundary_margin, boundary_normals,
+    move_allowed,
 )
 from patcherbot.controller.patch import AutoPatcher
 from patcherbot.devices.manipulator.manipulatorunit import ManipulatorUnit
@@ -79,16 +80,17 @@ class StubUnit:
 STAGE = SimpleNamespace(M=np.eye(2), r0=np.zeros(2), calibrated=True,
                         save_configuration=lambda: {"M": np.eye(2)},
                         load_configuration=lambda config: None)
-CONFIG = SimpleNamespace(collision_min_separation_um=100.0, collision_velocity_lookahead_s=0.5)
+CONFIG = SimpleNamespace(collision_tolerance_um=100.0, collision_velocity_lookahead_s=0.5)
 
 
 def rig(p0=(0.0, 0.0, 0.0), p1=(0.0, 0.0, 0.0), with_y_pipette=False):
     """pipette_0 on the left (world = its xy), pipette_1 on the right, mirrored
-    (world = (1000, 0) - its xy). Optional pipette_2 above, world = (500, 800) + its xy."""
+    (world = (1000, 0) - its xy). Optional pipette_2 above, coming in from the top."""
     units = {"pipette_0": StubUnit(rotation_z(0), (0, 0), p0, z_rotation=-20),
              "pipette_1": StubUnit(rotation_z(180), (1000, 0), p1, z_rotation=160)}
     if with_y_pipette:
-        units["pipette_2"] = StubUnit(rotation_z(0), (500, 800), z_rotation=70)
+        # Comes in from above: manipulator +x points down the image, shaft runs up (+y).
+        units["pipette_2"] = StubUnit(rotation_z(-90), (500, 800), z_rotation=70)
     return units
 
 
@@ -187,24 +189,58 @@ class ValidatePipetteGeometryTests(unittest.TestCase):
 
 
 # ------------------------------------------------------------------
-# Voronoi collision guard
+# Collision guard (line through the other tip)
 # ------------------------------------------------------------------
 class RuleTests(unittest.TestCase):
     def test_margin_and_symmetry(self):
-        self.assertAlmostEqual(voronoi_margin(at(0), at(1000), at(400), 100), 50)
-        self.assertAlmostEqual(voronoi_margin(at(1000), at(0), at(600), 100), 50)
-        self.assertFalse(move_allowed(at(0), at(460), at(1000), 100))
-        self.assertFalse(move_allowed(at(1000), at(540), at(0), 100))
+        # Line through the other tip (x = 1000), 100 um tolerance -> limit at 900.
+        self.assertAlmostEqual(boundary_margin(at(0), at(1000), at(400), 100), 500)
+        self.assertAlmostEqual(boundary_margin(at(1000), at(0), at(600), 100), 500)
+        self.assertTrue(move_allowed(at(0), at(890), at(1000), 100))
+        self.assertFalse(move_allowed(at(0), at(910), at(1000), 100))
+        self.assertTrue(move_allowed(at(1000), at(110), at(0), 100))
+        self.assertFalse(move_allowed(at(1000), at(90), at(0), 100))
 
-    def test_gap_stops_creeping(self):
-        seed, other = at(0), at(1000)
-        for _ in range(60):
-            target = seed.copy()
-            target[0] = (seed[0] + other[0]) / 2 - 50      # furthest allowed point
-            self.assertTrue(move_allowed(seed, target, other, 100))
-            seed = target
-        self.assertLessEqual(seed[0], 900 + 1e-6)
-        self.assertGreater(seed[0], 899)
+    def test_line_is_perpendicular_to_the_tips(self):
+        # Sideways moves are fine as long as they stay on the near side of the line.
+        self.assertTrue(move_allowed(at(0), at(850, 3000), at(1000), 100))
+        # Tilted pair: line through (1000, 1000) perpendicular to the diagonal.
+        self.assertTrue(move_allowed(at(0), at(1300, 500), at(1000, 1000), 100))
+        self.assertFalse(move_allowed(at(0), at(1300, 800), at(1000, 1000), 100))
+
+    def test_line_never_cuts_the_other_shaft(self):
+        # pipette_1's tip at (1000, 1000), shaft running +x back to its manipulator.
+        other, shaft = at(1000, 1000), np.array([1.0, 0.0])
+        # Active coming from the lower left: the shaft is on the far side, only
+        # the plain perpendicular applies.
+        normals = boundary_normals(at(0), other, shaft)
+        self.assertEqual(len(normals), 1)
+        np.testing.assert_allclose(normals[0], [0.7071, 0.7071], atol=1e-4)
+        # Active at the lower right: the perpendicular (x - y = 0) would cut the
+        # shaft and let the active tip reach (1600, 1400), above the shaft.
+        active = at(2000, 0)
+        self.assertTrue(move_allowed(active, at(1600, 1400), other, 100))          # plain rule
+        normals = boundary_normals(active, other, shaft)
+        np.testing.assert_allclose(normals[1], [0.0, 1.0], atol=1e-9)              # shaft line
+        self.assertFalse(move_allowed(active, at(1600, 1400), other, 100, shaft))
+        self.assertTrue(move_allowed(active, at(1600, 890), other, 100, shaft))
+        self.assertFalse(move_allowed(active, at(1600, 910), other, 100, shaft))
+        # Only the shaft-side half changes: on the other side of the tip-to-tip
+        # line the plain perpendicular still applies, so (500, 400) -- past it --
+        # stays refused even though it is well below the shaft.
+        self.assertFalse(move_allowed(active, at(500, 400), other, 100))
+        self.assertFalse(move_allowed(active, at(500, 400), other, 100, shaft))
+        self.assertTrue(move_allowed(active, at(717, 435), other, 100, shaft))
+        # Active tip right over the shaft (only after a manual move): it can step off it.
+        self.assertTrue(move_allowed(at(1500, 1000), at(1500, 800), other, 100, shaft))
+
+    def test_cannot_get_past_the_other_tip(self):
+        active, other = at(0), at(1000)
+        for _ in range(5):
+            target = at(1000 - 100)                       # furthest allowed point
+            self.assertTrue(move_allowed(active, target, other, 100))
+            self.assertFalse(move_allowed(target, at(901), other, 100))
+            active = target
 
     def test_already_too_close_may_not_get_worse(self):
         self.assertTrue(move_allowed(at(980), at(970), at(1000), 100))
@@ -214,12 +250,26 @@ class RuleTests(unittest.TestCase):
 class GuardTests(unittest.TestCase):
     def test_primary_cannot_pass_secondary_and_vice_versa(self):
         guard = guard_for(rig())
-        guard.check_move("pipette_0", at(0), at(400))
+        guard.check_move("pipette_0", at(0), at(890))
         with self.assertRaises(CollisionError):
-            guard.check_move("pipette_0", at(0), at(460))
-        guard.check_move("pipette_1", at(0), at(400))      # world 600
+            guard.check_move("pipette_0", at(0), at(910))
+        guard.check_move("pipette_1", at(0), at(890))      # world 110
         with self.assertRaises(CollisionError):
-            guard.check_move("pipette_1", at(0), at(540))  # world 460
+            guard.check_move("pipette_1", at(0), at(910))  # world 90
+
+    def test_guard_uses_calibrated_shaft_directions(self):
+        guard = guard_for(rig())
+        # rig(): pipette_0 on the left (shaft -x), pipette_1 mirrored on the right (shaft +x).
+        np.testing.assert_allclose(guard.shaft_direction("pipette_0"), [-1.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(guard.shaft_direction("pipette_1"), [1.0, 0.0], atol=1e-9)
+        # pipette_0 at the lower right of pipette_1's tip may not climb over its shaft.
+        units = rig(p0=(2000.0, 0.0, 0.0))
+        units["pipette_1"]._tip_reference = (np.array([1000.0, 1000.0]), np.zeros(3), np.zeros(2))
+        guard = guard_for(units)
+        with self.assertRaises(CollisionError) as caught:
+            guard.check_move("pipette_0", at(2000), at(1600, 1400))
+        self.assertIn("shaft", str(caught.exception))
+        guard.check_move("pipette_0", at(2000), at(1600, 800))
 
     def test_y_aligned_pipette_is_respected(self):
         guard = guard_for(rig(with_y_pipette=True))
@@ -231,11 +281,11 @@ class GuardTests(unittest.TestCase):
         units = rig()
         units["pipette_1"]._tip_reference = (np.array([500.0, 500.0]), np.zeros(3), np.zeros(2))
         guard = guard_for(units)
-        guard.config = SimpleNamespace(collision_min_separation_um=0.0, collision_velocity_lookahead_s=0.5)
-        # The target itself is on pipette_0's side, but the corner (600, 0) isn't.
-        self.assertTrue(move_allowed(at(0), at(600, -600), at(500, 500), 0))
+        guard.config = SimpleNamespace(collision_tolerance_um=0.0, collision_velocity_lookahead_s=0.5)
+        # Limit: x + y < 1000. The target (1100, -200) is inside, the corner (1100, 0) isn't.
+        self.assertTrue(move_allowed(at(0), at(1100, -200), at(500, 500), 0))
         with self.assertRaises(CollisionError):
-            guard.check_move("pipette_0", at(0), at(600, -600))
+            guard.check_move("pipette_0", at(0), at(1100, -200))
 
     def test_velocity_lookahead(self):
         guard = guard_for(rig())
@@ -262,7 +312,7 @@ class GuardTests(unittest.TestCase):
         guard = guard_for(units, home_anchor=anchors.get)
         self.assertEqual(guard.status()["unlocated"], {})
         with self.assertRaises(CollisionError):
-            guard.check_move("pipette_0", at(0), at(460))
+            guard.check_move("pipette_0", at(0), at(950))
 
     def test_disabled_and_manual(self):
         guard = guard_for(rig())
@@ -276,20 +326,21 @@ class GuardTests(unittest.TestCase):
         reported = []
         guard = guard_for(rig(), on_blocked=reported.append)
         with self.assertRaises(CollisionError) as caught:
-            guard.check_move("pipette_0", at(0), at(500))
+            guard.check_move("pipette_0", at(0), at(950))
         message = str(caught.exception)
-        for fragment in ("pipette_0", "pipette_1", "50 um too close", "to its right",
+        for fragment in ("pipette_0", "pipette_1", "50 um past", "to its right", "100 um short",
                          "Collision Guard in the Movement box"):
             self.assertIn(fragment, message)
         self.assertEqual(reported, [message])
 
     def test_cells(self):
         guard = guard_for(rig())
-        right_cell = np.array([-800.0, 0.0, 0.0])            # world (800, 0)
+        right_cell = np.array([-1100.0, 0.0, 0.0])           # world (1100, 0): past pipette_1
         guard.check_cell("pipette_1", right_cell)
+        guard.check_cell("pipette_0", np.array([-800.0, 0.0, 0.0]))   # short of pipette_1: fine
         with self.assertRaises(CollisionError) as caught:
             guard.check_cell("pipette_0", right_cell)
-        self.assertIn("inside pipette_1's workspace", str(caught.exception))
+        self.assertIn("past the limit at pipette_1's tip", str(caught.exception))
         autopatcher = AutoPatcher.__new__(AutoPatcher)
         autopatcher.collision_guard, autopatcher.pipette_key = guard, "pipette_0"
         with self.assertRaises(CollisionError):
@@ -343,9 +394,9 @@ class GuardedDeviceTests(unittest.TestCase):
 
     def test_refused_moves_are_not_sent(self):
         with self.assertRaises(CollisionError):
-            self.dev0.absolute_move(900.0, 1)
+            self.dev0.absolute_move(950.0, 1)
         with self.assertRaises(CollisionError):
-            self.dev0.relative_move(900.0, 1)
+            self.dev0.relative_move(950.0, 1)
         self.assertEqual(self.devices["pipette_0"].moves, [])
 
     def test_refused_velocity_stops_the_device(self):
@@ -359,7 +410,7 @@ class GuardedDeviceTests(unittest.TestCase):
         raw_unit = ManipulatorUnit(self.devices["pipette_0"], [1, 2, 3])
         raw_unit.dev = self.dev0
         with self.assertRaises(CollisionError):
-            raw_unit.relative_move([900.0, 0.0, 0.0])
+            raw_unit.relative_move([950.0, 0.0, 0.0])
         raw_unit.relative_move([10.0, 0.0, 0.0])
         self.assertEqual(len(self.devices["pipette_0"].moves), 1)
 

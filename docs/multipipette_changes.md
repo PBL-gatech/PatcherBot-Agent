@@ -824,12 +824,17 @@ Two pipettes with identical `pipette_z_rotation` only get a warning; the fake ri
 - The legacy top-level `manip/home/safe/bath` keys are always **pipette_0's**, and are omitted when pipette_0 isn't in the file. The rig replay and dataset builders read those keys alongside pipette_0's movement recording.
 - A legacy file loads into pipette_0 only.
 
-### 12.3 Collision guard (all pipettes, Voronoi cells)
+### 12.3 Collision guard (all pipettes, line through the other tip)
 [`WorkspaceGuard`](../patcherbot/controller/collision.py):
-- **Rule:** viewed from above (XY only), each pipette may only be moved *automatically* within its own Voronoi cell. That is the set of points closer to its own tip than to any other pipette's tip, shrunk by half of `collision_min_separation_um` (default 100 µm) on each side.
-  - All pipettes are treated the same: pipette_0 can't cross to pipette_1's side, pipette_1 can't cross to pipette_0's, and a y-aligned pipette can't be driven behind either of them.
-  - The gap stops creeping (repeated half-way moves converge at the gap).
-  - A pipette already too close (e.g. after a manual jog) may still move as long as the move doesn't bring it closer.
+- **Rule** (viewed from above, XY only), for the pipette being moved (*active*) and each other pipette:
+  1. draw the line joining the two tips;
+  2. draw the line perpendicular to it through the **other** pipette's tip;
+  3. the active pipette may be moved *automatically* to any point on its own side of that line, at least `collision_tolerance_um` (default 100 µm) short of it.
+  - **Shafts:** the limit may not cut the other pipette's shaft (from its tip back to its manipulator, direction from its calibration). If the shaft points back toward the active pipette, the half of the perpendicular on the shaft's side of the tip-to-tip line is replaced by the shaft line; the other half is unchanged. The active tip keeps `collision_tolerance_um` from both parts.
+  - With several other pipettes, every one of these limits applies.
+  - All pipettes are treated the same; whichever one is moving is "active".
+  - The active pipette can come up to `collision_tolerance_um` of the other tip, but never past the line through it.
+  - A pipette already past a limit (e.g. after a manual jog) may still move as long as the move doesn't take it further past.
 - **Where pipettes are:** in stage-frame µm (camera pixels minus the stage reference, converted with the stage calibration). This doesn't change as the stage moves, because the manipulators ride on it.
   - A tip is placed from an anchor (latest confirmed tip detection, then trusted detection, then "tip at the image centre at home") plus the pipette's calibration matrix, the same way the camera overlay draws it. The calibration offset `r0` isn't used.
 - **Enforcement:** every pipette's manipulator device is wrapped in a [`GuardedPipetteDevice`](../patcherbot/controller/collision.py), installed on both the raw unit and the calibrated unit.
@@ -866,6 +871,6 @@ Single-pipette sessions and pipette_0's data keep their formats. Secondary pipet
 - Norwich pipette_1 still uses `FakePressureController`. It can be moved and calibrated, but it can't really seal until a pressure channel is configured.
 - Tests: [test_multipipette_motion.py](../tests/test_multipipette_motion.py), 39 tests:
   - config views and the start-up check;
-  - the Voronoi rule, the guard and the guarded device;
+  - the collision rule, the guard and the guarded device;
   - routing, calibration files and the sanity check;
   - data compatibility.

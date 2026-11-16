@@ -1,20 +1,33 @@
-"""Collision guard: every pipette stays inside its own Voronoi cell.
+"""Collision guard: the active pipette stays on its own side of every other tip.
 
 The rule
 --------
-Each pipette's tip, seen from above (XY only, Z ignored), is a seed. A
-pipette may only be moved *automatically* to points that are closer to its
-own tip than to any other pipette's tip, keeping at least half of
-``collision_min_separation_um`` from each midpoint line. So all pipettes
-are treated the same: pipette_0 can't cross to pipette_1's side, pipette_1
-can't cross to pipette_0's, and a future y-aligned pipette can't be driven
-behind either of them.
+Seen from above (XY only, Z ignored), for the pipette being moved (the
+*active* pipette) and each other pipette:
 
-* The gap matters: without it a pipette could move halfway to its
-  neighbour, then halfway again, and so on, until they touch.
-* A pipette that is already too close (e.g. after a manual jog) may still
-  be moved as long as the move doesn't bring it closer; retreating always
-  works.
+1. draw the line joining the two tips;
+2. draw the line perpendicular to it through the *other* pipette's tip;
+3. the active tip is on one side of that line; it may be moved
+   *automatically* to any point on that same side, keeping at least
+   ``collision_tolerance_um`` from the line.
+
+With several other pipettes, the target must satisfy this for each of them.
+Because the line goes through the other tip, the active pipette can come up
+to ``collision_tolerance_um`` of the other tip but never get beyond it.
+
+The limit may not cut through the other pipette's shaft (the axis running
+from its tip back to its manipulator). The perpendicular through the other
+tip has two halves, one on each side of the line joining the tips. If the
+shaft points back towards the active pipette, the half on the shaft's side
+is replaced by the shaft itself; the other half is left unchanged. The limit
+is then a bent line (perpendicular on one side, shaft on the other) and the
+active tip must keep ``collision_tolerance_um`` from both parts. The shaft
+direction comes from the pipette's calibration (its manipulator x axis,
+which the pipette lies along), i.e. the same frame the tips are placed in.
+
+* A pipette that is already past a line (e.g. after a manual jog) may still
+  be moved as long as the move doesn't take it further past; retreating
+  always works.
 * Manual moves (keyboard jogs, raise/lower) run inside ``guard.manual()``
   and are never checked.
 * A pipette the guard can't place (not calibrated, or no known tip
@@ -47,41 +60,79 @@ import numpy as np
 
 from .errors import AutopatchError
 
-__all__ = ["CollisionError", "WorkspaceGuard", "GuardedPipetteDevice", "voronoi_margin",
-           "move_allowed"]
+__all__ = ["CollisionError", "WorkspaceGuard", "GuardedPipetteDevice", "boundary_normals",
+           "boundary_margin", "move_allowed"]
 
 LOGGER = logging.getLogger(__name__)
 
 
 class CollisionError(AutopatchError):
-    """A pipette was asked to move into another pipette's workspace."""
+    """A pipette was asked to move past another pipette's tip."""
 
 
 # ------------------------------------------------------------------
 # The rule (pure functions)
 # ------------------------------------------------------------------
-def voronoi_margin(seed, other, point, gap):
-    """How far ``point`` is inside ``seed``'s side of the line between ``seed``
-    and ``other``, after keeping ``gap / 2`` from the midpoint (um; negative =
-    too close to ``other``)."""
-    seed, other, point = (np.asarray(v, dtype=float)[:2] for v in (seed, other, point))
-    offset = other - seed
+def boundary_normals(active, other, other_shaft=None):
+    """Unit normals of the straight pieces of the limit through ``other``'s
+    tip, each pointing from the active side to the far side.
+
+    * The perpendicular to the line joining the tips (always).
+    * The shaft's line, when ``other_shaft`` (unit XY vector from ``other``'s
+      tip towards its manipulator) points back towards the active side, i.e.
+      when the perpendicular's half on the shaft's side would cut the shaft.
+      Requiring the active side of both lines replaces just that half of the
+      perpendicular with the shaft and leaves the other half as it is.
+
+    Empty if the tips coincide.
+    """
+    active, other = (np.asarray(v, dtype=float)[:2] for v in (active, other))
+    offset = other - active
     distance = float(np.linalg.norm(offset))
     if distance < 1e-9:
-        # Coincident seeds: fall back to plain distance from the other tip.
-        return float(np.linalg.norm(point - other)) - gap
+        return []
     normal = offset / distance
-    return float(np.dot((seed + other) / 2.0 - point, normal)) - gap / 2.0
+    normals = [normal]
+    if other_shaft is not None:
+        shaft = np.asarray(other_shaft, dtype=float)[:2]
+        if float(np.dot(normal, shaft)) < 0:
+            across = np.array([-shaft[1], shaft[0]])
+            if float(np.dot(across, normal)) < 0:
+                across = -across          # point away from the active tip
+            normals.append(across)
+    return normals
 
 
-def move_allowed(seed, target, other, gap):
-    """True if moving from ``seed`` to ``target`` keeps out of ``other``'s
-    workspace, or at least doesn't go further into it."""
-    target_margin = voronoi_margin(seed, other, target, gap)
-    if target_margin >= 0:
-        return True
-    start_margin = voronoi_margin(seed, other, seed, gap)
-    return start_margin < 0 and target_margin >= start_margin - 1e-9
+def _margins(active, other, point, tolerance, other_shaft):
+    other, point = (np.asarray(v, dtype=float)[:2] for v in (other, point))
+    normals = boundary_normals(active, other, other_shaft)
+    if not normals:
+        # Coincident tips: no direction to draw the line along; fall back to
+        # plain distance from the other tip.
+        return [float(np.linalg.norm(point - other)) - tolerance]
+    return [float(np.dot(other - point, normal)) - tolerance for normal in normals]
+
+
+def boundary_margin(active, other, point, tolerance, other_shaft=None):
+    """Signed distance (um) from ``point`` to the limit set by ``other``.
+
+    The limit is the line through ``other``'s tip perpendicular to the line
+    joining the tips, with its half on the shaft side replaced by ``other``'s
+    shaft when needed (``boundary_normals``), moved ``tolerance`` towards the
+    active side. Positive = on the active side with room to spare; negative
+    = that far past the limit.
+    """
+    return min(_margins(active, other, point, tolerance, other_shaft))
+
+
+def move_allowed(active, target, other, tolerance, other_shaft=None):
+    """True if moving the active tip from ``active`` to ``target`` stays on its
+    side of each piece of ``other``'s limit, or at least doesn't go further
+    past any piece it is already past."""
+    start = _margins(active, other, active, tolerance, other_shaft)
+    end = _margins(active, other, target, tolerance, other_shaft)
+    return all(after >= 0 or (before < 0 and after >= before - 1e-9)
+               for before, after in zip(start, end))
 
 
 def _usable(unit):
@@ -89,11 +140,11 @@ def _usable(unit):
 
 
 class WorkspaceGuard:
-    """Keeps every pipette inside its Voronoi cell (see the module docstring).
+    """Keeps the active pipette on its side of every other tip (see the module docstring).
 
     calibrated_units: ``{pipette_key: CalibratedUnit}``.
     calibrated_stage: the shared ``CalibratedStage``.
-    config: the shared calibration config (collision_min_separation_um,
+    config: the shared calibration config (collision_tolerance_um,
         collision_velocity_lookahead_s).
     home_anchor: optional ``f(key) -> (image_xy, home_um, home_stage_xy) or None``.
     camera: optional, only to word directions ("to its right") as displayed.
@@ -114,8 +165,8 @@ class WorkspaceGuard:
 
     # ---------------- settings ----------------
     @property
-    def gap(self):
-        return float(getattr(self.config, "collision_min_separation_um", 100.0))
+    def tolerance(self):
+        return float(getattr(self.config, "collision_tolerance_um", 100.0))
 
     @property
     def lookahead_s(self):
@@ -203,6 +254,18 @@ class WorkspaceGuard:
         stage_frame_px = tip_px + matrix @ (position_um[:2] - anchor_um[:2])
         return np.linalg.solve(self._stage_matrix(), stage_frame_px)
 
+    def shaft_direction(self, key):
+        """Unit XY vector (stage-frame um) from ``key``'s tip back towards its
+        manipulator, or None. The pipette lies along its manipulator's x axis
+        (+x drives the tip forward), so the shaft points along -x as measured
+        by the calibration."""
+        if self.unlocated_reason(key) is not None:
+            return None
+        x_axis_px = np.asarray(self.units[key].M, dtype=float)[:2, 0]
+        x_axis = np.linalg.solve(self._stage_matrix(), x_axis_px)
+        length = float(np.linalg.norm(x_axis))
+        return None if length < 1e-12 or not np.isfinite(length) else -x_axis / length
+
     def cell_location(self, cell):
         """A queued cell (``stage_reference_px - image_px``) in stage-frame um (XY)."""
         cell = np.asarray(cell, dtype=float).reshape(-1)
@@ -221,12 +284,12 @@ class WorkspaceGuard:
         return {"enabled": self.enabled, "unlocated": unlocated}
 
     def _seeds(self, mover):
-        """Current stage-frame XY of every located pipette except ``mover``."""
+        """``{key: (tip XY, shaft direction)}`` for every located pipette except ``mover``."""
         seeds = {}
         for key, unit in self.units.items():
             if key == mover or self.unlocated_reason(key) is not None:
                 continue
-            seeds[key] = self.locate(key, unit.position())
+            seeds[key] = (self.locate(key, unit.position()), self.shaft_direction(key))
         return seeds
 
     # ---------------- checks ----------------
@@ -267,25 +330,26 @@ class WorkspaceGuard:
         seed = self._mover_seed(key, current_um)
         if seed is None:
             return
-        gap = self.gap
+        tolerance = self.tolerance
         worst = None
         for target_um in targets_um:
             target = self.locate(key, target_um)
-            for other_key, other in self._seeds(key).items():
-                if move_allowed(seed, target, other, gap):
+            for other_key, (other, shaft) in self._seeds(key).items():
+                if move_allowed(seed, target, other, tolerance, shaft):
                     continue
-                overshoot = -voronoi_margin(seed, other, target, gap)
+                overshoot = -boundary_margin(seed, other, target, tolerance, shaft)
                 if worst is None or overshoot > worst[0]:
                     worst = (overshoot, other_key, other, target)
         if worst is None:
             return
         overshoot, other_key, other, target = worst
         self._block(
-            f"Collision guard stopped {key}: {what} would take it {overshoot:.0f} um too close to "
-            f"{other_key}, which is {self._direction_word(target, other)} in the camera image. "
-            f"{key} must stay at least {gap / 2:.0f} um on its own side of the midpoint between the "
-            f"two tips (minimum separation {gap:.0f} um). Move {other_key} away first, or switch "
-            f"off Collision Guard in the Movement box (debugging only).")
+            f"Collision guard stopped {key}: {what} would take it {overshoot:.0f} um past "
+            f"the limit at {other_key}'s tip, which is {self._direction_word(target, other)} in "
+            f"the camera image. {key} must stay on its own side of the line through {other_key}'s "
+            f"tip (never across {other_key}'s shaft), at least {tolerance:.0f} um short of it. "
+            f"Move {other_key} away first, or switch off Collision Guard in the Movement box "
+            f"(debugging only).")
 
     def check_move(self, key, current_um, target_um):
         """Check a discrete move of ``key`` from ``current_um`` to ``target_um``.
@@ -317,21 +381,21 @@ class WorkspaceGuard:
         self._check_points(key, current, [ahead], "this velocity command")
 
     def check_cell(self, key, cell):
-        """Raise CollisionError if ``cell`` lies in another pipette's workspace."""
+        """Raise CollisionError if ``cell`` lies past another pipette's tip."""
         if not self.should_check(key):
             return
         seed = self._mover_seed(key, self.units[key].position())
         if seed is None:
             return
         point = self.cell_location(cell)
-        gap = self.gap
-        for other_key, other in self._seeds(key).items():
-            margin = voronoi_margin(seed, other, point, gap)
+        tolerance = self.tolerance
+        for other_key, (other, shaft) in self._seeds(key).items():
+            margin = boundary_margin(seed, other, point, tolerance, shaft)
             if margin < 0:
                 self._block(
-                    f"{key} may not patch this cell: it is {-margin:.0f} um inside {other_key}'s "
-                    f"workspace ({other_key} is {self._direction_word(point, other)} in the camera "
-                    f"image; minimum separation {gap:.0f} um). Patch it with {other_key}, move "
+                    f"{key} may not patch this cell: it is {-margin:.0f} um past the limit at "
+                    f"{other_key}'s tip ({other_key} is {self._direction_word(point, other)} in the "
+                    f"camera image; tolerance {tolerance:.0f} um). Patch it with {other_key}, move "
                     f"{other_key} away first, or switch off Collision Guard in the Movement box "
                     f"(debugging only).")
 
