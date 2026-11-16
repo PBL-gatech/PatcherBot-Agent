@@ -94,6 +94,30 @@ class BaseSegmentor(ABC):
         scores_np = self._normalize_scores(iou_scores)
         return masks_np, scores_np
 
+    @staticmethod
+    def _ensure_bgr(image: np.ndarray) -> np.ndarray:
+        """Ensure *image* is a BGR array (H, W, 3)."""
+        if image.ndim == 2:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.ndim == 3 and image.shape[2] == 1:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.ndim == 3 and image.shape[2] == 3:
+            return image
+        raise ValueError(f"Unsupported image shape for BGR conversion: {image.shape}")
+
+    @staticmethod
+    def _prepare_for_segmentation(image: np.ndarray) -> np.ndarray:
+        """Return a uint8 BGR image suitable for SAM2."""
+        bgr = BaseSegmentor._ensure_bgr(image)
+        if bgr.dtype == np.uint16:
+            bgr = (bgr / 257.0).astype(np.uint8)
+        elif bgr.dtype != np.uint8:
+            arr = bgr.astype(np.float32)
+            if arr.max() > 1.0:
+                arr /= arr.max()
+            bgr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        return bgr
+
     def load_image(self, image_path=None, image=None):
         if image_path is not None:
             image = cv2.imread(image_path)
@@ -140,6 +164,41 @@ class BaseSegmentor(ABC):
 
         masks, scores = self.predict_mask(input_point, input_label, multimask_output)
         return masks[0]  # Return the first mask
+
+    @staticmethod
+    def get_mask_target(mask):
+        """Return the mask, up to three maximum-clearance interior points, and clearance.
+
+        Positive pixels are foreground. Image borders count as background.
+        Empty masks return an empty list. Coordinates are (x, y); tied points are spread apart spatially.
+        """
+        result = dict(mask=mask, target_points_xy=[], edge_clearance_px=0.0)
+        if mask is None:
+            return result
+        binary = np.asarray(mask)
+        while binary.ndim > 2 and binary.shape[0] == 1:
+            binary = binary[0]
+        if binary.ndim != 2 or not np.isfinite(binary).all():
+            raise ValueError("Expected one finite two-dimensional cell mask")
+        binary = (binary > 0).astype(np.uint8)
+        if not np.any(binary):
+            return result
+        padded = cv2.copyMakeBorder(binary, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        distances = cv2.distanceTransform(padded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        clearance = distances.max()
+        result["target_points_xy"] = [
+            (int(x) - 1, int(y) - 1)
+            for y, x in np.argwhere(distances == clearance)
+        ]
+        candidates = result["target_points_xy"]
+        if len(candidates) > 3:
+            selected = [candidates[0]]
+            for _ in range(2):
+                selected.append(max(candidates, key=lambda p: min(
+                    (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 for q in selected)))
+            result["target_points_xy"] = selected
+        result["edge_clearance_px"] = float(clearance)
+        return result
 
     def show_image(self):
         if self.image is not None:

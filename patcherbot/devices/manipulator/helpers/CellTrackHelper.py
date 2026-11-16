@@ -17,6 +17,7 @@ try:
     )
     from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
     from patcherbot.deepLearning.trackModel.PointTracker import PointTracker1
+    from patcherbot.deepLearning.CellDetector import CellDetector2
 except ModuleNotFoundError:  # pragma: no cover - allow standalone execution
     import sys
 
@@ -31,6 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - allow standalone execution
     )
     from patcherbot.deepLearning.cellSegmentor import CellSegmentor2
     from patcherbot.deepLearning.trackModel.PointTracker import PointTracker1
+    from patcherbot.deepLearning.CellDetector import CellDetector2
 
 try:
     import matplotlib.pyplot as plt

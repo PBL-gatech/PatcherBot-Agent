@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Homography-based mask warping built on top of PointMatcher (LightGlue).
+Homography-based mask warping built on top of PatchMatcher (LightGlue).
 
 Usage (copy-paste friendly):
     warper = MaskWarper(features="superpoint")
@@ -25,9 +25,9 @@ import numpy as np
 import torch
 
 try:
-    from .PointMatcher import PointMatcher
+    from .PatchMatcher import PatchMatcher
 except ImportError:  # pragma: no cover - allow running as script
-    from PointMatcher import PointMatcher
+    from PatchMatcher import PatchMatcher
 
 ImageInput = Union[str, Path, np.ndarray, torch.Tensor]
 MaskInput = np.ndarray
@@ -39,13 +39,13 @@ class MaskWarper:
     def __init__(
         self,
         *,
-        matcher: Optional[PointMatcher] = None,
+        matcher: Optional[PatchMatcher] = None,
         features: str = "superpoint",
         device: Optional[str] = None,
         extractor_conf: Optional[Dict] = None,
         matcher_conf: Optional[Dict] = None,
     ) -> None:
-        self._matcher = matcher or PointMatcher(
+        self._matcher = matcher or PatchMatcher(
             features=features,
             device=device,
             extractor_conf=extractor_conf,
@@ -146,8 +146,8 @@ class MaskWarper:
                 return tensor.permute(2, 0, 1)
             raise ValueError("Unsupported tensor shape for LightGlue input.")
         if isinstance(image, (str, Path)):
-            # PointMatcher.load_image handles path inputs internally.
-            return torch.from_numpy(np.array([]))  # placeholder; PointMatcher will load paths
+            # PatchMatcher.load_image handles path inputs internally.
+            return torch.from_numpy(np.array([]))  # placeholder; PatchMatcher will load paths
         arr = np.asarray(image)
         if arr.ndim == 2:
             arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
@@ -163,7 +163,7 @@ class MaskWarper:
 
     @staticmethod
     def _matched_points_from_result(result: Dict[str, object]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Extract matched keypoints (template->current) from PointMatcher.match()."""
+        """Extract matched keypoints (template->current) from PatchMatcher.match()."""
         feats0 = result.get("feats0")
         feats1 = result.get("feats1")
         matches = result.get("matches")

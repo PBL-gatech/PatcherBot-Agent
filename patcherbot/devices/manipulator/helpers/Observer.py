@@ -82,7 +82,7 @@ class Observer:
         return dict(raw_position=raw_position, pixel_position=pixel_position, pipette_detection=detection)
 
     def get_cell(self, image=None, *, detect=True, stage_data=None, include_masks=True, seed_points=None):
-        """Collect detections, optional masks/centroids, and their stage coordinates."""
+        """Collect detections, optional masks/centroids/interior targets, and their stage coordinates."""
         stage = self.get_stage() if stage_data is None else stage_data
         if image is None and detect:
             image = self.get_image()["image"]
@@ -92,9 +92,10 @@ class Observer:
         points = [] if detections is None else [row[:2] for row in detections]
         if seed_points is not None:
             points = list(seed_points)
-        masks, centroids = [], []
+        masks, centroids, targets = [], [], []
         if include_masks and points and image is not None:
             helper = self.stage._ensure_cell_track_helper()
             masks, centroids = helper.segment_cells(image, points)
+            targets = [helper.segmentor.get_mask_target(mask) for mask in masks]
         return dict(cell_detections=detections, cell_masks=masks, cell_centroids=centroids,
-                    cell_seed_points=points, stage=stage)
+                    cell_targets=targets, cell_seed_points=points, stage=stage)
