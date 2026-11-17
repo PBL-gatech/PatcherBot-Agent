@@ -400,6 +400,20 @@ class PatchGui(ManipulatorGui):
             except ValueError as error:
                 if str(error) != "The source book has no complete experiment details.":
                     raise
+                scans = book.logger.read_scans(source)
+                if scans:
+                    if self._setup_reload_busy():
+                        raise ValueError("Wait for the current movement/task to finish.")
+                    for role, path in scans.items():
+                        if role == "session":
+                            self.scan_viewer.load_image(path)
+                        else:
+                            self.atlas_window.scan_viewer.load_image(path)
+                            self.atlas_window.show_scan()
+                    book._set_status(
+                        "Saved " + "/".join(sorted(scans)) + " scans loaded without experiment details. "
+                        "Current experiment settings, tares, and origins retained.")
+                    return
                 message = (f"The selected book has no saved experiment details:\n{source}\n\n"
                            "Loading calibration can create a book containing only calibration notes. "
                            "Choose an earlier saved book with experiment details to reload.")

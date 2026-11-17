@@ -291,13 +291,13 @@ class CellDetector2(CellDetector):
         return x_pix, y_pix
 
     def detect_cells(
-        self, img: np.ndarray, max_outputs: Optional[int] = None
-    ) -> List[Tuple[int, int, float]]:
-        """Return detections as (x, y, confidence), sorted by confidence."""
+        self, img: np.ndarray, max_outputs: Optional[int] = None, *, include_boxes: bool = False
+    ) -> List[Tuple[int, int, float] | Tuple[int, int, float, Tuple[float, float, float, float]]]:
+        """Return (x, y, confidence), optionally followed by an (x1, y1, x2, y2) pixel box."""
         if img is None:
             return []
         try:
-            return self.adapter.predict(img, max_outputs=max_outputs)
+            return self.adapter.predict(img, max_outputs=max_outputs, include_boxes=include_boxes)
         except Exception as exc:
             logger.warning("%s inference failed: %s", self.model_type, exc)
             return []

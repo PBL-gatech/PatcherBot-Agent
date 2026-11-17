@@ -1,6 +1,7 @@
 """Bounded motor actions composed by calibrated devices and focus helpers."""
 import time
 import math
+import logging
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -128,3 +129,71 @@ class ActionHelper:
             motion.join(timeout=0.5)
             if motion.is_alive():
                 raise RuntimeError(f'{motion.label} monitor did not stop')
+
+
+class ObservationAction:
+    """One continuous motion, progressed by values from the phase observation."""
+
+    def __init__(self, device, move_velocity, tolerance=0.2, *, reversal_tolerance=1.0):
+        self.device = device
+        self.move_velocity = move_velocity
+        self.tolerance = tolerance
+        self.reversal_tolerance = reversal_tolerance
+        self.started = self.running = self.complete = False
+
+    def start(self, *, target, position, now, deadline, velocity):
+        if self.running:
+            raise RuntimeError("Stop the active action before starting another")
+        if not all(math.isfinite(v) for v in
+                   (target, position, now, deadline, velocity, self.tolerance, self.reversal_tolerance)):
+            raise ValueError("Motion values must be finite")
+        if velocity <= 0 or min(self.tolerance, self.reversal_tolerance) < 0 or deadline <= now:
+            raise ValueError("Motion needs positive speed and a future deadline")
+        self.origin, self.target, self.deadline = position, target, deadline
+        self.reversal_warned = False
+        self.direction = 1 if target >= position else -1
+        self.started = True
+        self.complete = abs(target - position) <= self.tolerance
+        if not self.complete:
+            self.running = True
+            try:
+                self.move_velocity(self.direction * velocity)
+            except Exception:
+                self.stop()
+                raise
+
+    def update(self, position, now):
+        if not self.running or self.complete:
+            return
+        if not math.isfinite(position) or not math.isfinite(now):
+            raise ValueError("Observed position/time must be finite")
+        self.complete = self.direction * (self.target - position) <= self.tolerance
+        if self.complete:
+            return  # A crossed endpoint wins over a late sample's deadline.
+        if now > self.deadline:
+            raise RuntimeError("Motion timed out")
+        away = -self.direction * (position - self.origin)
+        if away > self.reversal_tolerance + 1e-6:
+            raise RuntimeError(f"Motion moved in the wrong direction; start_z={self.origin}; "
+                f"actual_z={position}; target_z={self.target}; away_um={away}; "
+                f"tolerance_um={self.reversal_tolerance}")
+        if away > 1e-6 and not self.reversal_warned:
+            logging.getLogger(__name__).warning(
+                "Motion reversal drift within tolerance: start_z=%s; actual_z=%s; "
+                "target_z=%s; away_um=%s; tolerance_um=%s",
+                self.origin, position, self.target, away, self.reversal_tolerance)
+            self.reversal_warned = True
+
+    def is_complete(self):
+        return self.complete
+
+    def stop(self):
+        if self.running:
+            try:
+                self.device.stop()
+            finally:
+                self.running = False
+
+    def reset(self):
+        self.stop()
+        self.started = self.complete = False

@@ -1,563 +1,260 @@
-"""Cell-type-dependent approach from the common localization distance."""
-
+"""Cell approach using observation-driven movement helpers."""
+from copy import deepcopy
+from math import isfinite
+from types import SimpleNamespace
 import sys
 import time
+
 import numpy as np
-from ..errors import AutopatchError
+
 from ..PhaseController import PhaseController
+from ..errors import AutopatchError
+from ...devices.manipulator.helpers.ActionHelper import ActionHelper
+from ...devices.manipulator.helpers.Tracker import Tracker
+from ...devices.manipulator.helpers.Searcher import Searcher
+from ...devices.manipulator.helpers.Scanner import Scanner
+from ...devices.manipulator.helpers.Shifter import Shifter
+from ...devices.manipulator.helpers.Spearer import Spearer
+
 
 
 class ApproachCellPhase(PhaseController):
     phase_name = "Approach"
-    FOCUS_PEAK_DROP = 0.05
-    FOCUS_PEAK_MAX_AGE_S = 2.0
-    FOCUS_MINI_RADIUS_UM = 2.0
-    FOCUS_MINI_TIMEOUT_S = 12.0
+
+    def __init__(self, controller, *, select_cell=None, rank_cell=None, min_area_px=None,
+                 half_life_s=None):
+        super().__init__(controller)
+        self.select_cell = self._select_cell if select_cell is None else select_cell
+        self.rank_cell = self._rank_cell if rank_cell is None else rank_cell
+        self.min_area_px, self.half_life_s = min_area_px, half_life_s
+        self.alignment_snapshot = None
+        self.completed_successfully = False
+        self.cell = None
+
+    def invalidate_cell_reference(self, cell):
+        if self.cell is not None and self.cell[0] is cell:
+            self.completed_successfully = False
+            self.alignment_snapshot = self.cell_observation = self.pipette_observation = None
+
+    def build_helpers(self):
+        focus = self.stage.focusHelper
+        tracker = Tracker(self.select_cell, min_area_px=self.min_area_px,
+            min_area_fraction=self.config.cell_mask_min_area_fraction,
+            half_life_s=self.config.vision_half_life_s if self.half_life_s is None else self.half_life_s)
+        self.searcher = Searcher(focus, ActionHelper(), self.rank_cell, tracker)
+        self.scanner = Scanner(focus, ActionHelper())
+        self.spearer = Spearer(self.unit, ActionHelper())
+        models = self.stage._ensure_cell_track_helper()
+        self.shifter = Shifter(segmentor=models.segmentor, matcher=models._matcher)
+
+    @property
+    def depth_tolerance_um(self):
+        return self.spearer.DEPTH_TOLERANCE_UM
 
     def run(self, cell=None):
-        """Run one approach attempt; always release its owned motions."""
-        helper = self.controller.calibrated_unit.pipetteCalHelper
-        with helper.brain_slice_detector():
+        with self.controller.calibrated_unit.pipetteCalHelper.brain_slice_detector():
             try:
                 self.prepare(cell)
                 while True:
                     self.failure_gate()
                     self.success_gate()
-                    self.observe()
-                    self.calculate()
+                    if self.mode == "Adaptive" and self.initialized:
+                        self.observe()
+                        self.calculate()
                     self.decide()
                     self.act()
             finally:
                 self.finish()
 
     def prepare(self, cell=None):
-        """Establish safe defaults, recording, and ownership for this attempt."""
+        self.finished = self.speared = False
+        self.completed_successfully = False
         self.cell = cell
-        self.selected_cell_anchor = None if cell is None else np.array(cell[0], dtype=float, copy=True)
-        if self.selected_cell_anchor is not None:
-            self.selected_cell_anchor.setflags(write=False)
+        self.mode = self.controller.config.mode
+        self.config = SimpleNamespace(**{name: getattr(self.controller.config, name) for name in (
+            "cell_type", "cell_type_toggle", "cell_distance", "slice_start_distance",
+            "max_locate_speed", "max_clearing_speed", "use_centroid", "track_cell",
+            "search_speed", "search_z_radius_um", "scan_z_radius_um",
+            "approach_cell_max_shift", "approach_pipette_speed", "search_xy_radius_um",
+            "cell_mask_min_area_fraction", "vision_half_life_s")})
+        self.config.x1_focus_mode = getattr(self.controller.config, 'x1_focus_mode', 'Anchor')
+        self.config.x1_focus_score_threshold = getattr(self.controller.config, 'x1_focus_score_threshold', 0.5)
+        self.initialized = False
+        self.recovering_cell = False
+        self.interrupted = False
+        if self.mode not in ("Manual", "Classic", "Adaptive", "Agent", "Training"):
+            raise AutopatchError(f"Unsupported Approach mode: {self.mode}")
+        if cell is None and self.mode != "Training":
+            raise AutopatchError("Approach requires a selected cell")
+        self.stage = self.controller.calibrated_stage
+        self.unit = self.controller.calibrated_unit
         self.pipette_anchor = None
-        self.focus_reference = self.focus_threshold = None
-        self.reference_pending = False
-        self.focus_reference_unavailable = False
-        self.focus_peak_state = None
-        self.focus_recovery_pending = self.mini_scan = None
-        self._reset_position_fallbacks()
-        self.cell_reference_deleted = False
-        self.original_cell_reference = None
+        if self.cell is not None:
+            anchor = getattr(self.unit, '_trusted_tip_reference', None)
+            if anchor is None:
+                camera = self.stage.camera
+                anchor = ((camera.width / 2, camera.height / 2),
+                          self.controller.home_position, self.controller.home_stage_position[:2])
+            self.pipette_anchor = tuple(np.array(value, dtype=float, copy=True) for value in anchor)
+        self.initial_observation = None
+        self.cell_observation = self.pipette_observation = None
         self.operation = self._start
         self.next_action = None
-        self.finished = False
-        self.completed_successfully = False
-        self.mode = self.controller.config.mode
-        self.x1_focus_mode = getattr(self.controller.config, 'x1_focus_mode', 'Anchor')
-        self.x1_fixed_focus_threshold = getattr(self.controller.config, 'x1_focus_score_threshold', 0.5)
-        self.initialized = False
-        self.speared = False
-        self.cell_search_bounds = None
-        self.cell_focus_z = None
-        self.cell_focus_error = None
-        self.pipette_z = None
-        self.calibrated_pipette_z = None
-        self.hover_z = None
-        self.goal_distance = None
-        self.cell_detection = None
-        self.cell_template_point = None
-        self.cell_template_evidence = None
-        self.cell_shift_recheck = None
-        self.tracked_cell_reference = None
-        self.confirmed_tip_xy = None
-        self.detected_tip_xy = None
-        self.calibrated_tip_xy = None
-        self.tracked_tip_xy = None
-        self.saved_tip_evidence = None
-        self.spear_motion = None
-        self.spear_done = None
-        self.spear_target = None
-        self.spear_start_z = None
-        self.spear_remaining = None
-        self.spear_speed = None
-        self.pipette_plane = None
-        self.at_hover = False
-        self.cell_selection_locked = False
-        self.search_confirmed = False
-        self.scan_confirmed = False
-        self.shift_cell = False
-        self.shift_ready = False
-        self.spear_complete = False
-        self.decision_cell_type = None
-        self.decision_cell_type_toggle = None
-        self.observation = None
-        self.vision = {}
-        self.stage_position = None
-        self.manipulator_position = None
-        self.source_stage_xy = None
-        self.cell_detections = ()
-        self.vision_fresh = False
-        self.alignment_snapshot = None
-        self.cell_confidence_threshold = lambda: self.controller.calibrated_stage.cellDetectHelper.cellDetector.conf_threshold
-        self.pipette_confidence_threshold = lambda: self.controller.calibrated_unit.pipetteCalHelper.pipetteDetector.adapter.threshold
-        self.original_cell_reference = None if cell is None else cell[0]
-        self.failure_gate()
-        self.success_gate()
+        self.observation = self.alignment_snapshot = None
         self.begin_observations()
-        self.configure_observations()
+        self.controller.observer.set_reference(cell)
         self.controller.alignment_phase = self
-        self.controller.calibrated_stage.focusHelper.reset_search()
-        self.controller.info(f"Approach START: mode={self.mode}")
+        self.failure_gate(validate_cell=self.mode != "Training")
+        if self.mode == "Adaptive":
+            self.build_helpers()  # Fresh per-attempt state; shared models are reused.
+
+    def project_pipette_tip(self, anchor, position):
+        """The tissue stage can move under a stationary pipette on this rig."""
+        delta = np.asarray(position) - anchor[1]
+        return np.asarray(anchor[0])[:2] + self.unit.um_to_pixels_relative(delta)[:2]
 
     def observe(self, **kwargs):
-        """Acquire evidence once, retaining frame anchors and settled motor Z.
+        anchor = self.pipette_anchor
+        if anchor is not None:
+            # The unit's general reference transform adds stage motion since the anchor.
+            # Use the current tissue-stage origin for a tip fixed to the camera frame.
+            anchor = (anchor[0], anchor[1], self.stage.position()[:2])
+        options = dict(cell_inference=True, pipette_inference=True, cached_ephys=True,
+            pipette_anchor=anchor,
+            cell_masks=(self.searcher.searching or self.operation == self.search or
+                (self.operation == self.spear and self.config.track_cell)))
+        options.update(kwargs)
+        self.observation = super().observe(**options)
+        if self.initial_observation is None:
+            self.initial_observation = deepcopy(self.observation)
+        self.publish_alignment_snapshot()
+        return self.observation
 
-        The raw record remains available for recording and tracking helpers;
-        phase decisions use the named attributes unpacked here.
-        """
-        self.validate_pipette_anchor()
-        kwargs.setdefault("pipette_inference", self.mode == "Adaptive" and self.initialized)
-        kwargs.setdefault("cell_inference", self.mode == "Adaptive" and self.initialized)
-        observation = super().observe(**kwargs)
-        self.observation = observation
-        self.vision = observation.get("deep_learning", {})
-        self.stage_position = observation.get("stage_positions", self.stage_position)
-        self.manipulator_position = observation.get("manipulator_position", self.manipulator_position)
-        sources = self.vision.get("source_positions", {})
-        self.source_stage_xy = sources.get("stage_xy")
-        if self.source_stage_xy is None and self.stage_position is not None:
-            self.source_stage_xy = self.stage_position[:2]
-        detections = self.vision.get("cell_detections")
-        self.cell_detections = () if detections is None else detections
-        self.vision_fresh = not self.vision.get("stale", True)
-        self.detected_tip_xy = self.vision.get("pipette_position")
-        self.calibrated_tip_xy = sources.get("pipette_expected_xy")
-        self.tracked_tip_xy = self.vision.get("pipette_tracking_position", sources.get("pipette_tracking_xy"))
-        if (self.operation == self.spear and self.spear_start_z is not None
-                and "stage_positions" in observation and "manipulator_position" in observation):
-            try:
-                self.spear_done = (self.controller.calibrated_unit.actionHelper.is_complete(self.spear_motion)
-                                   if self.spear_motion is not None else None)
-            except RuntimeError as error:
-                raise AutopatchError(str(error)) from error
-            # The monitor can finish after the frame was acquired: reread settled Z.
-            if self.spear_done:
-                self.manipulator_position = self.controller.calibrated_unit.position()
-        return observation
+    def _select_cell(self, observation):
+        """Associate masks with the selected cell using calibrated, motion-projected XY."""
+        cell = observation.get("cell")
+        if cell is None or self.cell is None:
+            return None
+        expected = (np.asarray(observation["stage"]["pixel_position"])
+                    - np.asarray(self.cell[0])[:2])
+        searcher = self.searcher
+        tracker = searcher.tracker
+        radius = self.config.search_xy_radius_um
+        local_xy = None
+        if searcher.searching and getattr(self, "search_bounds", None) is not None:
+            # Hunt's post-Spear search also follows the cell seen at descent start.
+            if getattr(self.config, "hunt_limit_target_radius", True):
+                radius = min(radius, 7.0)
+            local_reference = getattr(self, "spear_cell_reference", None)
+            if local_reference is not None:
+                local_xy = np.asarray(observation["stage"]["pixel_position"]) - local_reference
+        elif (hasattr(self, "search_bounds") and not searcher.searching and self.operation != self.search
+              and getattr(self.config, "hunt_limit_target_radius", False)):
+            radius = min(radius, self.config.hunt_target_radius)
+        if not searcher.searching and tracker.last_cell_reference_xy is not None:
+            projected = tracker.position(observation, self.cell[0])
+            expected = expected + tracker.age_weight(tracker.last_cell_frame_time) * (projected - expected)
+        candidates = []
+        for index, (point, target) in enumerate(zip(cell["cell_seed_points"], cell["cell_targets"])):
+            point = np.asarray(point, dtype=float)
+            if point.shape != (2,) or not np.isfinite(point).all():
+                continue
+            if local_xy is not None and np.linalg.norm(
+                    self.stage.pixels_to_um_relative(np.r_[point - local_xy, 0.0])[:2]) > 7.0:
+                continue
+            distance = np.linalg.norm(self.stage.pixels_to_um_relative(np.r_[point - expected, 0.0])[:2])
+            if distance <= radius and (
+                not searcher.searching or searcher.matches_cell(observation, target, point, expected)
+            ):
+                candidates.append((distance, index, target))
+        return min(candidates, key=lambda row: row[:2])[2] if candidates else None
 
-    def configure_observations(self, *, tracking=False):
-        """Configure acquisition-time anchors in microscope/manipulator um."""
-        controller = self.controller
-        unit, stage = controller.calibrated_unit, controller.calibrated_stage
-        self.pipette_prefer_anchor = self.mode == "Adaptive"
-        self.pipette_anchor_homes = (controller.home_position, controller.home_stage_position)
-        if self.pipette_prefer_anchor and self.pipette_anchor is None:
-            self.pipette_anchor_source = getattr(unit, '_trusted_tip_reference', None)
-            anchor = self.pipette_anchor_source
-            if anchor is None:
-                anchor = (np.array([unit.camera.width / 2., unit.camera.height / 2.]),
-                          controller.home_position, np.asarray(controller.home_stage_position)[:2])
-            self.pipette_anchor = tuple(np.asarray(value, dtype=float).copy() for value in anchor)
-            for value in self.pipette_anchor:
-                value.setflags(write=False)
-        if self.pipette_prefer_anchor:
-            detector = getattr(getattr(unit, 'pipetteCalHelper', None), 'pipetteDetector', None)
-            controller.info(f'Adaptive pipette anchor: anchor_xy={self.pipette_anchor[0]}; '
-                f'radius_um={getattr(unit.config, "pipette_detection_radius_um", None)}; '
-                f'model={getattr(detector, "_active_model", None)}; '
-                f'model_version={getattr(detector, "model_version", None)}')
-        self.frame_context = dict(stage_xy=stage.position, pipette_xyz=unit.position,
-            focus_z=lambda: controller.microscope.position() / unit.config.microscope_units_per_um,
-            pipette_expected_xy=lambda: unit.reference_position(
-                anchor=self.pipette_anchor if self.pipette_prefer_anchor else
-                getattr(unit, '_trusted_tip_reference', None) or
-                (np.array([unit.camera.width / 2., unit.camera.height / 2.]),
-                 controller.home_position, np.asarray(controller.home_stage_position)[:2]))[:2])
-        if tracking:
-            self.frame_context.update(pipette_tracking_xy=lambda: unit.reference_position(anchor=unit._tip_reference)[:2]
-                if getattr(unit, '_tip_reference', None) is not None else None)
+    def _rank_cell(self, observation):
+        """Choose the selected cell's largest observed mask and its exact focus plane."""
+        tracker = self.searcher.tracker
+        return None if tracker.lost else float(tracker.area_px)
 
-    def _shift_cell_from_evidence(self):
-        """Apply existing cell consensus and centering; False requests a recheck."""
-        controller, stage = self.controller, self.controller.calibrated_stage
-        options = {}
-        fusion = getattr(controller.config, 'cell_shift_fusion', True)
-        if fusion:
-            options = stage.cellTrackHelper.cell_shift_options(stage, self.observation, self,
-                use_centroid=controller.config.use_centroid, info=controller.info, warning=controller.warning)
-            if options is False:
-                return False
-        elif self.mode == "Adaptive":
-            source_xy = np.asarray(self.source_stage_xy)[:2]
-            expected = self.expected_cell_xy(source_xy)
-            stage.cellTrackHelper.template_evidence(stage, self.observation, self, expected,
-                use_centroid=controller.config.use_centroid, info=controller.info)
-            template = self.cell_template_evidence
-            target = self.bounded_cell_target(None if template is None else
-                (stage.M @ source_xy + stage.r0)[:2] - template, source_xy)
-            options['detected_px'] = target + (stage.M @ (np.asarray(stage.position())[:2] - source_xy))[:2]
-            controller.info(f'Cell SHIFT template-only: anchor_xy={expected}; bounded_xy={target}')
-        else:
-            controller.info('Cell SHIFT consensus disabled; using existing template centering')
-        if 'detected_px' in options:
-            # Retain the accepted centering evidence with its own stage anchor.
-            self.alignment_snapshot = dict(self.alignment_snapshot or {},
-                cell_detection=None,
-                accepted_cell=dict(xy=np.asarray(options['detected_px']).copy(),
-                                   stage_xy=np.asarray(stage.position())[:2].copy()))
-        result = stage.center_on_cell(self.cell, use_centroid=controller.config.use_centroid,
-            max_error_px=controller.config.approach_cell_max_shift, **options)
-        return None if fusion else result
+    def publish_alignment_snapshot(self, observation=None):
+        captured_sweep_frame = observation is not None
+        if observation is None:
+            observation = self.observation
+        if observation is None or self.cell is None:
+            return
+        stage = observation["stage"]
+        pipette = observation.get("pipette")
+        target = self.select_cell(observation)
+        accepted = None
+        if target is not None and target["target_points_xy"]:
+            accepted = dict(xy=np.asarray(target["target_points_xy"][0]).copy(),
+                            stage_xy=np.asarray(stage["raw_position"])[:2].copy())
+        detection = pipette["pipette_detection"] if pipette is not None else None
+        pipette_position = np.asarray(pipette["raw_position"]).copy() if pipette is not None else None
+        saved_tip = None
+        if captured_sweep_frame and self.operation == self.scan and self.scanner.best_observation is not None:
+            best = self.scanner.best_observation
+            saved_tip = dict(xy=best["pipette"]["pipette_detection"]["tip_xy"],
+                             stage_xy=best["stage"]["raw_position"][:2], pipette_xyz=best["pipette"]["raw_position"])
+        self.alignment_snapshot = dict(operation=self.operation, cell_reference=self.cell[0],
+            saved_tip_evidence=saved_tip,
+            source_positions=dict(stage_xy=np.asarray(stage["raw_position"])[:2].copy(),
+                                  pipette_xyz=pipette_position),
+            stage_position=np.asarray(stage["raw_position"]).copy(),
+            manipulator_position=pipette_position,
+            accepted_cell=accepted, stale=observation["image"]["frame_number"] is None,
+            calibrated_tip_xy=pipette["pixel_position"] if pipette is not None else None,
+            detected_tip_xy=None if detection is None else detection.get("tip_xy"))
 
     def calculate(self):
-        """Calculate the four S-method facts and publish copied evidence."""
-        if self.mode == "Adaptive" and self.initialized:
-            self._update_focus_peak_from_observation(self.vision)
-            # Search and Scan confirm current evidence before Shift can be chosen.
-            self.calculate_search()
-            self.calculate_scan()
-            # Shift selects its target; Spear measures hover and descent progress.
-            self.calculate_shift()
-            self.calculate_spear()
-            self.controller.observer.annotate(self, self.observation,
-                fields={"cell_detection": self.cell_detection},
-                calculations={"cell_focus_error": self.cell_focus_error,
-                              "spear_target": self.spear_target, "spear_done": self.spear_done,
-                              "spear_remaining": self.spear_remaining, "pipette_plane": self.pipette_plane})
-        self.publish_alignment_snapshot()
+        self.calculate_geometry()
 
-    def _focus_recovery_requested(self):
-        return bool(getattr(self, 'focus_recovery_pending', None) or getattr(self, 'mini_scan', None))
+    def calculate_geometry(self):
+        reference = self.observation["reference"]
+        motor_z = self.observation["pipette"]["raw_position"][2]
+        self.cell_focus_z = (self.cell_observation["stage"]["raw_position"][2]
+            if self.cell_observation is not None else reference["cell_position"][2])
+        if self.pipette_observation is None:
+            self.pipette_z = (reference["home_stage_position"][2] + motor_z
+                              - reference["home_position"][2])
+        else:
+            self.pipette_z = (self.pipette_observation["stage"]["raw_position"][2] + motor_z
+                              - self.pipette_observation["pipette"]["raw_position"][2])
+        self.goal_distance = (reference["cell_distance"] if reference["cell_type"] == "Plate"
+            or (reference["cell_type"] == "Slice" and reference["cell_type_toggle"])
+            else reference["slice_start_distance"])
+        if not all(isfinite(v) for v in (self.cell_focus_z, self.pipette_z, self.goal_distance)):
+            raise AutopatchError("Approach needs finite depth geometry")
+        if self.goal_distance < 0:
+            raise AutopatchError("Approach separation must be nonnegative")
+        self.hover_z = self.cell_focus_z - self.goal_distance
 
-    def _update_focus_peak_from_observation(self, vision):
-        """Retain a recent peak from Observer evidence for a local Scan retry."""
-        if self._focus_recovery_requested():
-            return
-        if self.mode != 'Adaptive' or self.operation not in (self.scan, self.spear):
-            self.focus_peak_state = None
-            return
-        state = getattr(self, 'focus_peak_state', None)
-        if state is None or state['operation'] != self.operation:
-            state = self.focus_peak_state = dict(operation=self.operation, last_frame=None,
-                                                peak=None, missing=0, attempts=0)
-        frame, acquired = vision.get('source_frame'), vision.get('frame_retrieval_started_at')
-        if (vision.get('stale', True) or frame is None or frame == state['last_frame']
-                or state['attempts'] or acquired is None):
-            return
-        now = time.monotonic()
-        if not np.isfinite(acquired) or not 0 <= now - acquired <= self.FOCUS_PEAK_MAX_AGE_S:
-            return
-        state['last_frame'] = frame
-        sources = vision.get('source_positions', {})
-        pipette = np.asarray(sources.get('pipette_xyz'), dtype=float)
-        stage_xy = np.asarray(sources.get('stage_xy'), dtype=float)
-        if (pipette.shape != (3,) or stage_xy.shape != (2,)
-                or not np.isfinite(pipette).all() or not np.isfinite(stage_xy).all()):
-            state.update(peak=None, missing=0)
-            return
-        peak = state['peak']
-        if peak is not None and (now - peak['acquired'] > self.FOCUS_PEAK_MAX_AGE_S
-                or not np.allclose(stage_xy, peak['stage_xy'], atol=1e-6, rtol=0)
-                or not np.allclose(pipette[:2], peak['pipette_xyz'][:2], atol=1e-6, rtol=0)):
-            state.update(peak=None, missing=0)
-            peak = None
-        score, confidence = vision.get('pipette_focus_peak_score'), vision.get('pipette_focus_peak_confidence')
-        z = sources.get('focus_z')
-        usable = (score is not None and confidence is not None and z is not None
-                  and np.isfinite([score, confidence, z]).all() and 0 <= score <= 1
-                  and confidence >= self.pipette_confidence_threshold())
-        threshold = self._scan_focus_threshold()
-        threshold = getattr(self, 'x1_fixed_focus_threshold', .35) if threshold is None else threshold
-        if usable and score >= threshold and (peak is None or score > peak['score']):
-            state['peak'] = peak = dict(score=score, focus_z=z, acquired=acquired, frame=frame,
-                                        pipette_xyz=pipette.copy(), stage_xy=stage_xy.copy())
-            state['missing'] = 0
-        state['missing'] = 0 if vision.get('pipette_position') is not None else state['missing'] + 1
-        if peak is not None and state['missing'] and ((usable and peak['score'] - score >= self.FOCUS_PEAK_DROP)
-                                                     or state['missing'] >= 2):
-            self.focus_recovery_pending = peak
-            self.controller.info(f'{self.phase_name} FOCUS PEAK: frame={peak["frame"]}; '
-                                 f'score={peak["score"]}; missing pipette XY; local Scan requested')
-
-    def publish_alignment_snapshot(self):
-        """Publish copied evidence at either phase's completed calculation boundary."""
-        if self.observation is not None:
-            from copy import deepcopy
-            vision = self.observation.get("deep_learning", {})
-            snapshot = deepcopy(dict(
-                observation_id=self.observation.get("observation_id"),
-                source_frame=vision.get("source_frame"),
-                stale=vision.get("stale", True),
-                source_positions=vision.get("source_positions", {}),
-                stage_position=self.observation.get("stage_positions"),
-                manipulator_position=self.observation.get("manipulator_position"),
-                cell_detection=self.cell_detection,
-                accepted_cell=(self.alignment_snapshot or {}).get("accepted_cell"),
-                detected_tip_xy=self.detected_tip_xy,
-                calibrated_tip_xy=self.calibrated_tip_xy,
-                tracked_tip_xy=self.tracked_tip_xy,
-                confirmed_tip_xy=self.confirmed_tip_xy,
-                saved_tip_evidence=self.saved_tip_evidence,
-                spear_start_z=self.spear_start_z,
-            ))
-            # Preserve the selected reference and bound operation identities.
-            snapshot["cell_reference"] = self.original_cell_reference
-            snapshot["operation"] = self.operation
-            self.alignment_snapshot = snapshot
-
-    def expected_cell_xy(self, stage_xy):
-        stage = self.controller.calibrated_stage
-        return (stage.M @ np.asarray(stage_xy) + stage.r0)[:2] - self.selected_cell_anchor[:2]
-
-    def _reset_position_fallbacks(self):
-        self.visual_failures = {'search': 0, 'scan': 0}
-        self.position_fallback = None
-
-    def _clear_position_cycle(self, target):
-        self.visual_failures[target] = 0
-        if self.position_fallback == target:
-            self.position_fallback = None
-
-    def _position_ready(self, target):
-        return (getattr(self, 'position_fallback', None) == target
-                or getattr(self, target + '_confirmed', False))
-
-    def _position_target_xy(self, target):
-        xy = (self.expected_cell_xy(np.asarray(self.controller.calibrated_stage.position())[:2])
-              if target == 'search' else self.frame_context['pipette_expected_xy']())
-        xy = np.asarray(xy, dtype=float)
-        if xy.shape != (2,) or not np.isfinite(xy).all():
-            raise AutopatchError('Calibrated fallback requires a finite target XY')
-        return xy
-
-    def _activate_position_fallback(self, target):
-        """Use saved geometry explicitly; never manufacture visual evidence."""
-        xy = self._position_target_xy(target)
-        z = self.cell_focus_z if target == 'search' else self.pipette_z
-        if z is None or not np.isfinite(z):
-            raise AutopatchError('Calibrated fallback requires a finite saved focal plane')
-        self.controller.calibrated_stage.focusHelper.relocate(z)
-        self.controller.abort_if_requested()
-        self.stage_position = np.array(self.stage_position, dtype=float, copy=True)
-        self.stage_position[2] = (self.controller.microscope.position()
-            / self.controller.calibrated_unit.config.microscope_units_per_um)
-        self.position_fallback = target
-        self.controller.warning(f'{target.upper()} calibrated fallback after '
-            f'{self.visual_failures[target]} failed attempts: xy={xy}; focus_z={z}; '
-            f'source={"selected cell anchor" if target == "search" else "Locate/calibration anchor"}')
-
-    def _scan_focus_threshold(self):
-        # An unavailable X1 reference can be acquired later using its existing bootstrap floor.
-        if getattr(self, 'focus_reference_unavailable', False):
-            return np.nextafter(0.25, 1.)
-        return getattr(self, 'focus_threshold', None)
-
-    def _capture_focus_reference(self):
-        scores = self.controller.calibrated_stage.focusHelper.reference_focus_scores
-        if not self.scan_confirmed or self.confirmed_tip_xy is None or len(scores) < 3:
-            raise AutopatchError('Pipette reference requires three settled focused detections')
-        score = float(np.median(scores))
-        threshold = (0.25 + score) / 2
-        if min(scores) < threshold:
-            if self.failure_gate(message='Pipette reference focus is unstable', recover=True):
-                return False
-            raise AutopatchError('Pipette reference focus is unstable; restart Approach')
-        self.focus_reference = dict(cell=self.original_cell_reference,
-            score=score, threshold=threshold, xy=tuple(self.confirmed_tip_xy),
-            frame=self.vision.get('source_frame'), focus_z=self.stage_position[2],
-            stage_xy=tuple(self.source_stage_xy), pipette_xyz=tuple(self.manipulator_position),
-            attempt=self.controller.observer.attempt_token,
-            model=self.controller.calibrated_unit.pipetteCalHelper.pipetteDetector._active_model)
-        self.focus_threshold = threshold
-        self.focus_reference_unavailable = False
-        self.controller.info(f'Pipette focus reference={score:.3f}; threshold={threshold:.3f}')
-        return True
-
-    def select_cell_detection(self, detections, stage_xy, radius_um, *, local_reference=None, local_radius_um=None):
-        if stage_xy is None or not np.isfinite(stage_xy).all():
-            return None
-        stage = self.controller.calibrated_stage
-        expected = self.expected_cell_xy(stage_xy)
-        camera = self.controller.calibrated_unit.camera
-        local = None if local_reference is None else (stage.M @ np.asarray(stage_xy) + stage.r0)[:2] - np.asarray(local_reference)[:2]
-        candidates = []
-        for row in (() if detections is None else detections):
-            if len(row) < 3 or not np.isfinite(row[:3]).all() or row[2] < self.cell_confidence_threshold():
-                continue
-            xy = np.asarray(row[:2])
-            if not (0 <= xy[0] < camera.width and 0 <= xy[1] < camera.height):
-                continue
-            distance = np.linalg.norm(stage.pixels_to_um_relative(xy - expected)[:2])
-            if not np.isfinite(distance) or distance > radius_um:
-                continue
-            if local is not None:
-                local_distance = np.linalg.norm(stage.pixels_to_um_relative(xy - local)[:2])
-                if local_radius_um is None or not np.isfinite(local_distance) or local_distance > local_radius_um:
-                    continue
-            candidates.append((distance, -float(row[2]), row))
-        return min(candidates, key=lambda item: item[:2])[2] if candidates else None
-
-    def bounded_cell_target(self, point, stage_xy):
-        expected = self.expected_cell_xy(stage_xy)
-        point = None if point is None else np.asarray(point, dtype=float)
-        if point is None or point.shape != (2,) or not np.isfinite(point).all():
-            return expected.copy()
-        stage = self.controller.calibrated_stage
-        distance = np.linalg.norm(stage.pixels_to_um_relative(point - expected)[:2])
-        limit = min(self.controller.config.search_xy_radius_um, stage.focusHelper.TIP_STABILITY_UM)
-        if not np.isfinite(distance) or distance > limit:
-            self.controller.info(f'Cell refinement rejected: anchor_xy={expected}; measured_xy={point}; distance_um={distance}')
-            return expected.copy()
-        return point.copy()
-
-    def invalidate_cell_reference(self, cell):
-        if getattr(self, 'original_cell_reference', None) is cell:
-            self.cell_reference_deleted = True
-            self.focus_reference = self.focus_threshold = None
-            self.confirmed_tip_xy = self.saved_tip_evidence = None
-            self.scan_confirmed = self.completed_successfully = False
-
-    def validate_pipette_anchor(self):
-        if getattr(self, 'cell_reference_deleted', False):
-            raise AutopatchError('Selected cell was deleted; restart with a queued cell')
-        reference = getattr(self, 'focus_reference', None)
-        if reference is not None and (reference['attempt'] is not self.controller.observer.attempt_token
-                or reference['model'] != self.controller.calibrated_unit.pipetteCalHelper.pipetteDetector._active_model):
-            raise AutopatchError('Pipette focus reference changed; restart Approach')
-        if self.mode == "Adaptive" and getattr(self, 'pipette_anchor', None) is not None:
-            if (getattr(self.controller.calibrated_unit, '_trusted_tip_reference', None) is not self.pipette_anchor_source
-                    or self.controller.home_position is not self.pipette_anchor_homes[0]
-                    or self.controller.home_stage_position is not self.pipette_anchor_homes[1]):
-                raise AutopatchError('Pipette calibration changed; restart the phase to rebuild its anchor')
-
-    def projected_confirmed_tip(self):
-        sources = self.vision.get('source_positions', {})
-        unit, stage = self.controller.calibrated_unit, self.controller.calibrated_stage
-        if sources.get('pipette_xyz') is None or sources.get('stage_xy') is None:
-            raise AutopatchError('Confirmed pipette evidence has no motor/stage anchors')
-        return (np.asarray(self.confirmed_tip_xy).copy()
-                + unit.um_to_pixels_relative(np.asarray(unit.position()) - sources['pipette_xyz'])[:2]
-                + stage.um_to_pixels_relative(np.asarray(stage.position())[:2] - np.asarray(sources['stage_xy'])[:2])[:2])
-
-    def calculate_search(self):
-        """SEARCH: associate the selected cell and confirm settled focus evidence.
-
-        Identity uses confidence and calibrated distance in um. A locked Hunt
-        selection is retained; confirmation consumes this observation only.
-        """
-        self.cell_focus_error = self.stage_position[2] - self.cell_focus_z
-        if not self.cell_selection_locked:
-            self.cell_detection = None
-        if self.operation != self.search:
-            return
-        if getattr(self, 'position_fallback', None) == 'search':
-            return
-        stage = self.controller.calibrated_stage
-        if not self.cell_selection_locked:
-            self.cell_detection = (self.select_cell_detection(self.cell_detections,
-                self.source_stage_xy, self.controller.config.search_xy_radius_um) if self.vision_fresh else None)
-        try:
-            self.search_confirmed = stage.focusHelper.confirm_search(self.vision, self.cell_detection)
-        except RuntimeError as error:
-            if not (str(error).startswith("cell focus confirmation failed:")
-                    and self.failure_gate(message=str(error), recover=True)):
-                raise AutopatchError(str(error)) from error
-
-    def calculate_scan(self):
-        """SCAN: confirm detector XY and retain separately anchored provisional evidence."""
-        self.saved_tip_evidence = None
-        if self.operation != self.scan:
-            return
-        mini = getattr(self, 'mini_scan', None)
-        if getattr(self, 'focus_recovery_pending', None) or (mini and mini['done']):
-            return
-        if mini and time.monotonic() - mini['started'] > self.FOCUS_MINI_TIMEOUT_S:
-            mini['done'], self.scan_confirmed = True, False
-            return
-        if getattr(self, 'position_fallback', None) == 'scan':
-            return
-        focus = self.controller.calibrated_stage.focusHelper
-        try:
-            self.scan_confirmed = focus.confirm_search(self.vision)
-        except RuntimeError as error:
-            if mini and str(error).startswith('pipette focus confirmation failed:'):
-                mini['done'], self.scan_confirmed = True, False
-                return
-            if not (str(error).startswith("pipette focus confirmation failed:")
-                    and self.failure_gate(message=str(error), recover=True)):
-                raise AutopatchError(str(error)) from error
-            self.confirmed_tip_xy = None
-            return
-        self.confirmed_tip_xy = focus.confirmed_tip_xy
-        self.saved_tip_evidence = focus.saved_tip_evidence
-        if mini and self.scan_confirmed:
-            mini['done'] = True
-            self.pipette_z = float(self.stage_position[2])
-
-    def calculate_shift(self):
-        """SHIFT: select cell after Search or pipette after Scan and its readiness."""
-        self.shift_ready = False
-        if self.operation == self.search:
-            self.shift_cell = True
-            self.shift_ready = self._position_ready('search')
-        elif self.operation == self.scan:
-            self.shift_cell = False
-            self.shift_ready = self._position_ready('scan')
-
-    def calculate_spear(self):
-        """SPEAR: measure hover, target, and progress in calibrated um.
-
-        Observation supplies monitor completion and settled motor position.
-        Hunt keeps its own descent target, speed, and contact goal.
-        """
-        if self.operation != self.spear:
-            return
-        self.spear_speed = abs(self.controller.config.max_clearing_speed)
-        self.at_hover = (self.cell_focus_error >= 0 if self.hover_z is None
-                         else abs(self.stage_position[2] - self.hover_z) <= 0.5)
-        if self.spear_start_z is None:
-            distance = (self.controller.config.slice_start_distance - self.goal_distance
-                        if self.hover_z is None else self.hover_z - self.pipette_z)
-            self.spear_target = self.manipulator_position[2] + distance
-            self.spear_complete = False
-            return
-        pipette_z = self.manipulator_position[2]
-        self.spear_remaining = self.spear_target - pipette_z
-        self.pipette_plane = self.pipette_z + pipette_z - self.spear_start_z
-        self.spear_complete = self.spear_remaining <= 0.5 if self.spear_done is None else self.spear_done
+    def calculate_progress(self):
+        return self.hover_z - self.pipette_z
 
     def decide(self):
-        """Choose a named operation using calculated readiness and the live mode."""
         self.next_action = None
-        if self.awaiting_operator or self.finished:
+        if self.finished or self.awaiting_operator:
+            return
+        if not self.initialized:
+            self.next_action = self._start
             return
         if self.mode == "Training":
-            if not self.initialized:
-                self.next_action = self._start
             return
-        self.decision_cell_type = self.controller.config.cell_type
-        self.decision_cell_type_toggle = self.controller.config.cell_type_toggle
-        # Classic, Manual, and Agent share the existing cell-type route.
-        if self.controller.config.mode != "Adaptive" or not self.initialized:
-            self.next_action = self._start
-        elif self._focus_recovery_requested():
-            self.next_action = self.scan
-        elif self.operation == self.search:
-            self.next_action = self.shift if self.shift_ready else self.search
-        elif self.operation == self.scan:
-            self.next_action = self.shift if self.shift_ready else self.scan
-        elif self.operation == self.spear:
-            if self.spear_start_z is None:
-                if self.at_hover:
-                    self.next_action = self.spear
-            elif self.spear_complete:
+        self.next_action = self.operation
+        if self.operation == self.spear:
+            remaining_depth = self.calculate_progress()
+            if abs(remaining_depth) <= self.depth_tolerance_um:
+                # Already at the stopping distance: do the final alignment pass.
+                self.speared = True
+                self.next_action = self.search
+            elif remaining_depth < 0:
+                self.controller.warning("Pipette is past the intended depth; continuing final alignment")
+                self.speared = True
                 self.next_action = self.search
 
     def act(self):
-        """Check permission, then visibly execute the selected S method."""
-        if self.next_action is not None or (self.mode == "Adaptive" and self.initialized):
-            if not self.action_gate():
-                raise AutopatchError("Approach action is not permitted")
-        if self.next_action is None:
-            self.controller.sleep(0.1)
-        elif self.next_action == self._start:
+        if self.next_action is not None and not self.action_gate():
+            raise AutopatchError("Approach action is not permitted")
+        if self.next_action == self._start:
             self._start()
         elif self.next_action == self.search:
             self.search()
@@ -567,451 +264,211 @@ class ApproachCellPhase(PhaseController):
             self.scan()
         elif self.next_action == self.spear:
             self.spear()
+        else:
+            self.controller.sleep(0.1)
 
-    def search(self):
-        """Move the microscope to find the selected cell's focal plane.
-
-        After Spear, first stop the descent and return to the saved cell plane.
-        Continue the focus search until the cell is ready for centering by Shift."""
-        controller, helper = self.controller, self.controller.calibrated_stage.focusHelper
-        if self.operation == self.spear:
-            controller.microscope.stop()
-            # Cancel the monitor before another operation owns the devices.
-            if self.spear_motion is not None:
-                controller.calibrated_unit.actionHelper.cancel(self.spear_motion)
-                self.spear_motion = None
-            controller.calibrated_unit.stop()
-            self.operation = self.search
-            self.speared = True
-            self._clear_position_cycle('search')
-            self.pipette_z = self.pipette_plane
-            self.spear_start_z = None
-            helper.relocate(self.cell_focus_z)
-            self.failure_gate()
-            self.success_gate()
-            helper.reset_search()
-            self.search_confirmed = False
+    def search(self, *, bounds=None):
+        if bounds is None:
+            radius = self.config.search_z_radius_um
+            bounds = (self.cell_focus_z - radius, self.cell_focus_z + radius)
+        result = self.searcher.run(self, bounds=bounds, speed=self.config.search_speed)
+        if result is None:
             return
-        try:
-            helper.advance_search(actual_z=self.stage_position[2], vision=self.vision,
-                cell=self.cell_detection, center_z=self.cell_focus_z,
-                speed=controller.config.search_speed, motion=controller.calibrated_stage.actionHelper,
-                bounds=(self.cell_search_bounds if self.cell_search_bounds is not None else
-                        (self.cell_focus_z - controller.config.search_z_radius_um,
-                         self.cell_focus_z + controller.config.search_z_radius_um)), pipette=False,
-                pixels_to_um_relative=controller.calibrated_stage.pixels_to_um_relative,
-                confidence_threshold=self.cell_confidence_threshold,
-                abort_check=controller.abort_if_requested, info=controller.info, warning=controller.warning)
-        except (RuntimeError, ValueError) as error:
-            raise AutopatchError(str(error)) from error
-        if helper.empty:
-            reason = "SEARCH focus sweep found no valid samples"
-            if not self.failure_gate(message=reason, recover=True):
-                raise AutopatchError(reason)
+        if result == "not_found":
+            self.searcher.tracker.using_fallback = True
+            self.cell_observation = None
+        else:
+            self.cell_observation = result
+        self.shift_cell, self.operation = True, self.shift
 
     def scan(self):
-        """Move the microscope to find the pipette's focal plane.
-
-        The confirmed tip position is then used by Shift to center the pipette
-        in the camera image."""
-        controller = self.controller
-        stage, unit = controller.calibrated_stage, controller.calibrated_unit
-        mini = getattr(self, 'mini_scan', None)
-        if mini and mini['done']:
-            self.mini_scan = None
-            self.focus_peak_state['peak'] = None
-            if mini['operation'] == self.spear or not self.scan_confirmed:
-                stage.focusHelper.reset_search()
-            if mini['operation'] == self.spear:
-                stage.focusHelper.relocate(mini['restore_z'])
-                self.stage_position[2], self.spear_target = mini['restore_z'], mini['target']
-                self.failure_gate()
-                return ApproachCellPhase.spear(self)
-            if self.scan_confirmed:
-                return
-            mini = None
-        peak = getattr(self, 'focus_recovery_pending', None)
-        if peak:
-            self.failure_gate()
-            self.focus_peak_state['attempts'] += 1
-            mini = dict(operation=self.operation, target=self.spear_target,
-                        restore_z=float(self.stage_position[2]), started=time.monotonic(), done=False)
-            if self.operation == self.spear:
-                if self.spear_motion is not None:
-                    unit.actionHelper.cancel(self.spear_motion)
-                unit.stop()
-                self.manipulator_position = np.asarray(unit.position(), dtype=float)
-                if self.spear_start_z is not None:
-                    self.pipette_z += self.manipulator_position[2] - self.spear_start_z
-                self.spear_start_z = self.spear_motion = self.spear_done = None
-                self.pipette_plane = self.pipette_z
-            stopped_z = float(unit.position()[2])
-            center = peak['focus_z'] + stopped_z - peak['pipette_xyz'][2]
-            radius = min(self.FOCUS_MINI_RADIUS_UM, float(controller.config.scan_z_radius_um))
-            low = max(center - radius, self.pipette_z - controller.config.scan_z_radius_um)
-            high = min(center + radius, self.pipette_z + controller.config.scan_z_radius_um)
-            if not np.isfinite([low, high]).all() or low >= high:
-                raise AutopatchError('Focus peak mini sweep has no valid bounded interval')
-            mini.update(center=float(np.clip(center, low, high)), bounds=(low, high))
-            stage.focusHelper.reset_search()
-            self.mini_scan, self.focus_recovery_pending = mini, None
-            self.operation, self.scan_confirmed = self.scan, False
-            controller.info(f'{self.phase_name} MINI SCAN: peak_frame={peak["frame"]}; bounds={mini["bounds"]}')
-        threshold = self._scan_focus_threshold()
-        try:
-            stage.focusHelper.advance_search(actual_z=self.stage_position[2], vision=self.vision,
-                cell=self.cell_detection, center_z=mini['center'] if mini else self.pipette_z,
-                speed=min(controller.config.search_speed, 20.0) if mini else controller.config.search_speed,
-                motion=stage.actionHelper,
-                settled_focus_limit_um=(controller.config.scan_confirm_defocus_um
-                                        if self.mode == "Adaptive" and threshold is None else None),
-                bounds=mini['bounds'] if mini else (self.pipette_z - controller.config.scan_z_radius_um,
-                        self.pipette_z + controller.config.scan_z_radius_um), pipette=True,
-                pixels_to_um_relative=stage.pixels_to_um_relative,
-                confidence_threshold=self.pipette_confidence_threshold,
-                abort_check=controller.abort_if_requested, info=controller.info, warning=controller.warning,
-                **({'focus_score_threshold': threshold} if threshold is not None else {}))
-        except (RuntimeError, ValueError) as error:
-            raise AutopatchError(str(error)) from error
+        radius = self.config.scan_z_radius_um
+        result = self.scanner.run(self,
+            bounds=(self.pipette_z - radius, self.pipette_z + radius),
+            speed=self.config.search_speed)
+        if result is None:
+            return
+        self.pipette_observation = None if result == "not_found" else result
+        self.shift_cell, self.operation = False, self.shift
 
     def shift(self):
-        """Center the cell or pipette in the camera image.
-
-        After Search, move the stage to center the cell, then continue to Scan.
-        After Scan, move the manipulator to center the pipette, then start Spear
-        or finish if the alignment after descent is complete."""
-        controller = self.controller
-        controller.microscope.stop()
-        fallback = getattr(self, 'position_fallback', None)
-        if getattr(self, 'reference_pending', False):
-            focus = controller.calibrated_stage.focusHelper
-            if fallback == 'scan':
-                self.focus_reference_unavailable = True
-                self.focus_reference_model = controller.calibrated_unit.pipetteCalHelper.pipetteDetector._active_model
-                self.focus_threshold = None
-                controller.warning('X1 reference unavailable; continuing with calibrated pipette position')
-            elif not self._capture_focus_reference():
-                return
-            else:
-                self.pipette_z = self.stage_position[2]
-            self.reference_pending = False
-            self.scan_confirmed = False
-            self.operation = self.search
-            self._reset_position_fallbacks()
-            focus.reset_search()
-            focus.relocate(self.cell_focus_z)
+        helper = self.searcher if self.shift_cell else self.scanner
+        viewing_z = self.cell_focus_z if self.shift_cell else self.pipette_z
+        positioned = helper.move_to(self, viewing_z, self.config.search_speed)
+        if positioned is None:
+            return
+        desired_xy = (self.stage.camera.width / 2, self.stage.camera.height / 2)
+        if self.shift_cell:
+            result = self.shifter.shift_cell(self, target_xy=None,
+                max_error_px=self.config.approach_cell_max_shift)
+        else:
+            result = self.shifter.shift_pipette(self, desired_xy=desired_xy,
+                speed=self.config.approach_pipette_speed)
+        if result is None:
             return
         if self.shift_cell:
-            if fallback == 'search':
-                centered = controller.calibrated_stage.center_on_cell(self.cell,
-                    detected_px=self._position_target_xy('search'),
-                    use_centroid=controller.config.use_centroid,
-                    max_error_px=controller.config.approach_cell_max_shift)
-            else:
-                self.cell_focus_z = self.stage_position[2]
-                centered = self._shift_cell_from_evidence()
-            if centered is False:
-                return
-        else:
-            if self.mode == "Adaptive" and fallback != 'scan' and (not self.scan_confirmed or self.confirmed_tip_xy is None):
-                self.failure_gate(message='Pipette SHIFT requires confirmed anchored focus evidence', recover=True)
-                return
-            self.validate_pipette_anchor()
-            if fallback != 'scan':
-                if getattr(self, 'focus_reference_unavailable', False) and not self._capture_focus_reference():
-                    return
-                self.pipette_z = self.stage_position[2]
-            options = {}
-            if fallback == 'scan':
-                target = self._position_target_xy('scan')
-                options = dict(detected_px=target, expected_px=target,
-                    max_deviation_um=controller.calibrated_unit.config.pipette_detection_radius_um)
-            elif self.confirmed_tip_xy is not None:
-                options = dict(detected_px=self.projected_confirmed_tip() if self.mode == "Adaptive" else self.confirmed_tip_xy,
-                    expected_px=self.frame_context["pipette_expected_xy"](),
-                    max_deviation_um=controller.calibrated_unit.config.pipette_detection_radius_um)
-                self.confirmed_tip_xy = None
-            centered = controller.calibrated_unit.center_pipette(
-                speed=controller.config.approach_pipette_speed, **options)
-        if not self.action_gate():
-            raise AutopatchError("Mode changed during approach SHIFT")
-        if not self.shift_cell and centered is False:
-            reason = getattr(controller.calibrated_unit, "last_pipette_move_failure", None)
-            if not isinstance(reason, str) or not reason:
-                reason = "pipette centering did not complete"
-            next_action = "final alignment incomplete" if self.speared else "SPEAR cancelled"
-            raise AutopatchError(f"{self.phase_name} pipette SHIFT failed: {reason}; {next_action}")
-        controller.calibrated_stage.focusHelper.reset_search()
-        self._clear_position_cycle('search' if self.shift_cell else 'scan')
-        self.search_confirmed = False
-        self.scan_confirmed = False
-        if self.shift_cell:
-            self._clear_position_cycle('scan')
-            self.operation = self.scan
-            next_z = self.pipette_z
+            self.operation = self.spear if self.recovering_cell else self.scan
+            self.recovering_cell = False
         elif self.speared:
-            return self.finish(success=True)
+            self.finish(success=True)
         else:
             self.operation = self.spear
-            self.spear_start_z = None
-            next_z = self.hover_z = self.cell_focus_z - self.goal_distance
-        controller.calibrated_stage.focusHelper.relocate(next_z)
-        self.failure_gate()
-        self.success_gate()
 
     def spear(self):
-        """Start monitored pipette descent to the calculated target depth.
-
-        Return while the pipette moves so the phase can continue observing.
-        Later observations check the motion's progress and completion."""
-        self.validate_pipette_anchor()
-        controller = self.controller
-        controller.microscope.stop()
-        self.operation = self.spear
-        self.spear_start_z = self.manipulator_position[2]
-        unit, actions = controller.calibrated_unit, controller.calibrated_unit.actionHelper
-        try:
-            target, speed = float(self.spear_target), float(self.spear_speed)
-            if not np.isfinite([target, speed]).all() or speed <= 0:
-                raise ValueError('Spear requires a finite target and positive finite speed')
-            controller.abort_if_requested()
-            start = float(unit.position()[2])
-            if not np.isfinite(start):
-                raise RuntimeError('Spear has no valid pipette Z position')
-            if target < start - actions.MOTION_ENDPOINT_TOLERANCE_UM:
-                raise ValueError('Spear target is behind the current pipette position')
-            deadline = time.monotonic() + max(10.0, max(0.0, target - start) / speed * 20.0)
-            unit.stop()
-            unit.info(f'SPEAR motion: start_z={start}; target_z={target}; '
-                      f'velocity_command={-speed}; endpoint monitor active')
-            self.spear_motion = actions.start(unit, target=target, deadline=deadline,
-                read_position=lambda: float(unit.position()[2]),
-                move_velocity=lambda direction: unit.absolute_move_group_velocity([0.0, 0.0, -direction * speed]),
-                abort_check=controller.abort_if_requested, label='Spear motion', info=unit.info,
-                direction=1.0, reversal_origin=start,
-                reversal_tolerance=actions.MOTION_ENDPOINT_TOLERANCE_UM)
-        except (RuntimeError, ValueError) as error:
-            raise AutopatchError(str(error)) from error
+        viewing_z = self.cell_focus_z if self.config.track_cell else self.hover_z
+        positioned = self.searcher.move_to(self, viewing_z, self.config.search_speed)
+        if positioned is None:
+            return
+        self.calculate_geometry()
+        motor_z = self.observation["pipette"]["raw_position"][2]
+        target_z = motor_z + max(0.0, self.calculate_progress())
+        speed = abs(self.config.max_clearing_speed)
+        tracker = self.searcher.tracker if self.config.track_cell else None
+        result = self.spearer.run(self, target_z=target_z, speed=speed, tracker=tracker)
+        if result == "cell_lost":
+            self.recovering_cell = True
+            self.operation = self.search
+            return
+        if result is not None:
+            self.speared = True
+            self.operation = self.search
 
     def _start(self):
-        """Set up manual Training, initialize Adaptive, or execute the cell-type route."""
-        controller, config = self.controller, self.controller.config
+        config, controller = self.config, self.controller
         if self.mode == "Training":
             controller.amplifier.start_patch()
             self.initialized = True
             controller.info("Training mode: manual movement. Click Success or Abort to finish.")
             return
-        controller.calibrated_stage.set_max_speed(config.max_locate_speed)
-        controller.calibrated_unit.set_max_speed(config.max_locate_speed)
-        self.mode = config.mode
-        adaptive = self.mode == "Adaptive"
-        plate = not adaptive and config.cell_type == "Plate"
-        slice_route = not adaptive and config.cell_type == "Slice" and config.cell_type_toggle
+        self.stage.set_max_speed(config.max_locate_speed)
+        self.unit.set_max_speed(config.max_locate_speed)
+        plate = self.mode != "Adaptive" and config.cell_type == "Plate"
         if plate:
             controller.move_group_down(config.slice_start_distance - config.cell_distance)
             controller.sleep(0.1)
             controller.fine_calibrate_pipette()
-        if not self.action_gate():
-            raise AutopatchError("Cell type changed during approach")
         controller.amplifier.start_patch()
-        if adaptive:
-            controller.info("Approach WARMUP: 3 inference samples before motion")
-            for _ in range(3):
-                self.observe(pipette_inference=True, cell_inference=True)
-                self.failure_gate()
-                self.success_gate()
-            if config.mode != self.mode or not self.action_gate():
-                raise AutopatchError("Mode changed during approach warmup")
-            self.cell_focus_z = self.cell[0][2]
-            self.goal_distance = (config.cell_distance if config.cell_type == "Plate" or
-                (config.cell_type == "Slice" and config.cell_type_toggle) else config.slice_start_distance)
-            self.pipette_z = controller.microscope.position() / controller.calibrated_unit.config.microscope_units_per_um
-            self.operation = self.search
-            self.initialized = True
-            if getattr(controller.calibrated_unit.pipetteCalHelper.pipetteDetector, 'model_version', None) == 'X1':
-                self.calibrated_pipette_z = (controller.home_stage_position[2]
-                    + controller.calibrated_unit.position()[2] - controller.home_position[2])
-                focus_mode = getattr(self, 'x1_focus_mode', getattr(config, 'x1_focus_mode', 'Anchor'))
-                if focus_mode not in ('Anchor', 'Fixed'):
-                    raise AutopatchError('X1 focus mode must be Anchor or Fixed')
-                if not np.isfinite(self.pipette_z):
-                    raise AutopatchError('X1 requires a finite calibrated pipette plane')
-                if focus_mode == 'Anchor':
-                    self.reference_pending = True
-                    self.focus_threshold = np.nextafter(0.25, 1.)
-                    if self.pipette_z >= self.cell_focus_z:
-                        raise AutopatchError('X1 reference requires a calibrated pipette plane above the cell')
-                    self.operation = self.scan
-                else:
-                    threshold = getattr(self, 'x1_fixed_focus_threshold', getattr(config, 'x1_focus_score_threshold', 0.5))
-                    if not np.isfinite(threshold) or not 0 <= threshold <= 1:
-                        raise AutopatchError('X1 fixed focus threshold must be finite and between 0 and 1')
-                    self.focus_threshold = float(threshold)
-                    controller.info(f'X1 Fixed focus threshold={self.focus_threshold:.3f}; reference acquisition skipped')
-            controller.calibrated_stage.focusHelper.relocate(
-                self.pipette_z if self.reference_pending else self.cell_focus_z)
+        if self.mode == "Adaptive":
             self.failure_gate()
             self.success_gate()
+            self.unit.microscope.set_max_speed(config.max_locate_speed)
+            self.stage.focusHelper.relocate(float(self.cell[0][2]))
+            self.failure_gate()
+            self.success_gate()
+            self.operation = self.search
+            self.initialized = True
             return
-        self.align(self.cell, config.cell_distance if plate else config.slice_start_distance, config.use_centroid)
-        if slice_route:
-            if not self.action_gate():
-                raise AutopatchError("Cell type changed during approach")
-            self.clear_to_cell(self.cell)
-            if not self.action_gate():
-                raise AutopatchError("Cell type changed during approach")
-            self.align(self.cell, config.cell_distance, config.use_centroid)
+        self.align(config.cell_distance if plate else config.slice_start_distance)
+        if config.cell_type == "Slice" and config.cell_type_toggle:
+            self.clear_to_cell()
+            self.align(config.cell_distance)
         self.initialized = True
         self.finish(success=True)
 
-    def action_gate(self):
-        """Validate live selection and Adaptive evidence without losing ownership."""
+    def align(self, cell_distance):
         self.failure_gate()
         self.success_gate()
-        config = self.controller.config
-        if self.mode == "Training":
-            return self.next_action == self._start and not self.initialized
-        adaptive = ((self.mode == "Adaptive" and self.initialized) or config.mode == "Adaptive")
-        if adaptive:
-            if config.mode != "Adaptive":
-                return False
-            if not self.initialized:
-                return True
-            low = min(self.cell_focus_z - config.search_z_radius_um,
-                      self.pipette_z - config.scan_z_radius_um)
-            high = max(self.cell_focus_z + config.search_z_radius_um,
-                       self.pipette_z + config.scan_z_radius_um)
-            focus = self.controller.calibrated_stage.focusHelper
-            tolerance = (focus.BOUNDARY_TOLERANCE_UM
-                         if focus.active_search or self.operation in (self.search, self.scan) else 0.0)
-            if self.next_action == self.spear:
-                if not (self.spear_speed > 0 and np.isfinite(self.spear_target)
-                        and self.spear_target >= self.manipulator_position[2]):
-                    return False
-            return (self.vision_fresh and low - tolerance <= self.stage_position[2]
-                    <= high + tolerance)
-        return (self.decision_cell_type == config.cell_type and
-                (config.cell_type == "Plate" or bool(self.decision_cell_type_toggle) == bool(config.cell_type_toggle)))
+        focus = self.stage.focusHelper
+        self.unit.microscope.move_to_floor()
+        focus.relocate(self.cell[0][2])
+        if self.config.cell_type_toggle:
+            self.stage.center_on_cell(self.cell, use_centroid=self.config.use_centroid,
+                max_error_px=self.config.approach_cell_max_shift)
+            focus.relocate(self.cell[0][2] - cell_distance)
+            self.unit.center_pipette(speed=self.config.approach_pipette_speed)
+            focus.relocate(self.cell[0][2])
 
-    def failure_gate(self, *, message=None, recover=False, validate_cell=False):
-        """Check aborts and retry missing focus evidence without ending Approach."""
-        self.controller.abort_if_requested()
-        self.validate_pipette_anchor()
-        if recover:
-            if (self.mode != "Adaptive" or self.controller.config.mode != "Adaptive"
-                    or self.operation not in (self.search, self.scan)):
-                return False
-            target = 'search' if self.operation == self.search else 'scan'
-            if getattr(self, 'position_fallback', None) == target:
-                return True
-            if not hasattr(self, 'visual_failures'):
-                self._reset_position_fallbacks()
-            self.visual_failures[target] += 1
-            self.controller.calibrated_stage.focusHelper.reset_search()
-            self.search_confirmed = False
-            self.scan_confirmed = False
-            self.shift_ready = False
-            self.confirmed_tip_xy = None
-            self.saved_tip_evidence = None
-            if self.visual_failures[target] >= 2:
-                self._activate_position_fallback(target)
-            else:
-                self.controller.warning(f"{message}; retrying {target.upper()} (failure 1/2)")
-            return True
-        if validate_cell:
-            self.controller.isrigready()
-            if self.controller.rig_ready is False:
-                raise AutopatchError("Rig not ready for clearing to cell")
-            if self.cell is None:
-                raise AutopatchError("No cell given to patch!")
-
-    def success_gate(self, goal=None):
-        """Preserve shared operator and Training completion handling."""
-        return super().success_gate(None if goal is None else goal is True)
-
-    def stop_motions(self, *, all_devices=False):
-        """Cancel monitors and attempt every stop, retaining the original error."""
-        primary_error = sys.exc_info()[1]
-        stop_error = None
-        stops = ([self.controller.calibrated_stage.stop, self.controller.calibrated_unit.stop,
-                  self.controller.microscope.stop] if all_devices else [self.controller.calibrated_unit.stop])
-        focus = self.controller.calibrated_stage.focusHelper
-        if focus.active_search:
-            if all_devices:
-                stops.insert(0, focus.cancel_search)
-            else:
-                stops.append(focus.cancel_search)
-        if self.spear_motion is not None:
-            stops.insert(0, lambda: self.controller.calibrated_unit.actionHelper.cancel(self.spear_motion))
-        if not all_devices and self.mode == "Adaptive":
-            stops.extend([self.controller.calibrated_stage.stop, self.controller.microscope.stop])
-        for stop in stops:
-            try:
-                stop()
-            except BaseException as error:
-                if primary_error is not None:
-                    if hasattr(primary_error, "add_note"):
-                        primary_error.add_note(f"Approach stop also failed: {error}")
-                elif stop_error is None:
-                    stop_error = error
-        if stop_error is not None:
-            raise stop_error
-        return primary_error is None
-
-    def finish(self, *, success=False):
-        """Release owned motions/activity; publish successful Adaptive handoff."""
-        try:
-            if self.finished:
-                return
-            self.stop_motions()
-            self.finished = True
-            if success:
-                self.controller.calibrated_stage.set_max_speed(10000)
-                self.controller.calibrated_unit.set_max_speed(100000)
-                self.controller.info("Approached Cell")
-                self.completed_successfully = True
-                self.success_gate(True)
-                self.goal_event = False
-                if not self.awaiting_operator:
-                    self.complete_success()
-        finally:
-            if self.controller.alignment_phase is self:
-                self.controller.alignment_phase = None
-
-    def align(self, cell, cell_distance, use_centroid):
-        """Align the pipette to the cell using microscope imaging."""
-        controller, config = self.controller, self.controller.config
-        focus = controller.calibrated_stage.focusHelper
-        controller.microscope.move_to_floor()
-        focus.relocate(cell[0][2])
-        if config.cell_type_toggle:
-            controller.calibrated_stage.center_on_cell(
-                cell, use_centroid=use_centroid,
-                max_error_px=config.approach_cell_max_shift)
-            focus.relocate(cell[0][2] - cell_distance)
-            controller.calibrated_unit.center_pipette(speed=config.approach_pipette_speed)
-            focus.relocate(cell[0][2])
-
-    def clear_to_cell(self, cell):
-        """Run existing Slice clearing, stopping descent even when a gate fails."""
-        motion_started = False
+    def clear_to_cell(self):
+        # Preserve the old Slice clearing command and measured-travel condition.
         try:
             self.failure_gate(validate_cell=True)
             self.success_gate()
-            controller = self.controller
-            config = controller.config
-            controller.info("Clearing to cell")
-            if not (config.cell_type_toggle and config.cell_type == "Slice"):
-                return
+            config = self.config
             cell_hover_pos = config.cell_distance - config.slice_start_distance
-            controller.microscope.relative_move(-config.cell_distance)
-            start_pos = controller.calibrated_unit.position()
-            motion_started = True
-            controller.calibrated_unit.absolute_move_group_velocity([0, 0, config.max_clearing_speed])
-            while start_pos[2] - controller.calibrated_unit.position()[2] > cell_hover_pos:
+            self.unit.microscope.relative_move(-config.cell_distance)
+            start_pos = self.unit.position()
+            deadline = time.monotonic() + 45.0
+            self.unit.absolute_move_group_velocity([0, 0, config.max_clearing_speed])
+            while start_pos[2] - self.unit.position()[2] > cell_hover_pos:
                 self.failure_gate()
                 self.success_gate()
-                controller.sleep(0.1)
+                if time.monotonic() >= deadline:
+                    self.controller.warning("Slice clearing reached 45 seconds; stopping clearing")
+                    break
+                self.controller.sleep(0.1)
         finally:
-            if motion_started:
-                self.stop_motions()
+            self.stop_motions()
+
+    def action_gate(self):
+        self.failure_gate()
+        self.success_gate()
+        if self.finished or self.awaiting_operator or self.interrupted:
+            return False
+        if self.mode == "Training":
+            return self.next_action == self._start and not self.initialized
+        if self.mode != "Adaptive":
+            return self.next_action == self._start
+        # Helpers validate their own finite positions, speed and endpoint.
+        # Missing visual detections are allowed through calibrated fallback.
+        return self.next_action in (self._start, self.search, self.scan, self.shift, self.spear)
+
+    def motion_checkpoint(self):
+        self.failure_gate()
+        self.success_gate()
+        return not (self.finished or self.awaiting_operator or self.interrupted)
+
+    def failure_gate(self, *, validate_cell=False):
+        self.controller.abort_if_requested()
+        if validate_cell:
+            self.controller.isrigready()
+            if self.controller.rig_ready is False:
+                raise AutopatchError("Rig not ready for Approach")
+            if self.cell is None:
+                raise AutopatchError("Approach requires a selected cell")
+
+    def success_gate(self, goal=None):
+        self.controller.success_if_requested()
+        if goal is None or self.awaiting_operator:
+            return False
+        self.goal_event = goal is True
+        if self.goal_event and self.mode == "Training":
+            self.awaiting_operator = True
+            self.controller.info("Training mode: goal reached. Click Success or Abort to finish.")
+            return False
+        return self.goal_event
+
+    def stop_motions(self):
+        error = None
+        for device in (self.controller.calibrated_unit, self.controller.calibrated_stage,
+                       self.controller.calibrated_unit.microscope):
+            try:
+                device.stop()
+            except Exception as exc:
+                error = error or exc
+        if error is not None and sys.exc_info()[0] is None:
+            raise error
+
+    def finish(self, *, success=False):
+        if self.finished:
+            return
+        error = None
+        try:
+            self.stop_motions()
+        except Exception as exc:
+            error = exc
+        for device, speed in ((self.controller.calibrated_stage, 10000),
+                              (self.controller.calibrated_unit, 100000)):
+            try:
+                device.set_max_speed(speed)
+            except Exception as exc:
+                error = error or exc
+        self.finished = True
+        if self.controller.alignment_phase is self:
+            self.controller.alignment_phase = None
+        if error is not None and sys.exc_info()[0] is None:
+            raise error
+        if success and error is None:
+            self.completed_successfully = True
+            self.success_gate(True)
+            if not self.awaiting_operator:
+                self.complete_success()

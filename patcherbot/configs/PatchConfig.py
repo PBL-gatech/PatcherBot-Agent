@@ -61,6 +61,10 @@ class PatchConfig(Config):
     cell_shift_fusion = Boolean(True,
         doc='Combine detector, calibration and template evidence for every Adaptive Approach/Hunt cell SHIFT; disable for template-based centering')
     track_cell = Boolean(False, doc='Track cell position during approach')
+    vision_half_life_s = NumberWithUnit(1.0, bounds=(0.001, 3600), unit='s',
+        doc='Time for retained visual position evidence to lose half its weight')
+    cell_mask_min_area_fraction = Number(0.01, bounds=(1e-6, 1.0),
+        doc='Minimum tracked area as a fraction of the original reliable cell mask from the first successful Search')
     tracking_mode = Selector(default='fast', objects=['fast', 'cellbody', 'hybrid'], doc='Cell tracking strategy during approach')
     track_max_fast_jump_px = Number(80, bounds=(1, 10000), doc='Maximum accepted fast-tracking jump in pixels')
     
@@ -99,6 +103,7 @@ class PatchConfig(Config):
                       'max_locate_speed', 'search_speed', 'search_z_radius_um', 'search_xy_radius_um',
                       'scan_z_radius_um', 'scan_confirm_defocus_um', 'approach_cell_max_shift', 'approach_pipette_speed',
                       'max_clearing_speed', 'use_centroid', 'cell_shift_fusion', 'track_cell',
+                      'vision_half_life_s', 'cell_mask_min_area_fraction',
                       'tracking_mode', 'track_max_fast_jump_px']),
         ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin', 'hunt_timeout',
                   'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',

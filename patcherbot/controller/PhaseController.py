@@ -61,10 +61,10 @@ class PhaseController(ABC):
         return observation
 
     def observe(self, *, pipette_inference=False, cell_inference=False, cell_masks=False,
-                num_measurements=None, interval=None, raw_resistance=False):
+                num_measurements=None, interval=None, raw_resistance=False, **options):
         observation = self.controller.observe(pipette_inference=pipette_inference,
             cell_inference=cell_inference, cell_masks=cell_masks, num_measurements=num_measurements,
-            interval=interval, raw_resistance=raw_resistance)
+            interval=interval, raw_resistance=raw_resistance, **options)
         self.observation_count += 1
         return self.enrich_observation(observation)
 

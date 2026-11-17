@@ -98,3 +98,12 @@ experiments/Datasets/temp_dataset.hdf5
 /patcherbot/utils/registration_experiments
 /experiments/Analysis/temporary
 /patcherbot/controller/phases/scratchpad
+
+# Keep the runtime detector factory and port regression tests reviewable.
+!/patcherbot/deepLearning/cellModel/
+/patcherbot/deepLearning/cellModel/*
+!/patcherbot/deepLearning/cellModel/CDModelFactory.py
+!/tests/
+/tests/*
+!/tests/test_hunt_port.py
+!/tests/test_phase_port_integration.py

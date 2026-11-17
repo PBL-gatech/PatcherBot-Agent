@@ -36,7 +36,9 @@ max_descent_speed: -10
 max_clearing_speed: -100
 use_centroid: true
 cell_shift_fusion: true
-track_cell: false
+track_cell: true
+vision_half_life_s: 1.0
+cell_mask_min_area_fraction: 0.01
 tracking_mode: fast
 track_max_fast_jump_px: 80
 max_R_increase: 1000000.0

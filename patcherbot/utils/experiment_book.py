@@ -257,8 +257,8 @@ class ExperimentBookLogger:
         return scans
 
     @staticmethod
-    def read_details(source_path):
-        """Read reusable details without changing a source book or live hardware."""
+    def _read_sections(source_path):
+        """Parse book entries without requiring experiment metadata."""
         source = Path(source_path).expanduser().resolve()
         if source.is_dir():
             source = source / "experiment_book.log"
@@ -283,6 +283,27 @@ class ExperimentBookLogger:
                 body.append(line)
         if kind is not None:
             sections.append((kind, saved_at, body))
+        return source, sections
+
+    @staticmethod
+    def read_scans(source_path):
+        """Recover existing scans even when experiment details were never saved."""
+        source, sections = ExperimentBookLogger._read_sections(source_path)
+        scans, legacy = [], True
+        for kind, _, body in sections:
+            if kind == "IMPORT":
+                scans, legacy = [], False
+            elif kind == "SCAN":
+                try:
+                    scans.append(json.loads("\n".join(body)))
+                except ValueError:
+                    logging.getLogger(__name__).warning("Ignoring invalid saved scan in %s", source)
+        return ExperimentBookLogger._saved_scans(source, scans, legacy)
+
+    @staticmethod
+    def read_details(source_path):
+        """Read reusable details without changing a source book or live hardware."""
+        source, sections = ExperimentBookLogger._read_sections(source_path)
         prefixes = {"Experiment name: ": "experiment_name", "Strain/Culture: ": "strain_culture",
                     "Gender: ": "gender", "Age: ": "age"}
         details, tares = None, None
