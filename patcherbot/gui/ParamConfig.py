@@ -39,6 +39,24 @@ class ParamConfig(QtWidgets.QWidget):
         if build_ui:
             self._build_config_ui(show_name)
 
+    # Configs may expose editor rows that aren't plain parameters (e.g. one
+    # pipette's value, "pipette_1.pipette_z_rotation") through editor_param /
+    # editor_get / editor_set; plain configs use their parameters directly.
+    def _param(self, name):
+        accessor = getattr(self.config, "editor_param", None)
+        return accessor(name) if accessor is not None else self.config.param[name]
+
+    def _get(self, name):
+        accessor = getattr(self.config, "editor_get", None)
+        return accessor(name) if accessor is not None else getattr(self.config, name)
+
+    def _set(self, name, value):
+        accessor = getattr(self.config, "editor_set", None)
+        if accessor is not None:
+            accessor(name, value)
+        else:
+            setattr(self.config, name, value)
+
     def _build_config_ui(self, show_name=False):
         config = self.config
         layout = QtWidgets.QVBoxLayout()
@@ -65,7 +83,7 @@ class ParamConfig(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox(category)
         rows = QtWidgets.QVBoxLayout()
         for name in parameter_names:
-            parameter = self.config.param[name]
+            parameter = self._param(name)
             row = QtWidgets.QHBoxLayout()
             label = ElidedLabel(parameter.doc)
             label.setToolTip(parameter.doc)
@@ -78,63 +96,64 @@ class ParamConfig(QtWidgets.QWidget):
         return box
 
     def _create_value_widget(self, param_name, *, multiline=False):
-        config = self.config
-        param_obj = config.param[param_name]
+        param_obj = self._param(param_name)
         if multiline and not isinstance(param_obj, param.String):
             raise ValueError("Multiline editors require a string parameter.")
         if isinstance(param_obj, NumberWithUnit):
             value_widget = QtWidgets.QDoubleSpinBox()
+            value_widget.setDecimals(4)  # calibration angles/scales need more than 2
             magnitude = param_obj.magnitude
             value_widget.setMinimum(param_obj.bounds[0] / magnitude)
             value_widget.setMaximum(param_obj.bounds[1] / magnitude)
-            value_widget.setValue(getattr(config, param_name) / magnitude)
+            value_widget.setValue(self._get(param_name) / magnitude)
             value_widget.valueChanged.connect(
                 functools.partial(self.set_numerical_value_with_unit, param_name, magnitude))
         elif isinstance(param_obj, param.Number):
             value_widget = QtWidgets.QDoubleSpinBox()
+            value_widget.setDecimals(4)
             value_widget.setMinimum(param_obj.bounds[0])
             value_widget.setMaximum(param_obj.bounds[1])
-            value_widget.setValue(getattr(config, param_name))
+            value_widget.setValue(self._get(param_name))
             value_widget.valueChanged.connect(
                 functools.partial(self.set_numerical_value, param_name))
         elif isinstance(param_obj, param.Boolean):
             value_widget = QtWidgets.QCheckBox()
-            value_widget.setChecked(getattr(config, param_name))
+            value_widget.setChecked(self._get(param_name))
             value_widget.stateChanged.connect(
                 functools.partial(self.set_boolean_value, param_name, value_widget))
         elif isinstance(param_obj, (param.Selector)):
             value_widget = QtWidgets.QComboBox()
             value_widget.addItems([str(o) for o in param_obj.objects])
-            current = getattr(config, param_name)
+            current = self._get(param_name)
             if current in param_obj.objects:
                 value_widget.setCurrentIndex(param_obj.objects.index(current))
             value_widget.currentIndexChanged.connect(
                 functools.partial(self.set_selector_value, param_name, param_obj.objects))
         elif isinstance(param_obj, param.String) and multiline:
             value_widget = QtWidgets.QPlainTextEdit()
-            value_widget.setPlainText(str(getattr(config, param_name)))
+            value_widget.setPlainText(str(self._get(param_name)))
             value_widget.textChanged.connect(
                 lambda: self.set_string_value(param_name, value_widget.toPlainText()))
         elif isinstance(param_obj, param.String):
             value_widget = QtWidgets.QLineEdit()
-            value_widget.setText(str(getattr(config, param_name)))
+            value_widget.setText(str(self._get(param_name)))
             value_widget.textChanged.connect(
                 functools.partial(self.set_string_value, param_name))
         elif isinstance(param_obj, param.List):
             value_widget = QtWidgets.QLineEdit()
-            value_widget.setText(self._format_list_value(getattr(config, param_name)))
+            value_widget.setText(self._format_list_value(self._get(param_name)))
             value_widget.editingFinished.connect(
                 functools.partial(self.set_list_value, param_name, value_widget, param_obj))
         elif isinstance(param_obj, param.Tuple):         
             value_widget = QtWidgets.QLineEdit()          
             value_widget.setReadOnly(True)                
             value_widget.setEnabled(False)               
-            value_widget.setText(str(getattr(config, param_name))) 
+            value_widget.setText(str(self._get(param_name))) 
         else:
             value_widget = QtWidgets.QLineEdit()
             value_widget.setReadOnly(True)
             value_widget.setEnabled(False)
-            value_widget.setText(str(getattr(config, param_name)))
+            value_widget.setText(str(self._get(param_name)))
         value_widget.setToolTip(param_obj.doc)
         value_widget.setObjectName(param_name)
         self.value_widgets[param_name] = value_widget
@@ -144,17 +163,18 @@ class ParamConfig(QtWidgets.QWidget):
         """Relay parameter updates coming from the Config object.
         Numeric parameters are scaled by their unit magnitude; non‑numeric
         (e.g. Selector / Boolean) are forwarded unchanged."""
-        if key not in self.value_widgets:
-            return
-
-        param_obj  = self.config.param[key]
-        magnitude  = getattr(param_obj, 'magnitude', 1)
-
-        # Only scale numeric values; leave strings / bools intact
-        if isinstance(value, (int, float)):
-            self.value_changed_signal.emit(key, value / magnitude)
-        else:
-            self.value_changed_signal.emit(key, value)
+        names_for = getattr(self.config, "editor_names_for_change", None)
+        names = names_for(key) if names_for is not None else [key]
+        for name in names:
+            if name not in self.value_widgets:
+                continue
+            row_value = value if name == key else self._get(name)
+            magnitude = getattr(self._param(name), 'magnitude', 1)
+            # Only scale numeric values; leave strings / bools intact
+            if isinstance(row_value, (int, float)) and not isinstance(row_value, bool):
+                self.value_changed_signal.emit(name, row_value / magnitude)
+            else:
+                self.value_changed_signal.emit(name, row_value)
 
     @QtCore.pyqtSlot('QString', object)
     def display_changed_value(self, key, value):
@@ -183,20 +203,20 @@ class ParamConfig(QtWidgets.QWidget):
 
 
     def set_numerical_value(self, name, value):
-        setattr(self.config, name, value)
+        self._set(name, value)
 
     def set_numerical_value_with_unit(self, name, magnitude, value):
-        setattr(self.config, name, value * magnitude)
+        self._set(name, value * magnitude)
 
     def set_boolean_value(self, name, widget):
-        setattr(self.config, name, widget.isChecked())
+        self._set(name, widget.isChecked())
 
     def set_selector_value(self, name, options, index):
         if 0 <= index < len(options):
-            setattr(self.config, name, options[index])
+            self._set(name, options[index])
 
     def set_string_value(self, name, value):
-        setattr(self.config, name, value)
+        self._set(name, value)
 
     def _format_list_value(self, value):
         if isinstance(value, (list, tuple)):
@@ -249,7 +269,7 @@ class ParamConfig(QtWidgets.QWidget):
         try:
             item_type = getattr(param_obj, "item_type", None)
             parsed = self._parse_list_value(widget.text(), item_type=item_type)
-            setattr(self.config, name, parsed)
+            self._set(name, parsed)
             widget.blockSignals(True)
             widget.setText(self._format_list_value(parsed))
             widget.blockSignals(False)
@@ -258,7 +278,7 @@ class ParamConfig(QtWidgets.QWidget):
                 "Invalid list value for '%s': %s", name, widget.text(), exc_info=True
             )
             widget.blockSignals(True)
-            widget.setText(self._format_list_value(getattr(self.config, name)))
+            widget.setText(self._format_list_value(self._get(name)))
             widget.blockSignals(False)
 
 

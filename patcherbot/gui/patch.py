@@ -948,13 +948,15 @@ class ClassicPatchButtons(ButtonTabWidget):
         # add a box for testing controllability of the pipette and stage
         buttonList = [['Find Pipette','Test Pipette Movement'],
                       ['Detect Pipette','Detect Cells'],
-                      ['Test Pipette Planar Drift']]
+                      ['Test Pipette Planar Drift', 'Follow Stage']]
         cmds = [[self.pipette_location,self.pipette_interface.move_pipette_random_velocity],
                 [self.pipette_interface.detect_pipette, self.patch_interface.detect_cells],
-                [self.patch_interface.test_pipette_planar_drift]]
+                # Follow Stage: random stage step, then the active pipette moves by the
+                # step rotated by its pipette_z_rotation; the tip should end where it was.
+                [self.patch_interface.test_pipette_planar_drift, self.pipette_interface.follow_stage]]
         freq = [[1, 3],
                 [1, 1],
-                [1]]
+                [1, 1]]
         self.addButtonList('testing', layout, buttonList, cmds, freq=freq, sequential=True)
 
         # # Add a box for lamp commands

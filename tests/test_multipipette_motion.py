@@ -135,6 +135,20 @@ class PipetteConfigViewTests(unittest.TestCase):
         self.assertEqual(view0.home_position, (4.0, 5.0, 6.0))
         self.assertEqual(self.config.home_position, (9.0, 9.0, 9.0))
 
+    def test_editor_shows_every_selected_pipette(self):
+        self.config.show_pipettes_in_editor(["pipette_0", "pipette_1"])
+        categories = dict(self.config.categories)
+        self.assertIn("pipette_1.pipette_z_rotation", categories["Pipette 1 Calibration"])
+        self.assertIn("pipette_0.pipette_k_scale", categories["Pipette 0 Calibration"])
+        self.assertNotIn("pipette_z_rotation", categories["Pipette Calibration"])   # unused top level
+        self.assertEqual(self.config.editor_get("pipette_1.pipette_z_rotation"), 160.0)
+        self.config.editor_set("pipette_1.pipette_z_rotation", 155.0)
+        self.assertEqual(self.config.pipettes["pipette_1"]["pipette_z_rotation"], 155.0)
+        self.assertEqual(self.config.pipettes["pipette_0"]["pipette_z_rotation"], -20.0)
+        self.assertIs(self.config.editor_param("pipette_1.pipette_k_scale"),
+                      self.config.param["pipette_k_scale"])
+        self.assertEqual(len(self.config.editor_names_for_change("pipettes")), 20)
+
     def test_legacy_file_is_pipette_0_only(self):
         config = CalibrationConfig(name="Calibration")
         config.pipette_z_rotation = -17.0

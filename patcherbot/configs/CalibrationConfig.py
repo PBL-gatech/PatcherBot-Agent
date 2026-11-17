@@ -156,10 +156,57 @@ class CalibrationConfig(Config):
         ("Collision", ["collision_tolerance_um", "collision_velocity_lookahead_s"]),
     ]
 
-    def hide_fields_from_editor(self, names):
-        """Leave ``names`` out of this instance's editor categories (e.g. the
-        top-level per-pipette values, which no pipette uses once the file has
-        a ``pipettes:`` section)."""
-        hidden = set(names)
-        self.categories = [(category, [name for name in fields if name not in hidden])
-                           for category, fields in type(self).categories]
+    # ---- per-pipette values in the config editor ----
+    # Editor rows named "<pipette_key>.<field>" (e.g. "pipette_1.pipette_z_rotation")
+    # show and edit that pipette's own entry in ``pipettes``.
+
+    def show_pipettes_in_editor(self, pipette_keys):
+        """Show one editor group per pipette ("Pipette 0 Calibration", ...) with
+        its own per-pipette values, after "Pipette Calibration". The top-level
+        per-pipette values are left out: no pipette uses them once the file has
+        a ``pipettes:`` section."""
+        from patcherbot.utils.multipipette_helper import (
+            PER_PIPETTE_CALIBRATION_FIELDS, PIPETTE_GEOMETRY_FIELDS, PIPETTE_POSITION_FIELDS,
+            pipette_label,
+        )
+        hidden = set(PER_PIPETTE_CALIBRATION_FIELDS)
+        categories = []
+        for category, fields in type(self).categories:
+            categories.append((category, [name for name in fields if name not in hidden]))
+            if category == "Pipette Calibration":
+                for key in pipette_keys:
+                    categories.append((
+                        f"{pipette_label(key)} Calibration",
+                        [f"{key}.{field}" for field in PIPETTE_GEOMETRY_FIELDS + PIPETTE_POSITION_FIELDS]))
+        self.categories = categories
+
+    @staticmethod
+    def _split_editor_name(name):
+        key, _, field = name.partition(".")
+        return (key, field) if field else (None, name)
+
+    def editor_param(self, name):
+        """The param object describing editor row ``name``."""
+        return self.param[self._split_editor_name(name)[1]]
+
+    def editor_get(self, name):
+        key, field = self._split_editor_name(name)
+        if key is None:
+            return getattr(self, field)
+        from patcherbot.utils.multipipette_helper import PipetteConfigView
+        return getattr(PipetteConfigView(self, key), field)
+
+    def editor_set(self, name, value):
+        key, field = self._split_editor_name(name)
+        if key is None:
+            setattr(self, field, value)
+            return
+        from patcherbot.utils.multipipette_helper import PipetteConfigView
+        setattr(PipetteConfigView(self, key), field, value)
+
+    def editor_names_for_change(self, changed):
+        """Editor rows whose value may change when parameter ``changed`` is set
+        (setting ``pipettes`` changes every per-pipette row)."""
+        if changed == "pipettes":
+            return [name for _, fields in self.categories for name in fields if "." in name]
+        return [changed]

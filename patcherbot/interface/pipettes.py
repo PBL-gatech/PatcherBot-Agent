@@ -14,8 +14,8 @@ from patcherbot.configs.CalibrationConfig import CalibrationConfig
 from patcherbot.controller.collision import GuardedPipetteDevice, WorkspaceGuard
 from patcherbot.devices.cellsorter import CalibratedCellSorter
 from patcherbot.utils.multipipette_helper import (
-    PER_PIPETTE_CALIBRATION_FIELDS, PipetteConfigView, keyed_pipette_entries, pipette_index,
-    pipette_key_for, validate_pipette_geometry,
+    PipetteConfigView, keyed_pipette_entries, pipette_index, pipette_key_for,
+    validate_pipette_geometry,
 )
 import time
 
@@ -97,8 +97,10 @@ class PipetteInterface(TaskInterface):
         # started; this repeats the check for other entry points.
         validate_pipette_geometry(self.calibration_config, list(self.pipette_units))
         if keyed_pipette_entries(self.calibration_config) is not None:
-            # The top-level per-pipette values are unused with a `pipettes:` section.
-            self.calibration_config.hide_fields_from_editor(PER_PIPETTE_CALIBRATION_FIELDS)
+            # Calibration tab: one group per selected pipette with its own
+            # angles, k, cleaning order and positions (the unused top-level
+            # values are left out).
+            self.calibration_config.show_pipettes_in_editor(list(self.pipette_units))
         # Each pipette sees the shared config through a view of its own
         # `pipettes.<key>` entry (angles, saved positions...).
         self.calibrated_units = {}
