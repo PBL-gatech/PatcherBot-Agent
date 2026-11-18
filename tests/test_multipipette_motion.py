@@ -360,7 +360,7 @@ class GuardTests(unittest.TestCase):
             guard.check_move("pipette_0", at(0), at(950))
         message = str(caught.exception)
         for fragment in ("pipette_0", "pipette_1", "50 um past", "to its right", "100 um short",
-                         "Collision Guard in the Movement box"):
+                         "switch off the collision guard"):
             self.assertIn(fragment, message)
         self.assertEqual(reported, [message])
 
@@ -514,6 +514,23 @@ class PipetteInterfaceTests(unittest.TestCase):
         self.assertFalse(self.interface.collision_guard.enabled)
         self.interface.set_collision_guard(True)
         self.assertTrue(self.interface.collision_guard.enabled)
+
+    def test_collision_guard_follows_calibration_config(self):
+        config = CalibrationConfig(name="Calibration")
+        guard = WorkspaceGuard(self.units, STAGE, config)
+        self.assertTrue(guard.enabled)                      # YAML default
+        config.collision_guard_enabled = False              # Calibration tab checkbox
+        self.assertFalse(guard.enabled)
+        guard.set_enabled(True)                             # status-bar shield
+        self.assertTrue(config.collision_guard_enabled)
+
+    def test_step_active_pipette_wraps(self):
+        interface = make_pipette_interface(rig(with_y_pipette=True), self.tmp.name)
+        seen = []
+        for step in (1, 1, 1, -1, -1):
+            interface.step_active_pipette(step)
+            seen.append(interface.active_pipette)
+        self.assertEqual(seen, ["pipette_1", "pipette_2", "pipette_0", "pipette_2", "pipette_1"])
 
     def test_calibration_round_trip_keeps_each_pipette(self):
         interface = self.interface

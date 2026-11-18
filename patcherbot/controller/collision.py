@@ -159,7 +159,9 @@ class WorkspaceGuard:
         self.home_anchor = home_anchor
         self.camera = camera
         self.on_blocked = on_blocked
-        self.enabled = True
+        # On/off lives in config.collision_guard_enabled when the config has
+        # it (Calibration tab > Collision, saved in the YAML); else here.
+        self._enabled = True
         self._local = threading.local()
         self._warned = set()
 
@@ -172,8 +174,14 @@ class WorkspaceGuard:
     def lookahead_s(self):
         return float(getattr(self.config, "collision_velocity_lookahead_s", 0.5))
 
+    @property
+    def enabled(self):
+        return bool(getattr(self.config, "collision_guard_enabled", self._enabled))
+
     def set_enabled(self, enabled):
-        self.enabled = bool(enabled)
+        self._enabled = bool(enabled)
+        if hasattr(self.config, "collision_guard_enabled"):
+            self.config.collision_guard_enabled = self._enabled
         self._warned.discard("disabled")
         if not self.enabled:
             LOGGER.warning("Collision guard switched OFF: automatic pipette moves are not checked")
@@ -348,7 +356,7 @@ class WorkspaceGuard:
             f"the limit at {other_key}'s tip, which is {self._direction_word(target, other)} in "
             f"the camera image. {key} must stay on its own side of the line through {other_key}'s "
             f"tip (never across {other_key}'s shaft), at least {tolerance:.0f} um short of it. "
-            f"Move {other_key} away first, or switch off Collision Guard in the Movement box "
+            f"Move {other_key} away first, or switch off the collision guard (status-bar shield) "
             f"(debugging only).")
 
     def check_move(self, key, current_um, target_um):
@@ -396,7 +404,7 @@ class WorkspaceGuard:
                     f"{key} may not patch this cell: it is {-margin:.0f} um past the limit at "
                     f"{other_key}'s tip ({other_key} is {self._direction_word(point, other)} in the "
                     f"camera image; tolerance {tolerance:.0f} um). Patch it with {other_key}, move "
-                    f"{other_key} away first, or switch off Collision Guard in the Movement box "
+                    f"{other_key} away first, or switch off the collision guard (status-bar shield) "
                     f"(debugging only).")
 
 

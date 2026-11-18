@@ -12,7 +12,7 @@ import qtawesome as qta
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 
 from patcherbot.controller import TaskController
-from patcherbot.utils.multipipette_helper import pipette_color, pipette_key_for, pipette_label, tint
+from patcherbot.utils.multipipette_helper import pipette_color, pipette_key_for, pipette_label
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
 from patcherbot.gui.tabs.show_cells import CellListWindow
@@ -88,10 +88,12 @@ class PatchGui(ManipulatorGui):
         classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
         self.classic_patching_tab = classic_patching_tab
         classic_patching_tab.origin_requested.connect(self._request_origin)
-        # With several pipettes: the window takes the active pipette's colour,
-        # and the collision guard sits in the status bar.
+        # With several pipettes: a banner and frame in the active pipette's
+        # colour around the tabs, an active-pipette indicator and the collision
+        # guard in the status bar (the index buttons are in the 'multipipette' section).
         self._add_collision_guard_icon()
         if len(self.pipette_interface.calibrated_units) > 1:
+            self._add_active_pipette_indicator()
             self.pipette_interface.active_pipette_changed.connect(self._show_active_pipette_color)
             self._show_active_pipette_color(self.pipette_interface.active_pipette)
         self.experiment_book_tab.reload_requested.connect(self._reload_book_details)
@@ -109,17 +111,34 @@ class PatchGui(ManipulatorGui):
         )
         self._recording_indicator_timer.start(100)
 
-    # ---- active pipette colour (2+ pipettes) ----
-    ACTIVE_PIPETTE_TINT = 0.35   # window background: active pipette's colour mixed with white
+    # ---- active pipette (2+ pipettes) ----
+    ACTIVE_PIPETTE_FRAME_PX = 7
 
     @QtCore.pyqtSlot(str)
     def _show_active_pipette_color(self, key):
-        """Tint the window background with the active pipette's colour."""
-        palette = self.palette()
-        palette.setColor(QtGui.QPalette.Window,
-                         QtGui.QColor(tint(pipette_color(key), self.ACTIVE_PIPETTE_TINT)))
-        self.setPalette(palette)
-        self.setAutoFillBackground(True)
+        """Frame the tabs (PatcherBot Agent, Calibration, Patch, ...) in the
+        active pipette's colour and name it in the status-bar indicator."""
+        color = pipette_color(key)
+        self.config_tab.setObjectName("ConfigTabs")
+        self.config_tab.setStyleSheet(
+            f"#ConfigTabs::pane {{ border: {self.ACTIVE_PIPETTE_FRAME_PX}px solid "
+            f"{color}; border-radius: 4px; }}")
+        self.active_pipette_indicator.setText(f" {pipette_label(key)} ")
+        self.active_pipette_indicator.setStyleSheet(
+            f"font-weight: bold; color: white; background-color: {color}; "
+            f"padding: 2px 6px; border-radius: 4px;")
+
+    def _add_active_pipette_indicator(self):
+        """Status-bar label naming the active pipette, left of Switch View."""
+        label = QtWidgets.QLabel()
+        label.setToolTip("Active pipette (change it in the 'multipipette' section "
+                         "of the PatcherBot Agent tab)")
+        self.active_pipette_indicator = label
+        index = self._status_widget_index(self.switch_view_button)
+        if index is None:
+            self.status_bar.addPermanentWidget(label)
+        else:
+            self.status_bar.insertPermanentWidget(index - 1, label)
 
     # ---- collision guard icon (status bar, 2+ pipettes) ----
     _GUARD_ICONS = {
@@ -148,9 +167,9 @@ class PatchGui(ManipulatorGui):
         self._collision_box = None
         self._refresh_collision_guard_icon()
 
-    def _insert_status_widget_after(self, anchor, widget):
-        """Put ``widget`` right after ``anchor`` among the status bar's permanent
-        widgets (QStatusBar's index counts every widget before it)."""
+    def _status_widget_index(self, anchor):
+        """QStatusBar index just after ``anchor`` (it counts every widget
+        before it, normal and permanent); None if not found."""
         def find(layout):
             count = 0
             for i in range(layout.count()):
@@ -164,7 +183,11 @@ class PatchGui(ManipulatorGui):
                     if found is not None:
                         return found
             return None
-        index = find(self.status_bar.layout())
+        return find(self.status_bar.layout())
+
+    def _insert_status_widget_after(self, anchor, widget):
+        """Put ``widget`` right after ``anchor`` among the status bar's permanent widgets."""
+        index = self._status_widget_index(anchor)
         if index is None:
             self.status_bar.addPermanentWidget(widget)
         else:
@@ -967,8 +990,6 @@ class ClassicPatchButtons(ButtonTabWidget):
         # Display tare per pipette; ``tare_pipette_pos`` is the active one's.
         self._tare_pipette_by_key = {}
 
-        self._add_pipette_selection(layout)
-
         self.currx_stage_pos = [0, 0, 0]
         self.curry_stage_pos = [0, 0, 0]
         self.currz_stage_pos = [0, 0, 0]
@@ -1076,6 +1097,8 @@ class ClassicPatchButtons(ButtonTabWidget):
                 [self.patch_interface.move_cube_left, self.patch_interface.move_cube_right]
         ]
         self.addButtonList('fluorescence', layout, buttonList, cmds, sequential=True)
+
+        self._add_multipipette_section(layout)
 
         # Add a box for patching commands
         buttonList = [['Select Cell','Remove Last Cell','Center on Cell'],
@@ -1301,58 +1324,33 @@ class ClassicPatchButtons(ButtonTabWidget):
     def tare_pipette_pos(self, value):
         self._tare_pipette_by_key[self.pipette_interface.active_pipette] = value
 
-    def _add_pipette_selection(self, layout):
-        """'pipette selection' section (only with more than one pipette): one
-        button per pipette, in that pipette's colour; every manipulator,
-        calibration and patch command acts on the selected (active) pipette."""
-        keys = list(self.pipette_interface.calibrated_units)
-        self.pipette_buttons = {}
-        if len(keys) < 2:
+    def _add_multipipette_section(self, layout):
+        """'multipipette' section (2+ pipettes only): Decrement/Increment
+        Pipette Index change the active pipette, wrapping around (index
+        modulo the number of pipettes)."""
+        if len(self.pipette_interface.calibrated_units) < 2:
             return
-        box = CollapsibleGroupBox('pipette selection')
-        rows = QtWidgets.QVBoxLayout()
-        group = QtWidgets.QButtonGroup(self)
-        group.setExclusive(True)
-        for key in keys:
-            button = QtWidgets.QPushButton(pipette_label(key))
-            button.setCheckable(True)
-            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-            button.setMinimumHeight(50)
-            button.setToolTip(f"Make {pipette_label(key)} the active pipette")
-            button.clicked.connect(lambda checked, k=key: self._request_active_pipette(k))
-            group.addButton(button)
-            rows.addWidget(button)
-            self.pipette_buttons[key] = button
-        self._pipette_button_group = group
-        box.setContentLayout(rows)
-        layout.addWidget(box)
-        self.pipette_interface.active_pipette_changed.connect(self._show_active_pipette)
-        self._show_active_pipette(self.pipette_interface.active_pipette)
-
-    @staticmethod
-    def _pipette_button_style(key, active):
-        color = pipette_color(key)
-        if active:
-            return (f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
-                    f"border: 2px solid {color}; border-radius: 6px; }}")
-        return (f"QPushButton {{ background-color: {tint(color, 0.15)}; color: black; "
-                f"border: 1px solid {tint(color, 0.6)}; border-radius: 6px; }}"
-                f"QPushButton:hover {{ background-color: {tint(color, 0.35)}; }}")
-
-    def _request_active_pipette(self, key):
-        # Keep the buttons on the current pipette until the interface confirms
-        # the switch (it refuses while a task is running).
-        self._show_active_pipette(self.pipette_interface.active_pipette)
-        command_signal = self.interface_signals[self.pipette_interface][0]
-        command_signal.emit(self.pipette_interface.set_active_pipette, key)
+        names = ['Decrement Pipette Index', 'Increment Pipette Index']
+        self.addButtonList('multipipette', layout, [names], [])
+        buttons = self.section_button_map['multipipette']
+        for name, step in zip(names, (-1, +1)):
+            buttons[name].clicked.connect(lambda checked, st=step: self._step_active_pipette(st))
+        self.decrement_pipette_button = buttons[names[0]]
+        self.increment_pipette_button = buttons[names[1]]
+        self.pipette_interface.active_pipette_changed.connect(self._update_step_tooltips)
+        self._update_step_tooltips(self.pipette_interface.active_pipette)
 
     @QtCore.pyqtSlot(str)
-    def _show_active_pipette(self, key):
-        """Reflect the interface's active pipette (e.g. revert a refused switch)."""
-        for button_key, button in self.pipette_buttons.items():
-            active = button_key == key
-            button.setChecked(active)
-            button.setStyleSheet(self._pipette_button_style(button_key, active))
+    def _update_step_tooltips(self, active_key):
+        keys = list(self.pipette_interface.calibrated_units)
+        for button, step in ((self.decrement_pipette_button, -1), (self.increment_pipette_button, +1)):
+            target = keys[(keys.index(active_key) + step) % len(keys)]
+            button.setToolTip(f"Active: {pipette_label(active_key)}. "
+                              f"Click to switch to {pipette_label(target)}.")
+
+    def _step_active_pipette(self, step):
+        command_signal = self.interface_signals[self.pipette_interface][0]
+        command_signal.emit(self.pipette_interface.step_active_pipette, step)
 
     def tare_pipette(self):
         currPos = self.pipette_interface.calibrated_unit.unit.position()

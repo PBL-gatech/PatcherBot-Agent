@@ -26,6 +26,8 @@ microscope_units_per_um: 1.0
 #   pipette_k_scale:     pipette um per stage um
 #   pipette_y_rotation:  descent angle of the pipette (deg)
 # ---------------------------------------------------------------------------
+# Collision guard on at start-up (also toggled by the status-bar shield).
+collision_guard_enabled: true
 pipettes:
   pipette_0:                      # left manipulator (COM8)
     # Values that work on BrainScanNorwichClone (Follow Stage verified there).

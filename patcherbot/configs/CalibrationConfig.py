@@ -90,6 +90,11 @@ class CalibrationConfig(Config):
     # top-level geometry/position values are not used by any pipette.
     pipettes = param.Dict(default={},
                           doc="Per-pipette calibration values keyed by pipette (pipette_0, ...)")
+    collision_guard_enabled = param.Boolean(
+        default=True,
+        # Checks automatic pipette moves so pipettes can't run into each other;
+        # start-up default, also toggled by the status-bar shield. Off = debugging only.
+        doc="Collision avoidance toggle")
     collision_tolerance_um = NumberWithUnit(
         100, unit="um", bounds=(0, 10000),
         doc="How far short of the line through another pipette's tip a moving pipette must stay")
@@ -157,7 +162,7 @@ class CalibrationConfig(Config):
         ("Display", ["position_update", "record_overlays"]),
         ("Pressure", ["native_zero", "native_per_mbar", "reader_offset", "reader_scale"]),
         ("Positions", ["home_position", "home_position_stage", "safe_position", "safe_position_stage", "bath_position", "safe_position_delta_um", "home_position_delta_um"]),
-        ("Collision", ["collision_tolerance_um", "collision_velocity_lookahead_s"]),
+        ("Collision", ["collision_guard_enabled", "collision_tolerance_um", "collision_velocity_lookahead_s"]),
     ]
 
     # ---- per-pipette values in the config editor ----

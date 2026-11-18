@@ -122,8 +122,8 @@ def main():
     # graphs.location_on_the_screen()
     graphs.show()
     # The live window follows the active pipette (chosen in the main window's
-    # "pipette selection" section): its bottom bar controls that pipette and
-    # the window is tinted with its colour.
+    # Increment/Decrement Pipette Index buttons): its bottom bar controls
+    # that pipette, whose column is framed in its colour.
     pipette_controller.active_pipette_changed.connect(graphs.select_pipette_key)
     graphs.select_pipette_key(pipette_controller.active_pipette)
 

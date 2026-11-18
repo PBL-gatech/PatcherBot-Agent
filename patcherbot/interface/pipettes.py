@@ -234,6 +234,14 @@ class PipetteInterface(TaskInterface):
             self.info(f"Active pipette: {pipette_key}")
         self.active_pipette_changed.emit(self.active_pipette)
 
+    @command(category='Manipulators',
+             description='Make the next/previous pipette (by index, wrapping) the active one')
+    def step_active_pipette(self, step):
+        """Active pipette index += ``step``, modulo the number of pipettes."""
+        keys = list(self.calibrated_units)
+        index = keys.index(self.active_pipette)
+        self.set_active_pipette(keys[(index + int(step)) % len(keys)])
+
     def saved_positions(self, pipette_key=None):
         """Copy of one pipette's saved positions (default: the active pipette)."""
         key = self.active_pipette if pipette_key is None else pipette_key

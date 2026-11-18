@@ -2,6 +2,8 @@ use_ai_features: false
 # Per-pipette geometry (docs/multipipette_changes.md section 12.2). The fake
 # rig's manipulators all share one axis orientation, so their angles match
 # (the start-up check notes this; on a real rig they would differ).
+# Collision guard on at start-up (also toggled by the status-bar shield).
+collision_guard_enabled: true
 pipettes:
   pipette_0:
     stage_x_axis_flip: false

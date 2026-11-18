@@ -338,7 +338,7 @@ These are display effects. None of them means the samples themselves are out of 
   - [`PipetteEphysPanel`](../patcherbot/gui/graph.py#L684) is one column per pipette, with its own deques and recorder; [`refresh`](../patcherbot/gui/graph.py#L767) fetches that pipette's packet.
   - [`EPhysGraph`](../patcherbot/gui/graph.py#L817) lays panels out left to right.
   - The recorder writes `graph_recording.csv` for pipette 0 and `graph_recording_pipette_<n>.csv` for the others ([L861](../patcherbot/gui/graph.py#L861)).
-  - The "Control:" picker ([L878](../patcherbot/gui/graph.py#L878)) chooses which pipette the bottom bar acts on. [`_select_pipette`](../patcherbot/gui/graph.py#L1026) carries the laser state over.
+  - The bottom bar acts on the active pipette (`select_pipette_key`, driven by `active_pipette_changed`); `_select_pipette` carries the laser state over. Each column's title is in its pipette's colour (matplotlib tab10: blue, orange, green, …) and the active column is framed in it.
   - One 42 ms timer runs [`update_plot`](../patcherbot/gui/graph.py#L1054).
   - See §2.2 for the sync caveats.
 - **[gui/patch.py](../patcherbot/gui/patch.py#L109):** a "Run Protocols" checkbox grid (rows: protocols; columns: pipettes). The six protocol flags were removed from the parameter editor.
@@ -767,8 +767,10 @@ Ordered roughly by when you will hit them.
   - The store-position and clear commands write the active pipette's entries.
   - `read_calibration` fills every pipette found in the file.
 - GUI:
-  - "Active pipette" combo at the top of the PatcherBot Agent tab (shown only with more than one pipette). It reverts if the switch is refused.
-  - The live window's "Control:" picker follows it, one way.
+  - **Decrement / Increment Pipette Index** buttons in the 'multipipette' section of the PatcherBot Agent tab, between fluorescence and patching (only with more than one pipette). They call `step_active_pipette(±1)`, which wraps around (index modulo the pipette count). A switch is refused while a task is running.
+  - A 7px frame around the tab pane (PatcherBot Agent, Calibration, Patch, …) in the active pipette's colour (`pipette_color`).
+  - A "Pipette n" indicator in the status bar, left of "Switch to Pipette View", in the same colour.
+  - The live window's bottom bar follows the active pipette.
   - The movement recorder still records pipette_0, to keep the CSV schema fixed.
 
 ### 12.2 Per-pipette calibration and rig geometry
@@ -854,14 +856,16 @@ Two pipettes with identical `pipette_z_rotation` only get a warning; the fake ri
   - **Velocity commands:** projected `collision_velocity_lookahead_s` (default 0.5 s) ahead; a refused command stops the axes. The automatic loops re-issue velocity commands every cycle, so each cycle is checked.
 - **Manual moves are never checked:** the keyboard jogs (`move_pipette_x/y/z`) and raise/lower run inside `guard.manual()`.
 - **Unlocated pipettes:** a pipette that's not calibrated, or has no known tip position yet, is left out. Its own moves aren't checked and it doesn't restrict the others.
-  - The **Collision Guard** button in the Movement box turns orange and names it.
+  - The status-bar shield turns orange and its tooltip names it.
   - At start-up nothing is calibrated: jog one pipette into view by hand, calibrate it (it returns to safe automatically), then calibrate the next.
 - **Cells:** `check_cell` refuses a cell inside another pipette's workspace, both when queueing it (`add_cell`) and when a phase starts (`patch`, `whole_cell`, `locate`, `approach`, `hunt`).
 - **Errors:** a refused move raises `CollisionError` with an explanation. Example:
-  > Collision guard stopped pipette_0: this move would take it 150 um too close to pipette_1, which is to its right in the camera image … Move pipette_1 away first, or switch off Collision Guard in the Movement box.
+  > Collision guard stopped pipette_0: this move would take it 150 um too close to pipette_1, which is to its right in the camera image … Move pipette_1 away first, or switch off the collision guard (status-bar shield) (debugging only).
 
   The same text appears in a non-blocking warning dialog (`PipetteInterface.collision_blocked`).
-- **Toggle:** the **Collision Guard** button in the Movement box (shown with 2+ pipettes) switches it off for debugging; the button is red while off. The guard is ON at every start.
+- **Toggle:** two places, sharing one value (`collision_guard_enabled` in the calibration config):
+  - the shield icon in the status bar, after the record button (2+ pipettes): green shield = on, orange shield = on but a pipette is unlocated, yellow warning triangle = off. Hover explains; click toggles.
+  - the `collision_guard_enabled` checkbox in Calibration tab > Collision. Its YAML value (default `true`) is the start-up state; saving the calibration file saves the current state.
 - **Not covered:**
   - pipette shafts (only tips are seeds);
   - Z;

@@ -25,7 +25,7 @@ from datetime import datetime
 # new import
 
 from patcherbot.interface.graph import GraphInterface
-from patcherbot.utils.multipipette_helper import pipette_color, pipette_key_for, pipette_label, tint
+from patcherbot.utils.multipipette_helper import pipette_color, pipette_key_for, pipette_label
 
 __all__ = [
     "EPhysGraph",
@@ -1035,20 +1035,13 @@ class EPhysGraph(QWidget):
         self.show()
         self.raise_()
 
-    ACTIVE_PIPETTE_TINT = 0.35   # window background: active pipette's colour mixed with white
-
     @pyqtSlot(str)
     def select_pipette_key(self, pipette_key):
-        """Follow the active pipette: point the bottom bar at it and tint the
-        window (around the white plots) with its colour."""
+        """Follow the active pipette: point the bottom bar at it (its column
+        gets a frame in its colour)."""
         if len(self.panels) < 2:
             return
         self._select_pipette(pipette_label(pipette_key))
-        palette = self.palette()
-        palette.setColor(QtGui.QPalette.Window,
-                         QtGui.QColor(tint(pipette_color(pipette_key), self.ACTIVE_PIPETTE_TINT)))
-        self.setPalette(palette)
-        self.setAutoFillBackground(True)
 
     def _select_pipette(self, label):
         """Point the bottom bar at another pipette.
