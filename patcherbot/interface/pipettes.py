@@ -572,43 +572,64 @@ class PipetteInterface(TaskInterface):
         self.execute([self.calibrated_unit.calibrate_pipette])
         self.check_calibration_geometry()
 
-    def check_calibration_geometry(self, tolerance_deg=30.0):
-        """Compare each secondary pipette's calibration with its configured angle.
+    def check_calibration_geometry(self, angle_tolerance_deg=15.0, scale_tolerance=0.25):
+        """Compare each calibrated pipette's measured stage -> manipulator map
+        with the one its calibration-file geometry gives (k * Rz * flips, used
+        by Follow Stage and locate_cell). Returns the warnings.
 
-        The angle between a pipette's calibrated +x axis (in the image) and the
-        primary pipette's should match the difference of their
-        ``pipette_z_rotation`` values (compared up to sign, which is enough to
-        tell a mirrored manipulator from one that isn't). Returns the warnings.
+        The calibration predicts the map G = inv(M_pipette) @ M_stage, up to an
+        overall sign (which depends on conventions that are not verified here).
+        That sign doesn't affect the handedness (det of a 2x2 is unchanged by
+        negation) or the scale, and leaves the angle known modulo 180 deg, so
+        those three are what is checked.
         """
-        primary = self.primary_calibrated_unit
-        if not primary.calibrated:
+        stage = self.calibrated_stage
+        if not getattr(stage, "calibrated", False):
             return []
-
-        def axis_angle(unit):
-            x_axis = np.asarray(unit.M, dtype=float)[:2, 0]
-            return math.degrees(math.atan2(x_axis[1], x_axis[0]))
-
-        def wrap(angle):
-            return (angle + 180.0) % 360.0 - 180.0
-
         warnings = []
         for key, unit in self.calibrated_units.items():
-            if key == self.primary_pipette or not unit.calibrated:
+            if not unit.calibrated:
                 continue
             try:
-                measured = wrap(axis_angle(unit) - axis_angle(primary))
-                configured = wrap(float(unit.config.pipette_z_rotation)
-                                  - float(primary.config.pipette_z_rotation))
-            except (AttributeError, TypeError, ValueError, IndexError):
+                stage_map = np.asarray(stage.M, dtype=float)[:2, :2]
+                pipette_map = np.asarray(unit.M, dtype=float)[:2, :2]
+                measured = np.linalg.solve(pipette_map, stage_map)
+                config = unit.config
+                flips = np.diag([-1.0 if config.stage_x_axis_flip else 1.0,
+                                 -1.0 if config.stage_y_axis_flip else 1.0])
+                angle = float(config.pipette_z_rotation)
+                k_scale = float(config.pipette_k_scale)
+            except (AttributeError, TypeError, ValueError, IndexError, np.linalg.LinAlgError):
                 continue
-            error = min(abs(wrap(measured - configured)), abs(wrap(measured + configured)))
-            if error > tolerance_deg:
-                message = (
-                    f"{key}'s calibration puts its +x axis {measured:.0f} deg from "
-                    f"{self.primary_pipette}'s, but the calibration file's pipette_z_rotation values "
-                    f"differ by {configured:.0f} deg (pipettes.{key}.pipette_z_rotation = "
-                    f"{unit.config.pipette_z_rotation}). locate_cell moves {key} using that angle, so "
-                    f"correct it in the calibration file if this calibration is right.")
+            det = float(np.linalg.det(measured))
+            if not np.isfinite(det) or abs(det) < 1e-12:
+                continue
+            problems = []
+            if np.sign(det) != np.sign(np.linalg.det(flips)):
+                problems.append(
+                    f"its calibration is {'a mirror image of' if det < 0 else 'a plain rotation of'} the "
+                    f"stage axes, but stage_x_axis_flip={bool(config.stage_x_axis_flip)} / "
+                    f"stage_y_axis_flip={bool(config.stage_y_axis_flip)} say the opposite: toggle one "
+                    f"of pipettes.{key}.stage_x_axis_flip / stage_y_axis_flip (no pipette_z_rotation "
+                    f"can make up for it), then re-check the angle with Follow Stage")
+            else:
+                unflipped = measured @ flips          # = +/- k * Rz(angle)
+                measured_angle = math.degrees(math.atan2(unflipped[1, 0] - unflipped[0, 1],
+                                                         unflipped[0, 0] + unflipped[1, 1]))
+                error = (measured_angle - angle + 90.0) % 180.0 - 90.0
+                if abs(error) > angle_tolerance_deg:
+                    problems.append(
+                        f"its calibration puts the rotation at about {angle + error:.1f} deg "
+                        f"(or that +/- 180), but pipettes.{key}.pipette_z_rotation = {angle:g}")
+            measured_scale = math.sqrt(abs(det))
+            if k_scale and abs(measured_scale / abs(k_scale) - 1.0) > scale_tolerance:
+                problems.append(
+                    f"its calibration gives about {measured_scale:.2f} pipette um per stage um, but "
+                    f"pipettes.{key}.pipette_k_scale = {k_scale:g}")
+            if problems:
+                message = (f"{key}: " + "; ".join(problems) + ". Follow Stage and locate_cell move "
+                           f"{key} with the calibration-file values, so check them with Follow Stage "
+                           f"(if this calibration is right).")
                 self.warning(message)
                 warnings.append(message)
         return warnings

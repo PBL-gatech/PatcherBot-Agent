@@ -379,6 +379,10 @@ class PipetteDAQView:
 # Geometry every pipette must define for itself (never shared or copied from
 # another pipette: a wrong angle sends that pipette the wrong way).
 PIPETTE_GEOMETRY_FIELDS = (
+    # Handedness of this pipette's stage -> manipulator map, applied before the
+    # rotation (manipulators mounted on opposite sides can be mirror images).
+    "stage_x_axis_flip",
+    "stage_y_axis_flip",
     "pipette_z_rotation",      # direction of the manipulator's +x axis in stage axes (deg)
     "pipette_y_rotation",      # descent angle of the pipette (deg)
     "pipette_k_scale",

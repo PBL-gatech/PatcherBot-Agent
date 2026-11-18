@@ -3,7 +3,7 @@
 Calibration configuration parameters for manipulator units.
 """
 import param
-from .Config import Config, NumberWithUnit, Number, Boolean, Tuple, List
+from .Config import Config, NumberWithUnit, Number, Boolean, Tuple, List, EditorGrid, editor_names
 
 __all__ = ["CalibrationConfig"]
 
@@ -33,10 +33,14 @@ class CalibrationConfig(Config):
     pipette_diag_move = NumberWithUnit(200, unit="um",
                                      doc="x, y dist to move for pipette cal.",
                                      bounds=(50, 10000))
+    # The flips set the handedness of a pipette's stage -> manipulator map
+    # (applied before pipette_z_rotation in CalibratedUnit.rotate, the only
+    # reader). Per pipette in a `pipettes:` section: manipulators mounted on
+    # opposite sides of the rig can be mirror images of each other.
     stage_x_axis_flip = Boolean(False,
-                                doc="Flip the x axis of the stage")
+                                doc="Flip stage x before rotating a stage move into pipette axes")
     stage_y_axis_flip = Boolean(True,
-                                doc="Flip the y axis of the stage")
+                                doc="Flip stage y before rotating a stage move into pipette axes")
     pipette_z_rotation = NumberWithUnit(-60.75, unit="degrees",
                                 doc="Rotation of the pipette in the xy plane (degrees)",
                                 bounds=(-360, 360))
@@ -47,7 +51,7 @@ class CalibrationConfig(Config):
                                 item_type=str,
                                 doc="Axis command order for cleaning approach; safe-space return uses reverse order")
     pipette_k_scale = Number(1.0,
-                                doc="Scaling factor for pipette movement",
+                                doc="Pipette um per stage um (scales the rotated stage move)",
                                 bounds=(-10.0, 10.0))
 
     microscope_units_per_um = Number(5.0,
@@ -161,23 +165,25 @@ class CalibrationConfig(Config):
     # show and edit that pipette's own entry in ``pipettes``.
 
     def show_pipettes_in_editor(self, pipette_keys):
-        """Show one editor group per pipette ("Pipette 0 Calibration", ...) with
-        its own per-pipette values, after "Pipette Calibration". The top-level
-        per-pipette values are left out: no pipette uses them once the file has
-        a ``pipettes:`` section."""
+        """Show the per-pipette values in "Pipette Calibration" as a table with
+        one column per selected pipette (after the shared pipette rows). The
+        top-level per-pipette values are left out everywhere: no pipette uses
+        them once the file has a ``pipettes:`` section."""
         from patcherbot.utils.multipipette_helper import (
             PER_PIPETTE_CALIBRATION_FIELDS, PIPETTE_GEOMETRY_FIELDS, PIPETTE_POSITION_FIELDS,
             pipette_label,
         )
+        keys = list(pipette_keys)
+        grid = EditorGrid(keys, [pipette_label(key) for key in keys],
+                          list(PIPETTE_GEOMETRY_FIELDS + PIPETTE_POSITION_FIELDS))
         hidden = set(PER_PIPETTE_CALIBRATION_FIELDS)
         categories = []
         for category, fields in type(self).categories:
-            categories.append((category, [name for name in fields if name not in hidden]))
+            shown = [name for name in fields if name not in hidden]
             if category == "Pipette Calibration":
-                for key in pipette_keys:
-                    categories.append((
-                        f"{pipette_label(key)} Calibration",
-                        [f"{key}.{field}" for field in PIPETTE_GEOMETRY_FIELDS + PIPETTE_POSITION_FIELDS]))
+                shown.append(grid)
+            if shown:
+                categories.append((category, shown))
         self.categories = categories
 
     @staticmethod
@@ -208,5 +214,6 @@ class CalibrationConfig(Config):
         """Editor rows whose value may change when parameter ``changed`` is set
         (setting ``pipettes`` changes every per-pipette row)."""
         if changed == "pipettes":
-            return [name for _, fields in self.categories for name in fields if "." in name]
+            return [name for _, fields in self.categories
+                    for name in editor_names(fields) if "." in name]
         return [changed]

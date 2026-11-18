@@ -6,7 +6,7 @@ import param
 import qtawesome as qta
 from PyQt5 import QtCore, QtWidgets, QtGui
 from PyQt5.QtCore import Qt
-from patcherbot.configs.Config import NumberWithUnit
+from patcherbot.configs.Config import NumberWithUnit, EditorGrid
 
 __all__ = ["ParamConfig", "ElidedLabel"]
 
@@ -83,6 +83,9 @@ class ParamConfig(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox(category)
         rows = QtWidgets.QVBoxLayout()
         for name in parameter_names:
+            if isinstance(name, EditorGrid):
+                rows.addLayout(self._create_grid(name))
+                continue
             parameter = self._param(name)
             row = QtWidgets.QHBoxLayout()
             label = ElidedLabel(parameter.doc)
@@ -94,6 +97,33 @@ class ParamConfig(QtWidgets.QWidget):
             rows.addLayout(row)
         box.setLayout(rows)
         return box
+
+    def _create_grid(self, grid):
+        """A table of editor rows: one row per field, one column per item
+        (e.g. per pipette), like the Run Protocols selection."""
+        layout = QtWidgets.QGridLayout()
+        layout.setColumnStretch(0, 1)
+        for column, label in enumerate(grid.column_labels, start=1):
+            header = QtWidgets.QLabel(label)
+            header.setStyleSheet('font-weight: bold;')
+            layout.addWidget(header, 0, column, alignment=Qt.AlignCenter)
+        unit_column = len(grid.columns) + 1
+        for row, field in enumerate(grid.rows, start=1):
+            parameter = self._param(grid.cell_name(grid.columns[0], field))
+            # Rows are labelled with the field name (as written in the YAML);
+            # the description is in the tooltip.
+            label = QtWidgets.QLabel(field)
+            label.setToolTip(parameter.doc)
+            layout.addWidget(label, row, 0)
+            for column, key in enumerate(grid.columns, start=1):
+                widget = self._create_value_widget(grid.cell_name(key, field))
+                if isinstance(widget, QtWidgets.QCheckBox):
+                    layout.addWidget(widget, row, column, alignment=Qt.AlignCenter)
+                else:
+                    layout.addWidget(widget, row, column)
+            if isinstance(parameter, NumberWithUnit):
+                layout.addWidget(QtWidgets.QLabel(parameter.unit), row, unit_column)
+        return layout
 
     def _create_value_widget(self, param_name, *, multiline=False):
         param_obj = self._param(param_name)

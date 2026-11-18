@@ -777,36 +777,47 @@ Ordered roughly by when you will hit them.
 
 ```yaml
 # One entry per pipette, keyed like everywhere else in the code (pipette_0, pipette_1, ...).
-# Every entry needs all five geometry values; nothing is copied between pipettes.
+# Every entry needs all seven geometry values; nothing is copied between pipettes.
 pipettes:
   pipette_0:                      # left manipulator (COM8)
+    stage_x_axis_flip: false
+    stage_y_axis_flip: true
     pipette_z_rotation: -20.0105
     pipette_y_rotation: 25
     pipette_k_scale: 0.79156
     clean_move_order: [y, x, z]
     safe_position_delta_um: -18000
-  pipette_1:                      # right manipulator (COM7), mirrored in x and y
-    pipette_z_rotation: 159.9895  # initial guess = pipette_0 + 180; verify by jogging
+  pipette_1:                      # right manipulator (COM7)
+    stage_x_axis_flip: false
+    stage_y_axis_flip: false
+    pipette_z_rotation: 154.0
     pipette_y_rotation: 25
-    pipette_k_scale: 0.79156
+    pipette_k_scale: 0.82
     clean_move_order: [y, x, z]
     safe_position_delta_um: -18000
 ```
 
-- **`pipette_z_rotation`:** which way the manipulator's +x axis points in stage axes, i.e. which side of the stage the manipulator sits on. Mirrored in x and y = +180°. A y-aligned pipette would be roughly ±90° from pipette_0.
-- **`pipette_y_rotation`:** the pipette's descent angle.
-- **What uses them:**
-  - `locate_cell` moves a pipette by the stage displacement rotated by `pipette_z_rotation`; a wrong value sends that pipette the wrong way.
-  - The safe position is computed along `pipette_y_rotation`.
-  - Cleaning uses `clean_move_order`.
+- **Stage -> pipette map:** a stage move `s` (um) becomes the pipette move `k * Rz(pipette_z_rotation) * flips * s` (`CalibratedUnit.rotate`, the only reader of the flips). Follow Stage and `locate_cell` use it.
+  - **`stage_x_axis_flip` / `stage_y_axis_flip`:** the handedness of that map, applied before the rotation. They are per pipette because manipulators on opposite sides can be mirror images: on Norwich, pipette_0's map is a reflection (y flipped) and pipette_1's is a plain rotation, so no shared flip works for both and no angle can make up for a wrong flip.
+  - **`pipette_z_rotation`:** the rotation in the xy plane (deg).
+  - **`pipette_k_scale`:** pipette um per stage um.
+- **`pipette_y_rotation`:** the pipette's descent angle; the safe position is computed along it.
+- **`clean_move_order`:** axis order for cleaning moves.
 - **Not needed for collisions:** the collision guard uses each pipette's measured calibration (§12.3), so no mount coordinates are needed.
 - **Allowed fields:** listed in [multipipette_helper.py](../patcherbot/utils/multipipette_helper.py). `PIPETTE_GEOMETRY_FIELDS` are required per pipette; `PIPETTE_POSITION_FIELDS` (home/safe/bath positions) are saved per pipette at runtime.
+- **Calibration tab:** "Pipette Calibration" shows the shared pipette values, then a table with one column per selected pipette for these fields. Edits apply immediately (next Follow Stage / locate) but only last for the session; copy final values into the YAML.
+
+**Finding the geometry with Follow Stage** (testing box; acts on the active pipette):
+- Calibrate the stage, put the tip in focus near the image centre well above the slice, tare stage and pipette.
+- Press Follow Stage: the stage steps randomly (up to +/-50 um per axis) and the pipette moves by the map above. With correct geometry the tip returns to where it was.
+- To fit the geometry, re-centre the tip by hand after each press and record the stage and total pipette displacement (tare before each trial). 20-30 trials, then fit pipette = A * stage: det(A) < 0 means one flip is needed, the rotation part gives `pipette_z_rotation`, sqrt(|det A|) gives `pipette_k_scale`. Finish every manual correction from the same side in x to keep backlash out of the fit.
+- Norwich pipette_1 (2026-11-17, 27 trials): a plain rotation of about 154 deg, k 0.82-0.86 (y axis 0.76, x about 0.9), x backlash about 25 um.
 
 **Two layouts:**
 - **No `pipettes:` section (single pipette):** the top-level `pipette_z_rotation` etc. are pipette_0's, exactly as before. Used by bo, ibb, moscow and setup_test; the Moscow rig replay reads these top-level values.
 - **`pipettes:` present:**
   - Each pipette reads and writes only its own entry, through `PipetteConfigView`. Nothing falls back to another pipette or to the top level.
-  - The top-level geometry and position values are unused and hidden from the config editor.
+  - The top-level geometry and position values (flips included) are unused and hidden from the config editor.
   - `Norwich_cal.yaml` (both Norwich rigs) and `fake_cal.yaml` use this layout.
 
 **Start-up check:** `validate_pipette_geometry` runs in `RigConfigManager.build_devices`, before any device is opened, and again in `PipetteInterface`. It stops start-up with an explanation in the "Rig configuration error" dialog when:
@@ -817,8 +828,8 @@ pipettes:
 Two pipettes with identical `pipette_z_rotation` only get a warning; the fake rig's do, since its manipulators share one orientation.
 - **Note:** `moscow_multiple_rig.json` with 2 pipettes now stops with this error until pipette_1's geometry is measured and added to `moscow_cal.yaml`.
 
-**Sanity check:** after calibrating a pipette or loading a calibration, `PipetteInterface.check_calibration_geometry` compares each secondary pipette's calibrated +x direction with pipette_0's.
-- If the angle disagrees with the difference of their `pipette_z_rotation` values by more than 30°, it warns and names the YAML key. The comparison is up to sign, which is enough to catch a wrong mirroring guess.
+**Sanity check:** after calibrating a pipette or loading a calibration, `PipetteInterface.check_calibration_geometry` compares each calibrated pipette's measured stage -> manipulator map, `inv(M_pipette) @ M_stage`, with its configured `k * Rz * flips`.
+- The overall sign of the measured map isn't verified, so it checks what doesn't depend on it: handedness (the flips), the scale (more than 25% off), and the angle modulo 180 deg (more than 15 deg off). Each warning names the YAML key to change.
 
 **Calibration file (`calibration.pickle`, v2):** `{'version': 2, 'pipettes': {key: {manip, home, safe, bath}}, 'stage', 'floor_Z', 'saved_at'}`.
 - The legacy top-level `manip/home/safe/bath` keys are always **pipette_0's**, and are omitted when pipette_0 isn't in the file. The rig replay and dataset builders read those keys alongside pipette_0's movement recording.

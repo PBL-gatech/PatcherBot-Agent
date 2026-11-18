@@ -23,6 +23,8 @@ from patcherbot.controller.collision import (
     move_allowed,
 )
 from patcherbot.controller.patch import AutoPatcher
+from patcherbot.configs.Config import EditorGrid
+from patcherbot.devices.manipulator.calibratedunit import CalibratedUnit
 from patcherbot.devices.manipulator.manipulatorunit import ManipulatorUnit
 from patcherbot.interface import TaskInterface
 from patcherbot.interface.patch import AutoPatchInterface
@@ -46,8 +48,8 @@ def rotation_z(degrees):
                      [0.0, 0.0, 1.0]])
 
 
-GEOMETRY = dict(pipette_y_rotation=25, pipette_k_scale=1.0, clean_move_order=["y", "x", "z"],
-                safe_position_delta_um=-8000)
+GEOMETRY = dict(stage_x_axis_flip=False, stage_y_axis_flip=False, pipette_y_rotation=25,
+                pipette_k_scale=1.0, clean_move_order=["y", "x", "z"], safe_position_delta_um=-8000)
 
 
 class StubUnit:
@@ -62,7 +64,9 @@ class StubUnit:
         # Tip seen at image ``tip_px`` when the manipulator was at its origin.
         self._tip_reference = (np.asarray(tip_px, dtype=float), np.zeros(3), np.zeros(2))
         self._trusted_tip_reference = None
-        self.config = SimpleNamespace(pipette_z_rotation=z_rotation)
+        # Geometry consistent with M (stage 1 px = 1 um): G = inv(M) = Rz(-angle of M).
+        self.config = SimpleNamespace(pipette_z_rotation=z_rotation, pipette_k_scale=1.0,
+                                      stage_x_axis_flip=False, stage_y_axis_flip=False)
         self.loaded = None
 
     def position(self):
@@ -86,11 +90,11 @@ CONFIG = SimpleNamespace(collision_tolerance_um=100.0, collision_velocity_lookah
 def rig(p0=(0.0, 0.0, 0.0), p1=(0.0, 0.0, 0.0), with_y_pipette=False):
     """pipette_0 on the left (world = its xy), pipette_1 on the right, mirrored
     (world = (1000, 0) - its xy). Optional pipette_2 above, coming in from the top."""
-    units = {"pipette_0": StubUnit(rotation_z(0), (0, 0), p0, z_rotation=-20),
-             "pipette_1": StubUnit(rotation_z(180), (1000, 0), p1, z_rotation=160)}
+    units = {"pipette_0": StubUnit(rotation_z(0), (0, 0), p0, z_rotation=0),
+             "pipette_1": StubUnit(rotation_z(180), (1000, 0), p1, z_rotation=180)}
     if with_y_pipette:
         # Comes in from above: manipulator +x points down the image, shaft runs up (+y).
-        units["pipette_2"] = StubUnit(rotation_z(-90), (500, 800), z_rotation=70)
+        units["pipette_2"] = StubUnit(rotation_z(-90), (500, 800), z_rotation=90)
     return units
 
 
@@ -135,19 +139,32 @@ class PipetteConfigViewTests(unittest.TestCase):
         self.assertEqual(view0.home_position, (4.0, 5.0, 6.0))
         self.assertEqual(self.config.home_position, (9.0, 9.0, 9.0))
 
-    def test_editor_shows_every_selected_pipette(self):
+    def test_editor_shows_pipettes_side_by_side(self):
         self.config.show_pipettes_in_editor(["pipette_0", "pipette_1"])
         categories = dict(self.config.categories)
-        self.assertIn("pipette_1.pipette_z_rotation", categories["Pipette 1 Calibration"])
-        self.assertIn("pipette_0.pipette_k_scale", categories["Pipette 0 Calibration"])
-        self.assertNotIn("pipette_z_rotation", categories["Pipette Calibration"])   # unused top level
+        self.assertNotIn("Pipette 1 Calibration", categories)
+        grids = [field for field in categories["Pipette Calibration"] if isinstance(field, EditorGrid)]
+        self.assertEqual(len(grids), 1)
+        grid = grids[0]
+        self.assertEqual(grid.columns, ["pipette_0", "pipette_1"])
+        self.assertEqual(grid.column_labels, ["Pipette 0", "Pipette 1"])
+        self.assertIn("stage_y_axis_flip", grid.rows)
+        self.assertIn("pipette_1.pipette_z_rotation", grid.names())
+        # Shared rows stay; unused top-level per-pipette values don't show anywhere.
+        self.assertIn("pipette_diag_move", categories["Pipette Calibration"])
+        self.assertNotIn("pipette_z_rotation", categories["Pipette Calibration"])
+        self.assertNotIn("stage_y_axis_flip", categories["Stage Calibration"])
         self.assertEqual(self.config.editor_get("pipette_1.pipette_z_rotation"), 160.0)
         self.config.editor_set("pipette_1.pipette_z_rotation", 155.0)
+        self.config.editor_set("pipette_0.stage_y_axis_flip", True)
         self.assertEqual(self.config.pipettes["pipette_1"]["pipette_z_rotation"], 155.0)
         self.assertEqual(self.config.pipettes["pipette_0"]["pipette_z_rotation"], -20.0)
+        self.assertIs(self.config.pipettes["pipette_0"]["stage_y_axis_flip"], True)
+        self.assertIs(self.config.pipettes["pipette_1"]["stage_y_axis_flip"], False)
         self.assertIs(self.config.editor_param("pipette_1.pipette_k_scale"),
                       self.config.param["pipette_k_scale"])
-        self.assertEqual(len(self.config.editor_names_for_change("pipettes")), 20)
+        self.assertEqual(len(self.config.editor_names_for_change("pipettes")),
+                         2 * len(grid.rows))
 
     def test_legacy_file_is_pipette_0_only(self):
         config = CalibrationConfig(name="Calibration")
@@ -551,11 +568,93 @@ class PipetteInterfaceTests(unittest.TestCase):
         with open(os.path.join(self.tmp.name, "tare_pipettes.pickle"), "rb") as stream:
             self.assertEqual(list(pickle.load(stream)["pipette_1"]), [4.0, None, 6.0])
 
-    def test_sanity_check_catches_wrong_mirroring(self):
+    def test_sanity_check_compares_each_pipette_with_its_geometry(self):
         self.assertEqual(self.interface.check_calibration_geometry(), [])
-        self.units["pipette_1"].config.pipette_z_rotation = -20      # claims "not mirrored"
+        config = self.units["pipette_1"].config
+        config.pipette_z_rotation = 0.0        # 180 is also accepted (sign not verified)
+        self.assertEqual(self.interface.check_calibration_geometry(), [])
+        config.pipette_z_rotation = 150.0
         warnings = self.interface.check_calibration_geometry()
         self.assertTrue(warnings and "pipettes.pipette_1.pipette_z_rotation" in warnings[0])
+        config.pipette_z_rotation = 180.0
+        config.stage_y_axis_flip = True        # wrong handedness
+        warnings = self.interface.check_calibration_geometry()
+        self.assertTrue(warnings and "stage_y_axis_flip" in warnings[0]
+                        and "pipette_1" in warnings[0])
+        config.stage_y_axis_flip = False
+        config.pipette_k_scale = 0.5
+        warnings = self.interface.check_calibration_geometry()
+        self.assertTrue(warnings and "pipettes.pipette_1.pipette_k_scale" in warnings[0])
+
+    def test_sanity_check_accepts_a_mirrored_manipulator(self):
+        # Calibration of a manipulator whose map is k * Rz(-20) * flipY (Norwich pipette_0).
+        flip_y = np.diag([1.0, -1.0, 1.0])
+        G = 0.79 * rotation_z(-20) @ flip_y
+        unit = self.units["pipette_0"]
+        unit.M = np.linalg.inv(G)
+        unit.config.pipette_z_rotation, unit.config.pipette_k_scale = -20.0, 0.79
+        self.assertTrue(self.interface.check_calibration_geometry())   # flips not set yet
+        unit.config.stage_y_axis_flip = True
+        self.assertEqual(self.interface.check_calibration_geometry(), [])
+
+
+# ------------------------------------------------------------------
+# Stage -> pipette map (CalibratedUnit.rotate, Follow Stage)
+# ------------------------------------------------------------------
+NORWICH_PIPETTE_1_FOLLOW_STAGE = np.array([   # stage x, y -> total pipette x, y (um), 2026-11-17
+    [-129.8, -24.6, 101.7, -27.7], [-125.4, 5.7, 126.2, -46.7], [91.6, -118.8, -27.2, 109.1],
+    [-65.2, 10.4, 25.4, -30.5], [23.8, -10.7, -35.2, 13.8], [-86.7, -108.6, 145.1, 41.1],
+    [-62.1, -140.5, 91.5, 71.2], [99, 70.6, -104, -18.1], [-9.4, 19, -10.5, -16.9],
+    [-142, 48.2, 100.9, -85.3], [46, 44.9, -46.4, -14.7], [-22.5, 18.4, 8.9, -19.7],
+    [5.3, 14.5, -10.2, -6.7], [-130.4, 100.5, 63.4, -110.3], [46.7, 97.7, -62.6, -46.8],
+    [51, -20.8, -29.1, 32.7], [-101.7, -4.6, 73.8, -31.5], [46.3, -62.5, -9.8, 61.1],
+    [32.4, 103.7, -59.3, -59.9], [5.4, -140.6, 46.4, 96.6], [-3.3, -97.6, 30.4, 61.8],
+    [56.2, -92.3, -9.4, 79.4], [60.2, -59.1, -25.9, 61], [61.1, -41.1, -28.3, 49.7],
+    [-137.4, 83.7, 70, -110], [87.7, -46.2, -47.4, 63.5], [-116.7, 27.2, 74.1, -59.8]])
+
+
+def rotate_with(**geometry):
+    unit = SimpleNamespace(config=SimpleNamespace(**dict(GEOMETRY, **geometry)),
+                           debug=lambda *args, **kwargs: None)
+    return lambda coordinates, axis=2: CalibratedUnit.rotate(unit, coordinates, axis)
+
+
+def norwich_pipette(key):
+    config = CalibrationConfig(name="Calibration")
+    config.from_file(str(REPO / "rig_setup" / "cal_configs" / "Norwich_cal.yaml"))
+    return SimpleNamespace(config=PipetteConfigView(config, key), debug=lambda *a, **k: None)
+
+
+class RotateTests(unittest.TestCase):
+    def test_flips_rotation_and_k(self):
+        rotate = rotate_with(pipette_z_rotation=90.0, pipette_k_scale=0.5, stage_y_axis_flip=True)
+        step = np.array([10.0, 20.0, 0.0])
+        np.testing.assert_allclose(rotate(step), [10.0, 5.0, 0.0], atol=1e-9)  # 0.5*Rz(90)*(10,-20)
+        np.testing.assert_allclose(step, [10.0, 20.0, 0.0])                 # input untouched
+        np.testing.assert_allclose(rotate(step, [2]), rotate(step))         # list of axes
+        np.testing.assert_allclose(rotate([10.0, 20.0]), rotate(step))      # 2-vector padded
+
+    def test_each_pipette_uses_its_own_geometry(self):
+        step = np.array([30.0, -40.0, 0.0])
+        flip_y = np.diag([1.0, -1.0, 1.0])
+        np.testing.assert_allclose(CalibratedUnit.rotate(norwich_pipette("pipette_0"), step, [2]),
+                                   0.79156 * rotation_z(-20.0105) @ flip_y @ step)
+        np.testing.assert_allclose(CalibratedUnit.rotate(norwich_pipette("pipette_1"), step, [2]),
+                                   0.82 * rotation_z(154.0) @ step)
+
+    def test_norwich_pipette_1_data_fits_its_geometry(self):
+        unit = norwich_pipette("pipette_1")
+        stage, pipette = NORWICH_PIPETTE_1_FOLLOW_STAGE[:, :2], NORWICH_PIPETTE_1_FOLLOW_STAGE[:, 2:]
+        predicted = np.array([CalibratedUnit.rotate(unit, step, [2])[:2] for step in stage])
+        rms = np.sqrt(((pipette - predicted) ** 2).mean(axis=0))
+        # What's left is mostly x backlash (~25 um deadband) and the x/y scale difference.
+        self.assertLess(rms[0], 15.0)
+        self.assertLess(rms[1], 10.0)
+        # The old setting (158.5 deg, k unused) misses by far more.
+        old = rotate_with(pipette_z_rotation=158.5)
+        old_rms = np.sqrt(((pipette - np.array([old(step)[:2] for step in stage])) ** 2).mean(axis=0))
+        self.assertLess(np.linalg.norm(rms), 15.0)       # ~14 um
+        self.assertGreater(np.linalg.norm(old_rms), 20.0)  # ~26 um
 
 
 class AutoPatchRoutingTests(unittest.TestCase):

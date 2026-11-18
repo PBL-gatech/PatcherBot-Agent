@@ -4,18 +4,24 @@ use_ai_features: false
 # (the start-up check notes this; on a real rig they would differ).
 pipettes:
   pipette_0:
+    stage_x_axis_flip: false
+    stage_y_axis_flip: true
     pipette_z_rotation: -60.75
     pipette_y_rotation: 25
     pipette_k_scale: 1.0
     clean_move_order: [y, x, z]
     safe_position_delta_um: -8000
   pipette_1:
+    stage_x_axis_flip: false
+    stage_y_axis_flip: true
     pipette_z_rotation: -60.75
     pipette_y_rotation: 25
     pipette_k_scale: 1.0
     clean_move_order: [y, x, z]
     safe_position_delta_um: -8000
   pipette_2:
+    stage_x_axis_flip: false
+    stage_y_axis_flip: true
     pipette_z_rotation: -60.75
     pipette_y_rotation: 25
     pipette_k_scale: 1.0

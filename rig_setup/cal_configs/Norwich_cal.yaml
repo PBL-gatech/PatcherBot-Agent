@@ -11,29 +11,39 @@ position_update: 1000
 autofocus_dist: 50
 stage_diag_move: 500
 frame_lag: 4
-stage_x_axis_flip: false
-stage_y_axis_flip: false
 microscope_units_per_um: 1.0
 # ---------------------------------------------------------------------------
 # Per-pipette geometry, one entry per pipette, keyed like the rest of the code
 # (pipette_0, pipette_1, ...). Every selected pipette needs its own entry with
-# all five values below; nothing is copied from another pipette, and the
-# top-level pipette_z_rotation/pipette_y_rotation/... are NOT used once this
+# all seven values below; nothing is copied from another pipette, and the
+# top-level pipette_z_rotation/stage_*_axis_flip/... are NOT used once this
 # section exists. Format and meaning: docs/multipipette_changes.md section 12.2.
-#   pipette_z_rotation: direction the manipulator's +x axis points, in stage
-#                       axes (deg) -- i.e. which side of the stage it sits on
-#   pipette_y_rotation: descent angle of the pipette (deg)
+# A stage move s becomes the pipette move  k * Rz(pipette_z_rotation) * flips * s
+# (CalibratedUnit.rotate; used by Follow Stage and locate_cell):
+#   stage_x/y_axis_flip: handedness of that map. The two Norwich manipulators
+#                        are mirror images, so they differ here.
+#   pipette_z_rotation:  rotation in the xy plane (deg)
+#   pipette_k_scale:     pipette um per stage um
+#   pipette_y_rotation:  descent angle of the pipette (deg)
 # ---------------------------------------------------------------------------
 pipettes:
   pipette_0:                      # left manipulator (COM8)
+    # Values that work on BrainScanNorwichClone (Follow Stage verified there).
+    stage_x_axis_flip: false
+    stage_y_axis_flip: true
     pipette_z_rotation: -20.0105
     pipette_y_rotation: 25
     pipette_k_scale: 0.79156
     clean_move_order: [y, x, z]
     safe_position_delta_um: -18000
-  pipette_1:                      # right manipulator (COM7), mirrored in x and y
-    pipette_z_rotation: 159.9895  # initial guess = pipette_0 + 180; verify by jogging
+  pipette_1:                      # right manipulator (COM7)
+    # Fitted 2026-11-17 from 27 manual Follow Stage trials (raw stage vs raw
+    # manipulator um): proper rotation 153.4-154.6 deg, k 0.82-0.86 (axes: y 0.76,
+    # x ~0.9); the x axis has ~25 um of backlash.
+    stage_x_axis_flip: false
+    stage_y_axis_flip: false
+    pipette_z_rotation: 154.0
     pipette_y_rotation: 25
-    pipette_k_scale: 0.79156
+    pipette_k_scale: 0.82
     clean_move_order: [y, x, z]
     safe_position_delta_um: -18000
