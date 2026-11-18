@@ -145,8 +145,12 @@ def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, c
             phase.controller.warning(f'{label} sweep observed {missed_frames} frame ID gaps and '
                                      f'{unpaired_frames} frames without matching timing; '
                                      f'{len(frames)} timed in-range frames available')
+        frame_count = len(frames)
+        phase.controller.info(f'{label} sweep score analysis started ({frame_count} frames)')
+        scoring_started = time.monotonic()
         while frames and phase.motion_checkpoint():
             frame, pose, offset = frames.popleft()
+            phase.controller.info(f'{label} scoring {frame_count - len(frames)}/{frame_count}: frame={frame[0]}')
             if offset is not None:
                 try:
                     spill.seek(offset)
@@ -154,6 +158,8 @@ def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, c
                 except (OSError, EOFError, ValueError) as error:
                     raise FocusCaptureIncomplete(f'{label} could not read captured frames: {error}') from error
             calculate(frame, pose)
+        if not frames:
+            phase.controller.info(f'{label} sweep score analysis finished ({time.monotonic() - scoring_started:.2f} s)')
         return end_z if phase.motion_checkpoint() else None
 
 

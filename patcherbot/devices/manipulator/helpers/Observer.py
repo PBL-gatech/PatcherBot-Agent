@@ -121,7 +121,8 @@ class Observer:
             detection = self.unit.pipetteCalHelper.pipetteDetector.detect_pipette_details(image.copy())
         return dict(raw_position=raw_position, pixel_position=pixel_position, pipette_detection=detection)
 
-    def get_cell(self, image=None, *, detect=True, stage_data=None, include_masks=True, seed_points=None):
+    def get_cell(self, image=None, *, detect=True, stage_data=None, include_masks=True, seed_points=None,
+                 include_interior_points=True, select_detection=None):
         """Collect detections, optional masks/centroids/interior targets, and their stage coordinates."""
         stage = self.get_stage() if stage_data is None else stage_data
         if image is None and detect:
@@ -130,6 +131,10 @@ class Observer:
         if detect and image is not None:
             detections = self.stage.cellDetectHelper._ensure_detector().detect_cells(
                 image.copy(), include_boxes=True)
+            if select_detection is not None and detections is not None and len(detections):
+                selected = select_detection(dict(stage=stage, cell=dict(
+                    cell_seed_points=[row[:2] for row in detections], cell_targets=detections)))
+                detections = [] if selected is None else [selected]
         points = [] if detections is None else [row[:2] for row in detections]
         boxes = [] if detections is None else [row[3] for row in detections]
         if seed_points is not None:
@@ -153,7 +158,8 @@ class Observer:
                     mask = None
                 masks.append(mask)
                 centroids.append(None if mask is None else helper._compute_centroid(mask))
-                target = helper.segmentor.get_mask_target(mask)
+                target = (helper.segmentor.get_mask_target(mask) if include_interior_points
+                          else dict(mask=mask, target_points_xy=[]))
                 target.update(box_xyxy=box, seed_point_xy=point)
                 targets.append(target)
         return dict(cell_detections=detections, cell_masks=masks, cell_centroids=centroids,

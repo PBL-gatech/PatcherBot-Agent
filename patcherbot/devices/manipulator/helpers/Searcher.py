@@ -1,10 +1,12 @@
 import math
+import time
 from collections import deque
 from copy import deepcopy
 
 import numpy as np
 
 from .Scanner import FocusCaptureIncomplete, position_focus, sweep_captured_focus
+from patcherbot.deepLearning.cellSegmentor import BaseSegmentor
 
 class Searcher:
     """Same continuous trajectory, with an explicit selected-cell ranking rule."""
@@ -82,10 +84,16 @@ class Searcher:
 
             def score_frame(frame, stage):
                 number, timestamp, image = frame
-                cell = observer.get_cell(image, stage_data=stage, include_masks=True)
+                started = time.monotonic()
+                phase.controller.info(f'Search frame={number}: detecting cells and collecting masks')
+                cell = observer.get_cell(image, stage_data=stage, include_masks=True,
+                                         include_interior_points=False, select_detection=phase._select_cell)
+                phase.controller.info(f'Search frame={number}: collected {len(cell["cell_targets"])} targets '
+                                      f'in {time.monotonic() - started:.3f} s; scoring selected cell')
                 observation = dict(image=dict(frame_number=number, time=timestamp), stage=stage, cell=cell)
                 self.calculate(observation)
                 phase.publish_alignment_snapshot(observation)
+                phase.controller.info(f'Search frame={number}: score and snapshot complete')
 
             end_z = sweep_captured_focus(self.focus, self.actions, phase, bounds, speed,
                                          capture_pose, score_frame, 'Search')
@@ -117,14 +125,17 @@ class Searcher:
             selected = max(same_cell, key=lambda entry: (
                 entry["score"], -abs(entry["stage"]["raw_position"][2] - expected_z)))
             mask = np.unpackbits(selected["packed"], count=math.prod(selected["shape"])).reshape(selected["shape"]).view(bool)
-            target = dict(selected["target"], mask=mask)
+            target = dict(selected["target"])
+            target.update(BaseSegmentor.get_mask_target(mask))
             winner = dict(stage=selected["stage"], image=selected["image"],
                           cell=dict(cell_seed_points=[selected["seed"]], cell_targets=[target], cell_masks=[mask]))
             self.best_observation = winner
             self.best_score = selected["score"]
             self.best_area_px = selected["area"]
             self.best_target_points_xy = list(target["target_points_xy"])
+            phase.publish_alignment_snapshot(winner)
             winner_z = winner['stage']['raw_position'][2]
+            phase.controller.info(f'Search winner frame={winner["image"]["frame_number"]}; returning to Z={winner_z:.3f} um')
             restored = self.move_to(phase, winner_z, speed)
             if restored is None:
                 return None
