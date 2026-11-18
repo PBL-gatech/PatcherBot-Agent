@@ -25,7 +25,7 @@ from datetime import datetime
 # new import
 
 from patcherbot.interface.graph import GraphInterface
-from patcherbot.utils.multipipette_helper import pipette_label
+from patcherbot.utils.multipipette_helper import pipette_color, pipette_key_for, pipette_label, tint
 
 __all__ = [
     "EPhysGraph",
@@ -692,9 +692,14 @@ class PipetteEphysPanel(QWidget):
     def __init__(self, label, graph_interface: GraphInterface,
                  recording_state_manager: RecordingStateManager,
                  recorder_filename="graph_recording", update_dt_ms=42,
-                 show_title=True, show_axis_titles=True):
+                 show_title=True, show_axis_titles=True, color=None):
         super().__init__()
         self.label = label
+        # Pipette colour (several pipettes only): title in this colour, and a
+        # frame in it while this is the active pipette.
+        self.color = color
+        self.setObjectName("PipetteEphysPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.graph_interface = graph_interface
         self.recording_state_manager = recording_state_manager
         self.update_dt_ms = update_dt_ms
@@ -728,7 +733,8 @@ class PipetteEphysPanel(QWidget):
         self.resistancePlot.setLabel("bottom", "Samples", units="")
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
+        frame = 4 if color is not None else 0
+        layout.setContentsMargins(frame, frame, frame, frame)
         layout.addWidget(self.titleLabel)
         for plot in self.plots:
             layout.addWidget(plot)
@@ -762,8 +768,19 @@ class PipetteEphysPanel(QWidget):
         if self.graph_interface.pressure_is_simulated():
             parts.append("sim. pressure")
         self.titleLabel.setText(" · ".join(parts))
-        self.titleLabel.setStyleSheet(
-            "font-weight: bold; background-color: #cfe3ff;" if self.selected else "")
+        if self.color is None:
+            style = "font-weight: bold; background-color: #cfe3ff;" if self.selected else ""
+            frame = ""
+        elif self.selected:
+            style = f"font-weight: bold; color: white; background-color: {self.color};"
+            frame = f"#PipetteEphysPanel {{ border: 4px solid {self.color}; border-radius: 4px; }}"
+        else:
+            style = f"font-weight: bold; color: {self.color};"
+            frame = "#PipetteEphysPanel { border: 4px solid transparent; }"
+        if self.titleLabel.styleSheet() != style:
+            self.titleLabel.setStyleSheet(style)
+        if self.styleSheet() != frame:
+            self.setStyleSheet(frame)
 
     def refresh(self):
         """Fetch this pipette's latest pressure and DAQ packet, plot and record them."""
@@ -863,6 +880,7 @@ class EPhysGraph(QWidget):
                 update_dt_ms=self.updateDt,
                 show_title=several,
                 show_axis_titles=index == 0,
+                color=pipette_color(pipette_key_for(index)) if several else None,
             )
         self.selected_panel = next(iter(self.panels.values()))
         self.selected_panel.set_selected(several)
@@ -873,15 +891,8 @@ class EPhysGraph(QWidget):
         bottomBarLayout.setContentsMargins(0, 0, 0, 0)  # Preserve zero margins as in old UI.
         self.bottomBar.setLayout(bottomBarLayout)
 
-        # Which pipette the bar controls; only shown with several pipettes.
-        self.pipettePicker = None
-        if several:
-            self.pipettePickerLabel = QLabel("Control:")
-            bottomBarLayout.addWidget(self.pipettePickerLabel)
-            self.pipettePicker = QComboBox()
-            self.pipettePicker.addItems(list(self.graph_interfaces))
-            self.pipettePicker.currentTextChanged.connect(self._select_pipette)
-            bottomBarLayout.addWidget(self.pipettePicker)
+        # The bar controls the active pipette (chosen in the main window's
+        # "pipette selection" section; see select_pipette_key).
 
         self.resistanceLabel = QLabel("Resistance:")
         bottomBarLayout.addWidget(self.resistanceLabel)
@@ -1024,11 +1035,20 @@ class EPhysGraph(QWidget):
         self.show()
         self.raise_()
 
+    ACTIVE_PIPETTE_TINT = 0.35   # window background: active pipette's colour mixed with white
+
     @pyqtSlot(str)
     def select_pipette_key(self, pipette_key):
-        """Point the bottom bar at pipette ``pipette_key`` (e.g. the active pipette)."""
-        if self.pipettePicker is not None:
-            self.pipettePicker.setCurrentText(pipette_label(pipette_key))
+        """Follow the active pipette: point the bottom bar at it and tint the
+        window (around the white plots) with its colour."""
+        if len(self.panels) < 2:
+            return
+        self._select_pipette(pipette_label(pipette_key))
+        palette = self.palette()
+        palette.setColor(QtGui.QPalette.Window,
+                         QtGui.QColor(tint(pipette_color(pipette_key), self.ACTIVE_PIPETTE_TINT)))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
 
     def _select_pipette(self, label):
         """Point the bottom bar at another pipette.

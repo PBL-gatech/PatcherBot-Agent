@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from patcherbot.utils.multipipette_helper import (
     PER_PIPETTE_FIELDS, MultiPipetteDevice, PipetteDAQView, PipetteState,
     build_channel_map, device_for_pipette, multi_pipette_protocol, per_pipette,
-    pipette_index, pipette_key_for, pipette_label, takes_pipettes,
+    pipette_color, pipette_index, pipette_key_for, pipette_label, takes_pipettes, tint,
 )
 
 
@@ -18,6 +18,15 @@ class KeyTests(unittest.TestCase):
         self.assertEqual(pipette_index("pipette_2"), 2)
         self.assertIsNone(pipette_index("ai17"))
         self.assertEqual(pipette_label("pipette_0"), "Pipette 0")
+
+    def test_colors_follow_matplotlib_cycle(self):
+        self.assertEqual(pipette_color("pipette_0"), "#1f77b4")   # blue
+        self.assertEqual(pipette_color("pipette_1"), "#ff7f0e")   # orange
+        self.assertEqual(pipette_color("pipette_2"), "#2ca02c")   # green
+        self.assertEqual(pipette_color("pipette_10"), "#1f77b4")  # wraps
+        self.assertEqual(tint("#1f77b4", 1.0), "#1f77b4")
+        self.assertEqual(tint("#1f77b4", 0.0), "#ffffff")
+        self.assertEqual(tint("#000000", 0.5), "#808080")
 
 
 class PipetteStateTests(unittest.TestCase):

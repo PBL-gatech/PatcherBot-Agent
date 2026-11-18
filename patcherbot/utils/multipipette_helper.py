@@ -33,6 +33,7 @@ __all__ = [
     "multi_pipette_protocol", "takes_pipettes", "per_pipette", "PipetteDAQView",
     "PIPETTE_GEOMETRY_FIELDS", "PIPETTE_POSITION_FIELDS", "PER_PIPETTE_CALIBRATION_FIELDS",
     "keyed_pipette_entries", "validate_pipette_geometry", "PipetteConfigView",
+    "PIPETTE_COLORS", "pipette_color", "tint",
 ]
 
 
@@ -57,6 +58,29 @@ def pipette_label(key):
     """Display name for ``key`` (``"pipette_0"`` -> ``"Pipette 0"``)."""
     index = pipette_index(key)
     return f"Pipette {index}" if index is not None else str(key)
+
+
+# Display colour per pipette: matplotlib's default ("tab10") colour cycle,
+# pipette_0 blue, pipette_1 orange, pipette_2 green, ...
+PIPETTE_COLORS = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+)
+
+
+def pipette_color(key):
+    """Hex display colour for pipette ``key`` (cycles after 10 pipettes)."""
+    index = pipette_index(key)
+    return PIPETTE_COLORS[(index or 0) % len(PIPETTE_COLORS)]
+
+
+def tint(color, amount):
+    """``color`` (``"#rrggbb"``) mixed with white: ``amount`` 1 = the colour, 0 = white."""
+    amount = min(max(float(amount), 0.0), 1.0)
+    value = color.lstrip("#")
+    channels = [int(value[i:i + 2], 16) for i in (0, 2, 4)]
+    mixed = [round(255 - (255 - channel) * amount) for channel in channels]
+    return "#" + "".join(f"{channel:02x}" for channel in mixed)
 
 
 def validate_pipette_keys(pipette_keys=None):

@@ -7,11 +7,12 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import PyQt5.QtGui as QtGui
 import numpy as np
 import logging
+import qtawesome as qta
 
 from PyQt5.QtWidgets import QFileDialog, QWidget,QMessageBox
 
 from patcherbot.controller import TaskController
-from patcherbot.utils.multipipette_helper import pipette_key_for, pipette_label
+from patcherbot.utils.multipipette_helper import pipette_color, pipette_key_for, pipette_label, tint
 from patcherbot.gui.tabs.experiment_book_tab import ExperimentBookTab
 from patcherbot.gui.tabs.atlas_widget import AtlasWindow
 from patcherbot.gui.tabs.show_cells import CellListWindow
@@ -87,6 +88,12 @@ class PatchGui(ManipulatorGui):
         classic_patching_tab = ClassicPatchButtons(self.patch_interface, pipette_interface, self.start_task, self.interface_signals, self.recording_state_manager)
         self.classic_patching_tab = classic_patching_tab
         classic_patching_tab.origin_requested.connect(self._request_origin)
+        # With several pipettes: the window takes the active pipette's colour,
+        # and the collision guard sits in the status bar.
+        self._add_collision_guard_icon()
+        if len(self.pipette_interface.calibrated_units) > 1:
+            self.pipette_interface.active_pipette_changed.connect(self._show_active_pipette_color)
+            self._show_active_pipette_color(self.pipette_interface.active_pipette)
         self.experiment_book_tab.reload_requested.connect(self._reload_book_details)
         self._last_book_tares = None
         self.pipette_interface.task_finished.connect(self._tare_task_finished)
@@ -101,6 +108,111 @@ class PatchGui(ManipulatorGui):
             lambda: self.record_button.setChecked(self.recording_state_manager.is_recording_enabled())
         )
         self._recording_indicator_timer.start(100)
+
+    # ---- active pipette colour (2+ pipettes) ----
+    ACTIVE_PIPETTE_TINT = 0.35   # window background: active pipette's colour mixed with white
+
+    @QtCore.pyqtSlot(str)
+    def _show_active_pipette_color(self, key):
+        """Tint the window background with the active pipette's colour."""
+        palette = self.palette()
+        palette.setColor(QtGui.QPalette.Window,
+                         QtGui.QColor(tint(pipette_color(key), self.ACTIVE_PIPETTE_TINT)))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
+
+    # ---- collision guard icon (status bar, 2+ pipettes) ----
+    _GUARD_ICONS = {
+        "off": ("fa.exclamation-triangle", "#f2c200"),
+        "unlocated": ("fa.shield", "#ff8c00"),
+        "on": ("fa.shield", "#2e9e44"),
+    }
+
+    def _add_collision_guard_icon(self):
+        """Status-bar toggle for the collision guard, next to the record button.
+        Green shield = on; orange shield = on but a pipette can't be located (so
+        isn't protected); yellow warning sign = off. The tooltip explains."""
+        self.collision_guard_button = None
+        if len(self.pipette_interface.calibrated_units) < 2:
+            return
+        button = QtWidgets.QToolButton(clicked=self._toggle_collision_guard)
+        button.setAutoRaise(True)
+        self.collision_guard_button = button
+        self._guard_state = None
+        self._insert_status_widget_after(self.record_button, button)
+        self._guard_timer = QtCore.QTimer(self)
+        self._guard_timer.setInterval(500)
+        self._guard_timer.timeout.connect(self._refresh_collision_guard_icon)
+        self._guard_timer.start()
+        self.pipette_interface.collision_blocked.connect(self._show_collision_blocked)
+        self._collision_box = None
+        self._refresh_collision_guard_icon()
+
+    def _insert_status_widget_after(self, anchor, widget):
+        """Put ``widget`` right after ``anchor`` among the status bar's permanent
+        widgets (QStatusBar's index counts every widget before it)."""
+        def find(layout):
+            count = 0
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item.widget() is not None:
+                    count += 1
+                    if item.widget() is anchor:
+                        return count
+                elif item.layout() is not None:
+                    found = find(item.layout())
+                    if found is not None:
+                        return found
+            return None
+        index = find(self.status_bar.layout())
+        if index is None:
+            self.status_bar.addPermanentWidget(widget)
+        else:
+            self.status_bar.insertPermanentWidget(index, widget)
+
+    def _toggle_collision_guard(self):
+        enabled = not self.pipette_interface.collision_guard.status()["enabled"]
+        command_signal = self.interface_signals[self.pipette_interface][0]
+        command_signal.emit(self.pipette_interface.set_collision_guard, enabled)
+        QtCore.QTimer.singleShot(100, self._refresh_collision_guard_icon)
+
+    def _refresh_collision_guard_icon(self):
+        button = self.collision_guard_button
+        if button is None:
+            return
+        status = self.pipette_interface.collision_guard.status()  # no device access
+        if not status["enabled"]:
+            state = "off"
+            tooltip = ("Collision guard is OFF: automatic pipette moves are not checked, so "
+                       "pipettes can run into each other. Turn off only for debugging.\n"
+                       "Click to turn it on.")
+        elif status["unlocated"]:
+            state = "unlocated"
+            tooltip = ("Collision guard is ON, but these pipettes are not protected:\n"
+                       + "\n".join(f"- {key}: {reason}" for key, reason in status["unlocated"].items())
+                       + "\nClick to turn the guard off (debugging only).")
+        else:
+            state = "on"
+            tooltip = ("Collision guard is ON: every automatic move keeps each pipette on its "
+                       "own side of the others.\nClick to turn it off (debugging only).")
+        if state != self._guard_state:
+            name, color = self._GUARD_ICONS[state]
+            button.setIcon(qta.icon(name, color=color))
+            self._guard_state = state
+        if button.toolTip() != tooltip:
+            button.setToolTip(tooltip)
+
+    @QtCore.pyqtSlot(str)
+    def _show_collision_blocked(self, message):
+        """Explain a refused move in a (non-blocking) dialog, one at a time."""
+        box = getattr(self, "_collision_box", None)
+        if box is not None and box.isVisible():
+            box.setText(message)
+            return
+        box = QMessageBox(QMessageBox.Warning, "Collision guard", message, QMessageBox.Ok, self)
+        box.setModal(False)
+        box.show()
+        self._collision_box = box
 
     def _add_protocol_config_gui(self):
         protocol_config = self.patch_interface.protocol_config
@@ -855,7 +967,7 @@ class ClassicPatchButtons(ButtonTabWidget):
         # Display tare per pipette; ``tare_pipette_pos`` is the active one's.
         self._tare_pipette_by_key = {}
 
-        self._add_active_pipette_selector(layout)
+        self._add_pipette_selection(layout)
 
         self.currx_stage_pos = [0, 0, 0]
         self.curry_stage_pos = [0, 0, 0]
@@ -940,8 +1052,7 @@ class ClassicPatchButtons(ButtonTabWidget):
             [self.patch_interface.move_group_up, self.patch_interface.move_group_down],
             [self.pipette_interface.center_pipette,self.patch_interface.clean_pipette,self.pipette_interface.focus_pipette]
         ]
-        self.addButtonList('movement', layout, buttonList, cmds, sequential=True,
-                           extra_widget=self._make_collision_guard_button())
+        self.addButtonList('movement', layout, buttonList, cmds, sequential=True)
 
         # Find Pipette path
         self.pipette_location = [self.pipette_interface.center_pipette,self.pipette_interface.focus_pipette,self.pipette_interface.move_pipette_random,self.patch_interface.find_pipette]
@@ -1190,110 +1301,58 @@ class ClassicPatchButtons(ButtonTabWidget):
     def tare_pipette_pos(self, value):
         self._tare_pipette_by_key[self.pipette_interface.active_pipette] = value
 
-    def _add_active_pipette_selector(self, layout):
-        """'Active pipette' picker (only with more than one pipette): every
-        manipulator, calibration and patch command acts on that pipette."""
+    def _add_pipette_selection(self, layout):
+        """'pipette selection' section (only with more than one pipette): one
+        button per pipette, in that pipette's colour; every manipulator,
+        calibration and patch command acts on the selected (active) pipette."""
         keys = list(self.pipette_interface.calibrated_units)
-        self.active_pipette_combo = None
+        self.pipette_buttons = {}
         if len(keys) < 2:
             return
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Active pipette:"))
-        combo = QtWidgets.QComboBox()
+        box = CollapsibleGroupBox('pipette selection')
+        rows = QtWidgets.QVBoxLayout()
+        group = QtWidgets.QButtonGroup(self)
+        group.setExclusive(True)
         for key in keys:
-            combo.addItem(pipette_label(key), key)
-        combo.setCurrentIndex(keys.index(self.pipette_interface.active_pipette))
-        combo.currentIndexChanged.connect(self._request_active_pipette)
-        row.addWidget(combo)
-        row.addStretch(1)
-        layout.addLayout(row)
-        self.active_pipette_combo = combo
+            button = QtWidgets.QPushButton(pipette_label(key))
+            button.setCheckable(True)
+            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            button.setMinimumHeight(50)
+            button.setToolTip(f"Make {pipette_label(key)} the active pipette")
+            button.clicked.connect(lambda checked, k=key: self._request_active_pipette(k))
+            group.addButton(button)
+            rows.addWidget(button)
+            self.pipette_buttons[key] = button
+        self._pipette_button_group = group
+        box.setContentLayout(rows)
+        layout.addWidget(box)
         self.pipette_interface.active_pipette_changed.connect(self._show_active_pipette)
+        self._show_active_pipette(self.pipette_interface.active_pipette)
 
-    # ---- collision guard toggle (movement box) ----
-    _GUARD_STYLES = {
-        "off": "background-color: rgb(200, 30, 30); color: white; font-weight: bold;",
-        "unlocated": "background-color: rgb(255, 165, 0); color: black;",
-        "on": "",
-    }
+    @staticmethod
+    def _pipette_button_style(key, active):
+        color = pipette_color(key)
+        if active:
+            return (f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
+                    f"border: 2px solid {color}; border-radius: 6px; }}")
+        return (f"QPushButton {{ background-color: {tint(color, 0.15)}; color: black; "
+                f"border: 1px solid {tint(color, 0.6)}; border-radius: 6px; }}"
+                f"QPushButton:hover {{ background-color: {tint(color, 0.35)}; }}")
 
-    def _make_collision_guard_button(self):
-        """Toggle for the collision guard (only with 2+ pipettes): red when off,
-        orange while a pipette can't be located (so isn't protected)."""
-        self.collision_guard_button = None
-        if len(self.pipette_interface.calibrated_units) < 2:
-            return None
-        button = QtWidgets.QPushButton("Collision Guard: ON")
-        button.setCheckable(True)
-        button.setChecked(True)
-        button.setToolTip("Keeps every pipette inside its own workspace during automatic moves. "
-                          "Turn off only for debugging.")
-        button.clicked.connect(self._request_collision_guard)
-        self.collision_guard_button = button
-        self._guard_timer = QtCore.QTimer(self)
-        self._guard_timer.setInterval(500)
-        self._guard_timer.timeout.connect(self._refresh_collision_guard_button)
-        self._guard_timer.start()
-        self.pipette_interface.collision_blocked.connect(self._show_collision_blocked)
-        self._collision_box = None
-        self._refresh_collision_guard_button()
-        return button
-
-    def _request_collision_guard(self, checked):
-        command_signal = self.interface_signals[self.pipette_interface][0]
-        command_signal.emit(self.pipette_interface.set_collision_guard, bool(checked))
-        self._refresh_collision_guard_button()
-
-    def _refresh_collision_guard_button(self):
-        button = self.collision_guard_button
-        if button is None:
-            return
-        status = self.pipette_interface.collision_guard.status()  # no device access
-        if not status["enabled"]:
-            state, text = "off", "Collision Guard: OFF"
-            tooltip = "Automatic pipette moves are NOT checked for collisions."
-        elif status["unlocated"]:
-            state = "unlocated"
-            text = f"Collision Guard: ON ({', '.join(status['unlocated'])} not located)"
-            tooltip = "; ".join(f"{key} is not protected: {reason}"
-                                for key, reason in status["unlocated"].items())
-        else:
-            state, text = "on", "Collision Guard: ON"
-            tooltip = "Every pipette is kept inside its own workspace during automatic moves."
-        button.blockSignals(True)
-        button.setChecked(status["enabled"])
-        button.blockSignals(False)
-        if button.text() != text:
-            button.setText(text)
-        button.setStyleSheet(self._GUARD_STYLES[state])
-        button.setToolTip(tooltip)
-
-    @QtCore.pyqtSlot(str)
-    def _show_collision_blocked(self, message):
-        """Explain a refused move in a (non-blocking) dialog, one at a time."""
-        box = getattr(self, "_collision_box", None)
-        if box is not None and box.isVisible():
-            box.setText(message)
-            return
-        box = QMessageBox(QMessageBox.Warning, "Collision guard", message, QMessageBox.Ok, self)
-        box.setModal(False)
-        box.show()
-        self._collision_box = box
-
-    def _request_active_pipette(self, index):
-        key = self.active_pipette_combo.itemData(index)
+    def _request_active_pipette(self, key):
+        # Keep the buttons on the current pipette until the interface confirms
+        # the switch (it refuses while a task is running).
+        self._show_active_pipette(self.pipette_interface.active_pipette)
         command_signal = self.interface_signals[self.pipette_interface][0]
         command_signal.emit(self.pipette_interface.set_active_pipette, key)
 
     @QtCore.pyqtSlot(str)
     def _show_active_pipette(self, key):
         """Reflect the interface's active pipette (e.g. revert a refused switch)."""
-        combo = self.active_pipette_combo
-        index = combo.findData(key)
-        if index >= 0 and index != combo.currentIndex():
-            combo.blockSignals(True)
-            combo.setCurrentIndex(index)
-            combo.blockSignals(False)
+        for button_key, button in self.pipette_buttons.items():
+            active = button_key == key
+            button.setChecked(active)
+            button.setStyleSheet(self._pipette_button_style(button_key, active))
 
     def tare_pipette(self):
         currPos = self.pipette_interface.calibrated_unit.unit.position()

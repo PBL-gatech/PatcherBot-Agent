@@ -111,7 +111,7 @@ class ManipulatorGui(CameraGui):
             painter.drawLine(int(c_x), c_y,
                              int(c_x + round(length_in_um*scaled_length)), c_y)
             if text:
-                painter.drawText(c_x, c_y - 10, '{}Âµm'.format(length_in_um))
+                painter.drawText(c_x, c_y - 10, '{}µm'.format(length_in_um))
             painter.end()
 
     def register_commands(self, manipulator_keys = True):
@@ -129,7 +129,7 @@ class ManipulatorGui(CameraGui):
                                                     '/'.join(QtGui.QKeySequence(mod).toString()
                                                                  if mod is not Qt.NoModifier else 'No modifier'
                                                              for mod in modifiers),
-                                                    'Move stage by ' + '/'.join(str(x) for x in distances) + ' Âµm')
+                                                    'Move stage by ' + '/'.join(str(x) for x in distances) + ' µm')
             self.help_window.register_custom_action('Manipulators', 'A/S/W/D',
                                                     'Move pipette by in x/y direction')
             self.help_window.register_custom_action('Manipulators', 'Q/E',
@@ -138,7 +138,7 @@ class ManipulatorGui(CameraGui):
                                                     '/'.join(QtGui.QKeySequence(mod).toString()
                                                                  if mod is not Qt.NoModifier else 'No modifier'
                                                              for mod in modifiers),
-                                                    'Move pipette by ' + '/'.join(str(x) for x in distances) + ' Âµm')
+                                                    'Move pipette by ' + '/'.join(str(x) for x in distances) + ' µm')
 
             for modifier, distance in zip(modifiers, distances):
                 self.register_key_action(Qt.Key_Up, modifier,
@@ -206,7 +206,7 @@ class ManipulatorGui(CameraGui):
         key_string = (QtGui.QKeySequence(Qt.Key_PageUp).toString() + '/' +
                       QtGui.QKeySequence(Qt.Key_PageDown).toString())
         self.help_window.register_custom_action('Microscope', key_string,
-                                                'Move microscope up/down by 10Âµm')
+                                                'Move microscope up/down by 10µm')
         self.register_key_action(Qt.Key_F, None,
                                  self.interface.set_floor)
         self.register_key_action(Qt.Key_G, None,
