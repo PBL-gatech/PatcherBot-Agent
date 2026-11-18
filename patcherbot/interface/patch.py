@@ -266,10 +266,7 @@ class AutoPatchInterface(TaskInterface):
         """Keep primary entries first and make both pools mutually exclusive."""
         retained = []
         for cell in self.cells_to_patch:
-            if any(self._same_cell_position(cell[0], existing[0]) for existing in retained):
-                if not any(cell[0] is existing[0] for existing in retained):
-                    self._invalidate_cell_reference(cell[0])
-            else:
+            if not any(self._same_cell_position(cell[0], existing[0]) for existing in retained):
                 retained.append(cell)
         removed = len(self.cells_to_patch) - len(retained)
         self.cells_to_patch[:] = retained
@@ -356,16 +353,12 @@ class AutoPatchInterface(TaskInterface):
                 self.warning('Selected cells are limited to 20; remaining cells stay proposed')
         elif action == 'demote' and source_name == 'selected':
             for cell in chosen:
-                self._invalidate_cell_reference(cell[0])
                 source[:] = [existing for existing in source if existing is not cell]
                 self._admit_cell(cell, 'proposed')
         elif action == 'delete':
             identities.update(id(cell) for cell in self.cells_to_patch + self.proposed_cells
                               if any(self._same_cell_position(cell[0], removed[0])
                                      for removed in chosen))
-            for cell in self.cells_to_patch + self.proposed_cells:
-                if id(cell) in identities:
-                    self._invalidate_cell_reference(cell[0])
             self.cells_to_patch[:] = [cell for cell in self.cells_to_patch if id(cell) not in identities]
             self.proposed_cells[:] = [cell for cell in self.proposed_cells if id(cell) not in identities]
         elif action in ('up', 'down'):
@@ -464,15 +457,9 @@ class AutoPatchInterface(TaskInterface):
             return
         self.execute(self.current_autopatcher.scan_stage.safe_move, argument=np.r_[position, 0.0])
 
-    def _invalidate_cell_reference(self, cell):
-        for phase in (self.current_autopatcher.approach_cell_phase,
-                      self.current_autopatcher.hunt_cell_phase):
-            phase.invalidate_cell_reference(cell)
-
     def remove_last_cell(self):
         if self.cells_to_patch:
             last_cell = self.cells_to_patch[-1]
-            self._invalidate_cell_reference(last_cell[0])
             self.info(
                 f"removing last cell {last_cell}... {self.is_selecting_cells}, at {self.cells_to_patch}"
             )
@@ -487,7 +474,6 @@ class AutoPatchInterface(TaskInterface):
         """Remove the first queued cell after escape or automatic cleanup."""
         if self.cells_to_patch:
             first_cell = self.cells_to_patch[0]
-            self._invalidate_cell_reference(first_cell[0])
             self.info(f"Removing first queued cell {first_cell}")
             self.cells_to_patch = self.cells_to_patch[1:]
             self.update_camera_cell_list()

@@ -1466,18 +1466,6 @@ class AutoPatcher(TaskController):
 
         self.calibrated_stage.set_max_speed(10000)
         self.calibrated_unit.set_max_speed(100000)
-        if self.alignment_phase is None:
-            unit = self.calibrated_unit
-            anchor = (getattr(unit, '_trusted_tip_reference', None)
-                      or (np.array([unit.camera.width / 2., unit.camera.height / 2.]), self.home_position, np.asarray(self.home_stage_position)[:2]))
-            evidence = self.observer.confirm_pipette(frame_context={
-                "pipette_expected_xy": lambda: unit.reference_position(anchor=anchor)[:2],
-                "pipette_xyz": unit.position, "stage_xy": self.calibrated_stage.position},
-                confirmation={"confidence_threshold": lambda: 0.5},
-                pipette_prefer_anchor=self.config.mode == "Adaptive")
-            if evidence.get("confirmed_tip_xy") is not None:
-                source = evidence["source_positions"]
-                unit.set_tip_reference(evidence["confirmed_tip_xy"], source["pipette_xyz"], source["stage_xy"])
         self.info("Located Cell")
         self.calibrated_unit.log_pipette_resistance("locate_cell", "after")
         self.success_requested = True

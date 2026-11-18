@@ -31,11 +31,6 @@ class ApproachCellPhase(PhaseController):
         self.completed_successfully = False
         self.cell = None
 
-    def invalidate_cell_reference(self, cell):
-        if self.cell is not None and self.cell[0] is cell:
-            self.completed_successfully = False
-            self.alignment_snapshot = self.cell_observation = self.pipette_observation = None
-
     def build_helpers(self):
         focus = self.stage.focusHelper
         tracker = Tracker(self.select_cell, min_area_px=self.min_area_px,
