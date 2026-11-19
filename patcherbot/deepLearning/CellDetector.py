@@ -301,6 +301,22 @@ class CellDetector2(CellDetector):
         except Exception as exc:
             logger.warning("%s inference failed: %s", self.model_type, exc)
             return []
+
+    def detect_cells_with_context(
+        self, img: np.ndarray, max_outputs: Optional[int] = None, *, include_boxes: bool = True
+    ) -> dict:
+        """Expose same-frame PIDNet foreground and geometry for box refinement.
+
+        Foreground logits remain on the detector device as raw FP32 values.
+        Unsupported detectors and inference errors are explicit to callers.
+        """
+        if self.model_type != "pidnet":
+            raise ValueError("Box refinement requires the PIDNet detector")
+        if img is None:
+            raise ValueError("A current image is required for detector context")
+        return self.adapter.predict_with_context(
+            img, max_outputs=max_outputs, include_boxes=include_boxes
+        )
     
 if __name__ == '__main__':
     # detector = CellDetectorYOLO1()

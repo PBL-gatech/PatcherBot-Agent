@@ -15,6 +15,7 @@ class Observer:
         self.observation_deque = deque(maxlen=maxlen)
         self.reference = None
         self.inference_image, self.inference_frame_number = None, None
+        self._cell_segmentors = {}
 
     def set_reference(self, cell):
         """Bind existing selection/calibration data; do not acquire or infer."""
@@ -128,9 +129,20 @@ class Observer:
         if image is None and detect:
             image = self.get_image()["image"]
         detections = None
+        segmenter_class = getattr(getattr(self.controller, 'config', None),
+                                  'cell_segmenter_class', 'CellSegmenter4')
+        if segmenter_class not in ('CellSegmentor1', 'CellSegmentor2', 'CellSegmenter4'):
+            raise ValueError(f'Unsupported cell segmenter class: {segmenter_class}')
+        use_refiner = include_masks and segmenter_class == 'CellSegmenter4'
+        context = None
+        detector = None
         if detect and image is not None:
-            detections = self.stage.cellDetectHelper._ensure_detector().detect_cells(
-                image.copy(), include_boxes=True)
+            detector = self.stage.cellDetectHelper._ensure_detector()
+            if use_refiner:
+                context = detector.detect_cells_with_context(image.copy(), include_boxes=True)
+                detections = context['detections']
+            else:
+                detections = detector.detect_cells(image.copy(), include_boxes=True)
             if select_detection is not None and detections is not None and len(detections):
                 selected = select_detection(dict(stage=stage, cell=dict(
                     cell_seed_points=[row[:2] for row in detections], cell_targets=detections)))
@@ -142,23 +154,42 @@ class Observer:
             boxes = [None] * len(points)  # Explicit seeds have no corresponding detector box.
         masks, centroids, targets = [], [], []
         if include_masks and points and image is not None:
-            helper = self.stage._ensure_cell_track_helper()
-            helper._prime_segmentor(image)  # Encode once; all prompts use this image.
-            for point, box in zip(points, boxes):
+            from importlib import import_module
+            from .CellTrackHelper import CellTrackHelper
+            cellSegmentor = import_module('patcherbot.deepLearning.cellSegmentor')
+            if segmenter_class not in self._cell_segmentors:
+                self._cell_segmentors[segmenter_class] = getattr(cellSegmentor, segmenter_class)(
+                    device=getattr(detector, 'device', None))
+            segmentor = self._cell_segmentors[segmenter_class]
+            compute_centroid = CellTrackHelper._compute_centroid
+            get_mask_target = segmentor.get_mask_target
+            refined_masks = None
+            if use_refiner:
+                if context is None or any(box is None for box in boxes):
+                    raise ValueError('Refiner masks require PIDNet boxes and context from the same frame')
+                refined_masks = segmentor.segment_boxes(image, np.asarray(boxes),
+                    foreground_logits=context['foreground_logits'],
+                    detector_geometry=context['detector_geometry'])
+            else:
+                segmentor.load_image(image=segmentor._prepare_for_segmentation(image))
+                segmentor.set_image()  # Encode once; all prompts use this image.
+            for index, (point, box) in enumerate(zip(points, boxes)):
                 try:
-                    if box is None:
-                        mask = helper.segmentor.single_prediction(
+                    if refined_masks is not None:
+                        mask = refined_masks[index]
+                    elif box is None:
+                        mask = segmentor.single_prediction(
                             np.asarray([point]), np.asarray([1]), multimask_output=False)
                     else:
-                        predicted, _ = helper.segmentor.predict_mask_box(
+                        predicted, _ = segmentor.predict_mask_box(
                             np.asarray(box), multimask_output=False)
                         mask = predicted[0]
                 except (ValueError, RuntimeError) as error:
                     self.controller.warning(f"Cell mask unavailable: {error}")
                     mask = None
                 masks.append(mask)
-                centroids.append(None if mask is None else helper._compute_centroid(mask))
-                target = (helper.segmentor.get_mask_target(mask) if include_interior_points
+                centroids.append(None if mask is None else compute_centroid(mask))
+                target = (get_mask_target(mask) if include_interior_points
                           else dict(mask=mask, target_points_xy=[]))
                 target.update(box_xyxy=box, seed_point_xy=point)
                 targets.append(target)

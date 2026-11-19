@@ -107,3 +107,6 @@ experiments/Datasets/temp_dataset.hdf5
 /tests/*
 !/tests/test_hunt_port.py
 !/tests/test_phase_port_integration.py
+# Keep the local box segmenter and its trained checkpoint portable.
+!/patcherbot/deepLearning/cellModel/cell_refiner_100k.pt
+!/tests/test_refiner_search_integration.py

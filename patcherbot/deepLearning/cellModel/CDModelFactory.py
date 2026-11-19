@@ -668,10 +668,24 @@ class _PIDNetAdapter:
         self.model.load_state_dict(checkpoint["ema"], strict=True)
         self.model.to(self.device).eval()
 
-    @torch.inference_mode()
     def predict(
         self, img: np.ndarray, max_outputs: Optional[int] = None, *, include_boxes: bool = False
     ) -> List[Tuple[int, int, float] | Tuple[int, int, float, Tuple[float, float, float, float]]]:
+        return self._predict(img, max_outputs=max_outputs, include_boxes=include_boxes)
+
+    def predict_with_context(
+        self, img: np.ndarray, max_outputs: Optional[int] = None, *, include_boxes: bool = True
+    ) -> dict:
+        """Return detections and raw on-device foreground from the same model pass."""
+        return self._predict(
+            img, max_outputs=max_outputs, include_boxes=include_boxes, include_context=True
+        )
+
+    @torch.inference_mode()
+    def _predict(
+        self, img: np.ndarray, max_outputs: Optional[int] = None, *,
+        include_boxes: bool = False, include_context: bool = False
+    ):
         tensor, meta = _SegFormerAdapter._prepare(img)
         tensor = tensor.unsqueeze(0).to(self.device)
         with torch.autocast(
@@ -730,6 +744,12 @@ class _PIDNetAdapter:
                 if include_boxes:
                     detection += (tuple(selected_boxes[index]),)
                 detections.append(detection)
+        if include_context:
+            return dict(
+                detections=detections,
+                foreground_logits=outputs["foreground"].detach().float(),
+                detector_geometry=meta.copy(),
+            )
         return detections
 
 

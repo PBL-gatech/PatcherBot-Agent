@@ -13,9 +13,11 @@ __all__ = [
     "PipetteFocuser",
     "CellSegmentor2",
     "CellSegmentor3",
+    "CellSegmenter4",
 ]
 
 if TYPE_CHECKING:
+    from .cellSegmentor import CellSegmenter4  # pragma: no cover
     from .cellSegmentor import CellSegmentor2  # pragma: no cover
     from .pipetteDetector import PipetteDetector, PipetteDetector1, PipetteDetector2, PipetteDetectorYOLO1  # pragma: no cover
     from .pipetteFocuser import PipetteFocuser  # pragma: no cover
@@ -37,6 +39,11 @@ def __getattr__(name: str):
 
         globals()["PipetteFocuser"] = PipetteFocuser
         return globals()[name]
+    if name == "CellSegmenter4":
+        from .cellSegmentor import CellSegmenter4
+
+        globals()["CellSegmenter4"] = CellSegmenter4
+        return CellSegmenter4
     if name in {"CellSegmentor2", "CellSegmentor3"}:
         from .cellSegmentor import CellSegmentor2
         globals().update({

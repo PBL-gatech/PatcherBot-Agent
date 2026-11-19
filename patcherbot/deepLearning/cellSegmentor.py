@@ -6,10 +6,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
+from torch import nn
+from torch.nn import functional as F
 
 # ================= BASE SEGMENTOR =================
 class BaseSegmentor(ABC):
-    """Common functionality for cell image segmentation across different SAM backends."""
+    """Shared image, device and target utilities; SAM prediction hooks are optional."""
 
     def __init__(self, device: str | None = None, cache_image_embeddings: bool = True):
         self.device = self._resolve_device(device)
@@ -35,35 +38,29 @@ class BaseSegmentor(ABC):
     def _load_model(self):
         ...
 
-    @abstractmethod
     def _prepare_inputs(self, input_point, input_label, input_box, multimask_output):
-        """Child class prepares model inputs (including any wrapping or embeddings)."""
-        ...
+        """Prepare inputs for backends that use the shared SAM prediction path."""
+        raise NotImplementedError("This backend does not implement SAM prompt prediction")
 
-    @abstractmethod
     def _forward(self, inputs, multimask_output):
         """Child class runs the model and returns (pred_masks, scores)."""
-        ...
+        raise NotImplementedError("This backend does not implement SAM prompt prediction")
 
-    @abstractmethod
     def _post_process(self, pred_masks: torch.Tensor, inputs: dict):
         """Child class converts raw model masks to image space."""
-        ...
+        raise NotImplementedError("This backend does not implement SAM mask postprocessing")
 
-    @abstractmethod
     def _normalize_masks(self, masks):
         """Child class normalizes masks to numpy arrays."""
-        ...
+        raise NotImplementedError("This backend does not implement SAM mask normalization")
 
-    @abstractmethod
     def _normalize_scores(self, iou_scores):
         """Child class normalizes scores to numpy arrays."""
-        ...
+        raise NotImplementedError("This backend does not implement SAM score normalization")
 
-    @abstractmethod
     def _cache_image_embeddings(self):
         """Child class optionally computes and stores image embeddings."""
-        ...
+        return None
 
     @staticmethod
     def _to_pil(rgb_image):
@@ -571,6 +568,278 @@ class CellSegmentor2(BaseSegmentor):
             return embeddings
         return None
 
+
+
+def _resize(value, size):
+    return F.interpolate(value, size=size, mode='bilinear', align_corners=False)
+
+
+class TinyBoxUNet(nn.Module):
+    """99,981-parameter crop U-Net; frozen detector pixels are explicit inputs.
+
+    Input channels are grayscale intensity, the predicted-box prompt and the
+    frozen PIDNet foreground probability. The output is one mask-logit plane;
+    SAM2 targets never enter this forward path.
+    """
+    def __init__(self):
+        super().__init__()
+        def block(in_channels, channels):
+            return nn.Sequential(nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
+                nn.GroupNorm(2, channels), nn.SiLU(),
+                nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+                nn.GroupNorm(2, channels), nn.SiLU())
+        self.encoders = nn.ModuleList([block(3,8), block(8,16), block(16,32), block(32,50)])
+        self.decoders = nn.ModuleList([block(82,32), block(48,16), block(24,8)])
+        self.mask = nn.Conv2d(8,1,1)
+        self.parameter_count = sum(value.numel() for value in self.parameters())
+
+    def forward(self, inputs):
+        if inputs.ndim != 4 or inputs.shape[1] != 3 or min(inputs.shape[-2:]) < 8:
+            raise ValueError('Refinement requires Bx3xHxW grayscale/box/foreground crops')
+        skips = []
+        value = inputs
+        for index, encoder in enumerate(self.encoders):
+            value = encoder(value if index == 0 else F.max_pool2d(value,2))
+            skips.append(value)
+        for decoder, skip in zip(self.decoders, reversed(skips[:-1])):
+            value = decoder(torch.cat((_resize(value,skip.shape[-2:]),skip),dim=1))
+        return self.mask(value)
+
+
+def prepare_refinement_tensors(image_bgr, boxes_xyxy, foreground_logits, geometry, *, device='cuda',
+                               crop_size=64, context=1.25, image_normalization='none'):
+    """Keep the native foreground cascade and sample all ROI inputs on one device.
+
+    Geometry uses the CPU reference's float64 floor/ceil equations. Bilinear ROI
+    coordinates clamp to each integer crop before sampling; prompt sampling uses
+    OpenCV INTER_NEAREST's floor indices, not bilinear coordinates.
+    """
+    import cv2
+    import numpy as np
+    image=np.asarray(image_bgr);boxes=np.asarray(boxes_xyxy,np.float64).reshape(-1,4)
+    if image.dtype!=np.uint8 or image.ndim not in (2,3) or (image.ndim==3 and image.shape[2]!=3):
+        raise ValueError('Expected native uint8 grayscale or BGR image')
+    height,width=image.shape[:2]
+    if min(height,width)<1 or not np.isfinite(boxes).all() or np.any(boxes[:,2:]<=boxes[:,:2]):
+        raise ValueError('Expected nonempty image and finite positive-area XYXY boxes')
+    if type(crop_size) is not int or crop_size<8 or not np.isfinite(context) or context<1:
+        raise ValueError('Positive crop size and context >=1 required')
+    if image_normalization not in ('none','local_zscore_clip3'):raise ValueError('Unsupported image normalization')
+    if (int(geometry['height']),int(geometry['width']))!=(height,width):raise ValueError('Detector/native geometry differs')
+    value=torch.as_tensor(foreground_logits,device=device).detach().float().reshape(1,1,*foreground_logits.shape[-2:])
+    value=F.interpolate(value.sigmoid(),size=(640,640),mode='bilinear',align_corners=False)
+    left,top=int(geometry['left']),int(geometry['top'])
+    rw,rh=round(width*geometry['scale_x']),round(height*geometry['scale_y'])
+    foreground=F.interpolate(value[:,:,top:top+rh,left:left+rw],size=(height,width),mode='bilinear',align_corners=False)[0,0]
+    centers=(boxes[:,:2]+boxes[:,2:])*.5;half=(boxes[:,2:]-boxes[:,:2])*context*.5
+    lower=np.maximum(0,np.minimum([width,height],np.floor(centers-half))).astype(np.int64)
+    upper=np.maximum(0,np.minimum([width,height],np.ceil(centers+half))).astype(np.int64)
+    crop_edges=np.concatenate((lower,upper),axis=1);ready=np.all(upper>lower,axis=1)
+    geometries=[dict(native_hw=[height,width],crop_xyxy=edge.tolist(),box_xyxy_native=box.tolist(),
+        status='ready' if permitted else 'outside_image',crop_size=crop_size,context=float(context))
+        for edge,box,permitted in zip(crop_edges,boxes,ready)]
+    if not len(boxes):return dict(inputs=torch.empty((0,3,crop_size,crop_size),device=device),geometries=geometries,foreground=foreground)
+    gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY) if image.ndim==3 else image
+    gray=torch.from_numpy(np.ascontiguousarray(gray)).to(device=device,non_blocking=True).float()/255.
+    packed=np.concatenate((crop_edges,boxes,ready[:,None]),axis=1)
+    packed=torch.from_numpy(packed).to(device=device,non_blocking=True)
+    edges=packed[:,:4].float()
+    sizes=(edges[:,2:]-edges[:,:2]).clamp_min(1)
+    offsets=torch.arange(crop_size,device=device,dtype=torch.float32)
+    local_x=((offsets[None,:]+.5)*sizes[:,0:1]/crop_size-.5).clamp_min(0)
+    local_y=((offsets[None,:]+.5)*sizes[:,1:2]/crop_size-.5).clamp_min(0)
+    xs=edges[:,0:1]+torch.minimum(local_x,sizes[:,0:1]-1)
+    ys=edges[:,1:2]+torch.minimum(local_y,sizes[:,1:2]-1)
+    gx=((2*xs+1)/width-1)[:,None,:].expand(-1,crop_size,-1)
+    gy=((2*ys+1)/height-1)[:,:,None].expand(-1,-1,crop_size)
+    grid=torch.stack((gx,gy),dim=-1).reshape(1,len(boxes)*crop_size,crop_size,2)
+    sampled=F.grid_sample(torch.stack((gray,foreground))[None],grid,mode='bilinear',padding_mode='border',align_corners=False)
+    sampled=sampled[0].reshape(2,len(boxes),crop_size,crop_size).permute(1,0,2,3)
+    raw=packed[:,4:8]
+    nearest_x=edges[:,0:1]+torch.floor(offsets[None,:]*sizes[:,0:1]/crop_size)+.5
+    nearest_y=edges[:,1:2]+torch.floor(offsets[None,:]*sizes[:,1:2]/crop_size)+.5
+    prompt=((nearest_x[:,None,:]>=raw[:,0,None,None])&(nearest_x[:,None,:]<raw[:,2,None,None])&
+            (nearest_y[:,:,None]>=raw[:,1,None,None])&(nearest_y[:,:,None]<raw[:,3,None,None])).float()
+    inputs=torch.stack((sampled[:,0],prompt,sampled[:,1]),dim=1)
+    if image_normalization=='local_zscore_clip3':
+        plane=inputs[:,0];mean=plane.mean((-2,-1),keepdim=True);std=plane.std((-2,-1),unbiased=False,keepdim=True).clamp_min(1/255)
+        inputs[:,0]=((plane-mean)/std).clamp(-3,3)/6+.5
+    inputs*=packed[:,8].float()[:,None,None,None]
+    return dict(inputs=inputs,geometries=geometries,foreground=foreground)
+
+
+def _reconstruct_refinement_tensors(probabilities, foreground, geometries):
+    """Shared native reconstruction for eager and captured unchanged-head paths."""
+    union=torch.zeros_like(foreground)
+    for value,geometry in zip(probabilities,geometries):
+        if geometry['status']!='ready':continue
+        x1,y1,x2,y2=geometry['crop_xyxy']
+        restored=F.interpolate(value[None],size=(y2-y1,x2-x1),mode='bilinear',align_corners=False)[0,0]
+        union[y1:y2,x1:x2]=torch.maximum(union[y1:y2,x1:x2],restored)
+    return dict(probabilities=probabilities,geometries=geometries,foreground=foreground,mask_probability=union)
+
+
+class CudaBoxRefinementRuntime:
+    """Opt-in runtime: same outputs, GPU crops and padded32 captured head.
+
+    Each crop is independent (GroupNorm), so zero padding leaves real outputs
+    unchanged. More than32 boxes retain the eager, chunked all-box path. The
+    first nonempty CUDA call includes graph warmup/capture and is not a warm call.
+    """
+    def __init__(self, head, *, crop_size=64, context=1.25, image_normalization='none', batch_size=128):
+        self.head=head;self.crop_size=crop_size;self.context=context
+        self.image_normalization=image_normalization;self.batch_size=batch_size
+        self.device=next(head.parameters()).device
+        self._head_graph=None;self._head_input=None;self._head_output=None
+
+    def _probabilities(self, inputs):
+        count=len(inputs)
+        if not count:return inputs.new_empty((0,1,*inputs.shape[-2:]))
+        if self.device.type!='cuda' or count>32 or self.batch_size<32:
+            return torch.cat([self.head(batch).sigmoid() for batch in inputs.split(self.batch_size)])
+        if self._head_graph is None:
+            self._head_input=inputs.new_zeros((32,*inputs.shape[1:]))
+            current=torch.cuda.current_stream(self.device);stream=torch.cuda.Stream(device=self.device)
+            stream.wait_stream(current)
+            with torch.cuda.stream(stream):
+                for _ in range(3):self.head(self._head_input).sigmoid()
+            current.wait_stream(stream)
+            self._head_graph=torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._head_graph,stream=stream):
+                self._head_output=self.head(self._head_input).sigmoid()
+            current.wait_stream(stream)
+        self._head_input.zero_();self._head_input[:count].copy_(inputs)
+        self._head_graph.replay()
+        return self._head_output[:count]
+
+    def __call__(self, image_bgr, boxes, foreground_logits, detector_geometry):
+        with torch.inference_mode():
+            prepared=prepare_refinement_tensors(image_bgr,boxes,foreground_logits,detector_geometry,device=self.device,
+                crop_size=self.crop_size,context=self.context,image_normalization=self.image_normalization)
+            probabilities=self._probabilities(prepared['inputs'])
+            result=_reconstruct_refinement_tensors(probabilities,prepared['foreground'],prepared['geometries'])
+            if self.device.type!='cuda':
+                return {name:value if name=='geometries' else value.float().cpu().numpy() for name,value in result.items()}
+            names=[name for name in result if name!='geometries']
+            packed=torch.cat([result[name].float().reshape(-1) for name in names])
+            host=torch.empty(packed.shape,dtype=torch.float32,device='cpu',pin_memory=True)
+            host.copy_(packed,non_blocking=True)
+            torch.cuda.current_stream(self.device).synchronize()
+            array=host.numpy();offset=0;materialized={'geometries':result['geometries']}
+            for name in names:
+                value=result[name];count=value.numel()
+                materialized[name]=array[offset:offset+count].reshape(tuple(value.shape));offset+=count
+            return materialized
+
+class BoxRefiner:
+    """Load one local trained head; every segmentation call needs explicit PID inputs."""
+    def __init__(self, checkpoint, device='cuda'):
+        path=Path(checkpoint).expanduser().resolve()
+        if not path.is_file():raise FileNotFoundError(path)
+        requested=torch.device(device)
+        if requested.type not in ('cpu','cuda'):raise ValueError('Choose cpu or cuda explicitly')
+        if requested.type=='cuda' and (not torch.cuda.is_available() or
+                (requested.index is not None and requested.index>=torch.cuda.device_count())):
+            raise ValueError('Requested CUDA device is unavailable')
+        payload=torch.load(path,map_location='cpu',weights_only=True)
+        metadata=payload.get('metadata',{}) if isinstance(payload,dict) else {}
+        if metadata.get('schema')!='pidnet_box_refinement_v1' or metadata.get('parameter_count')!=99981:
+            raise ValueError('Expected the trained99,981-parameter box-refinement checkpoint')
+        if metadata.get('input_channels')!=['grayscale_0_1','box_prompt','pidnet_foreground_probability']:
+            raise ValueError('Checkpoint image/box/PID foreground input contract differs')
+        if metadata.get('crop_size')!=64 or metadata.get('context')!=1.25 or metadata.get('image_normalization','none')!='none':
+            raise ValueError('Checkpoint crop or normalization contract differs')
+        with torch.random.fork_rng(devices=[]):self.head=TinyBoxUNet()
+        self.head.load_state_dict(payload['state_dict'],strict=True)
+        self.head=self.head.to(requested).eval().requires_grad_(False)
+        self.metadata=metadata;self.device=next(self.head.parameters()).device
+        self.runtime=CudaBoxRefinementRuntime(self.head,crop_size=64,context=1.25,image_normalization='none')
+
+    def segment(self, image_bgr, boxes_xyxy_native, *, foreground_logits, detector_geometry):
+        if image_bgr is None or boxes_xyxy_native is None or foreground_logits is None or detector_geometry is None:
+            raise ValueError('image, boxes, PID foreground_logits and detector_geometry are all required')
+        image=np.asarray(image_bgr)
+        if image.dtype!=np.uint8 or image.ndim not in (2,3) or (image.ndim==3 and image.shape[2]!=3):
+            raise ValueError('image_bgr must be a native uint8 grayscale or BGR frame')
+        height,width=image.shape[:2]
+        if min(height,width)<1:raise ValueError('image_bgr must not be empty')
+        boxes=np.asarray(boxes_xyxy_native)
+        if boxes.ndim!=2 or boxes.shape[1]!=4 or boxes.dtype.kind not in 'iuf':
+            raise ValueError('boxes_xyxy_native must be an Nx4 numeric XYXY array; point prompts are unsupported')
+        if not np.isfinite(boxes).all() or np.any(boxes[:,2:]<=boxes[:,:2]):
+            raise ValueError('Boxes must be finite with positive XYXY area')
+        if not isinstance(detector_geometry,dict):raise ValueError('detector_geometry must be a letterbox geometry dictionary')
+        keys=('height','width','left','top','scale_x','scale_y')
+        try:values=np.array([detector_geometry[k] for k in keys],np.float64)
+        except (KeyError,TypeError,ValueError) as error:raise ValueError('Missing or invalid PID letterbox geometry') from error
+        if not np.isfinite(values).all() or tuple(values[:2])!=(height,width):
+            raise ValueError('PID geometry must match the current native image dimensions')
+        left,top,sx,sy=values[2:];rw,rh=round(width*sx),round(height*sy)
+        if left!=int(left) or top!=int(top) or min(left,top)<0 or min(sx,sy)<=0 or min(rw,rh)<1 or left+rw>640 or top+rh>640:
+            raise ValueError('PID geometry must describe valid640-pixel letterbox content')
+        if not isinstance(foreground_logits,torch.Tensor) or foreground_logits.dtype!=torch.float32:
+            raise ValueError('foreground_logits must be the raw FP32 PID tensor, not a probability mask')
+        if foreground_logits.device!=self.device:
+            raise ValueError('PID foreground_logits must already be on the segmenter device')
+        if tuple(foreground_logits.shape) not in ((160,160),(1,160,160),(1,1,160,160)):
+            raise ValueError('Expected one raw160x160 PID foreground-logit plane')
+        if not bool(torch.isfinite(foreground_logits).all()):raise ValueError('PID foreground_logits must be finite')
+        result=self.runtime(image,boxes,foreground_logits,detector_geometry)
+        result['masks']=result['probabilities'][:,0]>=.5
+        return result
+
+
+class CellSegmenter4(BaseSegmentor):
+    """Produce crop outputs or native per-cell masks from same-frame PIDNet inputs."""
+
+    def __init__(self, checkpoint=None, device="cuda"):
+        self.checkpoint = (Path(__file__).resolve().parent / "cellModel" / "cell_refiner_100k.pt"
+                           if checkpoint is None else checkpoint)
+        super().__init__(device=device, cache_image_embeddings=False)
+
+    def _load_model(self):
+        self._refiner = BoxRefiner(self.checkpoint, device=self.device)
+        self.model = self._refiner.head
+
+    def _require_ready(self):
+        if self.model is None:
+            raise RuntimeError("Box-refinement model has not been loaded")
+
+    def segment(self, image_bgr, boxes_xyxy_native, *, foreground_logits, detector_geometry):
+        return self._refiner.segment(image_bgr, boxes_xyxy_native,
+            foreground_logits=foreground_logits, detector_geometry=detector_geometry)
+
+    @torch.inference_mode()
+    def segment_boxes(self, image, boxes, *, foreground_logits, detector_geometry):
+        """Return native bool masks in box order, thresholding after resizing.
+
+        Restore each crop's probabilities independently so overlapping cells
+        keep separate masks. Outside-image boxes produce empty native masks.
+        """
+        boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
+        result = self.segment(image, boxes,
+            foreground_logits=foreground_logits, detector_geometry=detector_geometry)
+        height, width = np.asarray(image).shape[:2]
+        probabilities = result["probabilities"]
+        geometries = result["geometries"]
+        if len(probabilities) != len(geometries) or len(geometries) != len(boxes):
+            raise ValueError("Segmenter outputs must preserve detector box order")
+        masks = []
+        for probability, geometry in zip(probabilities, geometries):
+            if tuple(geometry["native_hw"]) != (height, width):
+                raise ValueError("Segmenter geometry differs from the current image")
+            mask = np.zeros((height, width), dtype=bool)
+            if geometry["status"] == "ready":
+                x1, y1, x2, y2 = geometry["crop_xyxy"]
+                if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                    raise ValueError("Segmenter crop lies outside the native image")
+                value = torch.as_tensor(probability, dtype=torch.float32)
+                restored = torch.nn.functional.interpolate(
+                    value[None], size=(y2-y1, x2-x1), mode="bilinear",
+                    align_corners=False)[0, 0]
+                mask[y1:y2, x1:x2] = (restored >= .5).cpu().numpy()
+            masks.append(mask)
+        return masks
 
 
 import sys, time
