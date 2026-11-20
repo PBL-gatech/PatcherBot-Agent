@@ -185,7 +185,7 @@ class CellTrackHelper:
 
 
     @staticmethod
-    def fuse_candidates(stage, candidates, expected_xy, template_xy=None, previous_xy=None):
+    def fuse_candidates(stage, candidates, expected_xy, template_xy=None, previous_xy=None, *, expected_weight=0.35):
         """Select a detected soma and combine spatially supported XY estimates.
 
         Reliability weights are heuristics, not calibrated probabilities. The
@@ -201,7 +201,7 @@ class CellTrackHelper:
             except (TypeError, ValueError):
                 return 0.0
 
-        references = [(expected_xy, 0.35)]
+        references = [(expected_xy, expected_weight)]
         if template_xy is not None:
             references.append((template_xy, 1.0))
 

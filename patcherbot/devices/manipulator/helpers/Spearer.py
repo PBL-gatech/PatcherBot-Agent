@@ -16,6 +16,11 @@ class Spearer:
             raise ValueError("Spear needs a finite target and positive speed")
         motion = None
         read_z = lambda: float(self.unit.position()[2])
+        seen_frames = set()
+        missed_detections = 0
+        last_good_z = loss_origin_z = None
+        max_misses = max(1, int(getattr(phase.config, "track_max_missed_detections", 3)))
+        max_unseen_travel = float(getattr(phase.config, "track_max_unseen_travel_um", 3.0))
         try:
             while phase.motion_checkpoint():
                 if motion is not None and self.actions.is_complete(motion):
@@ -29,9 +34,27 @@ class Spearer:
                 z = read_z()
                 if z >= target_z - self.DEPTH_TOLERANCE_UM:
                     return observation
-                if tracker is not None:
-                    tracker.update(observation)
-                    if tracker.lost and not tracker.using_fallback:
+                if tracker is not None and not getattr(phase, "search_disabled", False):
+                    frame = observation.get("image", {}).get("frame_number")
+                    fresh = frame is not None and frame not in seen_frames
+                    if fresh:
+                        seen_frames.add(frame)
+                        tracker.update(observation)
+                        if not tracker.lost:
+                            missed_detections = 0
+                            last_good_z, loss_origin_z = z, None
+                        else:
+                            missed_detections += 1
+                            if loss_origin_z is None:
+                                loss_origin_z = z if last_good_z is None else last_good_z
+                    elif loss_origin_z is None:
+                        # A repeated/missing frame supplies no new detection evidence.
+                        loss_origin_z = z if last_good_z is None else last_good_z
+                    unseen_travel = 0.0 if loss_origin_z is None else abs(z - loss_origin_z)
+                    if missed_detections >= max_misses or unseen_travel >= max_unseen_travel:
+                        phase.controller.warning(
+                            f"Spear cell tracking lost: consecutive_fresh_misses={missed_detections}/{max_misses}; "
+                            f"unseen_travel_um={unseen_travel:.3f}/{max_unseen_travel:g}; reacquiring cell")
                         return "cell_lost"
                 if motion is None:
                     phase.controller.info(f"Spear: start_z={z:.2f}, target_z={target_z:.2f} um, speed={speed:g} um/s")

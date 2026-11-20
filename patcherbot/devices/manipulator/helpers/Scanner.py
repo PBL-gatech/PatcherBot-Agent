@@ -3,6 +3,7 @@ import time
 from collections import deque
 from contextlib import ExitStack
 from copy import deepcopy
+from inspect import Parameter, signature
 from tempfile import TemporaryFile
 
 import numpy as np
@@ -14,11 +15,19 @@ class FocusCaptureIncomplete(RuntimeError):
     """Some frames could not be captured, so the scan result is incomplete."""
 
 
+def capture_checkpoint(phase):
+    """Reject queued inference and results as soon as the phase stops."""
+    if any(getattr(phase, name, False) for name in
+           ('finished', 'failed', 'awaiting_operator', 'interrupted')):
+        return False
+    return phase.motion_checkpoint()
+
+
 def position_focus(focus, phase, target_z):
     """Position at locate speed without running inference."""
     if not math.isfinite(target_z):
         raise ValueError('Focus position must be finite')
-    if not phase.motion_checkpoint():
+    if not capture_checkpoint(phase):
         return False
     if not phase.action_gate():
         if phase.interrupted:
@@ -26,7 +35,7 @@ def position_focus(focus, phase, target_z):
         raise RuntimeError('Focus positioning is not permitted')
     focus.microscope.set_max_speed(phase.config.max_locate_speed)
     focus.relocate(float(target_z))
-    return phase.motion_checkpoint()
+    return capture_checkpoint(phase)
 
 
 def _focus_position_at(samples, timestamp):
@@ -42,9 +51,12 @@ def _focus_position_at(samples, timestamp):
     return first_z + (timestamp - first_time) / (next_time - first_time) * (next_z - first_z)
 
 
-def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, calculate, label):
+def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, calculate, label,
+                         *, frame_stride=1):
     """Collect distinct published frames during motion and score them in order afterward."""
     low, high = bounds
+    if not isinstance(frame_stride, int) or frame_stride < 1:
+        raise ValueError('Frame stride must be a positive integer')
     if not all(math.isfinite(value) for value in (low, high, speed)) or low > high or speed <= 0:
         raise ValueError(f'{label} needs finite ordered bounds and positive speed')
     scale = focus._distance_scale()
@@ -118,7 +130,7 @@ def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, c
             reversal_tolerance=FocusHelper.BOUNDARY_TOLERANCE_UM, reversal_slack=1e-6)
         try:
             while not motion_device.is_complete(motion):
-                if not phase.motion_checkpoint():
+                if not capture_checkpoint(phase):
                     return None
                 if not phase.action_gate():
                     if phase.interrupted:
@@ -136,7 +148,7 @@ def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, c
 
         # Publication can trail retrieval by a frame interval at the endpoint.
         deadline = ended_at + 0.25
-        while phase.motion_checkpoint() and not collect_frame(ended_at):
+        while capture_checkpoint(phase) and not collect_frame(ended_at):
             if time.monotonic() >= deadline:
                 break
             phase.controller.sleep(0.002)
@@ -145,10 +157,20 @@ def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, c
             phase.controller.warning(f'{label} sweep observed {missed_frames} frame ID gaps and '
                                      f'{unpaired_frames} frames without matching timing; '
                                      f'{len(frames)} timed in-range frames available')
+        if not capture_checkpoint(phase):
+            return None
+        captured_count = len(frames)
+        if frame_stride > 1:
+            frames = deque(entry for index, entry in enumerate(frames)
+                           if index % frame_stride == 0 or index == captured_count - 1)
+            phase.controller.info(f'{label} selecting {len(frames)} of {captured_count} captured frames '
+                                  f'with stride={frame_stride}; retaining both endpoints')
         frame_count = len(frames)
         phase.controller.info(f'{label} sweep score analysis started ({frame_count} frames)')
         scoring_started = time.monotonic()
-        while frames and phase.motion_checkpoint():
+        while frames:
+            if not capture_checkpoint(phase):
+                return None
             frame, pose, offset = frames.popleft()
             phase.controller.info(f'{label} scoring {frame_count - len(frames)}/{frame_count}: frame={frame[0]}')
             if offset is not None:
@@ -158,9 +180,11 @@ def sweep_captured_focus(focus, motion_device, phase, bounds, speed, snapshot, c
                 except (OSError, EOFError, ValueError) as error:
                     raise FocusCaptureIncomplete(f'{label} could not read captured frames: {error}') from error
             calculate(frame, pose)
+            if not capture_checkpoint(phase):
+                return None
         if not frames:
             phase.controller.info(f'{label} sweep score analysis finished ({time.monotonic() - scoring_started:.2f} s)')
-        return end_z if phase.motion_checkpoint() else None
+        return end_z if capture_checkpoint(phase) else None
 
 
 class Scanner:
@@ -233,6 +257,14 @@ class Scanner:
         unit = phase.controller.calibrated_unit
         radius_um = unit.config.pipette_detection_radius_um
         detector = unit.pipetteCalHelper.pipetteDetector
+        detect = detector.detect_pipette_details
+        try:
+            parameters = signature(detect).parameters
+            guided = (any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
+                      or all(name in parameters and parameters[name].kind != Parameter.POSITIONAL_ONLY
+                             for name in ('expected_tip_xy', 'pixels_to_um', 'radius_um', 'prefer_anchor')))
+        except (TypeError, ValueError):
+            guided = False
         observer = phase.controller.observer
         expected_z = float(phase.pipette_z)
 
@@ -246,9 +278,16 @@ class Scanner:
             return stage_data, pipette
 
         def consider(frame, pose):
+            if not capture_checkpoint(phase):
+                return
             number, frame_time, image = frame
             stage_data, pipette = pose
-            detection = detector.detect_pipette_details(image.copy())
+            options = (dict(expected_tip_xy=pipette['pixel_position'],
+                            pixels_to_um=stage.pixels_to_um_relative,
+                            radius_um=radius_um, prefer_anchor=True) if guided else {})
+            detection = detect(image.copy(), **options)
+            if not capture_checkpoint(phase):
+                return
             pipette['pipette_detection'] = detection
             timestamp = round(frame_time, 3)
             observation = dict(time=timestamp,
@@ -256,6 +295,8 @@ class Scanner:
                            width=image.shape[1], height=image.shape[0]),
                 stage=stage_data, pipette=pipette)
             self.calculate(observation, stage=stage, radius_um=radius_um)
+            if not capture_checkpoint(phase):
+                return
             phase.publish_alignment_snapshot(observation)
             detection = detection or {}
             z = stage_data['raw_position'][2]
@@ -265,12 +306,17 @@ class Scanner:
 
         try:
             end_z = sweep_captured_focus(self.focus, self.actions, phase, bounds, speed,
-                                         snapshot, consider, 'Scan')
+                                         snapshot, consider, 'Scan',
+                                         frame_stride=max(1, int(getattr(phase.config, 'scan_frame_stride', 2))))
         except FocusCaptureIncomplete as error:
             self.clear_current_scan()
             phase.controller.warning(f'{error}; using calibrated fallback')
             return 'not_found'
+        except Exception:
+            self.clear_current_scan()
+            raise
         if end_z is None:
+            self.clear_current_scan()
             return None
 
         def rank(observation):
@@ -291,10 +337,14 @@ class Scanner:
         winner_z = winner['stage']['raw_position'][2]
         restored = self.move_to(phase, winner_z, speed)
         if restored is None:
+            self.clear_current_scan()
             return None
         settled_z = restored['stage']['raw_position'][2]
         detection = winner['pipette']['pipette_detection']
         frame = winner['image']
+        if not capture_checkpoint(phase):
+            self.clear_current_scan()
+            return None
         phase.publish_alignment_snapshot(winner)
         phase.controller.info(f'Scan ended at z={end_z:.3f} um, winner_z={winner_z:.3f} um, '
                               f'winner_frame={frame["frame_number"]}, frame_time_s={frame["time"]}, '

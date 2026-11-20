@@ -1,5 +1,6 @@
 import math
 import time
+from copy import deepcopy
 import numpy as np
 
 
@@ -29,6 +30,13 @@ class Tracker:
         self.last_frame = self.last_frame_time = None
         self.mask_reference = None
         self.largest_area_px = 0
+
+    def copy_state_from(self, other):
+        """Carry reliable tracking history into a new phase without its callbacks or policy."""
+        for name in ('area_px', 'original_area_px', 'target_points_xy', 'lost',
+                     'using_fallback', 'last_cell_reference_xy', 'last_cell_frame_time',
+                     'last_frame', 'last_frame_time', 'mask_reference', 'largest_area_px'):
+            setattr(self, name, deepcopy(getattr(other, name)))
 
     def set_reference_mask(self, observation, *, area_px=None):
         """Bind the first completed Search winner's area for this attempt."""

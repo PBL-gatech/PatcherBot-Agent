@@ -24,10 +24,16 @@ class PatchConfig(Config):
     search_speed = NumberWithUnit(100, bounds=(0, 10000), doc='Microscope Search/Scan speed for Adaptive Approach and Hunt', unit='\u03bcm/s')
     search_z_radius_um = NumberWithUnit(5, bounds=(0.1, 1000), unit='\u03bcm',
         doc='Search distance above and below the estimated cell plane in Adaptive Approach and Hunt; Hunt reacquisition uses measured travel plus hunt_search_margin')
+    final_search_z_radius_um = NumberWithUnit(10, bounds=(0.1, 1000), unit='\u03bcm',
+        doc='Detector-only focus range on each side of the last cell plane when Approach finishes with the cell missing')
+    final_search_xy_radius_um = NumberWithUnit(5, bounds=(3, 5), unit='\u03bcm',
+        doc='Planar cell-identity radius for Approach and Hunt cell shifts, and the Approach endpoint search and confirmation')
     search_xy_radius_um = NumberWithUnit(25, bounds=(0.1, 1000), unit='\u03bcm',
         doc='Cell matching radius during Search in Adaptive Approach and Hunt; post-Spear Hunt reacquisition retains its 7 um limit')
     scan_z_radius_um = NumberWithUnit(5, bounds=(0.1, 1000), unit='\u03bcm',
         doc='Scan distance above and below the estimated pipette plane in Adaptive Approach and Hunt')
+    scan_frame_stride = Number(2, bounds=(1, 100),
+        doc='Score every Nth pipette Scan frame; first and last frames are always retained (whole number)')
     scan_confirm_defocus_um = NumberWithUnit(0.5, bounds=(0.01, 100), unit='\u03bcm',
         doc='Maximum absolute predicted defocus on each settled Adaptive pipette Scan confirmation frame')
     x1_focus_mode = Selector(default='Anchor', objects=['Anchor', 'Fixed'],
@@ -70,6 +76,10 @@ class PatchConfig(Config):
         doc='Minimum tracked area as a fraction of the original reliable cell mask from the first successful Search')
     tracking_mode = Selector(default='fast', objects=['fast', 'cellbody', 'hybrid'], doc='Cell tracking strategy during approach')
     track_max_fast_jump_px = Number(80, bounds=(1, 10000), doc='Maximum accepted fast-tracking jump in pixels')
+    track_max_missed_detections = Number(3, bounds=(1, 1000),
+        doc='Consecutive distinct-frame cell detection misses before stopping Spear for reacquisition (whole number)')
+    track_max_unseen_travel_um = NumberWithUnit(3, bounds=(0.1, 1000), unit='\u03bcm',
+        doc='Maximum Spear travel from the last valid cell detection while the cell remains missing')
     
     max_R_increase = NumberWithUnit(1e6, bounds=(0, 500e6), doc='Increase in resistance over time', unit='MΩ', magnitude=1e6)
     cell_R_increase = Number(0.300, bounds=(0, 1), doc='Cell detection resistance limit') # in MOhm
@@ -104,10 +114,12 @@ class PatchConfig(Config):
         ('Cell Selection', ['cell_duplicate_radius_um', 'cell_duplicate_z_tolerance_um']),
         ('Approach', ['min_R', 'max_R', 'pressure_near', 'cell_distance', 'slice_start_distance',
                       'max_locate_speed', 'search_speed', 'search_z_radius_um', 'search_xy_radius_um',
-                      'scan_z_radius_um', 'scan_confirm_defocus_um', 'approach_cell_max_shift', 'approach_pipette_speed',
+                      'final_search_z_radius_um', 'final_search_xy_radius_um',
+                      'scan_z_radius_um', 'scan_frame_stride', 'scan_confirm_defocus_um', 'approach_cell_max_shift', 'approach_pipette_speed',
                       'max_clearing_speed', 'use_centroid', 'cell_shift_fusion', 'track_cell',
                       'vision_half_life_s', 'cell_mask_min_area_fraction', 'cell_segmenter_class',
-                      'tracking_mode', 'track_max_fast_jump_px']),
+                      'tracking_mode', 'track_max_fast_jump_px', 'track_max_missed_detections',
+                      'track_max_unseen_travel_um']),
         ('Hunt', ['max_distance', 'max_descent_speed', 'cell_R_increase', 'hunt_search_margin', 'hunt_timeout',
                   'hunt_progress_cycles', 'hunt_min_progress_percent', 'hunt_limit_target_radius',
                   'hunt_target_radius', 'hunt_contact_distance', 'hunt_contact_plane_tolerance_um',

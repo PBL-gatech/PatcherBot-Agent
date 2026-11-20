@@ -53,6 +53,9 @@ class ApproachCellPhase(PhaseController):
                 while True:
                     self.failure_gate()
                     self.success_gate()
+                    if self.finished or self.awaiting_operator:
+                        self.controller.sleep(0.04)
+                        continue
                     if self.mode == "Adaptive" and self.initialized:
                         self.observe()
                         self.calculate()
@@ -74,8 +77,19 @@ class ApproachCellPhase(PhaseController):
             "cell_mask_min_area_fraction", "vision_half_life_s")})
         self.config.x1_focus_mode = getattr(self.controller.config, 'x1_focus_mode', 'Anchor')
         self.config.x1_focus_score_threshold = getattr(self.controller.config, 'x1_focus_score_threshold', 0.5)
+        self.config.scan_frame_stride = getattr(self.controller.config, 'scan_frame_stride', 2)
+        self.config.final_search_z_radius_um = getattr(self.controller.config, 'final_search_z_radius_um', 10.)
+        self.config.final_search_xy_radius_um = getattr(self.controller.config, 'final_search_xy_radius_um', 5.)
+        self.config.track_max_missed_detections = getattr(self.controller.config, 'track_max_missed_detections', 3)
+        self.config.track_max_unseen_travel_um = getattr(self.controller.config, 'track_max_unseen_travel_um', 3.0)
+        self.config.cell_shift_fusion = getattr(self.controller.config, 'cell_shift_fusion', True)
         self.initialized = False
         self.recovering_cell = False
+        self.recovery_attempted = False
+        self.recovery_target_z = None
+        self.visual_fallback = False
+        self.final_search_reference_xy = None
+        self.endpoint_wide_attempted = False
         self.interrupted = False
         if self.mode not in ("Manual", "Classic", "Adaptive", "Agent", "Training"):
             raise AutopatchError(f"Unsupported Approach mode: {self.mode}")
@@ -93,6 +107,8 @@ class ApproachCellPhase(PhaseController):
             self.pipette_anchor = tuple(np.array(value, dtype=float, copy=True) for value in anchor)
         self.initial_observation = None
         self.cell_observation = self.pipette_observation = None
+        self.cell_search_motor_z = None
+        self.calibration_observation = None
         self.operation = self._start
         self.next_action = None
         self.observation = self.alignment_snapshot = None
@@ -104,21 +120,24 @@ class ApproachCellPhase(PhaseController):
             self.build_helpers()  # Fresh per-attempt state; shared models are reused.
 
     def project_pipette_tip(self, anchor, position):
-        """The tissue stage can move under a stationary pipette on this rig."""
+        """Use the existing calibrated unit and stage anchor transform."""
         delta = np.asarray(position) - anchor[1]
-        return np.asarray(anchor[0])[:2] + self.unit.um_to_pixels_relative(delta)[:2]
+        stage_delta = np.asarray(self.stage.position())[:2] - np.asarray(anchor[2])[:2]
+        return (np.asarray(anchor[0])[:2] + self.unit.um_to_pixels_relative(delta)[:2]
+                + self.stage.um_to_pixels_relative(stage_delta)[:2])
 
     def observe(self, **kwargs):
         anchor = self.pipette_anchor
-        if anchor is not None:
-            # The unit's general reference transform adds stage motion since the anchor.
-            # Use the current tissue-stage origin for a tip fixed to the camera frame.
-            anchor = (anchor[0], anchor[1], self.stage.position()[:2])
         options = dict(cell_inference=True, pipette_inference=True, cached_ephys=True,
             pipette_anchor=anchor,
             cell_masks=(self.searcher.searching or self.operation == self.search or
                 (self.operation == self.spear and self.config.track_cell)))
         options.update(kwargs)
+        if getattr(self, 'visual_fallback', False):
+            final_look = self.speared and self.operation == self.search
+            options['cell_inference'] = final_look and kwargs.get('cell_inference', False)
+            options['cell_masks'] = (final_look and self.final_search_reference_xy is not None
+                                     and kwargs.get('cell_masks', False))
         self.observation = super().observe(**options)
         if self.initial_observation is None:
             self.initial_observation = deepcopy(self.observation)
@@ -135,7 +154,10 @@ class ApproachCellPhase(PhaseController):
         searcher = self.searcher
         tracker = searcher.tracker
         radius = self.config.search_xy_radius_um
+        if getattr(self, "operation", None) == getattr(self, "spear", object()):
+            radius = min(radius, 7.0)
         local_xy = None
+        local_radius = 7.0
         if searcher.searching and getattr(self, "search_bounds", None) is not None:
             # Hunt's post-Spear search also follows the cell seen at descent start.
             if getattr(self.config, "hunt_limit_target_radius", True):
@@ -146,16 +168,21 @@ class ApproachCellPhase(PhaseController):
         elif (hasattr(self, "search_bounds") and not searcher.searching and self.operation != self.search
               and getattr(self.config, "hunt_limit_target_radius", False)):
             radius = min(radius, self.config.hunt_target_radius)
-        if not searcher.searching and tracker.last_cell_reference_xy is not None:
+        if tracker.last_cell_reference_xy is not None:
             projected = tracker.position(observation, self.cell[0])
             expected = expected + tracker.age_weight(tracker.last_cell_frame_time) * (projected - expected)
+        if getattr(self, 'speared', False) and self.phase_name == 'Approach':
+            radius = self.config.final_search_xy_radius_um
+        if getattr(self, 'final_search_reference_xy', None) is not None:
+            local_xy, local_radius = expected, radius
+            expected = np.asarray(observation['stage']['pixel_position']) - self.final_search_reference_xy
         candidates = []
         for index, (point, target) in enumerate(zip(cell["cell_seed_points"], cell["cell_targets"])):
             point = np.asarray(point, dtype=float)
             if point.shape != (2,) or not np.isfinite(point).all():
                 continue
             if local_xy is not None and np.linalg.norm(
-                    self.stage.pixels_to_um_relative(np.r_[point - local_xy, 0.0])[:2]) > 7.0:
+                    self.stage.pixels_to_um_relative(np.r_[point - local_xy, 0.0])[:2]) > local_radius:
                 continue
             distance = np.linalg.norm(self.stage.pixels_to_um_relative(np.r_[point - expected, 0.0])[:2])
             if distance <= radius and (
@@ -165,9 +192,29 @@ class ApproachCellPhase(PhaseController):
         return min(candidates, key=lambda row: row[:2])[2] if candidates else None
 
     def _rank_cell(self, observation):
-        """Choose the selected cell's largest observed mask and its exact focus plane."""
+        """Rank detector evidence against the last cell depth, allowing real travel."""
         tracker = self.searcher.tracker
-        return None if tracker.lost else float(tracker.area_px)
+        if tracker.lost:
+            return None
+        cell = self.select_cell(observation)
+        cells = observation['cell']
+        index = next(i for i, target in enumerate(cells['cell_targets']) if target is cell)
+        seed = np.asarray(cells['cell_seed_points'][index])
+        detections = cells.get('cell_detections')
+        rows = [] if detections is None else [row for row in detections
+            if len(row) >= 3 and np.isfinite(row[:3]).all()]
+        detection = min(rows, key=lambda row: np.linalg.norm(np.asarray(row[:2]) - seed), default=None)
+        confidence = 1.0 if detection is None else float(np.clip(detection[2], 0.0, 1.0))
+        origin = getattr(self, 'cell_search_motor_z', None)
+        if origin is None:
+            origin = getattr(self, 'descent_origin', None)
+        travelled = 0.0 if origin is None else abs(self.unit.position()[2] - origin)
+        scale = max(self.depth_tolerance_um, travelled)
+        prior_z = self.cell_focus_z
+        if getattr(self, 'final_search_reference_xy', None) is not None:
+            prior_z = sum(self.searcher.sweep_bounds) / 2.0
+        depth_error = abs(observation['stage']['raw_position'][2] - prior_z)
+        return confidence / (1.0 + (depth_error / scale) ** 2)
 
     def publish_alignment_snapshot(self, observation=None):
         captured_sweep_frame = observation is not None
@@ -183,6 +230,10 @@ class ApproachCellPhase(PhaseController):
             accepted = dict(xy=np.asarray(target["target_points_xy"][0]).copy(),
                             stage_xy=np.asarray(stage["raw_position"])[:2].copy())
         detection = pipette["pipette_detection"] if pipette is not None else None
+        if detection is not None and not Scanner.tip_matches_anchor(
+                detection.get("tip_xy"), pipette["pixel_position"], self.stage,
+                self.unit.config.pipette_detection_radius_um):
+            detection = None
         pipette_position = np.asarray(pipette["raw_position"]).copy() if pipette is not None else None
         saved_tip = None
         if captured_sweep_frame and self.operation == self.scan and self.scanner.best_observation is not None:
@@ -235,7 +286,7 @@ class ApproachCellPhase(PhaseController):
         if self.mode == "Training":
             return
         self.next_action = self.operation
-        if self.operation == self.spear:
+        if self.operation == self.spear and not getattr(self, 'visual_fallback', False):
             remaining_depth = self.calculate_progress()
             if abs(remaining_depth) <= self.depth_tolerance_um:
                 # Already at the stopping distance: do the final alignment pass.
@@ -263,18 +314,82 @@ class ApproachCellPhase(PhaseController):
             self.controller.sleep(0.1)
 
     def search(self, *, bounds=None):
+        endpoint = getattr(self, 'speared', False) and self.phase_name == 'Approach'
+        if endpoint:
+            def confirm(z, reference):
+                radius = self.config.search_z_radius_um
+                self.final_search_reference_xy = reference
+                try:
+                    return self.searcher.run(self, bounds=(z - radius, z + radius), speed=self.config.search_speed)
+                finally:
+                    self.final_search_reference_xy = None
+
+            def complete(result):
+                if result is None:
+                    return None
+                if result == 'not_found':
+                    self.searcher.tracker.using_fallback = True
+                    self.controller.info('Approach endpoint did not confirm the cell; retaining the previous depth')
+                    self.finish(success=True)
+                    return result
+                self.cell_observation = result
+                self.cell_search_motor_z = self.observation['pipette']['raw_position'][2]
+                self.visual_fallback = False
+                self.shift_cell, self.operation = True, self.shift
+                return result
+
+            if not getattr(self, 'visual_fallback', False):
+                radius = self.config.search_z_radius_um
+                local_bounds = bounds if bounds is not None else (self.cell_focus_z - radius, self.cell_focus_z + radius)
+                result = self.searcher.run(self, bounds=local_bounds, speed=self.config.search_speed)
+                if result != 'not_found':
+                    return complete(result)
+            else:
+                probe = self.observe(cell_inference=True, cell_masks=False, pipette_inference=False)
+                if probe is None or not self.motion_checkpoint():
+                    return None
+                cells = probe.get('cell') or {}
+                raw = cells.get('cell_detections')
+                rows = [] if raw is None else list(raw)
+                nomination = dict(probe, cell=dict(cells,
+                    cell_seed_points=[row[:2] for row in rows], cell_targets=rows))
+                selected = self._select_cell(nomination) if rows else None
+                if selected is not None:
+                    reference = np.asarray(probe['stage']['pixel_position']) - np.asarray(selected[:2])
+                    result = confirm(float(probe['stage']['raw_position'][2]), reference)
+                    if result != 'not_found':
+                        return complete(result)
+            if getattr(self, 'endpoint_wide_attempted', False):
+                return complete('not_found')
+            self.endpoint_wide_attempted = True
+            radius = getattr(self.config, 'final_search_z_radius_um', 10.)
+            detection = self.searcher.look_for_cell(self,
+                bounds=(self.cell_focus_z - radius, self.cell_focus_z + radius))
+            if detection is None or detection == 'not_found':
+                return complete(detection)
+            return complete(confirm(*detection))
+
         if bounds is None:
             radius = self.config.search_z_radius_um
             bounds = (self.cell_focus_z - radius, self.cell_focus_z + radius)
         result = self.searcher.run(self, bounds=bounds, speed=self.config.search_speed)
         if result is None:
-            return
-        if result == "not_found":
+            return None
+        if result == 'not_found':
             self.searcher.tracker.using_fallback = True
-            self.cell_observation = None
+            if (getattr(self, 'recovery_attempted', False) and self.recovering_cell
+                    and self.phase_name == 'Approach'):
+                self.visual_fallback = True
+                self.recovering_cell = False
+                self.operation = self.spear
+                self.controller.info('Recovery sweep found no cell; continuing to the saved Approach target')
+                return result
         else:
             self.cell_observation = result
+            self.cell_search_motor_z = self.observation['pipette']['raw_position'][2]
+            self.visual_fallback = False
         self.shift_cell, self.operation = True, self.shift
+        return result
 
     def scan(self):
         radius = self.config.scan_z_radius_um
@@ -292,17 +407,17 @@ class ApproachCellPhase(PhaseController):
         positioned = helper.move_to(self, viewing_z, self.config.search_speed)
         if positioned is None:
             return
-        desired_xy = (self.stage.camera.width / 2, self.stage.camera.height / 2)
         if self.shift_cell:
             result = self.shifter.shift_cell(self, target_xy=None,
                 max_error_px=self.config.approach_cell_max_shift)
         else:
-            result = self.shifter.shift_pipette(self, desired_xy=desired_xy,
+            center = (self.stage.camera.width / 2, self.stage.camera.height / 2)
+            result = self.shifter.shift_pipette(self, desired_xy=center,
                 speed=self.config.approach_pipette_speed)
         if result is None:
             return
         if self.shift_cell:
-            self.operation = self.spear if self.recovering_cell else self.scan
+            self.operation = self.scan
             self.recovering_cell = False
         elif self.speared:
             self.finish(success=True)
@@ -310,6 +425,13 @@ class ApproachCellPhase(PhaseController):
             self.operation = self.spear
 
     def spear(self):
+        if getattr(self, 'visual_fallback', False):
+            result = self.spearer.run(self, target_z=self.recovery_target_z,
+                speed=abs(self.config.max_clearing_speed), tracker=None)
+            if result is not None:
+                self.speared = True
+                self.operation = self.search
+            return
         viewing_z = self.cell_focus_z if self.config.track_cell else self.hover_z
         positioned = self.searcher.move_to(self, viewing_z, self.config.search_speed)
         if positioned is None:
@@ -321,6 +443,14 @@ class ApproachCellPhase(PhaseController):
         tracker = self.searcher.tracker if self.config.track_cell else None
         result = self.spearer.run(self, target_z=target_z, speed=speed, tracker=tracker)
         if result == "cell_lost":
+            if self.phase_name == 'Approach':
+                self.recovery_target_z = target_z
+                if self.recovery_attempted:
+                    self.visual_fallback = True
+                    self.recovering_cell = False
+                    self.controller.info('Cell lost again after recovery; continuing to the saved Approach target')
+                    return
+                self.recovery_attempted = True
             self.recovering_cell = True
             self.operation = self.search
             return
@@ -333,6 +463,7 @@ class ApproachCellPhase(PhaseController):
         if self.mode == "Training":
             controller.amplifier.start_patch()
             self.initialized = True
+            self.awaiting_operator = True
             controller.info("Training mode: manual movement. Click Success or Abort to finish.")
             return
         self.stage.set_max_speed(config.max_locate_speed)
